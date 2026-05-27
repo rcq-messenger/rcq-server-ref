@@ -1,0 +1,40 @@
+# Local environment
+.env
+.env.local
+.env.production
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local databases
+rcq.db
+rcq.db-shm
+rcq.db-wal
+*.sqlite
+*.sqlite3
+
+# Uploads (per-deployment data, never committed)
+media/
+news_media/
+evidence/
+
+# IDE / editor
+.idea/
+.vscode/
+.DS_Store
+
+# Logs
+*.log
+
+# Apple Push key — never check this in
+*.p8

@@ -1,0 +1,205 @@
+# Caddy config for RCQ.
+#
+# Caddy automatically obtains and renews a Let's Encrypt certificate for any
+# domain in here as long as the domain's A-record points at this machine.
+# Goes in /etc/caddy/Caddyfile on the droplet.
+#
+# Five sites live here:
+#   1. api.rcq.app      → uvicorn (FastAPI backend)
+#   2. rcq.app          → static landing page (built from web/, served from /var/www/rcq)
+#   3. www.rcq.app      → 301 → rcq.app (apex canonical)
+#   4. chat.rcq.app     → static SPA (built from web-chat/, served from /var/www/chat)
+#   5. admin.rcq.app    → static SPA (built from web-admin/, served from /var/www/admin)
+
+# ───────────────────────────────────────────────────────────────────
+# Global options
+# ───────────────────────────────────────────────────────────────────
+{
+	# HTTP/3 (QUIC) deliberately disabled — serve only h1 + h2.
+	#
+	# RCQ's iOS censorship-circumvention transport routes URLSession
+	# through a local SOCKS proxy (an embedded sing-box VLESS+Reality
+	# client). QUIC bypasses SOCKS proxies entirely, so any h3
+	# connection would leak around the obfuscated tunnel and hit the
+	# blocked direct path. Advertising only h1/h2 means iOS never
+	# attempts QUIC and every request stays inside the tunnel.
+	# Marginal perf cost — h2 is universal.
+	servers {
+		protocols h1 h2
+	}
+}
+
+# ───────────────────────────────────────────────────────────────────
+# Apex landing
+# ───────────────────────────────────────────────────────────────────
+rcq.app {
+    root * /var/www/rcq
+    file_server
+    encode gzip zstd
+
+    # Apple App Site Association — pinned BEFORE the SPA fallback so a
+    # request to /.well-known/apple-app-site-association serves the
+    # static JSON file instead of falling through to index.html. Apple
+    # also accepts the file with no extension; Caddy's file_server
+    # picks it up from /var/www/rcq/.well-known/ as long as Vite's
+    # dist/ ships the public/.well-known/ tree intact (it does).
+    @aasa path /.well-known/apple-app-site-association
+    header @aasa Content-Type "application/json"
+    header @aasa Cache-Control "public, max-age=3600"
+
+    # SPA fallback for client-side routes like /privacy, /terms and
+    # /u/<uin> — any non-asset, non-AASA path that doesn't resolve to a
+    # real file falls back to index.html, which lets the path-based
+    # router in App.tsx pick the right view.
+    @notFile {
+        not file
+        not path /assets/*
+        not path /.well-known/*
+    }
+    rewrite @notFile /index.html
+
+    # Vite emits content-hashed filenames under /assets/ so we can cache
+    # them aggressively. The HTML itself is fetched fresh every visit.
+    @assets path /assets/*
+    header @assets Cache-Control "public, max-age=31536000, immutable"
+    @html path /
+    header @html Cache-Control "public, max-age=300, must-revalidate"
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        Referrer-Policy           "no-referrer"
+        -Server
+    }
+}
+
+# www → apex canonical redirect
+www.rcq.app {
+    redir https://rcq.app{uri} permanent
+}
+
+# ───────────────────────────────────────────────────────────────────
+# API backend
+# ───────────────────────────────────────────────────────────────────
+api.rcq.app {
+    # Forward both HTTP and WebSocket traffic to the local uvicorn process.
+    # The /ws/* path is the WebSocket endpoint; Caddy upgrades the connection
+    # transparently — same `reverse_proxy` directive handles it.
+    reverse_proxy 127.0.0.1:8000 {
+        # Pass the real client IP through so FastAPI / our middlewares see it
+        # in `X-Forwarded-For` instead of always 127.0.0.1.
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP       {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+
+    # Reasonable structured logging — Caddy ships JSON to /var/log/caddy by default.
+    log {
+        output file /var/log/caddy/api.rcq.app.log {
+            roll_size  10mb
+            roll_keep  5
+        }
+    }
+
+    # Tighten the default header behaviour.
+    header {
+        # Browser UAs only — our iOS app doesn't care, but cheap defense.
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        Referrer-Policy           "no-referrer"
+        # Caddy adds Server: Caddy by default; hide it.
+        -Server
+    }
+}
+
+# ───────────────────────────────────────────────────────────────────
+# Web chat SPA
+# ───────────────────────────────────────────────────────────────────
+chat.rcq.app {
+    # === TEMPORARILY CLOSED for the iOS smoke-test launch (May 11). ===
+    #
+    # The web-chat SPA at /var/www/chat is fully built and ready, but
+    # we don't want users landing on the linking flow accidentally
+    # while we're focused on the TestFlight beta. Sending a 302 to the
+    # apex landing keeps the SSL cert (Let's Encrypt) auto-renewing on
+    # this hostname AND keeps the SPA bundle on disk untouched — so
+    # restoring access is just reverting this `redir` block back to
+    # the original `root` + `file_server` block in git.
+    #
+    # The original block (root + SPA fallback + headers) is kept as
+    # comment below for fast restoration. When the iOS launch settles
+    # and we're ready to expose the web client, swap this block for the
+    # commented-out one and re-deploy.
+    #
+    # ----------------------------------------------------------------
+    # ORIGINAL (preserved for restoration — uncomment to re-enable):
+    # ----------------------------------------------------------------
+    # root * /var/www/chat
+    # file_server
+    # encode gzip zstd
+    # @notFile {
+    #     not file
+    #     not path /assets/*
+    # }
+    # rewrite @notFile /index.html
+    # @assets path /assets/*
+    # header @assets Cache-Control "public, max-age=31536000, immutable"
+    # @html path /
+    # header @html Cache-Control "public, max-age=300, must-revalidate"
+    # header {
+    #     Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    #     X-Content-Type-Options    "nosniff"
+    #     X-Frame-Options           "DENY"
+    #     Referrer-Policy           "no-referrer"
+    #     -Server
+    # }
+
+    # 302 (temporary) — explicit Found, not 301, so browsers + caches
+    # don't memoise this redirect. When we re-enable the SPA, returning
+    # users won't be stuck on the apex landing.
+    redir https://rcq.app{uri} 302
+
+    # Minimal headers — even on the redirect path we want HSTS so the
+    # next request always lands HTTPS-first.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+}
+
+# ───────────────────────────────────────────────────────────────────
+# Admin SPA — gates against api.rcq.app/admin/* via HTTP Basic
+# (browser handles the Authorization header from `fetch`). The SPA
+# itself is public; the API endpoints behind it require admin creds
+# from the backend's .env. We deliberately don't IP-allowlist the
+# domain — the auth surface is the only gate, and Let's Encrypt won't
+# issue a cert for a domain that isn't reachable.
+# ───────────────────────────────────────────────────────────────────
+admin.rcq.app {
+    root * /var/www/admin
+    file_server
+    encode gzip zstd
+
+    # SPA fallback (everything that isn't an asset) → index.html so a
+    # hard refresh on any deep route still loads the app.
+    @notFile {
+        not file
+        not path /assets/*
+    }
+    rewrite @notFile /index.html
+
+    @assets path /assets/*
+    header @assets Cache-Control "public, max-age=31536000, immutable"
+    @html path /
+    header @html Cache-Control "public, max-age=300, must-revalidate"
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        # Admin UI must not be indexed.
+        X-Robots-Tag              "noindex, nofollow"
+        Referrer-Policy           "no-referrer"
+        -Server
+    }
+}

@@ -1,0 +1,63 @@
+# Local development / single-host self-hosting compose stack.
+#
+# Bring up:        docker compose up -d --build
+# Tail logs:       docker compose logs -f app
+# Shell in app:    docker compose exec app bash
+# Bring down:      docker compose down
+#
+# What this stack gives you:
+#   - app (FastAPI) on :8000, reading config from .env
+#   - postgres 16 with a persistent volume
+#   - redis 7 with a persistent volume (AOF on)
+#
+# What it deliberately doesn't include:
+#   - TLS termination — bring your own reverse proxy (Caddy / nginx /
+#     Traefik) in front of :8000 once you've pointed DNS at this host.
+#     The Caddyfile from the rcq.app production deployment lives in
+#     `deploy/Caddyfile` for reference.
+#   - Backups — DIY (volumes are at the bottom of this file).
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL + REDIS_URL so the app talks to the
+      # service hostnames rather than localhost.
+      DATABASE_URL: "postgresql+asyncpg://rcq:${POSTGRES_PASSWORD:-rcq}@postgres:5432/rcq"
+      REDIS_URL: "redis://redis:6379/0"
+    ports:
+      - "8000:8000"
+    volumes:
+      - media:/app/media
+      - news_media:/app/news_media
+      - evidence:/app/evidence
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rcq
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rcq}
+      POSTGRES_DB: rcq
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  media:
+  news_media:
+  evidence:

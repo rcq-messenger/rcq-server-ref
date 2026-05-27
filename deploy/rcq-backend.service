@@ -1,0 +1,50 @@
+[Unit]
+Description=RCQ FastAPI backend (uvicorn)
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service redis-server.service
+# Restart back-off — modern systemd wants these in [Unit], not [Service].
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=rcq
+Group=rcq
+WorkingDirectory=/opt/rcq/app/backend
+EnvironmentFile=/opt/rcq/.env
+ExecStart=/opt/rcq/venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --proxy-headers \
+    --forwarded-allow-ips '*' \
+    --workers 4
+# Multi-worker enabled. State that previously lived in a single
+# process is now Redis-backed:
+#   - WebSocket fanout via pub/sub (services/connection_manager.py)
+#   - Random-chat queue + pairs (routers/random.py)
+#   - Audio-room rosters + call signalling (routers/ws.py)
+#   - Background loops (crash, uin_auction, random expire) all
+#     leader-elected via Redis SETNX
+# When we need more headroom, bump `--workers` here AND re-size the
+# droplet (CPU is the gate — 4 workers fit a 4-core droplet cleanly).
+
+# Health: restart on any non-zero exit, but back off if it's flapping.
+Restart=always
+RestartSec=3
+
+# Security hardening — minimum kernel access uvicorn actually needs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/rcq/media /opt/rcq/app/backend /var/log/rcq
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Logs go to journald. View with:  journalctl -u rcq-backend -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
