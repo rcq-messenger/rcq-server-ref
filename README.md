@@ -136,6 +136,15 @@ The wire protocol is specified in a separate repo:
 [`rcq-messenger/rcq-spec`](https://github.com/rcq-messenger/rcq-spec).
 That's the document to read if you're implementing a client.
 
+## Public directory of instances
+
+Once your instance is up and you want users to find it without
+manually trading hostnames, open a PR against
+[`rcq-messenger/rcq-servers`](https://github.com/rcq-messenger/rcq-servers).
+That's a small JSON catalogue clients fetch on first launch and
+present as a picker. Each RCQ server is an isolated island — the
+directory is for discoverability, not federation.
+
 ## Contributing
 
 Issues and PRs welcome. Before opening a PR with non-trivial changes,
