@@ -46,7 +46,36 @@ hosted-key tooling), keep an eye on releases.
 * **Reports / moderation** — bug-bounty submissions, abuse reports
   with encrypted-media evidence, admin SPA at `admin.<your-domain>`.
 
-## Quick start (docker-compose)
+## One-line install (recommended)
+
+On a fresh Ubuntu / Debian VPS, as root or via sudo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh | bash
+```
+
+Asks you for the public domain, sanity-checks DNS, installs Docker
+if missing, generates a random `JWT_SECRET` + `POSTGRES_PASSWORD`,
+writes `.env`, brings the stack up, waits for the Let's Encrypt
+cert, smoke-tests `/health`, prints the next-step instructions.
+
+If you'd rather inspect first (recommended for any non-throwaway
+box):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+Prereqs the script assumes you've already done:
+* You have a VPS or other always-on host.
+* You own a domain (or subdomain) and have pointed an A-record at
+  the host.
+* Ports 80 + 443 are reachable on the host (Caddy needs both for
+  the ACME HTTP-01 challenge).
+
+## Quick start (manual docker-compose)
 
 Prereqs: a VPS with Docker installed, a domain (or subdomain) you can
 point at it, and an open port 80 + 443 (Caddy needs both for ACME).
