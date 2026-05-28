@@ -10,15 +10,16 @@ can run their own instance instead of trusting `api.rcq.app`.
 
 **Early. Reference, not yet production-tested by anyone but the
 maintainer.** The code is the same code that runs on `api.rcq.app`
-today — what is missing is a polished self-hosting story: per-instance
-TLS, an Android client that points at custom servers (iOS support
-incoming), automated migrations, and an installation walkthrough that
-handles the APNs setup hop. Track those items in [Issues](../../issues).
+today. The included `docker-compose.yml` covers TLS (Caddy + Let's
+Encrypt) and APNs setup is documented in [`docs/apns.md`](docs/apns.md).
+Open items: Android client pointing at custom servers, automated
+migrations, and a wider testing pass on the self-hosted path. Track
+those in [Issues](../../issues).
 
-If you're comfortable wiring up FastAPI + Postgres + Redis behind a
-reverse proxy yourself, the `docker-compose.yml` in this repo will get
-you a working server in about ten minutes. If you're not, wait a beat —
-the friction-light path is on the roadmap.
+If you have a small VPS, a domain you can point at it, and ten
+minutes, the quick-start below stands a working server up. If you'd
+rather wait for the friction-light path (one-command install,
+hosted-key tooling), keep an eye on releases.
 
 ## What this server does
 
@@ -47,26 +48,41 @@ the friction-light path is on the roadmap.
 
 ## Quick start (docker-compose)
 
+Prereqs: a VPS with Docker installed, a domain (or subdomain) you can
+point at it, and an open port 80 + 443 (Caddy needs both for ACME).
+
 ```bash
+# 1. DNS: point an A-record at this host. Wait for propagation
+#    (`dig +short rcq.example.com` should return the host's IP).
+
+# 2. Clone + configure
 git clone https://github.com/rcq-messenger/rcq-server-ref.git
 cd rcq-server-ref
 cp .env.example .env
-# At minimum set JWT_SECRET=$(openssl rand -hex 32).
-# Set POSTGRES_PASSWORD too if you'd rather not use the "rcq" default.
+$EDITOR .env
+# Fill at minimum:
+#   ENV=prod
+#   RCQ_DOMAIN=rcq.example.com
+#   JWT_SECRET=<output of `openssl rand -hex 32`>
+#   POSTGRES_PASSWORD=<anything other than the "rcq" default>
+# (Optional) Push notifications: see docs/apns.md, then drop your
+# apns.p8 next to docker-compose.yml and fill the APNS_* block.
+
+# 3. Bring the stack up
 docker compose up -d --build
-curl http://localhost:8000/health        # → {"ok":true,"app":"RCQ Backend"}
+# Caddy fetches a Let's Encrypt cert on first request to the new
+# hostname — takes a few seconds. Confirm with:
+curl https://rcq.example.com/health        # → {"ok":true,"app":"RCQ Backend"}
 ```
 
-Once `:8000` answers, put a TLS-terminating reverse proxy in front
-(the reference Caddyfile from the rcq.app production deploy is in
-[deploy/Caddyfile](deploy/Caddyfile)), point your DNS at the host,
-and you have a server.
-
-For iOS clients to connect to your instance instead of `api.rcq.app`,
-**a "custom server" picker in Settings is coming in the next iOS
-release** — it's already on the roadmap. Until then, self-hosting is
-most useful for people building their own client or testing
-modifications.
+Once `/health` answers over HTTPS, point an iOS client at the new
+backend via Settings → Privacy & Network → Custom server. The picker
+takes any `https://` URL that exposes the RCQ API, writes it to
+`UserDefaults`, and the next launch boots against your instance
+instead of `api.rcq.app`. Note that switching servers is destructive
+locally (the client treats it as a fresh install) — your account on
+the old server is unaffected, you simply allocate a new UIN on the new
+one.
 
 ## Quick start (no Docker)
 
@@ -87,11 +103,15 @@ for production and run via systemd / a process supervisor.
 ## APNs (push notifications)
 
 iOS push requires an Apple Developer account, an APNs `.p8` key, and
-a registered Bundle ID. The keys live entirely on your server — the
-iOS client never sees them. Configure via the `APNS_*` block in
-`.env.example`. Leave the key fields blank to disable push entirely;
-the server no-ops the sender path and your users still get messages
-on next WebSocket connect, just without iOS alert pushes.
+a registered Bundle ID. The key lives entirely on your server — the
+iOS client never sees it. Full step-by-step in
+[`docs/apns.md`](docs/apns.md): generating the `.p8`, finding your
+Key/Team/Bundle IDs, choosing `production` vs `sandbox`, and the
+docker-compose mount.
+
+Leave the key fields blank in `.env` to disable push entirely. The
+server no-ops the sender path and your users still get messages on
+next WebSocket connect, just without iOS alert pushes.
 
 ## What's intentionally NOT in this repo
 

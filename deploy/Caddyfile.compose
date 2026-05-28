@@ -1,0 +1,41 @@
+# Caddyfile for the docker-compose self-host path.
+#
+# Reads RCQ_DOMAIN from the .env file next to docker-compose.yml. Caddy then
+# automatically obtains and renews a Let's Encrypt certificate for that
+# domain. Pre-req: A-record for RCQ_DOMAIN points at this host before
+# `docker compose up -d` runs the first time (otherwise ACME fails until
+# DNS propagates).
+#
+# For multi-site production deployments (separate api / landing / admin
+# hostnames) see deploy/Caddyfile in this repo — that's the richer config
+# the maintainer runs on rcq.app.
+
+{
+	# HTTP/3 (QUIC) deliberately disabled.
+	#
+	# The iOS client routes traffic through a local SOCKS proxy (sing-box
+	# VLESS+Reality / Hysteria2) when censorship circumvention is active.
+	# QUIC bypasses SOCKS proxies and would leak around the obfuscated
+	# tunnel onto the blocked direct path. Advertising only h1 + h2 forces
+	# every request inside the tunnel. Marginal perf cost.
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$RCQ_DOMAIN} {
+	reverse_proxy app:8000 {
+		# Surface the real client IP to FastAPI so rate-limiters and audit
+		# logs don't all collapse to the caddy container's IP.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP       {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options    "nosniff"
+		Referrer-Policy           "no-referrer"
+		-Server
+	}
+}

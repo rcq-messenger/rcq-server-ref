@@ -15,6 +15,20 @@ from app.services.story_sweep import story_sweep_loop
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Fail-closed on misconfigured JWT_SECRET. Issuing tokens signed with
+    # the placeholder default would let anyone who reads the public repo
+    # forge a JWT for any UIN on this server. Equally, an empty secret
+    # means HS256 signs with the empty key — also forgeable. The `dev`
+    # escape hatch keeps local development + the test suite ergonomic;
+    # production / TestFlight / self-host operators must set a real
+    # secret in .env before the first boot.
+    if settings.ENV != "dev" and settings.JWT_SECRET in ("", "change-me-in-prod"):
+        raise RuntimeError(
+            "JWT_SECRET is unset or still the placeholder default. "
+            "Set JWT_SECRET in .env to a long random string "
+            "(e.g. `openssl rand -hex 32`), or set ENV=dev to allow "
+            "boot with the placeholder secret for local development."
+        )
     await init_db()
     # Warm the Redis client + ping the server. With multi-worker uvicorn
     # the main shared state (random-chat queue, audio-room rosters, WS

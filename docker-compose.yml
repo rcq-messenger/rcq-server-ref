@@ -1,23 +1,49 @@
-# Local development / single-host self-hosting compose stack.
+# Single-host self-hosting compose stack.
 #
 # Bring up:        docker compose up -d --build
 # Tail logs:       docker compose logs -f app
 # Shell in app:    docker compose exec app bash
 # Bring down:      docker compose down
 #
-# What this stack gives you:
-#   - app (FastAPI) on :8000, reading config from .env
+# Prerequisites before `docker compose up`:
+#   1. Copy `.env.example` to `.env` and fill in:
+#        - JWT_SECRET   (e.g. `openssl rand -hex 32`)
+#        - RCQ_DOMAIN   (the hostname iOS clients will connect to)
+#        - POSTGRES_PASSWORD (optional, falls back to "rcq")
+#      iOS clients require HTTPS (App Transport Security), so RCQ_DOMAIN
+#      must be a real hostname with a public A-record pointing at this
+#      host. Caddy auto-issues a Let's Encrypt cert on first boot.
+#   2. (Optional) Drop an APNs `.p8` key at `./apns.p8` next to this file
+#      if you want iOS push notifications. See `docs/apns.md`. Without
+#      the file the server runs fine — users get messages on the next
+#      WebSocket reconnect, just without iOS alert pushes.
+#
+# What you get:
+#   - caddy on :80 + :443, auto-TLS for RCQ_DOMAIN
+#   - app (FastAPI) on the internal docker network at app:8000
 #   - postgres 16 with a persistent volume
 #   - redis 7 with a persistent volume (AOF on)
-#
-# What it deliberately doesn't include:
-#   - TLS termination — bring your own reverse proxy (Caddy / nginx /
-#     Traefik) in front of :8000 once you've pointed DNS at this host.
-#     The Caddyfile from the rcq.app production deployment lives in
-#     `deploy/Caddyfile` for reference.
-#   - Backups — DIY (volumes are at the bottom of this file).
 
 services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # Caddy listens on UDP 443 too in default configs (HTTP/3). We've
+      # disabled h3 in Caddyfile.compose so the UDP port is harmless if
+      # not mapped, but exposing it costs nothing.
+      - "443:443/udp"
+    environment:
+      RCQ_DOMAIN: ${RCQ_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile.compose:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
   app:
     build: .
     restart: unless-stopped
@@ -28,12 +54,21 @@ services:
       # service hostnames rather than localhost.
       DATABASE_URL: "postgresql+asyncpg://rcq:${POSTGRES_PASSWORD:-rcq}@postgres:5432/rcq"
       REDIS_URL: "redis://redis:6379/0"
-    ports:
-      - "8000:8000"
+    # No `ports:` mapping — app is reachable only through Caddy from the
+    # outside. Inside the docker network it's `app:8000`.
+    expose:
+      - "8000"
     volumes:
       - media:/app/media
       - news_media:/app/news_media
       - evidence:/app/evidence
+      # APNs push notifications (optional). Drop your Apple `.p8` key at
+      # ./apns.p8 next to docker-compose.yml and uncomment the mount
+      # below, then set APNS_KEY_PATH=/keys/apns.p8 plus APNS_KEY_ID +
+      # APNS_TEAM_ID + APNS_BUNDLE_ID in .env. See docs/apns.md for the
+      # full walkthrough. Leave the mount commented out and the key
+      # fields empty in .env to disable push entirely.
+      # - ./apns.p8:/keys/apns.p8:ro
     depends_on:
       - postgres
       - redis
@@ -58,6 +93,8 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:
   media:
   news_media:
   evidence:
