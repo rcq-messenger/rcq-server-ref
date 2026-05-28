@@ -235,11 +235,43 @@ async def send_group_sealed(
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
 
 
+class AckIn(BaseModel):
+    # IDs the client successfully ingested into its local store. Two
+    # parallel arrays because OfflineMessage.id and OfflineGroupMessage.id
+    # are auto-increment per-table and can collide; clients split by the
+    # `group_id` field on HistoryRow (None → direct, set → group).
+    direct_ids: list[int] = Field(default_factory=list)
+    group_ids: list[int] = Field(default_factory=list)
+
+
+class AckOut(BaseModel):
+    deleted: int
+
+
 @router.get("/queue", response_model=list[HistoryRow])
 async def fetch_queue(
+    ack: bool = False,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> list[HistoryRow]:
+    """Fetch queued offline envelopes for the authenticated UIN.
+
+    `ack=false` (default, legacy): drain-on-fetch — server deletes
+    every returned row inside the same transaction. Simple but lossy:
+    if the client receives the HTTP response and then fails to persist
+    one envelope (decryption error, app crash mid-loop, serialisation
+    bug), that row is gone forever and the recipient sees the push
+    notification but no message in chat.
+
+    `ack=true`: server returns envelopes without deleting. The client
+    is expected to POST /messages/queue/ack with the IDs of the
+    envelopes it successfully persisted. Un-ACKed rows are reaped by
+    the background TTL sweeper after `OFFLINE_QUEUE_TTL_DAYS` (so
+    truly stuck rows don't accumulate forever). New clients opt in
+    via this parameter; old clients keep the legacy semantics. Once
+    every iOS build in the wild sends `ack=1`, the default can flip
+    in a future release.
+    """
     rows_1to1 = (
         await db.execute(
             select(OfflineMessage)
@@ -268,9 +300,58 @@ async def fetch_queue(
         ))
     out.sort(key=lambda x: x.received_at)
 
-    for r in rows_1to1:
-        await db.delete(r)
-    for r in rows_group:
-        await db.delete(r)
-    await db.commit()
+    if not ack:
+        # Legacy drain-on-fetch path. Keep behaviour identical to
+        # pre-ACK clients so a rolling iOS deploy doesn't regress.
+        for r in rows_1to1:
+            await db.delete(r)
+        for r in rows_group:
+            await db.delete(r)
+        await db.commit()
     return out
+
+
+@router.post("/queue/ack", response_model=AckOut)
+async def ack_queue(
+    body: AckIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> AckOut:
+    """Delete envelopes the client has confirmed it persisted locally.
+
+    Ownership-checked: a row is deleted only when its `to_uin` matches
+    the authenticated UIN. Spoofing someone else's IDs is a no-op.
+    Unknown IDs (already deleted, expired by TTL sweep, never existed)
+    are silently ignored — the endpoint is idempotent so retrying a
+    stale ACK list does no harm.
+    """
+    deleted = 0
+
+    if body.direct_ids:
+        rows = (
+            await db.execute(
+                select(OfflineMessage).where(
+                    OfflineMessage.id.in_(body.direct_ids),
+                    OfflineMessage.to_uin == uin,
+                )
+            )
+        ).scalars().all()
+        for r in rows:
+            await db.delete(r)
+        deleted += len(rows)
+
+    if body.group_ids:
+        rows = (
+            await db.execute(
+                select(OfflineGroupMessage).where(
+                    OfflineGroupMessage.id.in_(body.group_ids),
+                    OfflineGroupMessage.to_uin == uin,
+                )
+            )
+        ).scalars().all()
+        for r in rows:
+            await db.delete(r)
+        deleted += len(rows)
+
+    await db.commit()
+    return AckOut(deleted=deleted)

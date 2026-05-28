@@ -10,6 +10,7 @@ from app.core.redis import close_redis, get_redis
 from app.routers import admin, audio_rooms, auth, contacts, groups, hood, hood_banners, keys, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, stories, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.fake_users import seed_fake_users
+from app.services.offline_queue_sweep import offline_queue_sweep_loop
 from app.services.story_sweep import story_sweep_loop
 
 
@@ -39,11 +40,13 @@ async def lifespan(_: FastAPI):
     await seed_fake_users()
     expire_task = asyncio.create_task(random_chat.expire_loop())
     story_sweep_task = asyncio.create_task(story_sweep_loop())
+    offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     try:
         yield
     finally:
         expire_task.cancel()
         story_sweep_task.cancel()
+        offline_queue_sweep_task.cancel()
         await close_redis()
 
 
