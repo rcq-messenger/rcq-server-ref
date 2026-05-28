@@ -149,10 +149,29 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
 async def init_db() -> None:
     from app.models import user, contact, message, group, device_token, prekey, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message  # noqa: F401  (register tables)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
+
+    # Serialise schema creation across uvicorn workers. Without the lock,
+    # `--workers N` on a fresh Postgres DB races: every worker calls
+    # `create_all()` simultaneously, and the second one crashes with
+    # `UniqueViolationError` on `pg_class_relname_nsp_index` because the
+    # first has already issued the CREATE SEQUENCE for `users_uin_seq`.
+    # `pg_advisory_xact_lock` is session-level but auto-releases at end
+    # of the transaction, so once create_all returns and the `begin()`
+    # block exits, the lock is gone. Subsequent workers wake up, see
+    # every table already present (create_all is idempotent with
+    # checkfirst=True, the default), and proceed.
+    #
+    # SQLite has no analogue and doesn't need one — it doesn't run
+    # multi-worker uvicorn realistically (writes serialise on the file
+    # lock anyway), and the test suite hits it single-process.
+    async with engine.begin() as conn:
+        if dialect == "postgresql":
+            # Two int32 args by convention. Constants are arbitrary;
+            # 0x52435100 = "RCQ\0" packs the project name as a sentinel
+            # so it's identifiable in pg_locks during debugging.
+            await conn.execute(text("SELECT pg_advisory_xact_lock(0x52435100, 1)"))
+        await conn.run_sync(Base.metadata.create_all)
     additive: list[tuple[str, list[tuple[str, str]]]] = [
         ("users", _USER_STAGE3_COLUMNS),
         ("nearby_checkins", _NEARBY_CHECKIN_COLUMNS),
