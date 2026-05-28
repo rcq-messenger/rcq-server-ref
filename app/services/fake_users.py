@@ -22,10 +22,10 @@ from __future__ import annotations
 import base64
 import secrets
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import SessionLocal
+from app.core.db import SessionLocal, engine
 from app.models.user import User
 from app.services.uin import allocate_uin
 
@@ -73,31 +73,44 @@ def _rand_b64(n: int) -> str:
 
 async def seed_fake_users() -> None:
     """Insert demo users if none exist yet. Idempotent — skips when fakes are
-    already in the table. Called from the FastAPI lifespan after `init_db`."""
-    async with SessionLocal() as db:  # type: AsyncSession
-        existing = await db.scalar(
-            select(func.count()).select_from(User).where(User.is_fake == True)  # noqa: E712
-        )
-        if (existing or 0) > 0:
-            return
+    already in the table. Called from the FastAPI lifespan after `init_db`.
 
-        for seed in SEEDS:
-            uin = await allocate_uin(db)
-            user = User(
-                uin=uin,
-                nickname=seed["nickname"],
-                # Random base64 — fakes don't have real clients to decrypt
-                # anything, so the column NOT NULL constraint is all that
-                # matters. Real users send actual X25519 / Ed25519 pubkeys.
-                identity_key=_rand_b64(32),
-                signing_key=_rand_b64(32),
-                city=seed.get("city"),
-                country=seed.get("country"),
-                age=seed.get("age"),
-                about=seed.get("about") or None,
-                status=seed["status"],
-                status_message=seed.get("status_message"),
-                is_fake=True,
+    Serialised across uvicorn workers via a Postgres advisory lock: without
+    it, two workers booting against an empty fakes table both observe
+    `existing == 0` and both seed the full catalogue, producing duplicates
+    (two `neon`s, two `Ольга`s, etc). Lock key is distinct from the
+    `init_db` schema lock so the two stages don't artificially serialise.
+    SQLite-backed deployments don't multi-process and skip the lock branch.
+    """
+    dialect = engine.dialect.name
+    async with SessionLocal() as db:  # type: AsyncSession
+        async with db.begin():
+            if dialect == "postgresql":
+                # 0x52435100 = "RCQ\0" sentinel, second slot = 2 (init_db uses 1).
+                await db.execute(text("SELECT pg_advisory_xact_lock(0x52435100, 2)"))
+            existing = await db.scalar(
+                select(func.count()).select_from(User).where(User.is_fake == True)  # noqa: E712
             )
-            db.add(user)
-        await db.commit()
+            if (existing or 0) > 0:
+                return
+
+            for seed in SEEDS:
+                uin = await allocate_uin(db)
+                user = User(
+                    uin=uin,
+                    nickname=seed["nickname"],
+                    # Random base64 — fakes don't have real clients to decrypt
+                    # anything, so the column NOT NULL constraint is all that
+                    # matters. Real users send actual X25519 / Ed25519 pubkeys.
+                    identity_key=_rand_b64(32),
+                    signing_key=_rand_b64(32),
+                    city=seed.get("city"),
+                    country=seed.get("country"),
+                    age=seed.get("age"),
+                    about=seed.get("about") or None,
+                    status=seed["status"],
+                    status_message=seed.get("status_message"),
+                    is_fake=True,
+                )
+                db.add(user)
+            # Commit happens implicitly when `async with db.begin()` exits.
