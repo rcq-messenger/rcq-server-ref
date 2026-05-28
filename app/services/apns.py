@@ -336,6 +336,18 @@ async def send_to_user(
         if thread_id:
             aps["thread-id"] = thread_id
         payload: dict[str, Any] = {"aps": aps}
+        # Recipient UIN in plain so the iOS NSE can route the push to
+        # the right local account on a multi-account device. The
+        # device token is per-device (not per-account), so backends
+        # send one push for `uin` and APNs delivers it to every
+        # account on that device — NSE then reads `to_uin` here,
+        # looks up which local Account owns this UIN, swaps its
+        # libsignal + Keychain stores to that account, and decrypts.
+        # Without this field NSE falls back to the active account's
+        # stores and fails to decrypt envelopes destined for any
+        # non-active account, showing a generic "RCQ New message"
+        # banner instead of the real preview.
+        payload["to_uin"] = uin
         if envelope_b64:
             # Carried verbatim through APNs — the NSE pulls it out of
             # `userInfo["env"]` and runs SignalCryptoService.decrypt on
