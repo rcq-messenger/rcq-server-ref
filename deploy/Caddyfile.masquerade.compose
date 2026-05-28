@@ -1,0 +1,90 @@
+# Opt-in Caddyfile for the docker-compose self-host path with a passive-
+# scanner masquerade in front of the FastAPI backend.
+#
+# When this file replaces Caddyfile.compose in the operator's deployment,
+# the public surface of RCQ_DOMAIN looks like an ordinary "coming soon"
+# landing page. Only requests carrying `X-RCQ-Auth: <RCQ_AUTH_TOKEN>` get
+# proxied to the actual backend; everything else (Shodan/Censys probes,
+# curl health checks, random scanners poking /auth/register) sees the
+# decoy static site and reports a generic landing page.
+#
+# Required .env keys (in the same directory as docker-compose.yml):
+#   RCQ_DOMAIN       — the public hostname (already required by the
+#                      default Caddyfile)
+#   RCQ_AUTH_TOKEN   — long random string. Distribute to clients out of
+#                      band (Signal / Telegram / face-to-face). Treat
+#                      like a password; rotating is a docker compose
+#                      restart + re-issue to your users.
+#
+# How to enable (operator workflow):
+#   1. Add RCQ_AUTH_TOKEN=`openssl rand -hex 32` to .env
+#   2. Drop a static `index.html` into ./decoy/ next to docker-compose.yml
+#      (a copy of any generic landing page works — see the README for a
+#      template). It will be bind-mounted into the caddy container.
+#   3. Replace `Caddyfile.compose` with this file in docker-compose.yml:
+#      `- ./deploy/Caddyfile.masquerade.compose:/etc/caddy/Caddyfile`
+#   4. Add the decoy bind mount:
+#      `- ./decoy:/srv/decoy:ro`
+#   5. `docker compose up -d`
+#
+# How iOS clients connect:
+#   The "Add account" sheet has an optional "Auth token" field below the
+#   URL input. Users paste the token there; the iOS APIClient and
+#   WebSocket service both stamp `X-RCQ-Auth: <token>` onto every
+#   request, including the WS upgrade. Without the token, registration
+#   404s into the decoy and the user sees an error.
+
+{
+	# HTTP/3 (QUIC) deliberately disabled — see Caddyfile.compose
+	# comment for rationale.
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$RCQ_DOMAIN} {
+	# Named matcher: header exactly equals the operator's secret. Caddy
+	# expands {$RCQ_AUTH_TOKEN} at config-load time, so the token never
+	# leaves the operator's box. A scanner that doesn't know the token
+	# cannot satisfy this matcher.
+	@authed header X-RCQ-Auth {$RCQ_AUTH_TOKEN}
+
+	# Authed requests pass through to FastAPI exactly as the default
+	# Caddyfile would.
+	handle @authed {
+		reverse_proxy app:8000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP       {remote_host}
+			header_up X-Forwarded-Proto https
+		}
+
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options    "nosniff"
+			Referrer-Policy           "no-referrer"
+			-Server
+		}
+	}
+
+	# Everything else (no token, wrong token, unauthenticated scanner)
+	# gets the decoy static site. file_server emits 200 OK + the static
+	# index.html, so the scanner sees a normal landing page rather than
+	# a 401 / 403 (which would itself be a strong signal). Add your own
+	# index.html under ./decoy/ — a personal blog, generic SaaS landing,
+	# "Coming soon" — whatever doesn't look like RCQ.
+	handle {
+		root * /srv/decoy
+		try_files {path} /index.html
+		file_server
+
+		header {
+			# Same security headers a normal static site would set so
+			# the masquerade response doesn't stand out from a real
+			# Caddy-fronted landing page.
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options    "nosniff"
+			Referrer-Policy           "no-referrer"
+			-Server
+		}
+	}
+}

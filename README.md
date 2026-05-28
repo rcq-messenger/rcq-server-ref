@@ -142,6 +142,49 @@ Leave the key fields blank in `.env` to disable push entirely. The
 server no-ops the sender path and your users still get messages on
 next WebSocket connect, just without iOS alert pushes.
 
+## Hiding from passive scanners (opt-in)
+
+By default, your `RCQ_DOMAIN` answers `/health`, `/auth/register` and
+the rest of the RCQ surface to anyone who asks. That's fine for public
+instances and most self-host setups. If you'd rather not show up in
+Shodan / Censys datasets as "an RCQ backend", an opt-in masquerade
+config gates the entire surface behind a pre-shared header. Requests
+carrying `X-RCQ-Auth: <your-token>` reach FastAPI; everything else sees
+a generic decoy landing page.
+
+To enable:
+
+1. Add a long random token to `.env`:
+
+   ```bash
+   echo "RCQ_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
+   ```
+
+2. Drop your decoy `index.html` into `./deploy/decoy/`. The shipped
+   stub is a generic "Coming soon" page — replace it with a personal
+   blog, generic SaaS landing, or anything that doesn't look like RCQ.
+
+3. Point the caddy service at the masquerade config and mount the
+   decoy directory (in `docker-compose.yml`):
+
+   ```yaml
+   caddy:
+     volumes:
+       - ./deploy/Caddyfile.masquerade.compose:/etc/caddy/Caddyfile:ro
+       - ./deploy/decoy:/srv/decoy:ro
+   ```
+
+4. `docker compose up -d`
+
+5. Distribute the token to your iOS users out of band (Signal /
+   Telegram / face-to-face). When they add your server in the iOS
+   "Add account" sheet, the optional "Auth token" field below the URL
+   takes the token; subsequent requests are stamped with the header
+   transparently.
+
+Treat the token like a password. Rotating is `docker compose restart
+caddy` after editing `.env`, plus re-issuing to your users.
+
 ## What's intentionally NOT in this repo
 
 * **APNs `.p8` key** — Apple ties this to your own developer account,

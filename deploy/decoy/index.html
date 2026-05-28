@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!--
+  Decoy static landing served by the masquerade Caddyfile when a request
+  arrives without the right X-RCQ-Auth header. Replace this file with
+  your own landing page before going live — anything that looks like a
+  normal personal blog, generic SaaS, or "coming soon" page works. The
+  goal is to make a passive scanner report a boring static site, not an
+  RCQ backend.
+
+  Tips for a believable decoy:
+    - Pick a theme unrelated to messaging / privacy / Russia
+    - Don't reference RCQ, sing-box, Hysteria2, libsignal anywhere
+    - Avoid /api, /auth, /messages paths even as links
+    - Include a robots.txt that disallows everything — discourages
+      deeper crawling without being suspicious in itself
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Coming soon</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --fg: #e6e8ec;
+      --muted: #8a8f99;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fafafa;
+        --fg: #1a1a1a;
+        --muted: #6b6b6b;
+      }
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    main {
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    h1 {
+      font-size: clamp(28px, 6vw, 48px);
+      font-weight: 600;
+      margin: 0 0 12px;
+      letter-spacing: -0.02em;
+    }
+    p {
+      color: var(--muted);
+      font-size: clamp(14px, 2.5vw, 18px);
+      max-width: 32em;
+      line-height: 1.5;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Coming soon</h1>
+    <p>This site is being set up. Please check back later.</p>
+  </main>
+</body>
+</html>
