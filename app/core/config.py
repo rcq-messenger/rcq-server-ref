@@ -14,6 +14,18 @@ class Settings(BaseSettings):
     UIN_MIN: int = 100_000
     UIN_MAX: int = 999_999_999
 
+    # Surface flag advertised via /server/info → consumed by the iOS
+    # client to decide whether to render the in-app UIN-shop tab. Off
+    # by default for self-host operators because Apple IAP is bound to
+    # the App Store binary's bundle id, which means in-app purchases
+    # route money to the iOS app's developer account regardless of
+    # which backend is serving — incoherent if you're an operator
+    # running this code and want to monetize your own users.
+    # Operators who want a custom flow (Telegram-channel manual
+    # assignment, BTCPay invoice page, Patreon-tier rewards) handle
+    # UIN allocation out of band via an admin endpoint or DB write.
+    UIN_SHOP_ENABLED: bool = False
+
     # APNs config — populated in production via /opt/rcq/.env. Empty values
     # disable push (the sender no-ops cleanly), so dev environments without
     # the .p8 key just don't send pushes — they don't crash.
