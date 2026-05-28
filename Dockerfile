@@ -24,7 +24,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY alembic ./alembic
 
 # Media / news / evidence dirs are per-deployment data. Mount these
 # as volumes from docker-compose or your orchestrator.
