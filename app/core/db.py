@@ -9,7 +9,27 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
+# Managed Postgres has a hard, small connection cap (DigitalOcean's
+# smallest plan tops out at 25 total, 3 reserved for the superuser, and
+# DO's own monitoring eats several more). SQLAlchemy's default pool
+# (5 + 10 overflow) is *per process*, so 4 uvicorn workers can demand up
+# to 60 connections and exhaust the DB — surfacing as
+# asyncpg.TooManyConnectionsError turned into an HTTP 500 on EVERY
+# endpoint (sends AND reads), intermittently under load. Cap each
+# worker's pool so all 4 stay well under budget (4 × (2 + 1) = 12),
+# pre-ping to drop connections DO closed under us, and recycle before
+# the idle timeout. The pooling kwargs are Postgres-only: the SQLite
+# self-host / test path uses a pool class that rejects them.
+_engine_kwargs: dict = {"echo": False, "future": True}
+if settings.DATABASE_URL.startswith(("postgresql", "postgres")):
+    _engine_kwargs.update(
+        pool_size=2,
+        max_overflow=1,
+        pool_timeout=20,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
