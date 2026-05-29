@@ -12,6 +12,17 @@
 #   less install.sh
 #   bash install.sh
 #
+# Unattended / scripted provisioning (e.g. standing up a managed island
+# from a control plane). Pass values via env to skip every prompt:
+#
+#   RCQ_DOMAIN=org-acme.rcq.app RCQ_UNATTENDED=1 bash install.sh
+#
+#   RCQ_DOMAIN     public domain whose A-record already points here
+#   RCQ_UNATTENDED non-empty -> never prompt; abort (don't hang) if DNS
+#                  isn't ready yet, unless RCQ_FORCE=1 is also set
+#   RCQ_FORCE      non-empty -> proceed even on a DNS mismatch (ACME may
+#                  fail until DNS propagates)
+#
 # What this script does:
 #   1. Installs Docker (via the official get-docker.com script) + git +
 #      openssl + dig, if missing.
@@ -52,6 +63,19 @@ fi
 say()  { echo "${BOLD}==>${RESET} $*"; }
 warn() { echo "${YELLOW}==>${RESET} $*"; }
 fail() { echo "${RED}==> $*${RESET}" >&2; exit 1; }
+
+# Interactive y/N confirm, except under RCQ_UNATTENDED where we never
+# block on stdin: abort with $2 unless RCQ_FORCE is set. Keeps scripted
+# provisioning from hanging on a prompt.
+confirm_or_abort() {
+    local prompt="$1" abort_msg="$2" reply
+    if [ -n "${RCQ_UNATTENDED:-}" ]; then
+        [ -n "${RCQ_FORCE:-}" ] || fail "$abort_msg (set RCQ_FORCE=1 to override in unattended mode)"
+        return 0
+    fi
+    read -r -p "$prompt" reply
+    [[ "${reply:-N}" =~ ^[Yy] ]] || fail "$abort_msg"
+}
 
 # ─────────────────────────────────────────────────────────────────────
 # Preflight
@@ -98,7 +122,13 @@ if [ -f .env ]; then
 else
     say "Configuring .env…"
 
-    read -r -p "${BOLD}Public domain pointing at this host${RESET} (e.g. rcq.example.com): " DOMAIN
+    # Domain from RCQ_DOMAIN for unattended/scripted provisioning, else prompt.
+    if [ -n "${RCQ_DOMAIN:-}" ]; then
+        DOMAIN="$RCQ_DOMAIN"
+        say "Using domain from RCQ_DOMAIN: $DOMAIN"
+    else
+        read -r -p "${BOLD}Public domain pointing at this host${RESET} (e.g. rcq.example.com): " DOMAIN
+    fi
     [ -z "${DOMAIN:-}" ] && fail "Domain is required (Caddy + Let's Encrypt need one)."
 
     # Best-effort DNS sanity check. Failing this isn't fatal — the
@@ -109,12 +139,10 @@ else
     PUBLIC_IP=$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || echo "")
     if [ -z "$RESOLVED" ]; then
         warn "$DOMAIN doesn't resolve. Configure the A-record to point at ${PUBLIC_IP:-this host}, then re-run."
-        read -r -p "Continue anyway? (y/N): " CONTINUE
-        [[ "${CONTINUE:-N}" =~ ^[Yy] ]] || fail "Aborted. Configure DNS and re-run."
+        confirm_or_abort "Continue anyway? (y/N): " "Aborted. Configure DNS and re-run."
     elif [ -n "$PUBLIC_IP" ] && [ "$RESOLVED" != "$PUBLIC_IP" ]; then
         warn "$DOMAIN resolves to $RESOLVED but this host is $PUBLIC_IP. Let's Encrypt HTTP-01 challenge will fail."
-        read -r -p "Continue anyway? (y/N): " CONTINUE
-        [[ "${CONTINUE:-N}" =~ ^[Yy] ]] || fail "Aborted. Fix DNS and re-run."
+        confirm_or_abort "Continue anyway? (y/N): " "Aborted. Fix DNS and re-run."
     fi
 
     JWT_SECRET=$(openssl rand -hex 32)
