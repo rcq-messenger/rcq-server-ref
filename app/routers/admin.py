@@ -10,15 +10,17 @@ Surfaces:
   • Live presence: who's connected right now
 """
 
+import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.security import require_admin
+from app.models.invite import Invite
 from app.models.report import Report
 from app.models.user import User, effective_status
 
@@ -491,3 +493,75 @@ async def online_users(
         )
         for u in rows
     ]
+
+
+# ── Server-join invites ─────────────────────────────────────────────
+# Minted here (web-admin / console.rcq.app); self-host operators can also
+# mint via the `app.tools.mint_invite` CLI. Only meaningful when the server
+# runs REGISTRATION_POLICY=invite — an open server never checks them.
+
+
+class MintInviteIn(BaseModel):
+    label: str | None = Field(default=None, max_length=120)
+    max_uses: int = Field(default=1, ge=1, le=100_000)
+    ttl_hours: int | None = Field(default=None, ge=1)  # null = never expires
+
+
+class InviteOut(BaseModel):
+    code: str
+    label: str | None
+    max_uses: int
+    used_count: int
+    expires_at: datetime | None
+    created_at: datetime
+    join_url: str
+
+
+def _join_url(request: Request, code: str) -> str:
+    host = request.headers.get("x-forwarded-host") or (request.url.hostname or "")
+    return f"rcq://server/{host}?invite={code}"
+
+
+def _invite_out(request: Request, inv: Invite) -> InviteOut:
+    return InviteOut(
+        code=inv.code,
+        label=inv.label,
+        max_uses=inv.max_uses,
+        used_count=inv.used_count,
+        expires_at=inv.expires_at,
+        created_at=inv.created_at,
+        join_url=_join_url(request, inv.code),
+    )
+
+
+@router.post("/invites", response_model=InviteOut, status_code=status.HTTP_201_CREATED)
+async def mint_invite(
+    body: MintInviteIn, request: Request, db: AsyncSession = Depends(get_db)
+) -> InviteOut:
+    code = secrets.token_urlsafe(16)
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=body.ttl_hours)
+        if body.ttl_hours
+        else None
+    )
+    inv = Invite(code=code, label=body.label, max_uses=body.max_uses, expires_at=expires_at)
+    db.add(inv)
+    await db.commit()
+    await db.refresh(inv)
+    return _invite_out(request, inv)
+
+
+@router.get("/invites", response_model=list[InviteOut])
+async def list_invites(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> list[InviteOut]:
+    rows = (
+        await db.execute(select(Invite).order_by(desc(Invite.created_at)))
+    ).scalars().all()
+    return [_invite_out(request, inv) for inv in rows]
+
+
+@router.delete("/invites/{code}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_invite(code: str, db: AsyncSession = Depends(get_db)) -> None:
+    await db.execute(delete(Invite).where(Invite.code == code))
+    await db.commit()

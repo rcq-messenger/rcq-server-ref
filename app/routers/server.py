@@ -30,6 +30,10 @@ class ServerCapabilities(BaseModel):
     # which backend the user is on — incoherent for self-host operators.
     # Prod sets UIN_SHOP_ENABLED=true in /opt/rcq/.env.
     uin_shop: bool
+    # Server-join gate: "open" (anyone can register) or "invite" (a valid
+    # invite token is required). Clients prompt for an invite when "invite".
+    # Defaults to "open" so old clients that ignore the field are unaffected.
+    registration_policy: str = "open"
 
 
 class ServerInfo(BaseModel):
@@ -43,5 +47,6 @@ async def server_info() -> ServerInfo:
         name=settings.APP_NAME,
         capabilities=ServerCapabilities(
             uin_shop=settings.UIN_SHOP_ENABLED,
+            registration_policy=settings.REGISTRATION_POLICY,
         ),
     )

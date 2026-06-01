@@ -61,5 +61,12 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = ""
     ADMIN_PASSWORD: str = ""
 
+    # Server-join gate. "open" (default) = anyone can /auth/register on this
+    # server (the current behaviour). "invite" = registration requires a valid
+    # invite token (see app/models/invite.py); orgs/islands that want only
+    # specific people set this in their .env. Additive + default-open, so the
+    # central server and every existing self-host stay open until they opt in.
+    REGISTRATION_POLICY: str = "open"
+
 
 settings = Settings()

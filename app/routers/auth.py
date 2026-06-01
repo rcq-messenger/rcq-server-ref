@@ -1,14 +1,17 @@
 import logging
 import os
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import current_uin, issue_token
 from app.models.contact import Contact
+from app.models.invite import Invite
 from app.models.group import Group, GroupMember
 from app.models.user import User
 from app.routers.groups import _load_group, _members_with_users, _serialize
@@ -51,6 +54,9 @@ class RegisterIn(BaseModel):
     signing_key: str
     # Optional referral code — the inviter's UIN. Bad value is ignored.
     inviter_uin: int | None = None
+    # Server-join invite token. Required only when this server runs
+    # REGISTRATION_POLICY=invite (ignored otherwise).
+    invite: str | None = None
 
 
 class RegisterOut(BaseModel):
@@ -65,6 +71,26 @@ class SessionOut(BaseModel):
 
 @router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
+    # Invite gate (default-open servers skip this entirely). Validate + consume
+    # one use ATOMICALLY: a single UPDATE that only matches an unexpired,
+    # not-exhausted code locks the row, so two simultaneous registrations can't
+    # both spend the last use. It commits together with the user creation below.
+    if settings.REGISTRATION_POLICY == "invite":
+        code = (body.invite or "").strip()
+        if not code:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_required"})
+        consumed = await db.execute(
+            update(Invite)
+            .where(
+                Invite.code == code,
+                Invite.used_count < Invite.max_uses,
+                or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
+            )
+            .values(used_count=Invite.used_count + 1)
+        )
+        if consumed.rowcount == 0:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_invalid"})
+
     uin = await allocate_uin(db)
     user = User(
         uin=uin,
