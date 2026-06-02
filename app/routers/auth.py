@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.security import current_uin, issue_token
+from app.core.security import current_uin, issue_recover_challenge, issue_token, verify_recover_challenge
 from app.models.contact import Contact
 from app.models.invite import Invite
 from app.models.group import Group, GroupMember
@@ -144,6 +144,64 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
 @router.post("/session", response_model=SessionOut)
 async def session(uin: int = Depends(current_uin)) -> SessionOut:
     return SessionOut(token=issue_token(uin), ws_url=f"/ws/{uin}")
+
+
+# ── account recovery (seed-phrase) ──────────────────────────────────────────
+# The client's identity IS its keypair (X25519 + Ed25519); the UIN is just the
+# server-side handle bound to the public keys. A user who backed up the private
+# keys (the "recovery phrase") can re-bind a fresh device to the same UIN by
+# proving possession of the private signing key. Two-step, stateless:
+#   1) /auth/recover/challenge → a short-lived signed nonce for the pubkey
+#   2) /auth/recover → the client's Ed25519 signature over that nonce → token
+class RecoverChallengeIn(BaseModel):
+    signing_key: str
+
+
+class RecoverChallengeOut(BaseModel):
+    challenge: str
+
+
+class RecoverIn(BaseModel):
+    signing_key: str
+    challenge: str
+    # base64 Ed25519 signature over the exact challenge string.
+    signature: str
+
+
+@router.post("/recover/challenge", response_model=RecoverChallengeOut)
+async def recover_challenge(body: RecoverChallengeIn) -> RecoverChallengeOut:
+    sk = body.signing_key.strip()
+    if not sk:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "missing_key"})
+    return RecoverChallengeOut(challenge=issue_recover_challenge(sk))
+
+
+@router.post("/recover", response_model=RegisterOut)
+async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
+    sk = body.signing_key.strip()
+    if not verify_recover_challenge(body.challenge, sk):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_challenge"})
+    # Prove key ownership: the Ed25519 signature must verify over the exact
+    # challenge string under the claimed public signing key.
+    from base64 import b64decode
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(b64decode(sk)).verify(
+            b64decode(body.signature), body.challenge.encode()
+        )
+    except (InvalidSignature, ValueError, TypeError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"})
+    # Find the account bound to this signing key. Small scan at current scale;
+    # add an index on users.signing_key when the table grows.
+    uin = (
+        await db.execute(
+            select(User.uin).where(User.signing_key == sk).order_by(User.uin).limit(1)
+        )
+    ).scalar_one_or_none()
+    if uin is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
+    return RegisterOut(uin=uin, token=issue_token(uin))
 
 
 @router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)

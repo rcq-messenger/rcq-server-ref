@@ -28,6 +28,30 @@ def decode_token(token: str) -> int:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
 
 
+def issue_recover_challenge(signing_key: str) -> str:
+    """Short-lived signed nonce bound to a claimed signing pubkey, for the
+    account-recovery challenge-response. Stateless: the challenge IS the
+    server's commitment; the client proves key ownership by signing it back.
+    Reveals nothing about whether the account actually exists."""
+    payload = {
+        "typ": "recover",
+        "sk": signing_key,
+        "nonce": secrets.token_urlsafe(16),
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=120),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
+
+
+def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
+    """True if `challenge` is a non-expired recover challenge bound to
+    `signing_key` (jwt.decode enforces the signature + expiry)."""
+    try:
+        payload = jwt.decode(challenge, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
+    except JWTError:
+        return False
+    return payload.get("typ") == "recover" and payload.get("sk") == signing_key
+
+
 async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> int:
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
