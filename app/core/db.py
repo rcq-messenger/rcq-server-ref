@@ -221,6 +221,18 @@ async def init_db() -> None:
                     # loudly if it actually isn't.
                     pass
 
+    # Account-recovery lookup: /auth/recover finds the UIN by signing_key.
+    # Without an index that's a seq scan holding one of the (deliberately tiny)
+    # pooled connections longer than it should — under concurrent recovery load
+    # that exhausts the pool. Idempotent; safe on SQLite + Postgres.
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_users_signing_key ON users (signing_key)"
+            ))
+        except Exception:
+            pass
+
     # ── Pivot 2026-05-27: drop tables for cut features ─────────────
     # Marketplace / trades / UIN auctions / casino games / items /
     # pet hunt / bounty credits / jeton reactions / daily QA /
