@@ -1,8 +1,10 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.db import init_db
@@ -59,6 +61,29 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+_log = logging.getLogger("rcq")
+
+
+@app.exception_handler(Exception)
+async def cors_aware_internal_error(request: Request, exc: Exception):
+    """Return unhandled 500s WITH a CORS header.
+
+    Starlette produces a bare 500 from ServerErrorMiddleware, which sits OUTSIDE
+    CORSMiddleware — so without this the response carries no
+    Access-Control-Allow-Origin and a browser reports the failure as a phantom
+    "CORS error" instead of the real server error. HTTPExceptions (401/403/404/…)
+    already get CORS via the inner handler; this only covers true unhandled
+    exceptions. We still log the traceback so it stays visible in the logs.
+    Mirrors CORSMiddleware's allow_origins=["*"].
+    """
+    _log.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        {"detail": "internal_error"},
+        status_code=500,
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
 
 app.include_router(auth.router)
 app.include_router(users.router)
