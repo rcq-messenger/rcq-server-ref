@@ -24,6 +24,34 @@ from app.models.invite import Invite
 from app.models.report import Report
 from app.models.user import User, effective_status
 
+import time as _time
+
+# In-memory TTL cache for the read-heavy analytics endpoints. The admin
+# dashboard polls these on a short interval; without caching, each poll
+# (signups/DAU date aggregations, activity feed, online roster) checks out one
+# of the deliberately tiny pooled DB connections (pool_size=2 + overflow 1 per
+# worker), and a few concurrent polls starve everything else — users'
+# /contacts and the background story_sweep started returning 500 (QueuePool
+# timeout). In the browser that 500 looks like a CORS error, because an
+# unhandled 500 is produced above CORSMiddleware and so carries no
+# Access-Control-Allow-Origin header. Per-worker cache is fine: each worker
+# collapses its own repeated polls into one DB hit per TTL window, and admin
+# analytics tolerate a few seconds of staleness.
+_ANALYTICS_TTL = 15.0
+_analytics_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cache_get(key: str):
+    hit = _analytics_cache.get(key)
+    if hit is not None and hit[0] > _time.monotonic():
+        return hit[1]
+    return None
+
+
+def _cache_put(key: str, value: object) -> None:
+    _analytics_cache[key] = (_time.monotonic() + _ANALYTICS_TTL, value)
+
+
 router = APIRouter(
     prefix="/admin",
     tags=["admin"],
@@ -341,6 +369,10 @@ async def signups_timeseries(
     days: int = Query(30, ge=1, le=180),
     db: AsyncSession = Depends(get_db),
 ) -> TimeseriesOut:
+    ck = f"signups:{days}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
     now = datetime.now(timezone.utc)
     start = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -359,7 +391,9 @@ async def signups_timeseries(
     for i in range(days):
         d = (start + timedelta(days=i)).date().isoformat()
         out.append(DayPoint(date=d, count=by_day.get(d, 0)))
-    return TimeseriesOut(points=out)
+    result = TimeseriesOut(points=out)
+    _cache_put(ck, result)
+    return result
 
 
 @router.get("/timeseries/dau", response_model=TimeseriesOut)
@@ -367,6 +401,10 @@ async def dau_timeseries(
     days: int = Query(30, ge=1, le=180),
     db: AsyncSession = Depends(get_db),
 ) -> TimeseriesOut:
+    ck = f"dau:{days}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
     now = datetime.now(timezone.utc)
     start = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -385,7 +423,9 @@ async def dau_timeseries(
     for i in range(days):
         d = (start + timedelta(days=i)).date().isoformat()
         out.append(DayPoint(date=d, count=by_day.get(d, 0)))
-    return TimeseriesOut(points=out)
+    result = TimeseriesOut(points=out)
+    _cache_put(ck, result)
+    return result
 
 
 # ── Activity feed (recent admin actions) ────────────────────────────
@@ -405,6 +445,10 @@ async def recent_activity(
     db: AsyncSession = Depends(get_db),
 ) -> list[ActivityEvent]:
     """Recent resolved reports, newest first."""
+    ck = f"activity:{limit}"
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
     resolved = (await db.execute(
         select(Report)
         .where(Report.status != "open")
@@ -434,7 +478,9 @@ async def recent_activity(
         ))
 
     events.sort(key=lambda e: e.occurred_at, reverse=True)
-    return events[:limit]
+    result = events[:limit]
+    _cache_put(ck, result)
+    return result
 
 
 # ── Live presence ───────────────────────────────────────────────────
@@ -464,6 +510,9 @@ class OnlineUser(BaseModel):
 async def online_users(
     db: AsyncSession = Depends(get_db),
 ) -> list[OnlineUser]:
+    cached = _cache_get("online_users")
+    if cached is not None:
+        return cached
     from app.core.redis import get_redis
     try:
         redis = await get_redis()
@@ -483,7 +532,7 @@ async def online_users(
         .where(User.uin.in_(uins))
         .order_by(User.last_seen.desc())
     )).scalars().all()
-    return [
+    result = [
         OnlineUser(
             uin=int(u.uin),
             nickname=u.nickname,
@@ -493,6 +542,8 @@ async def online_users(
         )
         for u in rows
     ]
+    _cache_put("online_users", result)
+    return result
 
 
 # ── Server-join invites ─────────────────────────────────────────────
