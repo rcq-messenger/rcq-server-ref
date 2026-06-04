@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import get_db
+from app.core.db import engine, get_db
 from app.core.security import current_uin
 from app.models.device import Device
 from app.models.prekey import OneTimePreKey
@@ -21,6 +21,41 @@ router = APIRouter(prefix="/keys", tags=["keys"])
 # How many OPKs the client should keep on the server. Replenish endpoint is
 # expected to be called when the count drops below ~25.
 TARGET_PREKEY_COUNT = 100
+
+
+async def _claim_opk(db: AsyncSession, *, uin: int, device_id: int | None):
+    """Atomically claim one un-consumed one-time prekey for (uin, device_id) and
+    mark it consumed (the caller commits). Returns the ORM row, or None when the
+    pool is empty.
+
+    The row lock (FOR UPDATE SKIP LOCKED on Postgres) is what makes this safe
+    under concurrency: two senders fetching the same recipient's bundle at the
+    same time each lock+take a DIFFERENT free prekey instead of both reading the
+    same un-consumed one before either commits. A handed-out-twice single-use
+    prekey is exactly what made ~10% of first-in-session messages undecryptable
+    on the recipient (generic push + lost message). SQLite (self-host) serializes
+    writers, so the plain select is already safe there."""
+    pool = (
+        OneTimePreKey.device_id.is_(None)
+        if device_id is None
+        else OneTimePreKey.device_id == device_id
+    )
+    stmt = (
+        select(OneTimePreKey)
+        .where(
+            OneTimePreKey.uin == uin,
+            pool,
+            OneTimePreKey.consumed == False,  # noqa: E712
+        )
+        .order_by(OneTimePreKey.id.asc())
+        .limit(1)
+    )
+    if engine.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    opk = (await db.execute(stmt)).scalar_one_or_none()
+    if opk is not None:
+        opk.consumed = True
+    return opk
 
 
 class SignedPreKey(BaseModel):
@@ -174,12 +209,14 @@ async def fetch_bundle(
     """Hand a sender what they need to start an X3DH session with `uin`.
     Consumes one OPK from the pool — each prekey is single-use by design.
 
-    Concurrency: relies on the single-worker uvicorn invariant the app
-    is currently deployed with. Two parallel sender requests landing in
-    the same event-loop tick will serialize on the SELECT-then-UPDATE
-    here without contention. The day we scale to multi-worker we need
-    `SELECT ... FOR UPDATE SKIP LOCKED` (PG-only) or a row-versioned
-    compare-and-set. TODO when the migration to PG ships."""
+    Concurrency: the OPK is claimed under a row lock (FOR UPDATE SKIP LOCKED
+    on Postgres) so two senders fetching this bundle at once each take a
+    DIFFERENT free prekey. Without it the SELECT-then-UPDATE races (multi-worker,
+    or just two requests interleaving at an await on one worker): both read the
+    same un-consumed OPK before either commits, both encrypt to the recipient
+    with that single-use key, and the recipient's libsignal consumes it on the
+    first decrypt — making the second message undecryptable (InvalidKeyId), so
+    it shows a generic push and never lands in the chat. See `_claim_opk`."""
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -193,21 +230,9 @@ async def fetch_bundle(
         # 404 here as "fall back to v=1 envelope path".
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user has no signal bundle")
 
-    opk = (
-        await db.execute(
-            select(OneTimePreKey)
-            .where(
-                OneTimePreKey.uin == uin,
-                OneTimePreKey.device_id.is_(None),
-                OneTimePreKey.consumed == False,  # noqa: E712
-            )
-            .order_by(OneTimePreKey.id.asc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    opk = await _claim_opk(db, uin=uin, device_id=None)
     opk_out: OneTimePreKeyIn | None = None
     if opk is not None:
-        opk.consumed = True
         opk_out = OneTimePreKeyIn(id=opk.prekey_id, public=opk.public_key)
         await db.commit()
 
@@ -397,21 +422,9 @@ async def fetch_device_bundle(
     if device is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
 
-    opk = (
-        await db.execute(
-            select(OneTimePreKey)
-            .where(
-                OneTimePreKey.uin == uin,
-                OneTimePreKey.device_id == device_id,
-                OneTimePreKey.consumed == False,  # noqa: E712
-            )
-            .order_by(OneTimePreKey.id.asc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    opk = await _claim_opk(db, uin=uin, device_id=device_id)
     opk_out: OneTimePreKeyIn | None = None
     if opk is not None:
-        opk.consumed = True
         opk_out = OneTimePreKeyIn(id=opk.prekey_id, public=opk.public_key)
         await db.commit()
 
