@@ -7,8 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.security import current_uin
+from app.models.device import Device
 from app.models.prekey import OneTimePreKey
-from app.models.user import User
+from app.models.user import User, _as_aware
+
+# Primary device = the phone, libsignal deviceId 1, bundle on the User row.
+PRIMARY_DEVICE_ID = 1
+# libsignal caps deviceId at 127 (matches the WASM/iOS/Android clients).
+MAX_DEVICE_ID = 127
 
 router = APIRouter(prefix="/keys", tags=["keys"])
 
@@ -67,6 +73,15 @@ class BundleOut(BaseModel):
     prekey is never returned twice (X3DH uniqueness)."""
 
     uin: int
+    # libsignal deviceId this bundle is for. 1 = the primary device (phone).
+    # Additive field — pre-multi-device clients ignore it and keep using
+    # deviceId 1. Senders that fan out read it to address the right session.
+    device_id: int = 1
+    # X25519 sealed-sender (OUTER ECIES) pubkey to encrypt the outer envelope
+    # to for THIS device. Primary = the UIN identity_key; secondary = that
+    # device's own key. Additive — old clients ignore it and keep using the
+    # UIN identity_key from /users/{uin}/info as before.
+    sealed_sender_pub: str = ""
     registration_id: int
     signal_identity_key: str
     signed_prekey: SignedPreKey
@@ -113,9 +128,15 @@ async def upload_bundle(
 
     # Wipe any prior pool and stage the new one. Cheaper than a per-row
     # upsert and matches the "fresh bootstrap" semantics of this endpoint.
-    await db.execute(delete(OneTimePreKey).where(OneTimePreKey.uin == uin))
+    # Scoped to the PRIMARY pool (device_id IS NULL) so a re-bootstrap of the
+    # phone never wipes a linked web device's prekeys.
+    await db.execute(
+        delete(OneTimePreKey).where(
+            OneTimePreKey.uin == uin, OneTimePreKey.device_id.is_(None)
+        )
+    )
     for pk in body.one_time_prekeys:
-        db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public))
+        db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=None))
     await db.commit()
 
 
@@ -131,14 +152,16 @@ async def replenish_prekeys(
     existing = set(
         (
             await db.execute(
-                select(OneTimePreKey.prekey_id).where(OneTimePreKey.uin == uin)
+                select(OneTimePreKey.prekey_id).where(
+                    OneTimePreKey.uin == uin, OneTimePreKey.device_id.is_(None)
+                )
             )
         ).scalars().all()
     )
     for pk in body.one_time_prekeys:
         if pk.id in existing:
             continue
-        db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public))
+        db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=None))
     await db.commit()
 
 
@@ -173,7 +196,11 @@ async def fetch_bundle(
     opk = (
         await db.execute(
             select(OneTimePreKey)
-            .where(OneTimePreKey.uin == uin, OneTimePreKey.consumed == False)  # noqa: E712
+            .where(
+                OneTimePreKey.uin == uin,
+                OneTimePreKey.device_id.is_(None),
+                OneTimePreKey.consumed == False,  # noqa: E712
+            )
             .order_by(OneTimePreKey.id.asc())
             .limit(1)
         )
@@ -186,6 +213,8 @@ async def fetch_bundle(
 
     return BundleOut(
         uin=user.uin,
+        device_id=PRIMARY_DEVICE_ID,
+        sealed_sender_pub=user.identity_key,
         registration_id=user.signal_registration_id or 0,
         signal_identity_key=user.signal_identity_key,
         signed_prekey=SignedPreKey(
@@ -215,15 +244,228 @@ async def my_status(
         await db.execute(
             select(func.count())
             .select_from(OneTimePreKey)
-            .where(OneTimePreKey.uin == uin, OneTimePreKey.consumed == False)  # noqa: E712
+            .where(
+                OneTimePreKey.uin == uin,
+                OneTimePreKey.device_id.is_(None),
+                OneTimePreKey.consumed == False,  # noqa: E712
+            )
         )
     ).scalar_one()
     age: int | None = None
     if user.signed_prekey_uploaded_at is not None:
-        age = int((datetime.now(timezone.utc) - user.signed_prekey_uploaded_at).total_seconds())
+        age = int((datetime.now(timezone.utc) - _as_aware(user.signed_prekey_uploaded_at)).total_seconds())
     return StatusOut(
         has_bundle=has_bundle,
         one_time_prekey_count=int(count),
         target_count=TARGET_PREKEY_COUNT,
         signed_prekey_age_seconds=age,
     )
+
+
+# ============================================================================
+# Multi-device (additive) — secondary devices (the web client) register their
+# OWN libsignal bundle here; the primary device (phone, deviceId 1) stays on
+# the User row and the legacy /keys/{uin}/bundle path is unchanged. A sender
+# that wants to reach every device of a UIN calls GET /keys/{uin}/devices, then
+# fetches one bundle per device and fans out one ciphertext each. See
+# docs/web-multidevice-plan.md.
+# ============================================================================
+
+
+class DeviceRegisterIn(BundleIn):
+    """A secondary device's full libsignal bundle (same shape as BundleIn)
+    plus its X25519 sealed-sender (outer) pubkey and an optional human label.
+    The server assigns the deviceId."""
+
+    sealed_sender_pub: str = Field(min_length=1)
+    label: str | None = None
+
+
+class DeviceRegisterOut(BaseModel):
+    device_id: int
+
+
+class DeviceInfo(BaseModel):
+    device_id: int
+    label: str | None = None
+
+
+class DevicesOut(BaseModel):
+    """Devices of `uin` with a usable libsignal bundle. A fanning-out sender
+    fetches each device's bundle and sends one ciphertext per entry."""
+
+    uin: int
+    devices: list[DeviceInfo]
+
+
+@router.post("/devices", response_model=DeviceRegisterOut, status_code=status.HTTP_201_CREATED)
+async def register_device(
+    body: DeviceRegisterIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceRegisterOut:
+    """Register a SECONDARY device (e.g. the web client) under the caller's UIN.
+    The server assigns the next free libsignal deviceId (>= 2) — the client
+    never self-asserts it, so two devices can't collide. The device's own
+    identity + signed/kyber prekeys + initial OPK pool are stored independently
+    of the phone's (deviceId 1)."""
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+
+    existing_ids = (
+        await db.execute(select(Device.device_id).where(Device.uin == uin))
+    ).scalars().all()
+    next_id = (max(existing_ids) if existing_ids else PRIMARY_DEVICE_ID) + 1
+    if next_id > MAX_DEVICE_ID:
+        raise HTTPException(status.HTTP_409_CONFLICT, "device limit reached")
+
+    now = datetime.now(timezone.utc)
+    device = Device(
+        uin=uin,
+        device_id=next_id,
+        label=body.label,
+        sealed_sender_pub=body.sealed_sender_pub,
+        signal_identity_key=body.signal_identity_key,
+        signal_registration_id=body.registration_id,
+        signed_prekey_id=body.signed_prekey.id,
+        signed_prekey_public=body.signed_prekey.public,
+        signed_prekey_signature=body.signed_prekey.signature,
+        signed_prekey_uploaded_at=now,
+        kyber_prekey_id=body.kyber_prekey.id,
+        kyber_prekey_public=body.kyber_prekey.public,
+        kyber_prekey_signature=body.kyber_prekey.signature,
+        kyber_prekey_uploaded_at=now,
+    )
+    db.add(device)
+    for pk in body.one_time_prekeys:
+        db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=next_id))
+    await db.commit()
+    return DeviceRegisterOut(device_id=next_id)
+
+
+@router.get("/{uin}/devices", response_model=DevicesOut)
+async def list_devices(
+    uin: int,
+    _me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> DevicesOut:
+    """Every device of `uin` a sender should fan out to: the primary device
+    (deviceId 1) when the user has a libsignal bundle, plus each non-revoked
+    secondary device."""
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    devices: list[DeviceInfo] = []
+    if user.signal_identity_key is not None:
+        devices.append(DeviceInfo(device_id=PRIMARY_DEVICE_ID, label="primary"))
+    rows = (
+        await db.execute(
+            select(Device)
+            .where(Device.uin == uin, Device.revoked_at.is_(None))
+            .order_by(Device.device_id.asc())
+        )
+    ).scalars().all()
+    for d in rows:
+        devices.append(DeviceInfo(device_id=d.device_id, label=d.label))
+    return DevicesOut(uin=uin, devices=devices)
+
+
+@router.get("/{uin}/devices/{device_id}/bundle", response_model=BundleOut)
+async def fetch_device_bundle(
+    uin: int,
+    device_id: int,
+    _me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> BundleOut:
+    """Per-device prekey bundle for X3DH against a SPECIFIC device of `uin`.
+    deviceId 1 = the primary (phone) bundle on the User row (delegates to the
+    legacy path); >= 2 = a secondary device. Consumes one OPK from THAT
+    device's pool."""
+    if device_id == PRIMARY_DEVICE_ID:
+        return await fetch_bundle(uin, _me, db)
+
+    device = (
+        await db.execute(
+            select(Device).where(
+                Device.uin == uin,
+                Device.device_id == device_id,
+                Device.revoked_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if device is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+
+    opk = (
+        await db.execute(
+            select(OneTimePreKey)
+            .where(
+                OneTimePreKey.uin == uin,
+                OneTimePreKey.device_id == device_id,
+                OneTimePreKey.consumed == False,  # noqa: E712
+            )
+            .order_by(OneTimePreKey.id.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    opk_out: OneTimePreKeyIn | None = None
+    if opk is not None:
+        opk.consumed = True
+        opk_out = OneTimePreKeyIn(id=opk.prekey_id, public=opk.public_key)
+        await db.commit()
+
+    return BundleOut(
+        uin=uin,
+        device_id=device.device_id,
+        sealed_sender_pub=device.sealed_sender_pub,
+        registration_id=device.signal_registration_id,
+        signal_identity_key=device.signal_identity_key,
+        signed_prekey=SignedPreKey(
+            id=device.signed_prekey_id,
+            public=device.signed_prekey_public,
+            signature=device.signed_prekey_signature,
+        ),
+        kyber_prekey=KyberPreKey(
+            id=device.kyber_prekey_id,
+            public=device.kyber_prekey_public,
+            signature=device.kyber_prekey_signature,
+        ),
+        one_time_prekey=opk_out,
+    )
+
+
+@router.post("/devices/{device_id}/prekeys", status_code=status.HTTP_204_NO_CONTENT)
+async def replenish_device_prekeys(
+    device_id: int,
+    body: PreKeysIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Top up a secondary device's OPK pool. Caller must own the device.
+    Idempotent on prekey_id collision, like the primary /keys/prekeys."""
+    device = (
+        await db.execute(
+            select(Device).where(
+                Device.uin == uin,
+                Device.device_id == device_id,
+                Device.revoked_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if device is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+    existing = set(
+        (
+            await db.execute(
+                select(OneTimePreKey.prekey_id).where(
+                    OneTimePreKey.uin == uin, OneTimePreKey.device_id == device_id
+                )
+            )
+        ).scalars().all()
+    )
+    for pk in body.one_time_prekeys:
+        if pk.id in existing:
+            continue
+        db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=device_id))
+    await db.commit()

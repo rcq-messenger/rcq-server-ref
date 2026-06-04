@@ -213,11 +213,20 @@ class User(Base):
 PRESENCE_FRESHNESS_SECONDS = 60
 
 
+def _as_aware(dt: datetime) -> datetime:
+    """Coerce a naive datetime to UTC. PostgreSQL TIMESTAMPTZ round-trips as
+    tz-aware, but SQLite (the self-host / dev path) drops the tzinfo on read —
+    comparing such a value against `datetime.now(timezone.utc)` raises
+    "can't compare offset-naive and offset-aware". Treat naive as UTC (that's
+    what we wrote). No-op on already-aware values, so Postgres is unaffected."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def presence_is_fresh(last_seen: datetime | None) -> bool:
     """True if `last_seen` is recent enough to count as a live connection."""
     if last_seen is None:
         return False
-    return last_seen > datetime.now(timezone.utc) - timedelta(seconds=PRESENCE_FRESHNESS_SECONDS)
+    return _as_aware(last_seen) > datetime.now(timezone.utc) - timedelta(seconds=PRESENCE_FRESHNESS_SECONDS)
 
 
 def effective_status(user: "User") -> str:
@@ -245,7 +254,7 @@ def effective_status(user: "User") -> str:
             ttl == 0
             or (
                 user.last_seen is not None
-                and user.last_seen
+                and _as_aware(user.last_seen)
                 > datetime.now(timezone.utc) - timedelta(minutes=ttl)
             )
         )

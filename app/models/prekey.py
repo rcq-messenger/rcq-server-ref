@@ -20,6 +20,12 @@ class OneTimePreKey(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     uin: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.uin", ondelete="CASCADE"), index=True)
+    # Multi-device: which device's pool this OPK belongs to. NULL = the PRIMARY
+    # device (the phone, libsignal deviceId 1) — every pre-multi-device row is
+    # NULL, so the primary fetch/replenish/upload paths scope to `device_id IS
+    # NULL` and stay byte-for-byte back-compatible. A secondary device (web,
+    # deviceId >= 2) tags its pool with its device_id.
+    device_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Whatever id the client picked (libsignal-side `PreKeyRecord.id`). Carried
     # back inside the PreKeySignalMessage so the recipient knows which OPK
     # to feed into X3DH on their side.

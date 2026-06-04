@@ -17,6 +17,7 @@ APNs config isn't populated (dev environments without a .p8 key).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -201,8 +202,16 @@ async def _try_send(
         "apns-expiration": "0",
     }
     try:
-        resp = await client.post(url, headers=headers, content=json.dumps(payload))
-    except httpx.HTTPError as exc:
+        # Hard ceiling on top of httpx's own timeout: a shared http2
+        # client can occasionally wedge a stream past its configured
+        # timeout, and we must never let a send hang (it used to pin a
+        # DB connection; that's decoupled now, but a hung coroutine
+        # still leaks an http2 stream + delays delivery).
+        resp = await asyncio.wait_for(
+            client.post(url, headers=headers, content=json.dumps(payload)),
+            timeout=15.0,
+        )
+    except (httpx.HTTPError, asyncio.TimeoutError) as exc:
         log.warning("APNs transport error for token %s on %s: %s", token[:12], host, exc)
         return 0, None
     body_text = (resp.text or "").strip()
@@ -220,14 +229,17 @@ async def _try_send(
 
 
 async def _send_one(
-    db: AsyncSession,
-    token_row: DeviceToken,
+    token: str,
     payload: dict[str, Any],
     *,
     push_type: str,
     topic: str,
-) -> bool:
-    """POST one push to one device. Returns True on success.
+) -> tuple[bool, bool]:
+    """POST one push to one device. Returns (sent_ok, should_drop_token).
+
+    Pure network — does NOT touch the DB (so callers never hold a DB
+    connection across the APNs round-trip; see send_to_user). Dead-token
+    deletion is batched by the caller after the network phase.
 
     Tries the primary APNs host first (configured via APNS_ENVIRONMENT),
     and on a `BadEnvironmentKeyInToken` 403 falls back to the OTHER
@@ -245,7 +257,7 @@ async def _send_one(
     alternate = _APNS_SANDBOX_HOST if primary == _APNS_PROD_HOST else _APNS_PROD_HOST
 
     status_code, reason = await _try_send(
-        token_row.token, payload, host=primary, push_type=push_type, topic=topic,
+        token, payload, host=primary, push_type=push_type, topic=topic,
     )
 
     # Wrong-environment retry: same token, alternate host. Apple
@@ -260,11 +272,11 @@ async def _send_one(
     )
     if env_mismatch:
         status_code, reason = await _try_send(
-            token_row.token, payload, host=alternate, push_type=push_type, topic=topic,
+            token, payload, host=alternate, push_type=push_type, topic=topic,
         )
 
     if status_code == 200:
-        return True
+        return True, False
 
     drop_reasons = {"BadDeviceToken", "Unregistered", "BadEnvironmentKeyInToken"}
     should_drop = status_code in (400, 410)
@@ -272,16 +284,28 @@ async def _send_one(
         should_drop = True
 
     if should_drop:
-        await db.execute(delete(DeviceToken).where(DeviceToken.id == token_row.id))
-        await db.commit()
         log.warning(
-            "APNs %s reason=%s for %s — dropped stale token",
-            status_code, reason, token_row.token[:12],
+            "APNs %s reason=%s for %s — will drop stale token",
+            status_code, reason, token[:12],
         )
-        return False
+        return False, True
 
-    log.warning("APNs %s reason=%s for %s — non-fatal", status_code, reason, token_row.token[:12])
-    return False
+    log.warning("APNs %s reason=%s for %s — non-fatal", status_code, reason, token[:12])
+    return False, False
+
+
+async def _drop_dead_tokens(token_ids: list[int]) -> None:
+    """Batch-delete tokens APNs reported as dead, in a short session
+    AFTER the network phase (never held across an APNs send). Best-effort."""
+    if not token_ids:
+        return
+    try:
+        async with SessionLocal() as db:  # type: AsyncSession
+            await db.execute(delete(DeviceToken).where(DeviceToken.id.in_(token_ids)))
+            await db.commit()
+        log.warning("[apns] dropped %d stale token(s)", len(token_ids))
+    except Exception:  # noqa: BLE001 — token cleanup must never break a send
+        log.exception("[apns] failed to drop stale tokens")
 
 
 async def send_to_user(
@@ -317,66 +341,73 @@ async def send_to_user(
     if not _is_configured():
         log.warning("[apns] send_to_user uin=%s skipped: APNs not configured", uin)
         return 0
+    # Read tokens in a SHORT session, then release the DB connection
+    # BEFORE any APNs network I/O. Holding the connection across the
+    # HTTP/2 send is what leaked the pool: a stalled push left the
+    # connection `idle in transaction` until the pool starved (→ 500s).
+    # Select plain columns so the values survive the closed session.
     async with SessionLocal() as db:  # type: AsyncSession
-        rows = (
+        tokens = (
             await db.execute(
-                select(DeviceToken).where(
+                select(DeviceToken.id, DeviceToken.token).where(
                     DeviceToken.uin == uin, DeviceToken.platform == "ios"
                 )
             )
-        ).scalars().all()
-        log.warning("[apns] send_to_user uin=%s tokens=%d", uin, len(rows))
-        if not rows:
-            return 0
-        aps: dict[str, Any] = {
-            "alert": {"title": alert_title, "body": alert_body},
-            "sound": "default",
-            "mutable-content": 1,
-        }
-        if thread_id:
-            aps["thread-id"] = thread_id
-        payload: dict[str, Any] = {"aps": aps}
-        # Recipient UIN in plain so the iOS NSE can route the push to
-        # the right local account on a multi-account device. The
-        # device token is per-device (not per-account), so backends
-        # send one push for `uin` and APNs delivers it to every
-        # account on that device — NSE then reads `to_uin` here,
-        # looks up which local Account owns this UIN, swaps its
-        # libsignal + Keychain stores to that account, and decrypts.
-        # Without this field NSE falls back to the active account's
-        # stores and fails to decrypt envelopes destined for any
-        # non-active account, showing a generic "RCQ New message"
-        # banner instead of the real preview.
-        payload["to_uin"] = uin
-        if envelope_b64:
-            # Carried verbatim through APNs — the NSE pulls it out of
-            # `userInfo["env"]` and runs SignalCryptoService.decrypt on
-            # it locally (private keys live in the shared Keychain group).
-            payload["env"] = envelope_b64
-            payload["envType"] = envelope_type or "message"
-        if notif_kind:
-            # NSE swaps the body literal we sent for a localized
-            # version keyed off this field. `alert_body` stays as
-            # the fallback for clients that don't run the NSE
-            # translation step (older builds, NSE crashes, etc).
-            payload["notif_kind"] = notif_kind
-        if group_id is not None:
-            # NSE reads this to route the badge counter to the
-            # `group-<id>` thread key instead of `peer-<sender>`,
-            # otherwise opening the group chat can't clear the
-            # bump that this push made (different keys).
-            payload["group_id"] = group_id
+        ).all()
+    log.warning("[apns] send_to_user uin=%s tokens=%d", uin, len(tokens))
+    if not tokens:
+        return 0
+    aps: dict[str, Any] = {
+        "alert": {"title": alert_title, "body": alert_body},
+        "sound": "default",
+        "mutable-content": 1,
+    }
+    if thread_id:
+        aps["thread-id"] = thread_id
+    payload: dict[str, Any] = {"aps": aps}
+    # Recipient UIN in plain so the iOS NSE can route the push to
+    # the right local account on a multi-account device. The
+    # device token is per-device (not per-account), so backends
+    # send one push for `uin` and APNs delivers it to every
+    # account on that device — NSE then reads `to_uin` here,
+    # looks up which local Account owns this UIN, swaps its
+    # libsignal + Keychain stores to that account, and decrypts.
+    # Without this field NSE falls back to the active account's
+    # stores and fails to decrypt envelopes destined for any
+    # non-active account, showing a generic "RCQ New message"
+    # banner instead of the real preview.
+    payload["to_uin"] = uin
+    if envelope_b64:
+        # Carried verbatim through APNs — the NSE pulls it out of
+        # `userInfo["env"]` and runs SignalCryptoService.decrypt on
+        # it locally (private keys live in the shared Keychain group).
+        payload["env"] = envelope_b64
+        payload["envType"] = envelope_type or "message"
+    if notif_kind:
+        # NSE swaps the body literal we sent for a localized
+        # version keyed off this field. `alert_body` stays as
+        # the fallback for clients that don't run the NSE
+        # translation step (older builds, NSE crashes, etc).
+        payload["notif_kind"] = notif_kind
+    if group_id is not None:
+        # NSE reads this to route the badge counter to the
+        # `group-<id>` thread key instead of `peer-<sender>`,
+        # otherwise opening the group chat can't clear the
+        # bump that this push made (different keys).
+        payload["group_id"] = group_id
 
-        sent = 0
-        for row in rows:
-            ok = await _send_one(
-                db, row, payload,
-                push_type="alert",
-                topic=settings.APNS_BUNDLE_ID,
-            )
-            if ok:
-                sent += 1
-        return sent
+    sent = 0
+    dead_ids: list[int] = []
+    for token_id, token in tokens:
+        ok, drop = await _send_one(
+            token, payload, push_type="alert", topic=settings.APNS_BUNDLE_ID,
+        )
+        if ok:
+            sent += 1
+        if drop:
+            dead_ids.append(token_id)
+    await _drop_dead_tokens(dead_ids)
+    return sent
 
 
 async def send_voip_to_user(uin: int, *, payload: dict[str, Any]) -> int:
@@ -393,27 +424,31 @@ async def send_voip_to_user(uin: int, *, payload: dict[str, Any]) -> int:
     if not _is_configured():
         log.info("[apns] send_voip_to_user uin=%s skipped: APNs not configured", uin)
         return 0
+    # Same no-DB-across-network rule as send_to_user: read tokens, release
+    # the connection, then send.
     async with SessionLocal() as db:  # type: AsyncSession
-        rows = (
+        tokens = (
             await db.execute(
-                select(DeviceToken).where(
+                select(DeviceToken.id, DeviceToken.token).where(
                     DeviceToken.uin == uin, DeviceToken.platform == "ios-voip"
                 )
             )
-        ).scalars().all()
-        log.warning("[apns] send_voip_to_user uin=%s tokens=%d", uin, len(rows))
-        if not rows:
-            return 0
-        sent = 0
-        # VoIP topic is the bundle ID with `.voip` appended — Apple's
-        # convention. Push-type and priority are special too.
-        voip_topic = f"{settings.APNS_BUNDLE_ID}.voip"
-        for row in rows:
-            ok = await _send_one(
-                db, row, payload,
-                push_type="voip",
-                topic=voip_topic,
-            )
-            if ok:
-                sent += 1
-        return sent
+        ).all()
+    log.warning("[apns] send_voip_to_user uin=%s tokens=%d", uin, len(tokens))
+    if not tokens:
+        return 0
+    sent = 0
+    dead_ids: list[int] = []
+    # VoIP topic is the bundle ID with `.voip` appended — Apple's
+    # convention. Push-type and priority are special too.
+    voip_topic = f"{settings.APNS_BUNDLE_ID}.voip"
+    for token_id, token in tokens:
+        ok, drop = await _send_one(
+            token, payload, push_type="voip", topic=voip_topic,
+        )
+        if ok:
+            sent += 1
+        if drop:
+            dead_ids.append(token_id)
+    await _drop_dead_tokens(dead_ids)
+    return sent

@@ -125,6 +125,14 @@ _NEARBY_CHECKIN_COLUMNS: list[tuple[str, str]] = [
     ("display_name", "VARCHAR(64)"),
 ]
 
+# Additive on `one_time_prekeys` — multi-device pool tagging. NULL = the
+# primary device (phone); existing rows are all NULL so the primary OPK
+# paths (which now scope to `device_id IS NULL`) stay back-compatible. The
+# `devices` table itself is created fresh by create_all (new table, no ALTER).
+_ONE_TIME_PREKEY_COLUMNS: list[tuple[str, str]] = [
+    ("device_id", "INTEGER"),
+]
+
 # Additive on `groups`. Pre-existing rows default to free + everyone-
 # can-post, matching pre-feature behaviour. Avatar columns nullable —
 # legacy groups keep rendering the generic placeholder.
@@ -167,7 +175,7 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 
@@ -182,9 +190,11 @@ async def init_db() -> None:
     # every table already present (create_all is idempotent with
     # checkfirst=True, the default), and proceed.
     #
-    # SQLite has no analogue and doesn't need one — it doesn't run
-    # multi-worker uvicorn realistically (writes serialise on the file
-    # lock anyway), and the test suite hits it single-process.
+    # SQLite has no analogue and doesn't need one. Prod hasn't actually
+    # tripped this race (managed DO Postgres + only 4 workers booting in
+    # rapid sequence, not parallel enough), but mirroring the ref repo
+    # keeps the two codebases in lockstep so future self-host operators
+    # don't see "they have it, we don't, why".
     async with engine.begin() as conn:
         if dialect == "postgresql":
             # Two int32 args by convention. Constants are arbitrary;
@@ -198,6 +208,7 @@ async def init_db() -> None:
         ("groups", _GROUP_COLUMNS),
         ("audio_rooms", _AUDIO_ROOM_COLUMNS),
         ("reports", _REPORT_COLUMNS),
+        ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:
