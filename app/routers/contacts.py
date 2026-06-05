@@ -46,6 +46,13 @@ class RequestRow(BaseModel):
     state: str
 
 
+class OutgoingRow(BaseModel):
+    id: int
+    to_uin: int
+    nickname: str
+    state: str  # pending | declined
+
+
 class AddRequestIn(BaseModel):
     to_uin: int
 
@@ -266,6 +273,66 @@ async def pending(
         RequestRow(id=r.id, from_uin=r.from_uin, nickname=u.nickname, state=r.state)
         for r, u in rows
     ]
+
+
+@router.get("/outgoing", response_model=list[OutgoingRow])
+async def outgoing(
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> list[OutgoingRow]:
+    """Requests WE sent that are still pending, plus ones the recipient
+    DECLINED. Declined rows surface here because there's no push telling the
+    sender "X declined you" — the client shows them in the outgoing list so
+    the user can see the outcome and dismiss (DELETE /outgoing) them. The
+    recipient is never told from here that they were the one who declined.
+    Accepted requests are dropped from the list (the peer is already a
+    mutual contact, visible in the normal contact list)."""
+    rows = (
+        await db.execute(
+            select(ContactRequest, User)
+            .join(User, User.uin == ContactRequest.to_uin)
+            .where(
+                and_(
+                    ContactRequest.from_uin == uin,
+                    ContactRequest.state.in_(("pending", "declined")),
+                )
+            )
+        )
+    ).all()
+    return [
+        OutgoingRow(id=r.id, to_uin=r.to_uin, nickname=u.nickname, state=r.state)
+        for r, u in rows
+    ]
+
+
+@router.delete("/outgoing/{to_uin}", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_outgoing(
+    to_uin: int,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Cancel/revoke a contact request WE sent (state pending), or dismiss a
+    DECLINED one out of our outgoing list. Deleting a still-pending row pulls
+    the request out of the recipient's incoming list too: a WS
+    `contact_request_cancelled` nudges them if they're online, otherwise
+    their next /contacts/pending simply won't include it, and a stale
+    accept/decline against the now-gone row 404s harmlessly."""
+    req = await db.scalar(
+        select(ContactRequest).where(
+            and_(ContactRequest.from_uin == uin, ContactRequest.to_uin == to_uin)
+        )
+    )
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such request")
+    rid = req.id
+    was_pending = req.state == "pending"
+    await db.delete(req)
+    await db.commit()
+    if was_pending:
+        await manager.send(
+            to_uin,
+            {"type": "contact_request_cancelled", "request_id": rid, "from_uin": uin},
+        )
 
 
 @router.post("/respond")
