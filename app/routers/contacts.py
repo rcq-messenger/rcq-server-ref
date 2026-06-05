@@ -37,6 +37,11 @@ class ContactRow(BaseModel):
     # "nobody" / null hide. Null when contact is currently online
     # (status field already reflects that) or when hidden.
     last_seen: datetime | None = None
+    # Whether WE may place a call to this contact, per THEIR call_policy. The
+    # viewer is always a mutual contact here, so "contacts" passes too — only
+    # "nobody" hides the call buttons. The server still enforces the policy on
+    # the call_offer itself; this just keeps the UI honest.
+    callable: bool = True
 
 
 class RequestRow(BaseModel):
@@ -111,6 +116,7 @@ async def list_contacts(
                 signal_identity_key=u.signal_identity_key,
                 gender=gender_visible,
                 last_seen=last_seen_visible,
+                callable=(u.call_policy or "everyone") != "nobody",
             )
         )
     return out

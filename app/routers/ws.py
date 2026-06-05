@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.core.db import SessionLocal
 from app.core.security import decode_token
@@ -204,6 +204,29 @@ async def _clear_call(call_id: str, *uins: int) -> None:
     redis = await _get_redis()
     args = [call_id] + [str(u) for u in uins]
     await redis.eval(_CLEAR_CALL_LUA, 1, _CALLS_KEY, *args)
+
+
+async def _caller_allowed(caller_uin: int, callee_uin: int) -> bool:
+    """Does the CALLEE's `call_policy` let `caller_uin` ring them? This is the
+    authoritative gate: the caller's own policy is irrelevant (it only governs
+    who may call THEM). `everyone` → yes; `nobody` → no; `contacts` → only a
+    mutual contact. Enforced server-side so a `nobody` policy holds no matter
+    what the caller's client shows."""
+    async with SessionLocal() as db:
+        callee = await db.get(User, callee_uin)
+        policy = (callee.call_policy if callee else None) or "everyone"
+        if policy == "everyone":
+            return True
+        if policy == "nobody":
+            return False
+        # "contacts": the caller must be in the callee's contact list.
+        exists = await db.scalar(
+            select(Contact.id).where(
+                Contact.owner_uin == callee_uin,
+                Contact.contact_uin == caller_uin,
+            )
+        )
+        return exists is not None
 
 
 @router.websocket("/ws/{uin}")
@@ -465,6 +488,18 @@ async def _handle_client_message(uin: int, msg: dict) -> None:
         # establish a new pair on their own and are no-ops if the call
         # was already cleaned up by the offer's rejection.
         if kind == "call_offer":
+            # Honour the callee's "who can call me" policy server-side. The
+            # caller's OWN policy must NOT gate this — it only controls who may
+            # call THEM. Done before registering the pair so a rejected offer
+            # leaves no dangling active-call entry.
+            if not await _caller_allowed(uin, target):
+                await manager.send(uin, {
+                    "type": "call_end",
+                    "from_uin": target,
+                    "call_id": call_id,
+                    "reason": "unavailable",
+                })
+                return
             registered = await _register_call(call_id, uin, target)
             if not registered:
                 # Caller (or callee) is busy on another call. Tell the
