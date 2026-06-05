@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from app.core.db import SessionLocal
 from app.core.security import decode_token
 from app.models.contact import Contact
-from app.models.user import User, presence_is_fresh
+from app.models.user import User, presence_is_fresh, visible_status
 from app.routers import hood, random as random_chat
 from app.routers.presence import presence_watchers
 from app.routers.referrals import note_active_day
@@ -362,11 +362,18 @@ async def _debounced_offline(uin: int) -> None:
             # and writing "offline" would clobber a user-chosen
             # away/dnd/invisible. This block only fans out the live
             # presence event + cleans up calls / rooms / hood.
-            final_watchers = await presence_watchers(db, uin)
-            await manager.broadcast(
-                list(final_watchers),
-                {"type": "presence", "uin": uin, "status": "offline", "status_message": None},
-            )
+            # A user who opted to stay visible (presence_persistent within its
+            # TTL) must NOT be flapped to offline just because the socket
+            # dropped — that defeats the whole "stay online" setting and spams
+            # watchers with online/offline (+ knock sounds) every time the app
+            # backgrounds. effective/visible_status keeps them online; only fan
+            # out a real offline.
+            if visible_status(user) == "offline":
+                final_watchers = await presence_watchers(db, uin)
+                await manager.broadcast(
+                    list(final_watchers),
+                    {"type": "presence", "uin": uin, "status": "offline", "status_message": None},
+                )
             await random_chat.on_disconnect(uin)
             bucket, count = await hood.remove_subscriber(uin)
             if bucket is not None:
