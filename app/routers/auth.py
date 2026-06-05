@@ -204,6 +204,44 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     return RegisterOut(uin=uin, token=issue_token(uin))
 
 
+# ── identity key re-issue (in-place rotation) ───────────────────────────────
+# Re-key an EXISTING account without changing the UIN. The caller is already
+# authenticated (the bearer token proves they own the UIN), so this simply
+# rewrites the long-term X25519 identity key + Ed25519 signing key on the user
+# row. The client then follows up with POST /keys/bundle to rotate its libsignal
+# bundle — which changes the safety number, so contacts get a "safety number
+# changed" warning the next time they sync this user's keys. Used when a user
+# fears their keys were compromised, or just wants a fresh recovery phrase.
+#
+# Unlike /auth/recover this needs no signature proof: the JWT already authorises
+# the change, and a user can only ever brick their OWN account by uploading a
+# pubkey whose private half they don't hold (the client always generates the
+# pair locally, so it does). The existing token stays valid; we return a fresh
+# one for convenience / parity with register.
+class ReissueIn(BaseModel):
+    identity_key: str
+    signing_key: str
+
+
+@router.post("/reissue", response_model=RegisterOut)
+async def reissue(
+    body: ReissueIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> RegisterOut:
+    ik = body.identity_key.strip()
+    sk = body.signing_key.strip()
+    if not ik or not sk:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "missing_key"})
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found"})
+    user.identity_key = ik
+    user.signing_key = sk
+    await db.commit()
+    return RegisterOut(uin=uin, token=issue_token(uin))
+
+
 @router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_account(
     uin: int = Depends(current_uin),
