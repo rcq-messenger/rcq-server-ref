@@ -154,6 +154,13 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     ("pinned_by", "BIGINT"),
 ]
 
+# Additive on `group_members` — granular moderator capabilities the owner
+# grants per member (comma-joined subset of delete|members|info). Empty for
+# legacy rows (= plain member, no powers), matching pre-feature behaviour.
+_GROUP_MEMBER_COLUMNS: list[tuple[str, str]] = [
+    ("permissions", "VARCHAR(128) DEFAULT ''"),
+]
+
 # Additive on `audio_rooms` — owner-only-speaking toggle. Pre-existing
 # rows default false (anyone can speak), matching prior behaviour.
 _AUDIO_ROOM_COLUMNS: list[tuple[str, str]] = [
@@ -206,6 +213,7 @@ async def init_db() -> None:
         ("users", _USER_STAGE3_COLUMNS),
         ("nearby_checkins", _NEARBY_CHECKIN_COLUMNS),
         ("groups", _GROUP_COLUMNS),
+        ("group_members", _GROUP_MEMBER_COLUMNS),
         ("audio_rooms", _AUDIO_ROOM_COLUMNS),
         ("reports", _REPORT_COLUMNS),
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),

@@ -55,6 +55,10 @@ class GroupMemberOut(BaseModel):
     uin: int
     nickname: str
     role: str
+    # Granular moderator caps the owner granted this member (subset of
+    # delete|members|info). Empty for plain members; the owner implicitly
+    # has all. Clients enforce `delete` (sealed sender) + render the toggles.
+    permissions: list[str] = []
     # Live presence — online/away/dnd/offline. Invisible is reported as offline,
     # like everywhere else in the API.
     status: str = "offline"
@@ -134,6 +138,7 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
             uin=m.uin,
             nickname=u.nickname,
             role=m.role,
+            permissions=_perm_list(m.permissions),
             status=visible,
             identity_key=u.identity_key,
             signing_key=u.signing_key,
@@ -158,6 +163,24 @@ async def _ensure_admin(db: AsyncSession, group_id: int, uin: int) -> GroupMembe
     if m.role not in ("owner", "admin"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
     return m
+
+
+# Granular moderator capabilities the owner grants per member:
+#   delete  — delete ANY member's message (enforced client-side: sealed sender)
+#   members — remove members
+#   info    — edit group name / description / avatar / pinned announcement
+_GROUP_PERMS = ("delete", "members", "info")
+
+
+def _perm_list(raw: str | None) -> list[str]:
+    """Parse the stored comma-joined permission string to a clean list,
+    dropping anything not in the known set."""
+    return [p for p in (raw or "").split(",") if p in _GROUP_PERMS]
+
+
+def _member_can(g: Group, m: GroupMember, perm: str) -> bool:
+    """The owner can do everything; any other member needs the granted cap."""
+    return m.uin == g.owner_uin or perm in _perm_list(m.permissions)
 
 
 async def _filter_blocked(
@@ -593,8 +616,8 @@ async def remove_member(
     me = await _ensure_member(db, group_id, uin)
     g = await _load_group(db, group_id)
     is_self_leave = member_uin == uin
-    if not is_self_leave and me.role not in ("owner", "admin"):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+    if not is_self_leave and not _member_can(g, me, "members"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
     if member_uin == g.owner_uin and not is_self_leave:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot remove the owner")
 
@@ -654,15 +677,15 @@ async def patch_group(
     g = await _load_group(db, group_id)
 
     if body.name is not None:
-        if me.role not in ("owner", "admin"):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+        if not _member_can(g, me, "info"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
         g.name = body.name
     if body.description is not None:
         # Same admin-or-owner gate as name — it's group metadata.
         # Empty/whitespace-only string clears the description back
         # to NULL so the UI hides the blurb entirely.
-        if me.role not in ("owner", "admin"):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+        if not _member_can(g, me, "info"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
         cleaned = body.description.strip()
         g.description = cleaned or None
     if body.post_policy is not None:
@@ -681,8 +704,8 @@ async def patch_group(
         # Owner OR admin can pin / change / clear the announcement.
         # Empty / whitespace-only string clears the pin entirely so
         # the iOS banner disappears.
-        if me.role not in ("owner", "admin"):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+        if not _member_can(g, me, "info"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
         cleaned = body.pinned_text.strip()
         if cleaned:
             g.pinned_text = cleaned
@@ -697,8 +720,8 @@ async def patch_group(
     # gate). Empty string clears. Both fields must move together —
     # the blob is useless without its key and vice versa.
     if body.avatar_media_id is not None or body.avatar_media_key is not None:
-        if me.role not in ("owner", "admin"):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+        if not _member_can(g, me, "info"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
         new_id = (body.avatar_media_id or "").strip() or None
         new_key = (body.avatar_media_key or "").strip() or None
         # Reject mismatched pairs so the client can't accidentally
@@ -719,36 +742,41 @@ async def patch_group(
     return payload
 
 
-class MemberRoleIn(BaseModel):
-    role: str  # "admin" (= moderator) | "member"
+class MemberPermsIn(BaseModel):
+    # Any subset of {delete, members, info}. Empty list = demote back to a
+    # plain member. Unknown entries are rejected.
+    permissions: list[str]
 
 
-@router.post("/{group_id}/members/{member_uin}/role", response_model=GroupOut)
-async def set_member_role(
+@router.post("/{group_id}/members/{member_uin}/permissions", response_model=GroupOut)
+async def set_member_permissions(
     group_id: int,
     member_uin: int,
-    body: MemberRoleIn,
+    body: MemberPermsIn,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> GroupOut:
-    """Owner promotes a member to moderator (role "admin") or demotes back to
-    "member". OWNER-ONLY on purpose: a moderator can moderate (delete any
-    message, rename, remove members, pin) but cannot mint or strip other
-    moderators, so there's no privilege-escalation chain. "owner" is not
-    assignable here — ownership only moves via the leave/transfer path.
-    Deletion authz itself is enforced client-side (sealed sender: the server
-    never sees who sent or deletes a message); this endpoint just publishes
-    the role so every client's roster agrees on who may delete others'."""
+    """Owner grants/revokes a member's granular moderator capabilities (any
+    subset of delete|members|info — the owner decides which rights each
+    moderator gets). OWNER-ONLY on purpose: a moderator can use its caps but
+    can't grant caps to others, so there's no escalation chain. The owner's own
+    (implicit-all) powers aren't editable here, and ownership only moves via the
+    leave/transfer path. `delete` is enforced client-side (sealed sender: the
+    server never sees who sent or deleted a message); this endpoint just
+    publishes the caps every client's roster enforces against."""
     g = await _load_group(db, group_id)
     if g.owner_uin != uin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
-    if body.role not in ("admin", "member"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "role must be 'admin' or 'member'")
+    unknown = [p for p in body.permissions if p not in _GROUP_PERMS]
+    if unknown:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown permissions: {', '.join(unknown)}")
     if member_uin == g.owner_uin:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot change the owner's role")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "the owner already has every permission")
     target = await _ensure_member(db, group_id, member_uin)
-    if target.role != body.role:
-        target.role = body.role
+    # Dedupe + canonical order, comma-joined for storage.
+    canonical = ",".join(p for p in _GROUP_PERMS if p in body.permissions)
+    if target.permissions != canonical:
+        target.permissions = canonical
         await db.commit()
     members = await _members_with_users(db, group_id)
     payload = _serialize(g, members)

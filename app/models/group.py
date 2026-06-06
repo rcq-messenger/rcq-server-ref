@@ -69,7 +69,13 @@ class GroupMember(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     group_id: Mapped[int] = mapped_column(ForeignKey("groups.id", ondelete="CASCADE"), index=True)
     uin: Mapped[int] = mapped_column(BigInteger, index=True)
-    role: Mapped[str] = mapped_column(String(16), default="member")  # owner | admin | member
+    role: Mapped[str] = mapped_column(String(16), default="member")  # owner | member
+    # Granular moderator capabilities the OWNER grants per member: a
+    # comma-joined subset of {delete, members, info}. Empty = a plain member.
+    # The owner implicitly has all caps; this column is only meaningful for
+    # non-owner members. Enforcement of `delete` is client-side (sealed sender),
+    # `members`/`info` are enforced here. See routers/groups.py.
+    permissions: Mapped[str] = mapped_column(String(128), default="", server_default="")
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
