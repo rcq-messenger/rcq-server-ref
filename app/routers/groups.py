@@ -719,6 +719,44 @@ async def patch_group(
     return payload
 
 
+class MemberRoleIn(BaseModel):
+    role: str  # "admin" (= moderator) | "member"
+
+
+@router.post("/{group_id}/members/{member_uin}/role", response_model=GroupOut)
+async def set_member_role(
+    group_id: int,
+    member_uin: int,
+    body: MemberRoleIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> GroupOut:
+    """Owner promotes a member to moderator (role "admin") or demotes back to
+    "member". OWNER-ONLY on purpose: a moderator can moderate (delete any
+    message, rename, remove members, pin) but cannot mint or strip other
+    moderators, so there's no privilege-escalation chain. "owner" is not
+    assignable here — ownership only moves via the leave/transfer path.
+    Deletion authz itself is enforced client-side (sealed sender: the server
+    never sees who sent or deletes a message); this endpoint just publishes
+    the role so every client's roster agrees on who may delete others'."""
+    g = await _load_group(db, group_id)
+    if g.owner_uin != uin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
+    if body.role not in ("admin", "member"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "role must be 'admin' or 'member'")
+    if member_uin == g.owner_uin:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot change the owner's role")
+    target = await _ensure_member(db, group_id, member_uin)
+    if target.role != body.role:
+        target.role = body.role
+        await db.commit()
+    members = await _members_with_users(db, group_id)
+    payload = _serialize(g, members)
+    for m in members:
+        await manager.send(m.uin, {"type": "group_membership_changed", "group": payload.model_dump(mode="json")})
+    return payload
+
+
 @router.delete("/{group_id}")
 async def delete_group(
     group_id: int,
