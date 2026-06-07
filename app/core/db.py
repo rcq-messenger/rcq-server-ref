@@ -28,6 +28,15 @@ if settings.DATABASE_URL.startswith(("postgresql", "postgres")):
         pool_timeout=20,
         pool_pre_ping=True,
         pool_recycle=1800,
+        # PgBouncer (DO managed-Postgres connection pool, port 25061) runs in
+        # TRANSACTION mode, which is incompatible with server-side prepared
+        # statements: asyncpg caches them per backend connection, but PgBouncer
+        # hands each transaction whatever backend conn is free, so a cached
+        # statement may not exist there ("prepared statement ... does not
+        # exist"). Disabling both caches makes every query a one-shot, which is
+        # PgBouncer-safe — and harmless on a direct (:25060) connection too, so
+        # this is correct whether DATABASE_URL points at the pool or direct.
+        connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
     )
 engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
