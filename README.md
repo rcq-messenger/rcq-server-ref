@@ -104,14 +104,15 @@ docker compose up -d --build
 curl https://rcq.example.com/health        # → {"ok":true,"app":"RCQ Backend"}
 ```
 
-Once `/health` answers over HTTPS, point an iOS client at the new
-backend via Settings → Privacy & Network → Custom server. The picker
-takes any `https://` URL that exposes the RCQ API, writes it to
-`UserDefaults`, and the next launch boots against your instance
-instead of `api.rcq.app`. Note that switching servers is destructive
-locally (the client treats it as a fresh install) — your account on
-the old server is unaffected, you simply allocate a new UIN on the new
-one.
+Once `/health` answers over HTTPS, point a client at the new backend
+via Settings → Privacy & Network → Custom server. The picker takes any
+`https://` URL that exposes the RCQ API and **adds a new account on
+that instance** (its own UIN/identity) alongside your current one,
+then switches to it. This is NOT destructive: your existing account
+(UIN, contacts, groups, history) stays on the device, and you can
+switch between accounts anytime from the account switcher. (Older
+builds replaced the active backend in place and wiped local state —
+that is no longer the case; RCQ is multi-account.)
 
 ## Quick start (no Docker)
 
