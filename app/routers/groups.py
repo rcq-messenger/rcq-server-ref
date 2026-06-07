@@ -15,8 +15,6 @@ from app.services.connection_manager import manager
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
-MAX_GROUPS_PER_USER = 5
-
 
 class GroupOut(BaseModel):
     id: int
@@ -238,9 +236,9 @@ async def _can_invite_to_group(
     "",
     response_model=GroupOut,
     status_code=status.HTTP_201_CREATED,
-    # 5 owned groups is the hard cap (`MAX_GROUPS_PER_USER`); a
-    # rate limit on top stops a user from spam-creating-and-deleting
-    # to bypass the cap or to flood join-key generation.
+    # No per-user owned-groups cap (removed 2026-06-07 — power users / community
+    # organizers legitimately own many). The rate limit below (10/hour) still
+    # stops spam-creation and join-key flooding.
     dependencies=[Depends(rate_limit("groups_create", 10, 3600))],
 )
 async def create_group(
@@ -248,16 +246,6 @@ async def create_group(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> GroupOut:
-    # Cap at MAX_GROUPS_PER_USER per owner. Counts only groups *owned* by the
-    # caller — being a member of someone else's group doesn't count.
-    owned_count = await db.scalar(
-        select(func.count()).select_from(Group).where(Group.owner_uin == uin)
-    )
-    if (owned_count or 0) >= MAX_GROUPS_PER_USER:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"limit reached: max {MAX_GROUPS_PER_USER} owned groups",
-        )
 
     member_set = set(body.member_uins) | {uin}
     # Validate all members exist
