@@ -99,12 +99,14 @@ async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
     return out
 
 
-@router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def revoke_device(device_id: str, uin: int = Depends(current_uin)) -> None:
+@router.delete("/{device_id}")
+async def revoke_device(device_id: str, uin: int = Depends(current_uin)) -> dict:
     """Disconnect a web session: drop it from the registry AND denylist its
     token. When the last device is removed the hash disappears, so the account
-    is single-device again and `GET /keys/{uin}/bundle` resumes serving v=2."""
+    is single-device again and `GET /keys/{uin}/bundle` resumes serving v=2.
+    Returns 200 {ok:true} (any 2xx satisfies the clients)."""
     redis = await get_redis()
     await redis.hdel(_devices_key(uin), device_id)
     await redis.sadd(_revoked_key(uin), device_id)
     await redis.expire(_revoked_key(uin), DEVICE_TTL_SECONDS)
+    return {"ok": True}
