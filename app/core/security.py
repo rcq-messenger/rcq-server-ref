@@ -20,6 +20,20 @@ def issue_token(uin: int) -> str:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
+def issue_device_token(uin: int, device_id: str) -> str:
+    """A session token for a LINKED web device — same `sub` (uin) as the phone,
+    plus a `dev` claim so the session can be revoked independently (current_uin
+    checks the per-account `dev_revoked` denylist for tokens carrying a `dev`).
+    Lives ~90 days, matching the device-registry TTL in routers/devices.py."""
+    payload = {
+        "sub": str(uin),
+        "dev": device_id,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=90 * 24 * 3600),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
+
+
 def decode_token(token: str) -> int:
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
@@ -55,7 +69,21 @@ def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
 async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> int:
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
-    return decode_token(creds.credentials)
+    try:
+        payload = jwt.decode(creds.credentials, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
+        uin = int(payload["sub"])
+    except (JWTError, KeyError, ValueError) as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
+    # Linked-web-device tokens carry a `dev` claim and are independently
+    # revocable. Only THESE pay the Redis denylist lookup — a plain phone token
+    # (no `dev`) skips it, so the hot path is untouched.
+    dev = payload.get("dev")
+    if dev:
+        from app.core.redis import get_redis  # local import avoids an import cycle
+        redis = await get_redis()
+        if await redis.sismember(f"dev_revoked:{uin}", dev):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "device revoked")
+    return uin
 
 
 async def current_uin_optional(

@@ -220,6 +220,15 @@ async def fetch_bundle(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # Multi-device: while a web session is linked to this account, withhold the
+    # v=2 bundle so the sender falls back to v=1 (stateless → decryptable on
+    # every device of this identity). The Double Ratchet can't be shared across
+    # devices, so v=2 to a multi-homed account silently desyncs on whichever
+    # device didn't decrypt first. The 404 is the same "fall back to v=1" signal
+    # senders already handle. Auto-restores once the last device is removed.
+    from app.routers.devices import has_linked_devices  # local import: avoid cycle
+    if await has_linked_devices(uin):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "multi-device: v=1 only")
     if (
         user.signal_identity_key is None
         or user.signed_prekey_id is None
