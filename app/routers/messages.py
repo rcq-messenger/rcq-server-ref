@@ -22,7 +22,12 @@ log = logging.getLogger(__name__)
 # things like read receipts, typing relays, reactions, bounces, visits and
 # delete-tombstones — they're either delivery-state plumbing or cosmetic, no
 # benefit in waking the recipient's device for one.
-_PUSHABLE_TYPES = {"message", "system"}
+# "secscreen" carries BOTH the screenshot-taken notice (the recipient should be
+# alerted immediately, even backgrounded — it's a secret-chat security signal)
+# AND the silent secure-mode toggle. We push it so a screenshot taken while the
+# recipient's WS is down/stale doesn't sit unseen until they reopen the app; the
+# NSE shows a real "screenshot" body for the shot and suppresses the toggle.
+_PUSHABLE_TYPES = {"message", "system", "secscreen"}
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
