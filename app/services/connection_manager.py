@@ -66,6 +66,12 @@ class ConnectionManager:
         # Local-to-this-worker connection map. Other workers have
         # their own copies; we only see ours.
         self._conns: dict[int, set[WebSocket]] = defaultdict(set)
+        # Per-socket device id, so a reconnect supersedes only the SAME
+        # device's prior socket and DIFFERENT devices of one account
+        # (e.g. phone + a connect-to-web linked browser) coexist and both
+        # receive live. A regular phone session has no `dev` claim → keyed
+        # "primary", which preserves the old single-device behaviour exactly.
+        self._device_of: dict[WebSocket, str] = {}
         self._lock = asyncio.Lock()
         # Background task that subscribes to the fanout channel and
         # delivers received messages to LOCAL connections only. Started
@@ -123,14 +129,18 @@ class ConnectionManager:
                         if isinstance(uin, int):
                             await self._deliver_user_local(uin, payload_text)
                     elif target == "supersede":
-                        # Another worker accepted a new socket for
-                        # this UIN — close any stale sockets we still
-                        # hold for it so a future broadcast doesn't
-                        # fan out to ghost connections.
+                        # Another worker accepted a new socket for this
+                        # UIN+device — close any stale sockets WE still hold
+                        # for the SAME device so a future broadcast doesn't
+                        # fan out to that device's ghosts. Other devices of
+                        # the account are left alone (multi-device).
                         uin = envelope.get("uin")
                         origin_pid = envelope.get("pid")
+                        dev = envelope.get("device_id", "primary")
                         if isinstance(uin, int) and origin_pid != os.getpid():
-                            await self._close_local_sockets(uin)
+                            await self._close_local_sockets_for_device(
+                                uin, dev if isinstance(dev, str) else "primary"
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -154,6 +164,28 @@ class ConnectionManager:
         async with self._lock:
             old = list(self._conns.get(uin, set()))
             self._conns.pop(uin, None)
+            for ws in old:
+                self._device_of.pop(ws, None)
+        for ws in old:
+            try:
+                await ws.close(code=4000, reason="superseded")
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _close_local_sockets_for_device(self, uin: int, device_id: str) -> None:
+        """Close only the sockets we hold for one (uin, device) — used by
+        the cross-worker supersede so other devices of the account stay up."""
+        old: list[WebSocket] = []
+        async with self._lock:
+            conns = self._conns.get(uin)
+            if conns:
+                for ws in list(conns):
+                    if self._device_of.get(ws, "primary") == device_id:
+                        old.append(ws)
+                        conns.discard(ws)
+                        self._device_of.pop(ws, None)
+                if not conns:
+                    self._conns.pop(uin, None)
         for ws in old:
             try:
                 await ws.close(code=4000, reason="superseded")
@@ -170,19 +202,26 @@ class ConnectionManager:
 
     # ── Public API ──────────────────────────────────────────────────
 
-    async def connect(self, uin: int, ws: WebSocket) -> None:
+    async def connect(self, uin: int, ws: WebSocket, device_id: str = "primary") -> None:
         await ws.accept()
-        # Drop any stale sockets we already have for this UIN locally.
-        # iOS reconnect cycles + 4-worker round-robin LB previously
-        # left zombie connections on other workers: a single bid would
-        # then fan out and be delivered N times because the client
-        # had N parallel sockets (one per worker it had hit).
-        # Cluster-wide eviction is the next paragraph; this one just
-        # handles same-worker duplicates.
+        # Supersede only the SAME device's stale sockets — a reconnect of
+        # this device (iOS reconnect cycles, a browser tab reload) replaces
+        # its own old socket so a single bid isn't delivered N times to that
+        # device's zombies. Sockets belonging to OTHER devices of the same
+        # account (a phone + a connect-to-web linked browser) are kept, so
+        # both stay live and receive. Cross-worker eviction (also device-
+        # scoped) is the next paragraph.
         old_sockets: list[WebSocket] = []
         async with self._lock:
-            old_sockets = list(self._conns.get(uin, set()))
-            self._conns[uin] = {ws}
+            existing = self._conns.get(uin, set())
+            for old in list(existing):
+                if self._device_of.get(old, "primary") == device_id:
+                    old_sockets.append(old)
+                    existing.discard(old)
+                    self._device_of.pop(old, None)
+            existing.add(ws)
+            self._conns[uin] = existing
+            self._device_of[ws] = device_id
         for old in old_sockets:
             try:
                 await old.close(code=4000, reason="superseded")
@@ -200,6 +239,7 @@ class ConnectionManager:
             envelope = json.dumps({
                 "target": "supersede",
                 "uin": uin,
+                "device_id": device_id,
                 "pid": os.getpid(),
             })
             await redis.publish(_FANOUT_CHANNEL, envelope)
@@ -208,6 +248,7 @@ class ConnectionManager:
 
     async def disconnect(self, uin: int, ws: WebSocket) -> None:
         async with self._lock:
+            self._device_of.pop(ws, None)
             conns = self._conns.get(uin)
             if conns:
                 conns.discard(ws)

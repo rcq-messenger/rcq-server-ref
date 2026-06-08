@@ -42,6 +42,19 @@ def decode_token(token: str) -> int:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
 
 
+def decode_device_id(token: str) -> str:
+    """The `dev` claim of a linked-web-device token, or "primary" for a
+    regular (phone / direct-login) session. Used to key WS connections per
+    device so a phone and a connect-to-web linked browser coexist instead
+    of superseding each other. Never raises — falls back to "primary"."""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
+        dev = payload.get("dev")
+        return dev if isinstance(dev, str) and dev else "primary"
+    except JWTError:
+        return "primary"
+
+
 def issue_recover_challenge(signing_key: str) -> str:
     """Short-lived signed nonce bound to a claimed signing pubkey, for the
     account-recovery challenge-response. Stateless: the challenge IS the

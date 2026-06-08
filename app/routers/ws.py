@@ -5,7 +5,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, update
 
 from app.core.db import SessionLocal
-from app.core.security import decode_token
+from app.core.security import decode_token, decode_device_id
 from app.models.contact import Contact
 from app.models.user import User, presence_is_fresh, visible_status
 from app.routers import hood, random as random_chat
@@ -236,6 +236,9 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
     except Exception:
         await ws.close(code=4401)
         return
+    # Device key: a connect-to-web linked browser carries a `dev` claim and
+    # coexists with the phone ("primary"); both stay live and receive.
+    device_id = decode_device_id(token)
     if token_uin != uin:
         await ws.close(code=4403)
         return
@@ -254,7 +257,7 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
             await ws.close(code=4408)
             return
 
-    await manager.connect(uin, ws)
+    await manager.connect(uin, ws, device_id)
     try:
         await _on_connect(uin)
         while True:
