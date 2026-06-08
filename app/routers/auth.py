@@ -10,9 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import current_uin, issue_recover_challenge, issue_token, verify_recover_challenge
-from app.models.contact import Contact
+from app.models.contact import Contact, ContactRequest
 from app.models.invite import Invite
 from app.models.group import Group, GroupMember
+from app.models.message import OfflineMessage
+from app.models.audio_room import AudioRoom, AudioRoomMembership, AudioRoomMute
+from app.models.poll import Poll, PollVote
+from app.models.story import Story
+from app.models.device_token import DeviceToken
 from app.models.user import User
 from app.routers.groups import _load_group, _members_with_users, _serialize
 from app.routers.referrals import record_referral
@@ -299,6 +304,30 @@ async def delete_account(
     await db.execute(
         delete(GroupMember).where(GroupMember.uin == uin)
     )
+
+    # Wipe every other per-UIN row so a RECYCLED UIN (re-registered, or
+    # bought through /uin/purchase) never inherits the burned owner's
+    # data. one_time_prekeys and devices ON DELETE CASCADE off the user
+    # row, but these tables key on UIN with no FK cascade — exactly the
+    # rows /account migration re-keys. Without this the new owner of a
+    # recycled UIN sees the previous owner's contacts, pending requests,
+    # queued ciphertext, owned rooms/polls/stories, etc.
+    await db.execute(
+        delete(Contact).where(or_(Contact.owner_uin == uin, Contact.contact_uin == uin))
+    )
+    await db.execute(
+        delete(ContactRequest).where(
+            or_(ContactRequest.from_uin == uin, ContactRequest.to_uin == uin)
+        )
+    )
+    await db.execute(delete(OfflineMessage).where(OfflineMessage.to_uin == uin))
+    await db.execute(delete(AudioRoomMembership).where(AudioRoomMembership.uin == uin))
+    await db.execute(delete(AudioRoomMute).where(AudioRoomMute.uin == uin))
+    await db.execute(delete(AudioRoom).where(AudioRoom.owner_uin == uin))
+    await db.execute(delete(PollVote).where(PollVote.voter_uin == uin))
+    await db.execute(delete(Poll).where(Poll.creator_uin == uin))
+    await db.execute(delete(Story).where(Story.owner_uin == uin))
+    await db.execute(delete(DeviceToken).where(DeviceToken.uin == uin))
 
     await db.delete(user)
     await db.commit()
