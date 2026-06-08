@@ -29,9 +29,11 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Founder UIN — auto-added bidirectionally to every freshly registered
-# tester's contact list. Set RCQ_FOUNDER_UIN=0 in env to disable.
+# tester's contact list. OFF by default now (the old default 555555 was a
+# retired RCQ account; a self-host operator should never seed it either).
+# Opt in by setting RCQ_FOUNDER_UIN=<uin> in env.
 def _founder_uin() -> int:
-    raw = os.getenv("RCQ_FOUNDER_UIN", "555555")
+    raw = os.getenv("RCQ_FOUNDER_UIN", "0")
     try:
         return int(raw)
     except ValueError:
