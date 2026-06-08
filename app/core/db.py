@@ -190,6 +190,13 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
     ("attachments", "JSON"),
 ]
 
+# Additive on `invites` — an optional reserved UIN so an invite can grant a
+# specific (vanity) number at registration. NULL on existing rows = the prior
+# random-allocation behaviour.
+_INVITE_COLUMNS: list[tuple[str, str]] = [
+    ("uin", "BIGINT"),
+]
+
 async def init_db() -> None:
     from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite  # noqa: F401  (register tables)
 
@@ -226,6 +233,7 @@ async def init_db() -> None:
         ("audio_rooms", _AUDIO_ROOM_COLUMNS),
         ("reports", _REPORT_COLUMNS),
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
+        ("invites", _INVITE_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:

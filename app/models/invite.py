@@ -25,6 +25,12 @@ class Invite(Base):
     label: Mapped[str | None] = mapped_column(String(120), nullable=True)
     max_uses: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     used_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Optional reserved UIN: when set, `/auth/register` granting THIS invite
+    # assigns exactly this UIN (vanity / hand-picked) instead of a random one,
+    # provided it's still free at registration time. Lets a self-host operator
+    # hand out specific numbers ("your code -> UIN 777777"). NULL = normal
+    # random allocation. Pair with max_uses=1 so a number can't be claimed twice.
+    uin: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Admin uin that minted it (nullable — CLI mints have no admin session).
     created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(

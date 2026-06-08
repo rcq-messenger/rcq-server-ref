@@ -82,23 +82,45 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # one use ATOMICALLY: a single UPDATE that only matches an unexpired,
     # not-exhausted code locks the row, so two simultaneous registrations can't
     # both spend the last use. It commits together with the user creation below.
+    code = (body.invite or "").strip()
+    # A redeemed invite may carry a reserved (vanity) UIN; capture it so the
+    # holder gets exactly that number below.
+    reserved_uin: int | None = None
+    invite_gates = (
+        Invite.code == code,
+        Invite.used_count < Invite.max_uses,
+        or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
+    )
     if settings.REGISTRATION_POLICY == "invite":
-        code = (body.invite or "").strip()
         if not code:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_required"})
         consumed = await db.execute(
-            update(Invite)
-            .where(
-                Invite.code == code,
-                Invite.used_count < Invite.max_uses,
-                or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
-            )
-            .values(used_count=Invite.used_count + 1)
+            update(Invite).where(*invite_gates).values(used_count=Invite.used_count + 1)
         )
         if consumed.rowcount == 0:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_invalid"})
+        reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code))
+    elif code:
+        # Open server, but a reserved-UIN invite was supplied → consume it so the
+        # holder still gets their vanity number. A plain (uin-less) invite on an
+        # open server is simply ignored (registration is already allowed).
+        consumed = await db.execute(
+            update(Invite)
+            .where(*invite_gates, Invite.uin.isnot(None))
+            .values(used_count=Invite.used_count + 1)
+        )
+        if consumed.rowcount > 0:
+            reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code))
 
-    uin = await allocate_uin(db)
+    # A reserved vanity UIN wins when it's still free; otherwise fall back to a
+    # random allocation (the reservation lost a race, or none was set).
+    uin = None
+    if reserved_uin is not None and await db.scalar(
+        select(User.uin).where(User.uin == reserved_uin)
+    ) is None:
+        uin = reserved_uin
+    if uin is None:
+        uin = await allocate_uin(db)
     user = User(
         uin=uin,
         nickname=body.nickname,

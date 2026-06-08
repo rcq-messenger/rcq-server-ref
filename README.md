@@ -45,6 +45,15 @@ hosted-key tooling), keep an eye on releases.
   cleanly no-ops when nobody calls it.
 * **Reports / moderation** — bug-bounty submissions, abuse reports
   with encrypted-media evidence, admin SPA at `admin.<your-domain>`.
+* **Built-in admin console (self-host)** — open
+  `https://<your-server>/admin/console` and log in with the
+  `ADMIN_USERNAME` / `ADMIN_PASSWORD` you set in `.env`. One self-contained
+  page (no extra hosting) to see stats, search + ban users, work the reports
+  queue, and mint invites — **including handing out specific (vanity) UINs**:
+  create an invite with a reserved UIN (`{"uin": 777777, "max_uses": 1}`) and
+  whoever redeems that code registers as exactly that number. Reserved UINs
+  also work on an open-registration server (pass the code at sign-up); a
+  plain invite without a UIN still gets a random number.
 
 ## One-line install (recommended)
 

@@ -14,10 +14,12 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import require_admin
 from app.models.invite import Invite
@@ -57,6 +59,19 @@ router = APIRouter(
     tags=["admin"],
     dependencies=[Depends(require_admin)],
 )
+
+
+@router.get("/console", response_class=HTMLResponse, include_in_schema=False)
+async def admin_console() -> HTMLResponse:
+    """Self-host admin UI — a single self-contained page that drives this same
+    /admin API. Open `https://<server>/admin/console`; the browser prompts for
+    the ADMIN_USERNAME / ADMIN_PASSWORD set in .env (the page is Basic-gated by
+    the router dependency above), then replays those credentials for its calls.
+    The managed counterpart is console.rcq.app; this gives self-hosters parity
+    with zero extra hosting."""
+    from app.admin_console import ADMIN_CONSOLE_HTML
+
+    return HTMLResponse(ADMIN_CONSOLE_HTML)
 
 
 # ── DTOs ────────────────────────────────────────────────────────────
@@ -556,6 +571,10 @@ class MintInviteIn(BaseModel):
     label: str | None = Field(default=None, max_length=120)
     max_uses: int = Field(default=1, ge=1, le=100_000)
     ttl_hours: int | None = Field(default=None, ge=1)  # null = never expires
+    # Optional reserved (vanity) UIN this invite grants at registration. When
+    # set, the user who redeems this code gets exactly this number. Must be free
+    # and in [UIN_MIN, UIN_MAX]; pair with max_uses=1 so it isn't claimed twice.
+    uin: int | None = Field(default=None)
 
 
 class InviteOut(BaseModel):
@@ -563,6 +582,7 @@ class InviteOut(BaseModel):
     label: str | None
     max_uses: int
     used_count: int
+    uin: int | None = None
     expires_at: datetime | None
     created_at: datetime
     join_url: str
@@ -579,6 +599,7 @@ def _invite_out(request: Request, inv: Invite) -> InviteOut:
         label=inv.label,
         max_uses=inv.max_uses,
         used_count=inv.used_count,
+        uin=inv.uin,
         expires_at=inv.expires_at,
         created_at=inv.created_at,
         join_url=_join_url(request, inv.code),
@@ -589,13 +610,37 @@ def _invite_out(request: Request, inv: Invite) -> InviteOut:
 async def mint_invite(
     body: MintInviteIn, request: Request, db: AsyncSession = Depends(get_db)
 ) -> InviteOut:
+    # A reserved (vanity) UIN must be in range, not already registered, and not
+    # already reserved by another live invite — otherwise two people could be
+    # promised the same number.
+    reserved_uin = body.uin
+    if reserved_uin is not None:
+        if not (settings.UIN_MIN <= reserved_uin <= settings.UIN_MAX):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail={"code": "uin_out_of_range", "min": settings.UIN_MIN, "max": settings.UIN_MAX},
+            )
+        if await db.scalar(select(User.uin).where(User.uin == reserved_uin)) is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_taken"})
+        already = await db.scalar(
+            select(Invite.code).where(
+                Invite.uin == reserved_uin,
+                Invite.used_count < Invite.max_uses,
+                or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
+            )
+        )
+        if already is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_reserved"})
     code = secrets.token_urlsafe(16)
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=body.ttl_hours)
         if body.ttl_hours
         else None
     )
-    inv = Invite(code=code, label=body.label, max_uses=body.max_uses, expires_at=expires_at)
+    inv = Invite(
+        code=code, label=body.label, max_uses=body.max_uses,
+        expires_at=expires_at, uin=reserved_uin,
+    )
     db.add(inv)
     await db.commit()
     await db.refresh(inv)
