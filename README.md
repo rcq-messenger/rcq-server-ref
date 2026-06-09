@@ -224,8 +224,10 @@ Once your instance is up and you want users to find it without
 manually trading hostnames, open a PR against
 [`rcq-messenger/rcq-servers`](https://github.com/rcq-messenger/rcq-servers).
 That's a small JSON catalogue clients fetch on first launch and
-present as a picker. Each RCQ server is an isolated island — the
-directory is for discoverability, not federation.
+present as a picker. Each RCQ server is an independent island; the
+directory is for discoverability. (Cross-island messaging —
+federation — is on the roadmap as a separate, client-side layer the
+catalogue will feed; today the islands are still independent.)
 
 ## Contributing
 
