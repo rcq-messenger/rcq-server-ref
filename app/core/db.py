@@ -198,7 +198,7 @@ _INVITE_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 

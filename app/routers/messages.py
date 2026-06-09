@@ -4,14 +4,15 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import current_uin
+from app.core.security import current_device_id, current_uin
 from app.models.group import GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
+from app.models.queue_cursor import QueueCursor
 from app.models.user import User
 from app.services.apns import is_group_muted, send_to_user as apns_send
 from app.services.connection_manager import manager
@@ -253,41 +254,89 @@ class AckOut(BaseModel):
     deleted: int
 
 
+async def _advance_cursor(
+    db: AsyncSession, uin: int, device_id: str, max_direct: int, max_group: int
+) -> int:
+    """Move THIS device's drain cursor forward (never backward), then reap any
+    queued rows now below EVERY device's cursor. Returns rows reaped."""
+    cursor = await db.get(QueueCursor, (uin, device_id))
+    if cursor is None:
+        cursor = QueueCursor(uin=uin, device_id=device_id, last_direct_id=0, last_group_id=0)
+        db.add(cursor)
+    if max_direct > cursor.last_direct_id:
+        cursor.last_direct_id = max_direct
+    if max_group > cursor.last_group_id:
+        cursor.last_group_id = max_group
+    await db.flush()
+    return await _reap_below_min(db, uin)
+
+
+async def _reap_below_min(db: AsyncSession, uin: int) -> int:
+    """Delete queued rows every one of the user's devices has already drained
+    (id <= the minimum cursor across the user's devices). The TTL sweep is the
+    backstop for rows held up by a device that went away without unlinking."""
+    cursors = (
+        await db.execute(select(QueueCursor).where(QueueCursor.uin == uin))
+    ).scalars().all()
+    if not cursors:
+        return 0
+    min_direct = min(c.last_direct_id for c in cursors)
+    min_group = min(c.last_group_id for c in cursors)
+    reaped = 0
+    if min_direct > 0:
+        res = await db.execute(
+            delete(OfflineMessage).where(
+                OfflineMessage.to_uin == uin, OfflineMessage.id <= min_direct
+            )
+        )
+        reaped += res.rowcount or 0
+    if min_group > 0:
+        res = await db.execute(
+            delete(OfflineGroupMessage).where(
+                OfflineGroupMessage.to_uin == uin, OfflineGroupMessage.id <= min_group
+            )
+        )
+        reaped += res.rowcount or 0
+    return reaped
+
+
 @router.get("/queue", response_model=list[HistoryRow])
 async def fetch_queue(
     ack: bool = False,
     uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> list[HistoryRow]:
-    """Fetch queued offline envelopes for the authenticated UIN.
+    """Fetch queued offline envelopes for the authenticated UIN, PER DEVICE.
 
-    `ack=false` (default, legacy): drain-on-fetch — server deletes
-    every returned row inside the same transaction. Simple but lossy:
-    if the client receives the HTTP response and then fails to persist
-    one envelope (decryption error, app crash mid-loop, serialisation
-    bug), that row is gone forever and the recipient sees the push
-    notification but no message in chat.
+    The queue is shared across a user's devices (their phone + a connect-to-web
+    browser). Each device drains independently via a per-device cursor
+    (`QueueCursor`): we return only rows above THIS device's cursor, so a phone
+    and a linked browser each receive every message instead of whichever drains
+    first deleting them for the other (founder report).
 
-    `ack=true`: server returns envelopes without deleting. The client
-    is expected to POST /messages/queue/ack with the IDs of the
-    envelopes it successfully persisted. Un-ACKed rows are reaped by
-    the background TTL sweeper after `OFFLINE_QUEUE_TTL_DAYS` (so
-    truly stuck rows don't accumulate forever). New clients opt in
-    via this parameter; old clients keep the legacy semantics. Once
-    every iOS build in the wild sends `ack=1`, the default can flip
-    in a future release.
+    `ack=true` (new clients): rows are returned without advancing the cursor; the
+    client POSTs /messages/queue/ack with the ids it persisted, which advances
+    the cursor. `ack=false` (legacy drain-on-fetch): we advance this device's
+    cursor past everything returned (instead of the old per-uin delete, which
+    robbed the user's other devices). A row is reaped only once every device's
+    cursor has passed it; the TTL sweep backstops abandoned cursors.
     """
+    cursor = await db.get(QueueCursor, (uin, device_id))
+    after_direct = cursor.last_direct_id if cursor else 0
+    after_group = cursor.last_group_id if cursor else 0
+
     rows_1to1 = (
         await db.execute(
             select(OfflineMessage)
-            .where(OfflineMessage.to_uin == uin)
+            .where(OfflineMessage.to_uin == uin, OfflineMessage.id > after_direct)
             .order_by(OfflineMessage.received_at.asc())
         )
     ).scalars().all()
     rows_group = (
         await db.execute(
             select(OfflineGroupMessage)
-            .where(OfflineGroupMessage.to_uin == uin)
+            .where(OfflineGroupMessage.to_uin == uin, OfflineGroupMessage.id > after_group)
             .order_by(OfflineGroupMessage.received_at.asc())
         )
     ).scalars().all()
@@ -306,12 +355,11 @@ async def fetch_queue(
     out.sort(key=lambda x: x.received_at)
 
     if not ack:
-        # Legacy drain-on-fetch path. Keep behaviour identical to
-        # pre-ACK clients so a rolling iOS deploy doesn't regress.
-        for r in rows_1to1:
-            await db.delete(r)
-        for r in rows_group:
-            await db.delete(r)
+        # Legacy drain-on-fetch: the client takes everything in one shot, so
+        # advance this device's cursor past all returned rows.
+        max_direct = max((r.id for r in rows_1to1), default=after_direct)
+        max_group = max((r.id for r in rows_group), default=after_group)
+        await _advance_cursor(db, uin, device_id, max_direct, max_group)
         await db.commit()
     return out
 
@@ -320,43 +368,19 @@ async def fetch_queue(
 async def ack_queue(
     body: AckIn,
     uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> AckOut:
-    """Delete envelopes the client has confirmed it persisted locally.
+    """Advance THIS device's drain cursor past the envelopes it has persisted.
 
-    Ownership-checked: a row is deleted only when its `to_uin` matches
-    the authenticated UIN. Spoofing someone else's IDs is a no-op.
-    Unknown IDs (already deleted, expired by TTL sweep, never existed)
-    are silently ignored — the endpoint is idempotent so retrying a
-    stale ACK list does no harm.
+    Per-device (keyed off the token's `dev` claim): acking on the linked browser
+    does NOT remove rows the phone still needs — a queued row is reaped only once
+    every device's cursor has passed it. The cursor only moves FORWARD, so a
+    stale or out-of-order ACK list is harmless (idempotent). Returns rows
+    actually reaped by the resulting min-cursor cleanup.
     """
-    deleted = 0
-
-    if body.direct_ids:
-        rows = (
-            await db.execute(
-                select(OfflineMessage).where(
-                    OfflineMessage.id.in_(body.direct_ids),
-                    OfflineMessage.to_uin == uin,
-                )
-            )
-        ).scalars().all()
-        for r in rows:
-            await db.delete(r)
-        deleted += len(rows)
-
-    if body.group_ids:
-        rows = (
-            await db.execute(
-                select(OfflineGroupMessage).where(
-                    OfflineGroupMessage.id.in_(body.group_ids),
-                    OfflineGroupMessage.to_uin == uin,
-                )
-            )
-        ).scalars().all()
-        for r in rows:
-            await db.delete(r)
-        deleted += len(rows)
-
+    max_direct = max(body.direct_ids) if body.direct_ids else 0
+    max_group = max(body.group_ids) if body.group_ids else 0
+    reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group)
     await db.commit()
-    return AckOut(deleted=deleted)
+    return AckOut(deleted=reaped)

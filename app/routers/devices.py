@@ -20,9 +20,13 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.db import get_db
 from app.core.redis import get_redis
 from app.core.security import current_uin, issue_device_token
+from app.models.queue_cursor import QueueCursor
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -100,7 +104,11 @@ async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
 
 
 @router.delete("/{device_id}")
-async def revoke_device(device_id: str, uin: int = Depends(current_uin)) -> dict:
+async def revoke_device(
+    device_id: str,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """Disconnect a web session: drop it from the registry AND denylist its
     token. When the last device is removed the hash disappears, so the account
     is single-device again and `GET /keys/{uin}/bundle` resumes serving v=2.
@@ -109,4 +117,11 @@ async def revoke_device(device_id: str, uin: int = Depends(current_uin)) -> dict
     await redis.hdel(_devices_key(uin), device_id)
     await redis.sadd(_revoked_key(uin), device_id)
     await redis.expire(_revoked_key(uin), DEVICE_TTL_SECONDS)
+    # Drop this device's offline-queue cursor so it no longer holds back the
+    # min-cursor cleanup of the user's queue (a removed device shouldn't pin rows
+    # for the others). Best-effort.
+    await db.execute(
+        delete(QueueCursor).where(QueueCursor.uin == uin, QueueCursor.device_id == device_id)
+    )
+    await db.commit()
     return {"ok": True}

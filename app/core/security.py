@@ -99,6 +99,16 @@ async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) ->
     return uin
 
 
+async def current_device_id(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:
+    """The calling session's device id: "primary" for a phone / direct login, or
+    the linked-web token's `dev` claim. Used to drain the offline queue PER
+    DEVICE so a phone and a linked browser each receive every message instead of
+    whichever drains first deleting them for the other."""
+    if creds is None:
+        return "primary"
+    return decode_device_id(creds.credentials)
+
+
 async def current_uin_optional(
     creds: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> int | None:
