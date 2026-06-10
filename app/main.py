@@ -39,7 +39,11 @@ async def lifespan(_: FastAPI):
     # missing Redis is a hard error we want to surface at boot, not on
     # the first user request.
     await get_redis()
-    await seed_fake_users()
+    # Demo fakes are opt-in (default off) so self-hosted islands never seed
+    # phantom accounts. The flagship keeps its long-ago-seeded fakes regardless
+    # (seeding is idempotent); this just stops new islands from getting any.
+    if settings.SEED_FAKE_USERS:
+        await seed_fake_users()
     expire_task = asyncio.create_task(random_chat.expire_loop())
     story_sweep_task = asyncio.create_task(story_sweep_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())

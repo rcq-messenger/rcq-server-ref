@@ -325,6 +325,76 @@ async def _summarize(db: AsyncSession, user: User) -> UserSummary:
     )
 
 
+# ── Hall of Fame ────────────────────────────────────────────────────
+
+
+class HofRow(BaseModel):
+    uin: int
+    nickname: str
+    opt_in: bool
+    approved: bool
+    created_at: datetime
+    last_seen: datetime
+
+
+class HofListOut(BaseModel):
+    items: list[HofRow]
+    approved_count: int
+
+
+class HofApproveIn(BaseModel):
+    approved: bool
+
+
+@router.get("/hof", response_model=HofListOut)
+async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
+    """Everyone who opted into the Hall of Fame, newest opt-ins implicitly
+    surfaced by the approved-last ordering. The founder flips `approved` per
+    row; only approved+opted-in users reach the public /public/hof wall."""
+    rows = (
+        await db.execute(
+            select(User)
+            .where(User.hof_opt_in.is_(True), User.is_fake.is_(False))
+            .order_by(User.hof_approved.desc(), User.last_seen.desc())
+        )
+    ).scalars().all()
+    approved = sum(1 for u in rows if u.hof_approved)
+    return HofListOut(
+        items=[
+            HofRow(
+                uin=u.uin,
+                nickname=u.nickname,
+                opt_in=u.hof_opt_in,
+                approved=u.hof_approved,
+                created_at=u.created_at,
+                last_seen=u.last_seen,
+            )
+            for u in rows
+        ],
+        approved_count=approved,
+    )
+
+
+@router.post("/hof/{uin}", response_model=HofRow)
+async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depends(get_db)) -> HofRow:
+    """Founder toggle: approve/un-approve a uin for the public wall. Does not
+    touch the user's own opt-in consent."""
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    user.hof_approved = body.approved
+    await db.commit()
+    await db.refresh(user)
+    return HofRow(
+        uin=user.uin,
+        nickname=user.nickname,
+        opt_in=user.hof_opt_in,
+        approved=user.hof_approved,
+        created_at=user.created_at,
+        last_seen=user.last_seen,
+    )
+
+
 # ── Stats ───────────────────────────────────────────────────────────
 
 

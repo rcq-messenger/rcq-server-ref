@@ -90,6 +90,13 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     <table><thead><tr><th>#</th><th>Target</th><th>Reason</th><th>Context</th><th></th></tr></thead>
       <tbody id="reports"></tbody></table>
   </section>
+
+  <section>
+    <h2>Hall of Fame</h2>
+    <p class="muted" style="margin:0 0 10px">Users who opted in from their client. Add the ones who earned it to your public wall (<span class="mono">/public/hof</span>).</p>
+    <table><thead><tr><th>UIN</th><th>Nickname</th><th>On wall</th><th></th></tr></thead>
+      <tbody id="hof"></tbody></table>
+  </section>
 </main>
 
 <script>
@@ -167,7 +174,20 @@ async function resolve(id, ban_target) {
   try { await api('POST', '/reports/' + id + '/resolve', { action: ban_target?'banned':'dismissed', notes:'', ban_target }); loadReports(); loadStats(); }
   catch(e){ alert(e.message); }
 }
-loadStats(); loadInvites(); loadReports();
+async function loadHof() {
+  try {
+    const r = await api('GET', '/hof');
+    $('hof').innerHTML = (r.items||[]).map(u => `<tr>
+      <td class="mono">${u.uin}</td><td>${u.nickname}</td>
+      <td>${u.approved?'<span style="color:#3a7">yes</span>':'<span class="muted">no</span>'}</td>
+      <td><button class="${u.approved?'ghost':''}" onclick="hofToggle(${u.uin}, ${!u.approved})">${u.approved?'Remove':'Add to wall'}</button></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="muted">Nobody opted in yet.</td></tr>';
+  } catch (e) { $('hof').innerHTML = '<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
+}
+async function hofToggle(uin, approved) {
+  try { await api('POST', '/hof/' + uin, { approved }); loadHof(); } catch(e){ alert(e.message); }
+}
+loadStats(); loadInvites(); loadReports(); loadHof();
 </script>
 </body>
 </html>"""

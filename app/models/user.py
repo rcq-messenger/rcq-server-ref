@@ -79,6 +79,13 @@ class User(Base):
     # disappearance).
     is_suspended: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
+    # Hall of Fame. `hof_opt_in` is set by the user from their client (consent
+    # to be considered). `hof_approved` is set by the founder from the admin
+    # console — only the founder decides who actually appears. Both true → the
+    # user shows on the public /hof wall (nickname + uin).
+    hof_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
+    hof_approved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
     first_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     age: Mapped[int | None] = mapped_column(Integer, nullable=True)

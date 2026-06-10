@@ -125,6 +125,11 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # forever (legacy persistent behaviour). N>0 = appear "visible"
     # for N minutes past last_seen, then fall back to offline.
     ("presence_ttl_minutes", "INTEGER"),
+    # Hall of Fame (founder-curated wall of notable contributors). The user
+    # opts IN from their client; the founder separately APPROVES from the
+    # admin console. Both must be true to appear on the public /hof wall.
+    ("hof_opt_in", "BOOLEAN DEFAULT FALSE"),
+    ("hof_approved", "BOOLEAN DEFAULT FALSE"),
 ]
 
 # Additive columns on `nearby_checkins`. Same idempotent

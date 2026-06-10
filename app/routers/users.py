@@ -82,6 +82,10 @@ class PublicUser(BaseModel):
     # Optional TTL (minutes) for `presence_persistent`. NULL/0 =
     # forever; >0 = visible for N minutes past last_seen.
     presence_ttl_minutes: int | None = None
+    # Owner-only mirror of the Hall-of-Fame opt-in (consent to be
+    # considered). Approval is a separate founder-only flag, never
+    # echoed here. Null for third-party callers.
+    hof_opt_in: bool | None = None
 
     @classmethod
     def from_model_for_viewer(
@@ -135,6 +139,7 @@ class PublicUser(BaseModel):
             read_receipts_visibility=(u.read_receipts_visibility if owner_self else None),
             presence_persistent=(u.presence_persistent if owner_self else None),
             presence_ttl_minutes=(u.presence_ttl_minutes if owner_self else None),
+            hof_opt_in=(u.hof_opt_in if owner_self else None),
         )
 
     @classmethod
@@ -245,6 +250,9 @@ class ProfileUpdate(BaseModel):
     # NULL) for "forever". Server validates against a small allow-list
     # so we don't accept arbitrary precision the UI can't render.
     presence_ttl_minutes: int | None = None
+    # Hall-of-Fame consent toggle. User opts in; the founder approves
+    # separately (admin-only). `hof_approved` is NOT settable here.
+    hof_opt_in: bool | None = None
 
 
 @router.get(

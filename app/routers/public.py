@@ -55,6 +55,40 @@ async def active_testers(
     )
 
 
+class HofEntry(BaseModel):
+    uin: int
+    nickname: str
+
+
+class HofResponse(BaseModel):
+    members: list[HofEntry]
+
+
+@router.get("/hof", response_model=HofResponse)
+async def hall_of_fame(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> HofResponse:
+    """Public Hall of Fame wall. A member shows here only when BOTH the user
+    opted in (`hof_opt_in`, set from their client) AND the founder approved
+    them (`hof_approved`, set from the admin console). Nickname + uin only —
+    the same always-public identity fields the contact card already exposes.
+    Cached 5 min."""
+    stmt = (
+        select(User.uin, User.nickname)
+        .where(
+            User.hof_approved.is_(True),
+            User.hof_opt_in.is_(True),
+            User.is_fake.is_(False),
+            User.is_suspended.is_(False),
+        )
+        .order_by(User.nickname.asc())
+    )
+    rows = (await db.execute(stmt)).all()
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return HofResponse(members=[HofEntry(uin=r.uin, nickname=r.nickname) for r in rows])
+
+
 class StatsResponse(BaseModel):
     user_count: int
 
