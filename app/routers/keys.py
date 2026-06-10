@@ -119,6 +119,11 @@ class BundleOut(BaseModel):
     sealed_sender_pub: str = ""
     registration_id: int
     signal_identity_key: str
+    # The account's Ed25519 `signing_key` (v=1 sealed-sender signing pubkey).
+    # Additive — pre-federation clients ignore it. Federation (Layer B) resolvers
+    # read it to anchor the `sk` in a peer's signed home-island record
+    # (docs/federation-protocol.md §2.4). Empty for the rare legacy row missing it.
+    signing_key: str = ""
     signed_prekey: SignedPreKey
     kyber_prekey: KyberPreKey
     # Optional — if the recipient has run out of OPKs, X3DH can still
@@ -251,6 +256,7 @@ async def fetch_bundle(
         sealed_sender_pub=user.identity_key,
         registration_id=user.signal_registration_id or 0,
         signal_identity_key=user.signal_identity_key,
+        signing_key=user.signing_key or "",
         signed_prekey=SignedPreKey(
             id=user.signed_prekey_id,
             public=user.signed_prekey_public or "",
