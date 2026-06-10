@@ -130,6 +130,12 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # admin console. Both must be true to appear on the public /hof wall.
     ("hof_opt_in", "BOOLEAN DEFAULT FALSE"),
     ("hof_approved", "BOOLEAN DEFAULT FALSE"),
+    # Optional public Hall-of-Fame avatar — a small data-URI (image/gif|png|
+    # jpeg|webp, base64, capped ~256KB) the user uploads next to the opt-in.
+    # Stored inline (no media bucket) and served ONLY for approved members via
+    # GET /public/hof/{uin}/avatar, so it is never public before the founder
+    # approves. NULL = the initial-letter fallback on the wall.
+    ("hof_avatar", "TEXT"),
 ]
 
 # Additive columns on `nearby_checkins`. Same idempotent

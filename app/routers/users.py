@@ -20,6 +20,34 @@ from app.models.user import User, visible_status
 
 router = APIRouter(prefix="/users", tags=["users"])
 
+# HoF avatar limits. Stored inline in the DB as a data-URI and served publicly
+# only for approved members, so keep it small (≈256 KB of image → ~350 KB
+# base64 → ~360 KB with the prefix). Animated GIF is allowed (the wall is the
+# website, where browsers animate it natively).
+_HOF_AVATAR_MIMES = {"image/gif", "image/png", "image/jpeg", "image/webp"}
+_HOF_AVATAR_MAX_CHARS = 360_000
+
+
+def _validate_hof_avatar(raw: str) -> str:
+    """Accept only a `data:image/{gif|png|jpeg|webp};base64,<b64>` URI under the
+    size cap, with a base64 body that actually decodes. Returns the normalized
+    string to store; raises 400 otherwise."""
+    if len(raw) > _HOF_AVATAR_MAX_CHARS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "hof_avatar too large")
+    if not raw.startswith("data:") or ";base64," not in raw:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "hof_avatar must be a base64 image data-URI")
+    header, b64 = raw.split(";base64,", 1)
+    mime = header[len("data:"):].strip().lower()
+    if mime not in _HOF_AVATAR_MIMES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "hof_avatar unsupported image type")
+    try:
+        decoded = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "hof_avatar invalid base64")
+    if not decoded:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "hof_avatar empty")
+    return f"data:{mime};base64,{b64}"
+
 
 class PublicUser(BaseModel):
     uin: int
@@ -86,6 +114,9 @@ class PublicUser(BaseModel):
     # considered). Approval is a separate founder-only flag, never
     # echoed here. Null for third-party callers.
     hof_opt_in: bool | None = None
+    # Owner-only echo of the uploaded HoF avatar data-URI so the client can
+    # preview its current image (incl. before approval). Null for third parties.
+    hof_avatar: str | None = None
 
     @classmethod
     def from_model_for_viewer(
@@ -140,6 +171,7 @@ class PublicUser(BaseModel):
             presence_persistent=(u.presence_persistent if owner_self else None),
             presence_ttl_minutes=(u.presence_ttl_minutes if owner_self else None),
             hof_opt_in=(u.hof_opt_in if owner_self else None),
+            hof_avatar=(u.hof_avatar if owner_self else None),
         )
 
     @classmethod
@@ -253,6 +285,9 @@ class ProfileUpdate(BaseModel):
     # Hall-of-Fame consent toggle. User opts in; the founder approves
     # separately (admin-only). `hof_approved` is NOT settable here.
     hof_opt_in: bool | None = None
+    # Optional public HoF avatar as a data-URI. Empty string clears it.
+    # Validated (mime allow-list + base64 + size cap) in update_me.
+    hof_avatar: str | None = None
 
 
 @router.get(
@@ -350,6 +385,15 @@ async def update_me(
     if "gender" in data and data["gender"] is not None:
         if data["gender"] not in ("male", "female", "other"):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid gender")
+    if "hof_avatar" in data:
+        # Empty/blank string clears the avatar; otherwise it must be a small
+        # base64 image data-URI of an allowed type. Stored inline + served
+        # publicly only once approved, so cap it hard and validate the bytes.
+        raw = (data["hof_avatar"] or "").strip()
+        if not raw:
+            data["hof_avatar"] = None
+        else:
+            data["hof_avatar"] = _validate_hof_avatar(raw)
     if "presence_ttl_minutes" in data and data["presence_ttl_minutes"] is not None:
         # Allowlist matches the iOS picker options so we don't accept
         # arbitrary values from a poked client. 0 = forever; the rest

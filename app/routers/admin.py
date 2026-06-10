@@ -335,6 +335,10 @@ class HofRow(BaseModel):
     approved: bool
     created_at: datetime
     last_seen: datetime
+    # The member's uploaded HoF avatar as a data-URI (so the founder sees what
+    # he's approving), or null. Inline is fine — the admin list is small and
+    # founder-only.
+    avatar: str | None = None
 
 
 class HofListOut(BaseModel):
@@ -368,6 +372,7 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
                 approved=u.hof_approved,
                 created_at=u.created_at,
                 last_seen=u.last_seen,
+                avatar=u.hof_avatar,
             )
             for u in rows
         ],
@@ -392,6 +397,7 @@ async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depe
         approved=user.hof_approved,
         created_at=user.created_at,
         last_seen=user.last_seen,
+        avatar=user.hof_avatar,
     )
 
 

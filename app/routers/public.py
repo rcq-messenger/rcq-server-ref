@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,6 +58,9 @@ async def active_testers(
 class HofEntry(BaseModel):
     uin: int
     nickname: str
+    # True when this member uploaded an avatar; the wall then loads it from
+    # GET /public/hof/{uin}/avatar (kept out of the list to keep it small).
+    has_avatar: bool = False
 
 
 class HofResponse(BaseModel):
@@ -75,7 +78,7 @@ async def hall_of_fame(
     the same always-public identity fields the contact card already exposes.
     Cached 5 min."""
     stmt = (
-        select(User.uin, User.nickname)
+        select(User.uin, User.nickname, User.hof_avatar)
         .where(
             User.hof_approved.is_(True),
             User.hof_opt_in.is_(True),
@@ -86,7 +89,48 @@ async def hall_of_fame(
     )
     rows = (await db.execute(stmt)).all()
     response.headers["Cache-Control"] = "public, max-age=300"
-    return HofResponse(members=[HofEntry(uin=r.uin, nickname=r.nickname) for r in rows])
+    return HofResponse(
+        members=[
+            HofEntry(uin=r.uin, nickname=r.nickname, has_avatar=bool(r.hof_avatar))
+            for r in rows
+        ]
+    )
+
+
+@router.get("/hof/{uin}/avatar")
+async def hall_of_fame_avatar(
+    uin: int,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Serve an APPROVED member's HoF avatar image. The stored value is a
+    `data:<mime>;base64,<b64>` URI; we decode it and return the raw image bytes
+    so the wall can use a plain <img>. 404 unless the uin is an approved,
+    opted-in, non-suspended member WITH an avatar — so an avatar is never
+    public before the founder approves. Cached 5 min."""
+    from base64 import b64decode
+
+    row = (
+        await db.execute(
+            select(User.hof_avatar).where(
+                User.uin == uin,
+                User.hof_approved.is_(True),
+                User.hof_opt_in.is_(True),
+                User.is_fake.is_(False),
+                User.is_suspended.is_(False),
+            )
+        )
+    ).first()
+    data_uri = row[0] if row else None
+    if not data_uri or not data_uri.startswith("data:") or ";base64," not in data_uri:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no avatar")
+    header, b64 = data_uri.split(";base64,", 1)
+    mime = header[len("data:"):].strip().lower() or "application/octet-stream"
+    try:
+        blob = b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no avatar")
+    return Response(content=blob, media_type=mime, headers={"Cache-Control": "public, max-age=300"})
 
 
 class StatsResponse(BaseModel):

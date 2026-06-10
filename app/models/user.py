@@ -85,6 +85,9 @@ class User(Base):
     # user shows on the public /hof wall (nickname + uin).
     hof_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
     hof_approved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # Optional public HoF avatar as a data-URI (see db.py note). Served only
+    # for approved members; NULL falls back to the initial-letter circle.
+    hof_avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     first_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
