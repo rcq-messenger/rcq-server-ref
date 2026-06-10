@@ -15,6 +15,7 @@ and is deliberately not the trust root.
 import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +23,7 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.federation import HomeIslandRecord
+from app.models.user import User
 
 router = APIRouter(prefix="/federation", tags=["federation"])
 
@@ -94,3 +96,41 @@ async def get_island_record(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no record")
     return json.loads(row.doc)
+
+
+class PublicKeysOut(BaseModel):
+    """A user's PUBLIC key card — nothing secret, nothing consumable."""
+    uin: int
+    identity_key: str                        # v=1 X25519 (seal an envelope to them)
+    signing_key: str                         # v=1 Ed25519 (verify their sigs + the record `sk`)
+    signal_identity_key: str | None = None   # v=2 libsignal (safety-number key + the record `ik`)
+
+
+@router.get(
+    "/keys/{uin}",
+    response_model=PublicKeysOut,
+    dependencies=[Depends(rate_limit("federation_keys_get", 120, 60))],
+)
+async def get_public_keys(
+    uin: int,
+    db: AsyncSession = Depends(get_db),
+) -> PublicKeysOut:
+    """Open, minimal public-key card for cross-island anchoring (federation §4).
+
+    A sender on another island fetches this to anchor the `ik`/`sk` of a peer's
+    signed home-island record before depositing. Returns ONLY public keys: it
+    consumes no one-time prekey and exposes nothing the safety number does not
+    already let a contact verify. Unlike `/keys/{uin}/bundle` (which is
+    authenticated and consumes an OPK), this is the cheap, idempotent, open card
+    a dumb mailbox serves for its residents so other islands can reach them. IP
+    rate-limited to bound UIN enumeration.
+    """
+    u = await db.get(User, uin)
+    if u is None or not u.identity_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    return PublicKeysOut(
+        uin=u.uin,
+        identity_key=u.identity_key,
+        signing_key=u.signing_key,
+        signal_identity_key=u.signal_identity_key,
+    )
