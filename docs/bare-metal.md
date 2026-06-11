@@ -166,20 +166,54 @@ holds only undelivered sealed envelopes and is emptied on delivery. The durable
 data is accounts, contacts, group rosters and keys, all in Postgres. History
 lives on the clients.
 
-## nginx instead of Caddy?
+## Option B: nginx + certbot instead of Caddy
 
-Caddy is recommended because it handles TLS automatically. If you must use
-nginx, terminate TLS with certbot and `proxy_pass http://127.0.0.1:8000;`, and
-make sure WebSocket upgrade headers are forwarded:
+If you already run nginx, use this in place of step 1's `caddy` package and
+step 7. Caddy is only recommended because it auto-issues TLS; nginx works fine
+with certbot. (RCQ uses WebSockets, so the `Upgrade`/`Connection` headers below
+are required — without them the socket won't connect.)
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+```
+
+Create `/etc/nginx/sites-available/rcq`:
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+server {
+    listen 80;
+    listen [::]:80;
+    server_name island.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        # WebSocket upgrade (required for live message delivery)
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Don't time the WebSocket out after 60s of quiet
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
 }
 ```
+
+Enable it and issue the certificate — certbot rewrites this block to add the
+`listen 443 ssl` server and the HTTP→HTTPS redirect for you:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/rcq /etc/nginx/sites-enabled/rcq
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d island.example.com   # gets + installs the LE cert, sets auto-renewal
+```
+
+Verify end to end:
+
+```bash
+curl -fsS https://island.example.com/health && echo "island is live"
+```
+
+You can skip the `caddy` install in step 1 entirely if you go this route.
