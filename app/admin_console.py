@@ -87,6 +87,10 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 
   <section>
     <h2>Open reports</h2>
+    <p class="muted" style="margin:0 0 10px">
+      <button class="ghost" onclick="setReportKind('user')">User reports</button>
+      <button class="ghost" onclick="setReportKind('crash')">Crashes</button>
+    </p>
     <table><thead><tr><th>#</th><th>Target</th><th>Reason</th><th>Context</th><th></th></tr></thead>
       <tbody id="reports"></tbody></table>
   </section>
@@ -159,9 +163,11 @@ async function searchUsers() {
   } catch (e) { $('users').innerHTML = '<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
 }
 async function ban(uin, suspended) { try { await api('POST', '/users/' + uin + '/ban', { suspended }); searchUsers(); } catch(e){ alert(e.message); } }
+let reportKind = 'user'; // auto crash reports ([CRASH] marker) get their own view
+function setReportKind(k) { reportKind = k; loadReports(); }
 async function loadReports() {
   try {
-    const r = await api('GET', '/reports?status=open');
+    const r = await api('GET', '/reports?status=open&kind=' + reportKind);
     $('reports').innerHTML = (r.items||[]).map(rp => `<tr>
       <td>${rp.id}</td>
       <td class="mono">${rp.target_uin}${rp.target_nickname?' ('+rp.target_nickname+')':''}</td>

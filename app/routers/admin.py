@@ -103,6 +103,10 @@ class ReportOut(BaseModel):
 class ReportsListOut(BaseModel):
     items: list[ReportOut]
     open_count: int
+    # Open auto-crash reports (reason carries the [CRASH] marker), counted
+    # separately so the admin UI can badge its Crashes tab. Additive with a
+    # default so older admin SPAs keep parsing.
+    open_crash_count: int = 0
 
 
 class ResolveReportIn(BaseModel):
@@ -136,23 +140,38 @@ class StatsOut(BaseModel):
     suspended_users: int
     new_users_24h: int
     new_users_7d: int
+    # Human reports only — auto crash reports are counted in open_crashes
+    # (additive default so older admin SPAs keep parsing).
     open_reports: int
+    open_crashes: int = 0
     resolved_reports_7d: int
 
 
 # ── Reports ─────────────────────────────────────────────────────────
 
 
+# Auto-submitted crash reports carry this marker in `reason` (clients prefix
+# "[<platform> <version>] [CRASH]"). They ride the same /reports channel but
+# clutter human triage, so the admin UI splits them into their own tab.
+CRASH_MARKER = "[CRASH]"
+
+
 @router.get("/reports", response_model=ReportsListOut)
 async def list_reports(
     status_filter: str = Query("open", alias="status"),
+    kind: str = Query("all"),
     limit: int = Query(50, le=200),
     db: AsyncSession = Depends(get_db),
 ) -> ReportsListOut:
-    """`status` accepts: open | resolved | dismissed | duplicate | all."""
+    """`status` accepts: open | resolved | dismissed | duplicate | all.
+    `kind` accepts: all | crash (auto crash reports) | user (everything else)."""
     query = select(Report).order_by(desc(Report.created_at)).limit(limit)
     if status_filter != "all":
         query = query.where(Report.status == status_filter)
+    if kind == "crash":
+        query = query.where(Report.reason.contains(CRASH_MARKER))
+    elif kind == "user":
+        query = query.where(~Report.reason.contains(CRASH_MARKER))
     rows = (await db.execute(query)).scalars().all()
 
     uins: set[int] = set()
@@ -164,9 +183,14 @@ async def list_reports(
         for u in (await db.execute(select(User).where(User.uin.in_(uins)))).scalars().all():
             nicks[u.uin] = u.nickname
 
-    open_count = await db.scalar(
-        select(func.count(Report.id)).where(Report.status == "open")
+    open_crash_count = await db.scalar(
+        select(func.count(Report.id)).where(
+            Report.status == "open", Report.reason.contains(CRASH_MARKER)
+        )
     ) or 0
+    open_count = (await db.scalar(
+        select(func.count(Report.id)).where(Report.status == "open")
+    ) or 0) - int(open_crash_count)
 
     items = [
         ReportOut(
@@ -186,7 +210,11 @@ async def list_reports(
         )
         for r in rows
     ]
-    return ReportsListOut(items=items, open_count=int(open_count))
+    return ReportsListOut(
+        items=items,
+        open_count=int(open_count),
+        open_crash_count=int(open_crash_count),
+    )
 
 
 def _coerce_attachments(raw) -> list[ReportAttachmentOut]:
@@ -423,9 +451,14 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
     new_users_7d = await db.scalar(
         select(func.count(User.uin)).where(User.created_at >= week_ago)
     ) or 0
-    open_reports = await db.scalar(
-        select(func.count(Report.id)).where(Report.status == "open")
+    open_crashes = await db.scalar(
+        select(func.count(Report.id)).where(
+            Report.status == "open", Report.reason.contains(CRASH_MARKER)
+        )
     ) or 0
+    open_reports = (await db.scalar(
+        select(func.count(Report.id)).where(Report.status == "open")
+    ) or 0) - int(open_crashes)
     resolved_reports_7d = await db.scalar(
         select(func.count(Report.id)).where(
             Report.status != "open", Report.resolved_at >= week_ago
@@ -439,6 +472,7 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
         new_users_24h=int(new_users_24h),
         new_users_7d=int(new_users_7d),
         open_reports=int(open_reports),
+        open_crashes=int(open_crashes),
         resolved_reports_7d=int(resolved_reports_7d),
     )
 
