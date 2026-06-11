@@ -153,3 +153,38 @@ async def get_public_keys(
         gender=u.gender if (profile_open and (u.gender_visibility or "nobody") == "everyone") else None,
         status_message=u.status_message if profile_open else None,
     )
+
+
+class UinForKeyOut(BaseModel):
+    uin: int
+
+
+@router.get(
+    "/uin-for-key",
+    response_model=UinForKeyOut,
+    dependencies=[Depends(rate_limit("federation_uin_for_key", 120, 60))],
+)
+async def uin_for_key(
+    signing_key: str,
+    db: AsyncSession = Depends(get_db),
+) -> UinForKeyOut:
+    """Resolve the local account bound to a given Ed25519 signing key (base64).
+
+    Open + idempotent. The signing key is already public (it ships in the open
+    key card above), so this exposes nothing new — it's just the inverse map,
+    `key → uin`. Used by cross-island GROUP add (§5c): the inviting member
+    looks up whether the foreign contact already has an account on THIS island
+    before registering one for their keys, so an owner-initiated add never
+    mints a duplicate account. Returns the SAME lowest uin that
+    `/auth/recover` would resolve for the key (so the added uin matches the one
+    the contact later recovers). IP rate-limited to bound enumeration.
+    """
+    sk = signing_key.strip()
+    uin = (
+        await db.execute(
+            select(User.uin).where(User.signing_key == sk).order_by(User.uin).limit(1)
+        )
+    ).scalar_one_or_none()
+    if uin is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no account for key")
+    return UinForKeyOut(uin=uin)
