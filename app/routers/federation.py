@@ -99,11 +99,23 @@ async def get_island_record(
 
 
 class PublicKeysOut(BaseModel):
-    """A user's PUBLIC key card — nothing secret, nothing consumable."""
+    """A user's PUBLIC key card — nothing secret, nothing consumable.
+
+    Carries the always-visible IDENTITY fields a cross-island client needs to
+    render a peer like a normal contact (nickname + island, optional profile
+    bits) instead of a bare `uin@host`. `nickname` is always present (it is
+    always-visible identity, exactly as same-island search exposes it); the
+    optional `gender`/`status_message` are gated by the user's
+    `profile_visibility` ("everyone" only), so a privacy-conscious user on an
+    open island still leaks only their nickname here.
+    """
     uin: int
     identity_key: str                        # v=1 X25519 (seal an envelope to them)
     signing_key: str                         # v=1 Ed25519 (verify their sigs + the record `sk`)
     signal_identity_key: str | None = None   # v=2 libsignal (safety-number key + the record `ik`)
+    nickname: str | None = None              # always-visible identity (display name)
+    gender: str | None = None                # profile_visibility=="everyone" only
+    status_message: str | None = None        # profile_visibility=="everyone" only
 
 
 @router.get(
@@ -128,9 +140,16 @@ async def get_public_keys(
     u = await db.get(User, uin)
     if u is None or not u.identity_key:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # Optional profile bits only when the user keeps an open profile — same
+    # gate /users/{uin}/info applies to outsiders. Nickname is always-visible
+    # identity and ships regardless.
+    profile_open = (u.profile_visibility or "everyone") == "everyone"
     return PublicKeysOut(
         uin=u.uin,
         identity_key=u.identity_key,
         signing_key=u.signing_key,
         signal_identity_key=u.signal_identity_key,
+        nickname=u.nickname,
+        gender=u.gender if (profile_open and (u.gender_visibility or "nobody") == "everyone") else None,
+        status_message=u.status_message if profile_open else None,
     )
