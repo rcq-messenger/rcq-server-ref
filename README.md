@@ -139,6 +139,10 @@ cp .env.example .env
 `run.sh` starts uvicorn on `:8000` with `--reload`. Strip `--reload`
 for production and run via systemd / a process supervisor.
 
+For a full **production** deploy on Debian without Docker — Postgres + Redis
+setup, a systemd service, and HTTPS via Caddy, step by step — see
+[docs/bare-metal.md](docs/bare-metal.md).
+
 ## APNs (push notifications)
 
 iOS push requires an Apple Developer account, an APNs `.p8` key, and
