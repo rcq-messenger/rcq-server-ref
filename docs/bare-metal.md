@@ -145,6 +145,69 @@ In the RCQ app: Settings → Network → Custom server → enter `island.example
 The app registers a fresh account on your island; your flagship account stays on
 the device (RCQ is multi-account, nothing is wiped).
 
+## Calls (optional: TURN)
+
+Voice/video calls are WebRTC. **Signalling** (finding the other party, exchanging
+SDP/ICE) runs over the WebSocket of *this island* — the backend is a dumb relay
+for the offer/answer/hangup, and the call media itself goes peer-to-peer
+(DTLS-SRTP); the server is never in the media path. So basic calls work with no
+extra service.
+
+A **TURN** server is only needed to relay media when peers are behind hard
+(symmetric) NATs and can't reach each other directly. Without TURN configured,
+the app falls back to STUN-only: calls work on permissive networks and fail
+behind symmetric NAT. To make calls reliable everywhere, run coturn:
+
+```bash
+sudo apt install -y coturn
+sudo sed -i 's/^#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn
+```
+
+Put this in `/etc/turnserver.conf` (pick a strong secret — it must match
+`TURN_SECRET` in the app's `.env`):
+
+```ini
+listening-port=3478
+fingerprint
+use-auth-secret
+static-auth-secret=CHANGE_ME_TURN_SECRET
+realm=island.example.com
+min-port=49152
+max-port=65535
+no-cli
+```
+
+```bash
+sudo systemctl enable --now coturn
+```
+
+Then add to `/opt/rcq/.env` and restart the app:
+
+```ini
+TURN_HOST=island.example.com
+TURN_SECRET=CHANGE_ME_TURN_SECRET
+# TURN_TTL_SECONDS=86400   # credential lifetime, optional (default 24h)
+```
+
+Open the firewall for TURN: TCP+UDP **3478** (control) and UDP **49152-65535**
+(the relay range above). The backend mints short-lived HMAC credentials per call
+(TURN REST API pattern), so no per-user TURN accounts are needed.
+
+## Files and media
+
+Uploaded media (photos, files, voice, video) is stored as encrypted blobs on the
+local filesystem under `media/uploads/{uuid}.bin` (relative to the app's working
+directory, so `/opt/rcq/media/uploads/` with the systemd unit above; override
+with `RCQ_MEDIA_DIR`). The client encrypts every blob before upload, so the
+server only ever holds opaque bytes — it cannot read your files.
+
+- **Size limit:** 2 GB per upload.
+- **Retention:** chat-media blobs are not auto-purged (only expired Stories are
+  swept). Account for disk growth, and include `media/uploads/` in backups if you
+  want media to survive a fresh device fetch. The text/queue side keeps nothing
+  durable — the offline queue holds only undelivered sealed envelopes, deleted on
+  delivery.
+
 ## Operating it
 
 ```bash
