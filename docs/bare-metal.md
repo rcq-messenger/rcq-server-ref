@@ -195,13 +195,31 @@ Open the firewall for TURN: TCP+UDP **3478** (control) and UDP **49152-65535**
 
 ## Files and media
 
-Uploaded media (photos, files, voice, video) is stored as encrypted blobs on the
-local filesystem under `media/uploads/{uuid}.bin` (relative to the app's working
-directory, so `/opt/rcq/media/uploads/` with the systemd unit above; override
-with `RCQ_MEDIA_DIR`). The client encrypts every blob before upload, so the
-server only ever holds opaque bytes — it cannot read your files.
+Unlike calls, file transfer is **store-and-forward through the island** (it has
+to be — the recipient may be offline), the same shape as Matrix's media repo or
+XMPP's HTTP File Upload, but with mandatory client-side encryption. The flow:
 
-- **Size limit:** 2 GB per upload.
+1. The sender encrypts the file on-device with a fresh per-file key (AES-GCM)
+   and uploads the **ciphertext** via `POST /media/upload`, getting back a
+   `media_id` (a uuid4).
+2. The sender then sends a normal end-to-end-encrypted message that carries the
+   `media_id` + the file's decryption key. That message is sealed, so the
+   **key never reaches the server** — only the recipient can read it.
+3. The recipient fetches the ciphertext via `GET /media/{media_id}` and decrypts
+   it locally.
+
+Blobs live on the local filesystem under `media/uploads/{uuid}.bin` (relative to
+the app's working directory, so `/opt/rcq/media/uploads/` with the systemd unit
+above; override with `RCQ_MEDIA_DIR`). The server only ever holds opaque
+encrypted bytes — it cannot read your files. The `/media` endpoints are
+unauthenticated by design: security rests on the encryption plus the unguessable
+uuid id, not on access control over an already-encrypted blob. (`PUT /media/{id}`
+also exists so a sender can deposit the same blob on several islands for
+cross-island/federated delivery.)
+
+- **Size limit:** 2 GB per upload. Behind nginx, also raise
+  `client_max_body_size` (see the nginx section) or the proxy rejects large
+  uploads before they reach the app.
 - **Retention:** chat-media blobs are not auto-purged (only expired Stories are
   swept). Account for disk growth, and include `media/uploads/` in backups if you
   want media to survive a fresh device fetch. The text/queue side keeps nothing
@@ -261,6 +279,12 @@ server {
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
+
+    # IMPORTANT: nginx defaults client_max_body_size to 1 MB, which would
+    # reject any media upload bigger than that. The app accepts up to 2 GB
+    # per blob, so raise (or cap) this to taste. Caddy has no such default
+    # limit, which is why the Caddy section above needs nothing extra.
+    client_max_body_size 2g;
 }
 ```
 
