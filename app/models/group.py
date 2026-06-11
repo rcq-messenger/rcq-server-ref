@@ -29,10 +29,10 @@ class Group(Base):
     #   "owner_only" — broadcast mode; only the owner can post, members
     #                  can read + react. Server enforces on every send.
     post_policy: Mapped[str] = mapped_column(String(16), default="all")
-    # Token cost to JOIN the group. NULL = free (default for legacy
-    # rows). When set, the join endpoint deducts the price from the
-    # joining user's wallet, credits the owner with `floor(price * 0.95)`,
-    # and burns the 5% delta. Mirrors the marketplace fee model.
+    # Vestigial. The pre-pivot "paid groups" feature was cut on
+    # 2026-05-27; this column is always NULL now (all groups are free).
+    # Kept only so the existing schema + serializer don't need a
+    # destructive migration; nothing reads or writes a non-NULL value.
     entry_price_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Closed groups can only be joined via an explicit invitation
     # the owner extended (link-share inserts a GroupMember row

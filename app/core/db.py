@@ -94,11 +94,11 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # Mirrors the other *_visibility columns; default "everyone"
     # keeps existing accounts unchanged.
     ("profile_visibility", "TEXT DEFAULT 'everyone'"),
-    # Social reputation counter — bumped by `/reputation/grant`. Default 0
-    # so every existing row defaults to zero rep without a backfill pass.
+    # Vestigial pre-pivot columns (social-reputation feature cut
+    # 2026-05-27). No code reads or writes them; the ORM no longer maps
+    # them. Kept in the add-list ONLY so an existing deployment's schema
+    # is unchanged. Safe to DROP COLUMN by hand for a clean table.
     ("reputation", "BIGINT DEFAULT 0"),
-    # Tri-state visibility for the rep counter (everyone | contacts | nobody).
-    # Display-only gate; the grant endpoint ignores it.
     ("reputation_visibility", "TEXT DEFAULT 'everyone'"),
     # Per-user push toggles + muted-uin list. NULL = use code-side
     # defaults (`_pref` in apns.py); writes flow through PUT

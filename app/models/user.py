@@ -157,21 +157,10 @@ class User(Base):
     # The server still ferries the setting back to the owner so
     # Settings can render the current state.
     read_receipts_visibility: Mapped[str] = mapped_column(String(16), default="everyone")
-    # Social reputation counter. Other users can spend jettons (min 5)
-    # to grant +N reputation; the spent jettons are burned outright
-    # (full sink, no transfer to the recipient). Lives on the user
-    # row so it transfers verbatim through account migration just like
-    # any other profile field. Default 0 for every existing row.
-    reputation: Mapped[int] = mapped_column(BigInteger, default=0)
-    # Tri-state visibility for the reputation counter — same shape as
-    # `profile_visibility`. "everyone" → counter is in /users/{uin}/info
-    # for any caller; "contacts" → only mutual contacts see the value;
-    # "nobody" → counter is suppressed on the wire for outsiders.
-    # Note: visibility ONLY gates display of the counter — the
-    # /reputation/grant endpoint accepts grants regardless of the
-    # target's visibility setting (you can still donate even if you
-    # can't see the running total). Default "everyone".
-    reputation_visibility: Mapped[str] = mapped_column(String(16), default="everyone")
+    # (The pre-pivot social-reputation columns were removed here; the
+    # 2026-05-27 pivot cut that feature. Existing deployments may still
+    # carry unused `reputation`/`reputation_visibility` columns — the ORM
+    # simply doesn't map them.)
     # Per-user push notification preferences. JSON shape:
     #   {
     #     "contact_requests": bool,         # default true

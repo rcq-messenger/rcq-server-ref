@@ -8,8 +8,8 @@ never land in an empty messenger).
 A referral activates once the invitee is online on 3 distinct
 calendar days. Sealed-sender hides per-message counts, so
 distinct-active-days is the retention signal we can both observe
-and not have trivially faked. Activation is currently a tracking
-counter only — pre-pivot there was a jeton bounty here, now removed.
+and not have trivially faked. Activation is a tracking counter only:
+there is no reward attached to a referral.
 """
 
 from __future__ import annotations
