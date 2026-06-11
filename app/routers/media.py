@@ -49,6 +49,35 @@ async def upload(
     return UploadOut(media_id=media_id, size=size)
 
 
+@router.put("/{media_id}", response_model=UploadOut, status_code=status.HTTP_201_CREATED)
+async def deposit(
+    media_id: str,
+    blob: UploadFile = File(...),
+) -> UploadOut:
+    """Cross-island blob deposit (federation): the CLIENT supplies the id, so
+    one envelope's media reference resolves on every island the sender deposits
+    the blob to (own island for carbons + the recipient's island). Same trust
+    model as the open envelope deposit — the blob is client-side encrypted.
+
+    First write wins: re-depositing an existing id is an idempotent success,
+    never an overwrite (ids are uuid4 hex, unguessable)."""
+    try:
+        uuid.UUID(hex=media_id)
+    except ValueError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "bad media id")
+    contents = await blob.read()
+    size = len(contents)
+    if size > MAX_BLOB_SIZE:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "blob too large")
+
+    target = MEDIA_ROOT / f"{media_id.lower()}.bin"
+    if target.exists():
+        return UploadOut(media_id=media_id.lower(), size=target.stat().st_size)
+    with open(target, "wb") as f:
+        f.write(contents)
+    return UploadOut(media_id=media_id.lower(), size=size)
+
+
 @router.get("/{media_id}")
 async def fetch(media_id: str) -> FileResponse:
     # Reject anything that doesn't look like a uuid hex. Avoids path traversal.
