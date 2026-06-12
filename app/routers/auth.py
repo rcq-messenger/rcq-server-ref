@@ -64,6 +64,12 @@ class RegisterIn(BaseModel):
     # Server-join invite token. Required only when this server runs
     # REGISTRATION_POLICY=invite (ignored otherwise).
     invite: str | None = None
+    # Best-effort preferred UIN (federation §5a multihoming): a client adding a
+    # BACKUP island asks to keep its primary number so the user has one UIN
+    # everywhere. Granted only if free on THIS island; otherwise a fresh UIN is
+    # minted (uin is per-island and is NOT identity — the key is). A redeemed
+    # vanity invite still wins over this.
+    desired_uin: int | None = None
 
 
 class RegisterOut(BaseModel):
@@ -112,13 +118,18 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         if consumed.rowcount > 0:
             reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code))
 
-    # A reserved vanity UIN wins when it's still free; otherwise fall back to a
-    # random allocation (the reservation lost a race, or none was set).
+    # A reserved vanity UIN wins when it's still free; then a best-effort
+    # desired UIN (multihoming "same number on every island"); otherwise fall
+    # back to a random allocation.
     uin = None
     if reserved_uin is not None and await db.scalar(
         select(User.uin).where(User.uin == reserved_uin)
     ) is None:
         uin = reserved_uin
+    if uin is None and body.desired_uin is not None and body.desired_uin > 0 and await db.scalar(
+        select(User.uin).where(User.uin == body.desired_uin)
+    ) is None:
+        uin = body.desired_uin
     if uin is None:
         uin = await allocate_uin(db)
     user = User(
