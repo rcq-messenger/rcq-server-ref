@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import current_device_id, current_uin
-from app.models.group import GroupMember, OfflineGroupMessage
+from app.core.security import current_device_id, current_uin, current_uin_optional
+from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
@@ -155,13 +155,42 @@ class GroupSealedSendIn(BaseModel):
 )
 async def send_group_sealed(
     body: GroupSealedSendIn,
+    caller: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> SendOut:
     """Per-recipient fan-out for a group. Sender provides one ciphertext
     per member; server validates each `to_uin` is actually a member and
     routes accordingly. Server has no plaintext access — every payload is
     a sealed-sender envelope encrypted to that one recipient's identity
-    key. Confidentiality and authentication match the 1:1 path."""
+    key. Confidentiality and authentication match the 1:1 path.
+
+    Broadcast-mode enforcement (post_policy='owner_only'): sealed sender
+    normally hides WHICH member sent a message, but in a broadcast group
+    every post is known to come from the owner, so requiring the owner to
+    authenticate leaks nothing AND is the only way to enforce the policy
+    server-side — the composer-hide on clients is bypassable (an old/web/
+    modified client can POST here directly). We therefore reject any
+    *identified* non-owner caller. Auth is OPTIONAL so we stay
+    backward-compatible: clients that still send the group fan-out
+    anonymously (no token) fall back to the client-side gate for now; once
+    every client attaches the owner token for owner_only sends, this can
+    tighten to reject anonymous owner_only posts too (see TODO below)."""
+    # Only an actual POST ("message" — text/media bubble) is gated. Reactions,
+    # reads, typing, edits and deletes still fan out from any member so a
+    # broadcast group keeps its reaction/read interactions (and web clients,
+    # which always send a token, don't get their member reactions rejected).
+    if body.envelope_type == "message":
+        g = await db.get(Group, body.group_id)
+        if g is not None and g.post_policy == "owner_only" and caller is not None and caller != g.owner_uin:
+            # An authenticated caller who is NOT the owner tried to post to a
+            # broadcast group. Web clients always send their token, so this
+            # closes the "any member can post via chat.rcq.app" hole at once.
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
+        # TODO(owner_only-phase2): once Android+iOS attach the owner token for
+        # owner_only MESSAGE sends (anonymous otherwise, to keep sealed-sender
+        # for 'all' groups), drop the `caller is not None` clause so an
+        # anonymous owner_only post is rejected too — closing the
+        # modified-native-client bypass.
     members = set(
         (
             await db.execute(select(GroupMember.uin).where(GroupMember.group_id == body.group_id))
