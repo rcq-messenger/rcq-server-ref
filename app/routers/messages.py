@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_device_id, current_uin, current_uin_optional
+from app.models.capability import UserCapability
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
@@ -265,6 +266,135 @@ async def send_group_sealed(
     log.warning(
         "[group-sealed] gid=%s type=%s payloads=%d delivered_any=%s offline=%d",
         body.group_id, body.envelope_type, len(body.payloads),
+        delivered_any, len(offline_recipients),
+    )
+    return SendOut(delivered=delivered_any, queued=True, server_time=now)
+
+
+class GroupBroadcastIn(BaseModel):
+    group_id: int
+    # Declared inner type — "message" today (reactions/edits/reads keep the
+    # per-member path for now). Drives the owner_only gate + pushability;
+    # the queued/WS envelope itself always rides as type "gmsg".
+    envelope_type: str = Field(default="message")
+    # base64 of the sender-keys wire JSON {v, kid, e, i, n, ct}: ONE
+    # ChaCha20-Poly1305 ciphertext under the sender's current group message
+    # key. The server cannot read it and cannot tell who sent it — `kid` is
+    # an opaque per-(sender, group, epoch) distribution id, so group posts
+    # stay pseudonymous at the server (vs fully anonymous on the legacy
+    # sealed path; accepted — members learn the sender anyway).
+    payload: str = Field(max_length=1_500_000)
+
+
+@router.post(
+    "/group-broadcast",
+    response_model=SendOut,
+    # One small POST per group message regardless of group size — same
+    # budget as 1:1 sends (the legacy group endpoint's 60/min existed
+    # because every call carried N payloads).
+    dependencies=[Depends(rate_limit("messages_broadcast", 120, 60))],
+)
+async def send_group_broadcast(
+    body: GroupBroadcastIn,
+    caller: int | None = Depends(current_uin_optional),
+    db: AsyncSession = Depends(get_db),
+) -> SendOut:
+    """Sender-keys group delivery: the sender encrypts ONCE with their group
+    chain key and the server fans the SAME ciphertext to every member whose
+    client advertised the `sender_keys` capability — O(1) crypto + upload for
+    the sender instead of the legacy once-per-member sealing. Members without
+    the capability are deliberately skipped (they can't parse `gmsg`); the
+    sender covers them with the legacy per-member fan-out (dual-send) until
+    their clients update.
+
+    The chain key itself was distributed per-member over the existing sealed
+    channel (`skdm` envelopes via /messages/group-sealed), so confidentiality
+    still ends at the members: the server only ever holds one opaque blob.
+
+    owner_only enforcement is STRICT here from day one (unlike the legacy
+    endpoint's phase-1 leniency): this endpoint is new, no deployed client
+    posts to it anonymously in owner_only groups, so an unauthenticated or
+    non-owner `message` broadcast to a broadcast-mode group is rejected
+    outright."""
+    g = await db.get(Group, body.group_id)
+    if g is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+    if (
+        body.envelope_type == "message"
+        and g.post_policy == "owner_only"
+        and caller != g.owner_uin
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
+
+    recipients = (
+        (
+            await db.execute(
+                select(GroupMember.uin)
+                .join(UserCapability, UserCapability.uin == GroupMember.uin)
+                .where(
+                    GroupMember.group_id == body.group_id,
+                    UserCapability.sender_keys.is_(True),
+                )
+            )
+        ).scalars().all()
+    )
+    if not recipients:
+        # A capable client always advertises before its first broadcast, so
+        # at minimum the sender's own uin matches. Empty therefore means a
+        # bogus group id / not-a-member race — nothing to deliver.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no broadcast-capable members")
+
+    now = datetime.now(timezone.utc)
+    delivered_any = False
+    offline_recipients: list[int] = []
+    # The sender's own uin is included on purpose: their other devices get
+    # the broadcast as the carbons copy (the sending device dedupes by
+    # message UUID, same as the WS/queue double-delivery case).
+    for uin in recipients:
+        pkt = {
+            "type": "gmsg",
+            "payload": body.payload,
+            "group_id": body.group_id,
+            "server_time": now.isoformat(),
+        }
+        delivered = await manager.send(uin, pkt)
+        if delivered:
+            delivered_any = True
+        else:
+            offline_recipients.append(uin)
+        db.add(OfflineGroupMessage(
+            to_uin=uin,
+            group_id=body.group_id,
+            envelope_type="gmsg",
+            payload=body.payload,
+            received_at=now,
+        ))
+    await db.commit()
+    # Push offline members for real posts only (mirrors _PUSHABLE_TYPES
+    # gating on the declared inner type). Everyone gets the SAME envelope —
+    # that's the whole point. The iOS NSE shows a generic group banner for
+    # gmsg (it never advances ratchet state out-of-process).
+    if body.envelope_type in _PUSHABLE_TYPES:
+        group_id = body.group_id
+        payload = body.payload
+
+        async def _push(target_uin: int) -> None:
+            if await is_group_muted(target_uin, group_id):
+                return
+            await apns_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload,
+                envelope_type="gmsg",
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+            )
+
+        for uin in offline_recipients:
+            asyncio.create_task(_push(uin))
+    log.warning(
+        "[group-broadcast] gid=%s type=%s recipients=%d delivered_any=%s offline=%d",
+        body.group_id, body.envelope_type, len(recipients),
         delivered_any, len(offline_recipients),
     )
     return SendOut(delivered=delivered_any, queued=True, server_time=now)

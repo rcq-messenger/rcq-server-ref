@@ -15,6 +15,7 @@ from app.models.contact import Contact
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
+from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.user import User, visible_status
 
@@ -462,6 +463,39 @@ async def delete_push_token(
             and_(DeviceToken.uin == uin, DeviceToken.token == body.token)
         )
     )
+    await db.commit()
+
+
+class CapabilitiesIn(BaseModel):
+    # Sender-keys group path (`gmsg` broadcast + `skdm` distribution).
+    # Advertised once per app start by clients that ship it; the
+    # /messages/group-broadcast fan-out only targets capable accounts and
+    # group member lists expose the flag so senders know who still needs
+    # the legacy per-member fan-out. Optional so future flags can ride the
+    # same endpoint without old clients clearing them.
+    sender_keys: bool | None = None
+
+
+@router.post("/me/capabilities", status_code=status.HTTP_204_NO_CONTENT)
+async def set_capabilities(
+    body: CapabilitiesIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Upsert this account's client-capability flags. Idempotent — clients
+    fire it on every start without tracking whether they already did."""
+    if body.sender_keys is None:
+        return
+    now = datetime.now(timezone.utc)
+    stmt = (
+        pg_insert(UserCapability)
+        .values(uin=uin, sender_keys=body.sender_keys, updated_at=now)
+        .on_conflict_do_update(
+            index_elements=["uin"],
+            set_={"sender_keys": body.sender_keys, "updated_at": now},
+        )
+    )
+    await db.execute(stmt)
     await db.commit()
 
 

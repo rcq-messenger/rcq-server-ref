@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
+from app.models.capability import UserCapability
 from app.models.contact import Contact
 from app.models.group import Group, GroupMember, GroupMessageView
 from app.models.user import User
@@ -70,6 +71,10 @@ class GroupMemberOut(BaseModel):
     # and the sender can ride the v=2 envelope path for them (and a Sender
     # Key distribution for groups). Null means Stage 2 only.
     signal_identity_key: str | None = None
+    # This member's client(s) understand the sender-keys group path (gmsg
+    # broadcast + skdm distribution). Senders seal SKDMs to capable members
+    # and keep the legacy per-member fan-out for the rest (dual-send).
+    sender_keys: bool = False
 
 
 GroupOut.model_rebuild()
@@ -120,6 +125,18 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
             .where(GroupMember.group_id == group_id)
         )
     ).all()
+    # One batched lookup for the sender-keys capability of every member —
+    # senders use it to split the dual-send (broadcast vs legacy fan-out).
+    capable: set[int] = set(
+        (
+            await db.execute(
+                select(UserCapability.uin).where(
+                    UserCapability.uin.in_([m.uin for m, _ in rows]),
+                    UserCapability.sender_keys.is_(True),
+                )
+            )
+        ).scalars().all()
+    ) if rows else set()
     out: list[GroupMemberOut] = []
     for m, u in rows:
         # Live presence: only show as their saved status if they currently have
@@ -141,6 +158,7 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
             identity_key=u.identity_key,
             signing_key=u.signing_key,
             signal_identity_key=u.signal_identity_key,
+            sender_keys=m.uin in capable,
         ))
     return out
 
