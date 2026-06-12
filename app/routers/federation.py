@@ -12,9 +12,11 @@ and serves it to anyone. All cryptographic trust is verified client-side against
 the identity key the user anchors by safety number; the server holds no libsignal
 and is deliberately not the trust root.
 """
+import base64
+import binascii
 import json
 
-from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
-from app.models.federation import HomeIslandRecord
+from app.models.federation import GossipRecord, HomeIslandRecord
 from app.models.user import User
 
 router = APIRouter(prefix="/federation", tags=["federation"])
@@ -30,6 +32,35 @@ router = APIRouter(prefix="/federation", tags=["federation"])
 # The signed document is small: a key, a short list of (host, uin) homes, a
 # timestamp, a signature. Anything larger is malformed or abusive.
 _MAX_DOC_BYTES = 8 * 1024
+
+
+def _record_signed_bytes(doc: dict) -> bytes:
+    """Reconstruct the EXACT bytes a client signs for a home-island record.
+
+    Must match the clients' `signedPart` + canonical JSON byte-for-byte
+    (web `federation.ts`, Android `RcqFederation.kt`, iOS `RcqFederation.swift`):
+    the object `{v:1, ik, sk, homes:[{host,uin}…], ts}` serialized with keys
+    sorted recursively, compact separators, UTF-8, ints as ints. Built field by
+    field (never "doc minus sig") so an injected field can never enter the
+    signed bytes.
+    """
+    homes = [{"host": h["host"], "uin": h["uin"]} for h in doc["homes"]]
+    part = {"v": 1, "ik": doc["ik"], "sk": doc["sk"], "homes": homes, "ts": doc["ts"]}
+    return json.dumps(part, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _verify_record_sig(doc: dict) -> bool:
+    """True iff `doc.sig` is a valid Ed25519 signature over the canonical signed
+    bytes under `doc.sk`. Self-authenticates an unauthenticated gossip write:
+    only the holder of `sk`'s private key can produce a row under `sk`."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(doc["sk"]))
+        pub.verify(base64.b64decode(doc["sig"]), _record_signed_bytes(doc))
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError, binascii.Error):
+        return False
 
 
 @router.put(
@@ -92,6 +123,82 @@ async def get_island_record(
     """
     row = (
         await db.execute(select(HomeIslandRecord).where(HomeIslandRecord.uin == uin))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no record")
+    return json.loads(row.doc)
+
+
+# ── Gossip: mirror ANY identity's signed record (address-mobility B1) ──────────
+# These let a peer's routing record be served from any honest island a contact
+# uses, not only the peer's own island. Keyed by the global identity (`sk`),
+# self-authenticated by server-side signature verification on write.
+
+
+@router.put(
+    "/gossip-record",
+    dependencies=[Depends(rate_limit("federation_gossip_put", 60, 60))],
+)
+async def put_gossip_record(
+    doc: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Mirror a signed home-island record onto this island (open, no auth).
+
+    A client mirrors a contact's record here after it has resolved + verified
+    it, so this island can serve that contact's homes to others when the
+    contact's own island is unreachable. Unauthenticated, so the server itself
+    VERIFIES the Ed25519 signature over the canonical signed bytes under
+    `doc.sk` — a row can only exist for a document that key actually signed.
+    Anti-rollback by `ts`, keyed by `sk`.
+    """
+    raw = json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
+    if len(raw.encode("utf-8")) > _MAX_DOC_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "record too large")
+
+    if doc.get("v") != 1:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "unsupported record version")
+    ts = doc.get("ts")
+    if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing or invalid ts")
+    homes = doc.get("homes")
+    if not isinstance(homes, list) or not homes:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing homes")
+    sk = doc.get("sk")
+    if not isinstance(sk, str) or not isinstance(doc.get("ik"), str) or not isinstance(doc.get("sig"), str):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing ik/sk/sig")
+    # The whole point of an open write: prove the record is genuinely signed by
+    # the key it claims, so a stranger cannot poison `sk`'s slot.
+    if not _verify_record_sig(doc):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "bad signature")
+
+    existing = (
+        await db.execute(select(GossipRecord).where(GossipRecord.sk == sk))
+    ).scalar_one_or_none()
+    if existing is not None:
+        if ts < existing.ts:
+            raise HTTPException(status.HTTP_409_CONFLICT, "stale ts")
+        existing.doc = raw
+        existing.ts = ts
+    else:
+        db.add(GossipRecord(sk=sk, doc=raw, ts=ts))
+    await db.commit()
+    return {"ok": True, "ts": ts}
+
+
+@router.get("/gossip-record")
+async def get_gossip_record(
+    sk: str = Query(..., min_length=1, max_length=128),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return a mirrored signed record by its identity key `sk`, or 404.
+
+    Open: the record is public signed routing data. `sk` is a base64 query
+    param (path-unsafe `+`/`/`). The client re-verifies the signature and
+    anchors `sk`/`ik` to the peer it already knows before trusting the homes.
+    """
+    row = (
+        await db.execute(select(GossipRecord).where(GossipRecord.sk == sk.strip()))
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no record")

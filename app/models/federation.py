@@ -38,3 +38,37 @@ class HomeIslandRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
     )
+
+
+class GossipRecord(Base):
+    """A MIRROR of some identity's signed home-island record (Layer B gossip /
+    address-mobility B1).
+
+    Unlike `HomeIslandRecord` (keyed by a LOCAL uin, written only by its
+    authenticated owner), a gossip record is keyed by the GLOBAL identity — the
+    base64 Ed25519 `signing_key` (`sk`) inside the document — and may be written
+    by ANYONE: a client that has resolved + verified a contact's record mirrors
+    it here so this island can serve it to others. A peer's routing record thus
+    becomes reachable from *any* honest island a contact uses, not only the
+    peer's own island, so a blocked/dead island no longer hides where its
+    residents moved.
+
+    Because the write path is unauthenticated, the server VERIFIES the Ed25519
+    signature over the canonical signed bytes before storing, so a row can only
+    exist under an `sk` for a document that key actually signed — the store is
+    self-authenticating, and `ts` anti-rollback stops a replay of an older
+    island list. Verification is repeated client-side on read (redundancy, not
+    added trust).
+    """
+    __tablename__ = "gossip_records"
+
+    # The base64 Ed25519 signing key (`sk`) — the global identity the record
+    # belongs to, independent of any local uin (44 base64 chars for 32 bytes).
+    sk: Mapped[str] = mapped_column(Text, primary_key=True)
+    # The full §2.3 signed object verbatim, exactly as the owner signed it.
+    doc: Mapped[str] = mapped_column(Text, nullable=False)
+    # Extracted issued-at for anti-rollback without re-parsing `doc`.
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
+    )
