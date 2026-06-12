@@ -134,6 +134,15 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     .scrim { display:none; position:fixed; inset:0; background:rgba(12,13,14,.25); z-index:30; }
     .scrim.on { display:block; }
   }
+  /* On a phone a dense table (a long crash REASON especially) crushed the
+     other columns into tall thin strips. Make tables scroll horizontally
+     instead so every column keeps a usable width — standard mobile pattern. */
+  @media (max-width:640px) {
+    .card.pad { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    table { min-width:520px; }
+    th, td { white-space:nowrap; }
+    td:nth-child(3) { white-space:normal; min-width:200px; }  /* the reason/long cell wraps within its own width */
+  }
 </style>
 </head>
 <body>
