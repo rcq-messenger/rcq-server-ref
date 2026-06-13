@@ -17,8 +17,9 @@ is derived from the requester IP block + a daily epoch + a server secret (NOT a
 client-chosen param), so a single IP sees one stable subset it cannot vary, and
 the per-relay score is HMAC'd with a server secret so an attacker can't grind
 which relay lands in which bucket offline. Selection is trusted-preferred so a
-community flood can't displace vetted relays, community registrations land
-DISABLED until an admin vets them, and registration is capped per-key + globally.
+community flood can't displace vetted relays, community registrations land ENABLED
+(self-serve гидра — no manual approval) but are SERVED only once the canary has
+verified them e2e (recent last_ok), and registration is capped per-key + globally.
 
 Fully decoupled from send/queue/bundle. The server is NOT a trust root: a hostile
 relay's max exposure is metadata + DoS, healed by multi-relay + onion. The
@@ -52,6 +53,7 @@ _MAX_TS_SKEW = 300              # ts must not be future-dated past this (clock-s
 _MAX_ROWS_PER_KEY = 8          # one operator key can list at most this many relays
 _MAX_TOTAL_ROWS = 1000         # global pool cap (DB-bloat floor)
 _BUCKET_PERIOD = 86400         # ring reshuffles daily
+_LIVENESS_WINDOW = 2700        # a community relay is served only if probed-alive within this many seconds (canary runs ~every 10 min)
 
 # Per-proto descriptor schema: required + optional keys, each with a charset.
 _RE = {
@@ -208,8 +210,10 @@ async def register_relay(
     `{descriptor:{proto,server,port,sni,…}, key:<b64 ed25519 pub>, sig:<b64>, ts:int}`.
     The server canonicalizes the key, VERIFIES the signature before storing (a
     stranger cannot poison a descriptor), bounds `ts` to a sane window, and caps
-    rows per-key + globally. New relays land DISABLED (tier=community) until an
-    admin vets them into the served pool."""
+    rows per-key + globally. New relays land ENABLED (self-serve гидра — no manual
+    approval); the safety net is in /bridges, which SERVES a community relay only
+    after the canary has verified it e2e (recent last_ok), so a dead/junk
+    self-registration is never handed to a client."""
     raw_key = body.get("key")
     sig_b64 = body.get("sig")
     ts = body.get("ts")
@@ -248,10 +252,13 @@ async def register_relay(
     total = (await db.execute(select(func.count()).select_from(BrokerRelay))).scalar_one()
     if total >= _MAX_TOTAL_ROWS:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "broker pool full")
-    # Community relays are NOT served until an admin enables them (anti-flood).
-    db.add(BrokerRelay(tag=tag, descriptor=raw, operator_key=key_b64, tier="community", enabled=False, ts=ts))
+    # Self-serve гидра: a community relay lands ENABLED (no founder approval). The
+    # brakes are (a) /bridges' liveness gate — a community relay isn't SERVED until
+    # the canary verifies it e2e — plus (b) the admin kill switch (enabled=False)
+    # and (c) the per-key (8) + global (1000) registration caps above.
+    db.add(BrokerRelay(tag=tag, descriptor=raw, operator_key=key_b64, tier="community", enabled=True, ts=ts))
     await db.commit()
-    return {"ok": True, "tag": tag, "enabled": False, "pending": True}
+    return {"ok": True, "tag": tag, "enabled": True}
 
 
 @router.get(
@@ -263,18 +270,29 @@ async def get_bridges(
     db: AsyncSession = Depends(get_db),
     n: int = Query(3, ge=1, le=5),
 ) -> dict:
-    """Return up to `n` ENABLED relays for this requester's NETWORK bucket. The
-    bucket is the requester IP block + a daily epoch (NOT client-chosen), and the
-    per-relay score is HMAC'd with a server secret, so the subset can be neither
-    cycled from one IP nor ground offline. Trusted relays fill first so a
+    """Return up to `n` ENABLED, LIVE relays for this requester's NETWORK bucket.
+    The bucket is the requester IP block + a daily epoch (NOT client-chosen), and
+    the per-relay score is HMAC'd with a server secret, so the subset can be
+    neither cycled from one IP nor ground offline. Trusted relays fill first so a
     community flood can't displace them. No stable `tag` is returned — clients
-    dedup locally by proto:server:port."""
+    dedup locally by proto:server:port.
+
+    Liveness gate (the safety net for self-serve auto-enable): a COMMUNITY relay is
+    served only once the canary has verified it e2e recently (last_ok within
+    _LIVENESS_WINDOW), so a never-probed or gone-dead self-registration never
+    reaches a client. TRUSTED relays (admin-set, and independently monitored by the
+    signed-config canary) are exempt — promoting one is instant, with no gap."""
+    now = int(time.time())
     rows = (
         await db.execute(select(BrokerRelay).where(BrokerRelay.enabled.is_(True)))
     ).scalars().all()
+    rows = [
+        r for r in rows
+        if r.tier == "trusted" or (r.last_ok is not None and now - r.last_ok <= _LIVENESS_WINDOW)
+    ]
     if not rows:
-        return {"relays": [], "ts": int(time.time())}
-    bucket = f"{_ip_block(_client_ip(request))}:{int(time.time()) // _BUCKET_PERIOD}"
+        return {"relays": [], "ts": now}
+    bucket = f"{_ip_block(_client_ip(request))}:{now // _BUCKET_PERIOD}"
     secret = _bucket_secret()
 
     def score(r: BrokerRelay) -> str:
@@ -291,7 +309,7 @@ async def get_bridges(
             continue
         d["tier"] = r.tier
         out.append(d)
-    return {"relays": out, "ts": int(time.time())}
+    return {"relays": out, "ts": now}
 
 
 # ── admin (HTTP Basic) ────────────────────────────────────────────────────────
@@ -338,6 +356,41 @@ async def admin_set(body: AdminSet, db: AsyncSession = Depends(get_db)) -> dict:
         row.enabled = body.enabled
     await db.commit()
     return {"ok": True, "tag": row.tag, "tier": row.tier, "enabled": row.enabled}
+
+
+class LivenessResult(BaseModel):
+    tag: str
+    ok: bool
+
+
+class LivenessReport(BaseModel):
+    results: list[LivenessResult]
+
+
+@router.post("/admin/liveness", dependencies=[Depends(require_admin)])
+async def admin_liveness(body: LivenessReport, db: AsyncSession = Depends(get_db)) -> dict:
+    """Liveness report from the out-of-band prober (the prod relay canary, which
+    e2e-probes each ENABLED broker relay every cycle). For each {tag, ok}: a
+    success stamps last_ok=now + resets fail_count; a failure bumps fail_count and
+    leaves last_ok untouched, so a relay ages out of /bridges' liveness window once
+    it stops passing. Unknown tags are ignored. This is the ONLY writer of
+    last_ok/fail_count — the serving path (/bridges) only reads them."""
+    now = int(time.time())
+    updated = 0
+    for res in body.results:
+        row = (
+            await db.execute(select(BrokerRelay).where(BrokerRelay.tag == res.tag))
+        ).scalar_one_or_none()
+        if row is None:
+            continue
+        if res.ok:
+            row.last_ok = now
+            row.fail_count = 0
+        else:
+            row.fail_count = (row.fail_count or 0) + 1
+        updated += 1
+    await db.commit()
+    return {"ok": True, "updated": updated, "ts": now}
 
 
 @router.delete("/admin/{tag}", dependencies=[Depends(require_admin)])
