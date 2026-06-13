@@ -25,6 +25,7 @@ from app.core.security import require_admin
 from app.models.invite import Invite
 from app.models.report import Report
 from app.models.user import User, effective_status
+from app.services.hof_stats import bug_report_stats
 
 import time as _time
 
@@ -367,6 +368,13 @@ class HofRow(BaseModel):
     # he's approving), or null. Inline is fine — the admin list is small and
     # founder-only.
     avatar: str | None = None
+    # Founder-assigned wall rating (bronze/silver/gold) — drives the flower.
+    tier: str = "gold"
+    # Bug-bounty effort, so the founder can see contribution before grading.
+    # `reports` = total bug reports filed; `bugs_confirmed` = of those, how
+    # many were confirmed as real bugs (status=resolved).
+    reports: int = 0
+    bugs_confirmed: int = 0
 
 
 class HofListOut(BaseModel):
@@ -374,8 +382,15 @@ class HofListOut(BaseModel):
     approved_count: int
 
 
+# Valid founder ratings. Anything else on POST is a 400.
+_HOF_TIERS = {"bronze", "silver", "gold"}
+
+
 class HofApproveIn(BaseModel):
-    approved: bool
+    # Both optional so the founder can toggle wall membership and set the rating
+    # independently through the same endpoint. A request sets whatever it sends.
+    approved: bool | None = None
+    tier: str | None = None
 
 
 @router.get("/hof", response_model=HofListOut)
@@ -391,6 +406,7 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
         )
     ).scalars().all()
     approved = sum(1 for u in rows if u.hof_approved)
+    stats = await bug_report_stats(db, [u.uin for u in rows])
     return HofListOut(
         items=[
             HofRow(
@@ -401,6 +417,9 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
                 created_at=u.created_at,
                 last_seen=u.last_seen,
                 avatar=u.hof_avatar,
+                tier=(u.hof_tier or "gold"),
+                reports=stats.get(u.uin, (0, 0))[0],
+                bugs_confirmed=stats.get(u.uin, (0, 0))[1],
             )
             for u in rows
         ],
@@ -410,14 +429,25 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
 
 @router.post("/hof/{uin}", response_model=HofRow)
 async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depends(get_db)) -> HofRow:
-    """Founder toggle: approve/un-approve a uin for the public wall. Does not
-    touch the user's own opt-in consent."""
+    """Founder controls for one member: flip wall membership (`approved`) and/or
+    set the rating tier (`tier`). Both optional — a request changes only what it
+    sends. Does not touch the user's own opt-in consent."""
+    if body.tier is not None and body.tier not in _HOF_TIERS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"invalid tier (expected one of {sorted(_HOF_TIERS)})",
+        )
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-    user.hof_approved = body.approved
+    if body.approved is not None:
+        user.hof_approved = body.approved
+    if body.tier is not None:
+        user.hof_tier = body.tier
     await db.commit()
     await db.refresh(user)
+    stats = await bug_report_stats(db, [user.uin])
+    total, confirmed = stats.get(user.uin, (0, 0))
     return HofRow(
         uin=user.uin,
         nickname=user.nickname,
@@ -426,6 +456,9 @@ async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depe
         created_at=user.created_at,
         last_seen=user.last_seen,
         avatar=user.hof_avatar,
+        tier=(user.hof_tier or "gold"),
+        reports=total,
+        bugs_confirmed=confirmed,
     )
 
 

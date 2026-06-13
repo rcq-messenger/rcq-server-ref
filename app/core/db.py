@@ -136,6 +136,10 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # GET /public/hof/{uin}/avatar, so it is never public before the founder
     # approves. NULL = the initial-letter fallback on the wall.
     ("hof_avatar", "TEXT"),
+    # Founder-assigned wall rating: 'bronze' | 'silver' | 'gold'. Defaults to
+    # 'gold' so the pre-existing all-gold wall is unchanged after the migration
+    # (every current member keeps a gold flower until the founder re-grades).
+    ("hof_tier", "VARCHAR(8) DEFAULT 'gold'"),
 ]
 
 # Additive columns on `nearby_checkins`. Same idempotent
@@ -209,7 +213,7 @@ _INVITE_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor, federation, capability  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor, federation, capability, broker  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 

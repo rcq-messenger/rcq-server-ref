@@ -9,8 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.models.user import User
+from app.services.hof_stats import bug_report_stats, effort_score
 
 router = APIRouter(prefix="/public", tags=["public"])
+
+# Wall ordering — gold flowers first, then silver, then bronze, alphabetical
+# within a tier. A curated wall, not a leaderboard, so the only signal in the
+# order is the founder's rating; report counts never reorder anyone.
+_TIER_RANK = {"gold": 0, "silver": 1, "bronze": 2}
 
 
 class ActiveTesterOut(BaseModel):
@@ -61,6 +67,15 @@ class HofEntry(BaseModel):
     # True when this member uploaded an avatar; the wall then loads it from
     # GET /public/hof/{uin}/avatar (kept out of the list to keep it small).
     has_avatar: bool = False
+    # Founder-assigned rating → which flower the wall draws (bronze/silver/gold).
+    tier: str = "gold"
+    # Bug-bounty effort. `reports` is the count the wall shows in the center of
+    # the ring; `confirmed` is how many were real bugs; `effort` (0..1) is the
+    # ring fill, red→amber→green. Members who never reported bugs are (0, 0, 0)
+    # and the wall draws a neutral ring — they earn their place via `tier`.
+    reports: int = 0
+    confirmed: int = 0
+    effort: float = 0.0
 
 
 class HofResponse(BaseModel):
@@ -78,23 +93,33 @@ async def hall_of_fame(
     the same always-public identity fields the contact card already exposes.
     Cached 5 min."""
     stmt = (
-        select(User.uin, User.nickname, User.hof_avatar)
+        select(User.uin, User.nickname, User.hof_avatar, User.hof_tier)
         .where(
             User.hof_approved.is_(True),
             User.hof_opt_in.is_(True),
             User.is_fake.is_(False),
             User.is_suspended.is_(False),
         )
-        .order_by(User.nickname.asc())
     )
     rows = (await db.execute(stmt)).all()
+    stats = await bug_report_stats(db, [r.uin for r in rows])
+    members = []
+    for r in rows:
+        total, confirmed = stats.get(r.uin, (0, 0))
+        members.append(
+            HofEntry(
+                uin=r.uin,
+                nickname=r.nickname,
+                has_avatar=bool(r.hof_avatar),
+                tier=(r.hof_tier or "gold"),
+                reports=total,
+                confirmed=confirmed,
+                effort=effort_score(confirmed),
+            )
+        )
+    members.sort(key=lambda m: (_TIER_RANK.get(m.tier, 0), m.nickname.lower()))
     response.headers["Cache-Control"] = "public, max-age=300"
-    return HofResponse(
-        members=[
-            HofEntry(uin=r.uin, nickname=r.nickname, has_avatar=bool(r.hof_avatar))
-            for r in rows
-        ]
-    )
+    return HofResponse(members=members)
 
 
 @router.get("/hof/{uin}/avatar")

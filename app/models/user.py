@@ -88,6 +88,12 @@ class User(Base):
     # Optional public HoF avatar as a data-URI (see db.py note). Served only
     # for approved members; NULL falls back to the initial-letter circle.
     hof_avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Founder-assigned rating tier — which flower shows next to the member on
+    # the wall: "bronze" | "silver" | "gold". Independent of the auto-computed
+    # bug-report effort ring; this is the founder's manual "thank you" for
+    # people who helped (not all of them report bugs). Defaults to "gold" so
+    # the existing all-gold wall looks unchanged until the founder grades.
+    hof_tier: Mapped[str] = mapped_column(String(8), default="gold")
 
     first_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
