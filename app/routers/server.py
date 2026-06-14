@@ -30,6 +30,11 @@ class ServerCapabilities(BaseModel):
     # which backend the user is on — incoherent for self-host operators.
     # Prod sets UIN_SHOP_ENABLED=true in /opt/rcq/.env.
     uin_shop: bool
+    # Hall of Fame leaderboard surface. Off by default for self-hosters (a
+    # flagship-community feature). Defaults false so old clients that ignore the
+    # field hide it; prod sets HALL_OF_FAME_ENABLED=true. Clients hide the
+    # Settings opt-in when this is false.
+    hall_of_fame: bool = False
     # Server-join gate: "open" (anyone can register) or "invite" (a valid
     # invite token is required). Clients prompt for an invite when "invite".
     # Defaults to "open" so old clients that ignore the field are unaffected.
@@ -47,6 +52,7 @@ async def server_info() -> ServerInfo:
         name=settings.APP_NAME,
         capabilities=ServerCapabilities(
             uin_shop=settings.UIN_SHOP_ENABLED,
+            hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=settings.REGISTRATION_POLICY,
         ),
     )

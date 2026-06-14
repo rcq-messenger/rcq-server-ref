@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     # UIN allocation out of band via an admin endpoint or DB write.
     UIN_SHOP_ENABLED: bool = False
 
+    # Hall of Fame leaderboard surface (rcq.app/hof). Off by default for
+    # self-hosters — it's a flagship-community feature the operator doesn't run
+    # or curate. Prod sets HALL_OF_FAME_ENABLED=true in /opt/rcq/.env, same as
+    # the UIN shop flag above.
+    HALL_OF_FAME_ENABLED: bool = False
+
     # APNs config — populated in production via /opt/rcq/.env. Empty values
     # disable push (the sender no-ops cleanly), so dev environments without
     # the .p8 key just don't send pushes — they don't crash.
