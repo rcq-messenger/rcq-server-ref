@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import current_uin
+from app.core.security import current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.contact import Contact
 from app.models.group import Group, GroupMember, GroupMessageView
@@ -389,7 +389,11 @@ class GroupPreviewOut(BaseModel):
 )
 async def preview_group(
     group_id: int,
-    _viewer_uin: int = Depends(current_uin),
+    # Optional auth: the invite LINK is the capability, so a cross-island /
+    # not-yet-joined client (no token on this island) can still read the public
+    # card (name / avatar / member count / open-closed) to render the join card.
+    # Rate-limited above. Nothing private is exposed.
+    _viewer_uin: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> GroupPreviewOut:
     g = await _load_group(db, group_id)
