@@ -272,6 +272,32 @@ async def init_db() -> None:
                     # loudly if it actually isn't.
                     pass
 
+    # Self-heal drifted column DEFAULTs (Postgres). `ADD COLUMN IF NOT
+    # EXISTS` above SKIPS a column that already exists — so a deployment
+    # that upgraded ACROSS a schema change can carry an OLD column without
+    # the default the add-list intends. That bit a self-hoster: the
+    # vestigial `reputation` was left NOT NULL with no default by a
+    # pre-pivot model, the ORM no longer sets it, so every /auth/register
+    # INSERT NULL-violated and 500'd. Re-assert the intended DEFAULT on
+    # every add-list column that declares one. Idempotent (a column already
+    # at the right default = no-op), per-statement so a stray failure can't
+    # abort startup. Postgres only — SQLite can't ALTER an existing
+    # column's default, and its ADD COLUMN already carries the default so
+    # it never drifts.
+    if dialect == "postgresql":
+        for table, columns in additive:
+            for col, typ in columns:
+                if " DEFAULT " not in typ:
+                    continue
+                default_expr = typ.split(" DEFAULT ", 1)[1].strip()
+                async with engine.begin() as conn:
+                    try:
+                        await conn.execute(text(
+                            f"ALTER TABLE {table} ALTER COLUMN {col} SET DEFAULT {default_expr}"
+                        ))
+                    except Exception:
+                        pass
+
     # Account-recovery lookup: /auth/recover finds the UIN by signing_key.
     # Without an index that's a seq scan holding one of the (deliberately tiny)
     # pooled connections longer than it should — under concurrent recovery load
