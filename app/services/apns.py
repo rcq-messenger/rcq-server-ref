@@ -318,6 +318,7 @@ async def send_to_user(
     thread_id: str | None = None,
     notif_kind: str | None = None,
     group_id: int | None = None,
+    group_name: str | None = None,
 ) -> int:
     """Regular APNs push to every iOS device of `uin`. Skips VoIP tokens —
     those have a separate code path (`send_voip_to_user`) with a different
@@ -395,6 +396,13 @@ async def send_to_user(
         # otherwise opening the group chat can't clear the
         # bump that this push made (different keys).
         payload["group_id"] = group_id
+    if group_name:
+        # Plaintext group name so the NSE can title the banner with the group
+        # even when it can't decrypt the envelope (sender-keys `gmsg` is not
+        # decryptable out-of-process) — without it the fallback shows a generic
+        # "RCQ / New group message". A member already knows the group name, so
+        # this doesn't weaken sealed-SENDER (the sender uin stays hidden).
+        payload["group_name"] = group_name
 
     sent = 0
     dead_ids: list[int] = []

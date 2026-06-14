@@ -377,6 +377,7 @@ async def send_group_broadcast(
     if body.envelope_type in _PUSHABLE_TYPES:
         group_id = body.group_id
         payload = body.payload
+        gname = g.name
 
         async def _push(target_uin: int) -> None:
             if await is_group_muted(target_uin, group_id):
@@ -388,9 +389,15 @@ async def send_group_broadcast(
                 envelope_type="gmsg",
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
+                group_name=gname,
             )
 
         for uin in offline_recipients:
+            # Never push the sender their OWN message: they backgrounded right
+            # after sending and fell into offline_recipients. Their other
+            # devices still get the WS/queue carbon — just no APNs banner.
+            if uin == caller:
+                continue
             asyncio.create_task(_push(uin))
     log.warning(
         "[group-broadcast] gid=%s type=%s recipients=%d delivered_any=%s offline=%d",
