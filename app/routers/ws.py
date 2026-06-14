@@ -12,6 +12,7 @@ from app.routers import hood, random as random_chat
 from app.routers.presence import presence_watchers
 from app.routers.referrals import note_active_day
 from app.services.apns import send_voip_to_user
+from app.services.unifiedpush import send_call_to_user as up_call
 from app.services.connection_manager import manager
 
 router = APIRouter(tags=["ws"])
@@ -557,6 +558,10 @@ async def _handle_client_message(uin: int, msg: dict) -> None:
                 "sdp": msg.get("sdp", ""),
             }
             await send_voip_to_user(target, payload=voip_payload)
+            # Android wakes via UnifiedPush (no PushKit) — same call payload so
+            # the receiver can ring with a full-screen incoming-call UI. No-op
+            # when the callee has no Android endpoints.
+            await up_call(target, payload=voip_payload)
 
         # call_end fallback. If the recipient's WS wasn't connected
         # (their device just woke from the offer push but hasn't
@@ -576,6 +581,9 @@ async def _handle_client_message(uin: int, msg: dict) -> None:
                 "reason": msg.get("reason", "remote_ended"),
             }
             await send_voip_to_user(target, payload=voip_payload)
+            # Android: dismiss a ringing full-screen call UI that the offer-wake
+            # raised but the WS relay couldn't reach (woke too late).
+            await up_call(target, payload=voip_payload)
         return
 
     # ── Audio Rooms ──

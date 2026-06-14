@@ -16,6 +16,7 @@ from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
 from app.services.apns import is_group_muted, send_to_user as apns_send
+from app.services.unifiedpush import send_to_user as up_send
 from app.services.connection_manager import manager
 
 log = logging.getLogger(__name__)
@@ -118,6 +119,14 @@ async def send_sealed(
     # push would buzz the user twice.
     if not delivered and body.envelope_type in _PUSHABLE_TYPES:
         pushed = await apns_send(
+            body.to_uin,
+            alert_body="New message",
+            envelope_b64=body.payload,
+            envelope_type=body.envelope_type,
+        )
+        # Android has no APNs — fire the parallel UnifiedPush wake (no-op when
+        # the recipient has no Android endpoints, the iOS-only common case).
+        pushed += await up_send(
             body.to_uin,
             alert_body="New message",
             envelope_b64=body.payload,
@@ -260,6 +269,14 @@ async def send_group_sealed(
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
             )
+            await up_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload_by_uin.get(target_uin),
+                envelope_type=envelope_type,
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+            )
 
         for uin in offline_recipients:
             asyncio.create_task(_push(uin))
@@ -383,6 +400,15 @@ async def send_group_broadcast(
             if await is_group_muted(target_uin, group_id):
                 return
             await apns_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload,
+                envelope_type="gmsg",
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+                group_name=gname,
+            )
+            await up_send(
                 target_uin,
                 alert_body="New group message",
                 envelope_b64=payload,
