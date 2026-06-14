@@ -488,6 +488,11 @@ async def _handle_client_message(uin: int, msg: dict) -> None:
         "call_renegotiate",
         "call_renegotiate_answer",
         "call_renegotiate_decline",
+        # ICE restart: recover a dropped/failed connection mid-call without
+        # re-ringing. Same dumb-relay path as renegotiate; the call is already
+        # registered so no concurrency check (the guard fires only on offer).
+        "call_ice_restart",
+        "call_ice_restart_answer",
     }:
         target = int(msg.get("to_uin", 0))
         if not target:
