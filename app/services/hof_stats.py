@@ -4,7 +4,8 @@ how many were confirmed as real bugs.
 Shared by the public wall (`/public/hof`) and the admin curation list
 (`/admin/hof`) so both compute "effort" the same way. A contributor's effort
 ring on the wall is driven purely by CONFIRMED bug-bounty reports; abuse
-reports against other users never count toward it.
+reports against other users — and AUTO-SUBMITTED CRASH reports — never count
+toward it.
 """
 
 from sqlalchemy import case, func, select
@@ -21,15 +22,23 @@ HOF_EFFORT_TARGET = 8
 # (acted on it = it was real), as opposed to dismissing it as not-a-bug.
 _CONFIRMED_STATUS = "resolved"
 
+# Auto-submitted crash reports ride the same /reports channel as human bug
+# reports (clients prefix the reason with "[<platform> <version>] [CRASH]").
+# They are NOT a contributor's deliberate effort, so they must not inflate the
+# count or the ring. Mirrors CRASH_MARKER in app/routers/admin.py — keep in sync.
+_CRASH_MARKER = "[CRASH]"
+
 
 async def bug_report_stats(
     db: AsyncSession, uins: list[int]
 ) -> dict[int, tuple[int, int]]:
     """Map each uin → (total bug-bounty reports filed, confirmed-as-bug count).
 
-    Scoped to `context == "bug_bounty"` so plain abuse reports never feed the
-    score. uins with no bug reports are simply absent from the result; callers
-    default them to (0, 0). One grouped query regardless of how many uins.
+    Scoped to `context == "bug_bounty"` and excludes auto crash reports (reason
+    carries the [CRASH] marker) so neither plain abuse reports nor crash dumps
+    feed the score. uins with no qualifying reports are simply absent from the
+    result; callers default them to (0, 0). One grouped query regardless of how
+    many uins.
     """
     if not uins:
         return {}
@@ -46,6 +55,7 @@ async def bug_report_stats(
             .where(
                 Report.reporter_uin.in_(uins),
                 Report.context == "bug_bounty",
+                ~Report.reason.contains(_CRASH_MARKER),
             )
             .group_by(Report.reporter_uin)
         )
