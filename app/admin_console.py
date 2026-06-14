@@ -219,7 +219,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     <!-- REPORTS -->
     <section class="view" id="v-reports">
       <div class="head">
-        <div><h1>Reports</h1><p>User reports and automatic crash reports.</p></div>
+        <div><h1>Reports</h1><p>User reports.</p></div>
         <div class="seg" id="report-seg">
           <button class="on" onclick="setReportKind('user')">User</button>
           <button onclick="setReportKind('crash')">Crashes</button>
@@ -255,6 +255,9 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const MOCK = location.protocol === 'file:' || location.search.includes('mock');
+// Crash-reports tab gate. The backend rewrites this to false for self-hosters
+// (RCQ_ADMIN_SHOW_CRASHES, default off); the raw file keeps true for the preview.
+const SHOW_CRASHES = true;
 
 /* ---- brand flower (red daisy, brand mark) ---- */
 $('flower').innerHTML = `<svg width="26" height="26" viewBox="0 0 24 24" fill="#ef3e36" aria-hidden>
@@ -310,10 +313,10 @@ async function loadStats() {
     const cells = [
       ['Users', s.total_users, false, true], ['Online now', online, false, false],
       ['New · 24h', s.new_users_24h], ['New · 7d', s.new_users_7d],
-      ['Open reports', s.open_reports, s.open_reports>0], ['Crashes', s.open_crashes||0, (s.open_crashes||0)>0],
+      ['Open reports', s.open_reports, s.open_reports>0], ...(SHOW_CRASHES ? [['Crashes', s.open_crashes||0, (s.open_crashes||0)>0]] : []),
     ];
     $('stats').innerHTML = cells.map(c => `<div class="stat${c[2]?' warn':''}"><div class="n">${c[3]?'<span class="dot"></span>':''}${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
-    const badge = $('reports-badge'); const open=(s.open_reports||0)+(s.open_crashes||0);
+    const badge = $('reports-badge'); const open=(s.open_reports||0)+(SHOW_CRASHES?(s.open_crashes||0):0);
     badge.textContent = open; badge.classList.toggle('on', open>0);
   } catch (e) { $('stats').innerHTML = '<span class="err">'+e.message+' — check ADMIN_USERNAME / ADMIN_PASSWORD</span>'; }
 }
@@ -456,6 +459,7 @@ async function checkUpdate() {
 
 /* ---- boot ---- */
 loadStats(); loadChart(); loadActivity(); checkUpdate();
+if (!SHOW_CRASHES) { const seg=$('report-seg'); if (seg) seg.style.display='none'; }
 </script>
 </body>
 </html>"""

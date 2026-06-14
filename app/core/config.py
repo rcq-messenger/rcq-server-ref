@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     RCQ_UPDATE_CHECK: bool = True
     UPDATE_CHECK_URL: str = "https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/VERSION"
     REPO_URL: str = "https://github.com/rcq-messenger/rcq-server-ref"
+    # Show the crash-reports tab in the admin console. Default OFF — auto crash
+    # reports are an RCQ-app maintainer concern, not a self-host operator's; they
+    # just see user reports. The maintainer's flagship sets RCQ_ADMIN_SHOW_CRASHES=true.
+    RCQ_ADMIN_SHOW_CRASHES: bool = False
     ENV: str = "dev"
     DATABASE_URL: str = "sqlite+aiosqlite:///./rcq.db"
     REDIS_URL: str = "redis://localhost:6379/0"
