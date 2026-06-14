@@ -322,6 +322,40 @@ class ConnectionManager:
             for uin in uins:
                 await self._deliver_user_local(uin, text)
 
+    async def fanout(self, uins: list[int], payload: dict[str, Any]) -> None:
+        """Publish `payload` to the ONLINE subset of `uins` in a single
+        pipelined Redis round-trip.
+
+        The per-uin `send()` loop is O(N) round-trips (a publish + a
+        sismember each) which, on a large group (1000+ members), turned a
+        membership broadcast into a ~15s crawl in the request path. Offline
+        users receive nothing from a publish anyway (no live socket; they
+        resync on reconnect), so we filter to the online set and pipeline
+        the publishes — O(1) round-trips regardless of N, and behaviourally
+        identical (the same users actually get the message).
+        """
+        if not uins:
+            return
+        await self._ensure_pubsub()
+        text = json.dumps(payload)
+        try:
+            redis = await get_redis()
+            online = await redis.smembers(_ONLINE_KEY)  # set[str] (decode_responses=True)
+            targets = [u for u in uins if str(u) in online]
+            if not targets:
+                return
+            async with redis.pipeline(transaction=False) as pipe:
+                for uin in targets:
+                    pipe.publish(
+                        _FANOUT_CHANNEL,
+                        json.dumps({"target": "user", "uin": uin, "payload_text": text}),
+                    )
+                await pipe.execute()
+        except Exception:  # noqa: BLE001
+            # Redis blip: best-effort local delivery, same fallback as send/broadcast.
+            for uin in uins:
+                await self._deliver_user_local(uin, text)
+
     async def broadcast_all(self, payload: dict[str, Any]) -> None:
         """Fan out to every connected UIN across the cluster. Used by
         the Crash game's round broadcasts and the UIN auction loop.

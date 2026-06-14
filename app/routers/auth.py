@@ -175,8 +175,13 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
             members = await _members_with_users(db, beta_group_id)
             g = await _load_group(db, beta_group_id)
             payload = _serialize(g, members).model_dump(mode="json")
-            for m in members:
-                await manager.send(m.uin, {"type": "group_membership_changed", "group": payload})
+            # One pipelined fanout to the ONLINE members instead of a sequential
+            # per-member send(): on the 1300+ member beta group the old loop was
+            # ~2N sequential Redis round-trips IN the register path = ~15s sign-up.
+            await manager.fanout(
+                [m.uin for m in members],
+                {"type": "group_membership_changed", "group": payload},
+            )
 
     return RegisterOut(uin=uin, token=issue_token(uin))
 
