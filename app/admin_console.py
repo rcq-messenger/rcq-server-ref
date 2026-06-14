@@ -146,6 +146,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 </style>
 </head>
 <body>
+<div id="updbar" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:#b45309;color:#fff;padding:10px 16px;font-size:14px;line-height:1.45;text-align:center;box-shadow:0 1px 6px rgba(0,0,0,.25)"></div>
 <div class="layout">
   <aside id="side">
     <div class="brand">
@@ -437,8 +438,24 @@ function mock(method, path, body) {
   return null;
 }
 
+/* ---- update check ---- */
+async function checkUpdate() {
+  if (MOCK) return;
+  try {
+    const u = await api('GET','/update-check');
+    if (!u || !u.update_available) return;
+    const bar = $('updbar');
+    bar.innerHTML = '🔔 Доступно обновление RCQ-сервера: <b>'+u.latest+'</b> (у вас '+u.current+'). '
+      + 'Обновите: <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px">git pull</code> и перезапустите сервис &middot; '
+      + '<a href="'+u.repo_url+'" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">что изменилось</a>'
+      + ' &nbsp;|&nbsp; Update available — pull &amp; restart.';
+    bar.style.display='block';
+    document.body.style.paddingTop='46px';
+  } catch(e) {}
+}
+
 /* ---- boot ---- */
-loadStats(); loadChart(); loadActivity();
+loadStats(); loadChart(); loadActivity(); checkUpdate();
 </script>
 </body>
 </html>"""

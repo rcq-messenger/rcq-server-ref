@@ -123,4 +123,4 @@ app.include_router(ws.router)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "app": settings.APP_NAME}
+    return {"ok": True, "app": settings.APP_NAME, "version": settings.SERVER_VERSION}

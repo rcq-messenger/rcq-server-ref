@@ -10,6 +10,7 @@ Surfaces:
   • Live presence: who's connected right now
 """
 
+import httpx
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -73,6 +74,44 @@ async def admin_console() -> HTMLResponse:
     from app.admin_console import ADMIN_CONSOLE_HTML
 
     return HTMLResponse(ADMIN_CONSOLE_HTML)
+
+
+# ── self-host update check ──────────────────────────────────────────
+# Compares this server's VERSION against the VERSION on the repo's main branch
+# so the admin console can show an "update available" banner. Cached 6h,
+# fail-silent (never blocks the console), and skipped entirely when
+# RCQ_UPDATE_CHECK=false (air-gapped installs).
+_UPDATE_TTL = 6 * 3600.0
+_update_cache: tuple[float, dict] | None = None
+
+
+@router.get("/update-check", include_in_schema=False)
+async def update_check() -> dict:
+    current = settings.SERVER_VERSION
+    base = {"current": current, "repo_url": settings.REPO_URL}
+    if not settings.RCQ_UPDATE_CHECK:
+        return {**base, "latest": None, "update_available": False, "disabled": True}
+    global _update_cache
+    now = _time.monotonic()
+    if _update_cache is not None and _update_cache[0] > now:
+        return _update_cache[1]
+    latest: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(settings.UPDATE_CHECK_URL)
+        if r.status_code == 200:
+            latest = (r.text.strip().splitlines() or [""])[0].strip()[:32] or None
+    except (httpx.HTTPError, OSError):
+        latest = None
+    result = {
+        **base,
+        "latest": latest,
+        # Any difference means "behind": a self-hoster tracking main is never
+        # ahead of it. A blank/unknown latest → no nag.
+        "update_available": bool(latest) and latest != current,
+    }
+    _update_cache = (now + _UPDATE_TTL, result)
+    return result
 
 
 # ── DTOs ────────────────────────────────────────────────────────────

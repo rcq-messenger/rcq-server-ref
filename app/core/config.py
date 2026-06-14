@@ -1,10 +1,31 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _read_version() -> str:
+    """Running server version, from the repo-root VERSION file. Bumped on each
+    release; drives the admin-console 'update available' check."""
+    try:
+        return (Path(__file__).resolve().parents[2] / "VERSION").read_text().strip() or "unknown"
+    except OSError:
+        return "unknown"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     APP_NAME: str = "RCQ Backend"
+
+    # Running version (VERSION file) + best-effort self-host update check. The
+    # admin console compares SERVER_VERSION against the VERSION on the repo's
+    # main branch and shows an "update available" banner when behind. The check
+    # is a cached, fail-silent outbound GET to GitHub — set RCQ_UPDATE_CHECK=false
+    # in .env to disable it entirely (air-gapped installs).
+    SERVER_VERSION: str = _read_version()
+    RCQ_UPDATE_CHECK: bool = True
+    UPDATE_CHECK_URL: str = "https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/VERSION"
+    REPO_URL: str = "https://github.com/rcq-messenger/rcq-server-ref"
     ENV: str = "dev"
     DATABASE_URL: str = "sqlite+aiosqlite:///./rcq.db"
     REDIS_URL: str = "redis://localhost:6379/0"
