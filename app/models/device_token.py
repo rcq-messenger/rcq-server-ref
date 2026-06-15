@@ -34,6 +34,12 @@ class DeviceToken(Base):
     # PushKit and route to a different endpoint. Distinguished here so the
     # APNs sender knows which kind to use.
     platform: Mapped[str] = mapped_column(String(16), nullable=False, default="ios")
+    # Stable per-install identifier the client keeps in its Keychain (which
+    # survives an app reinstall). NULL for pre-device-id clients. When set,
+    # registration replaces this device's previous token instead of piling up
+    # a new row per reinstall (each reinstall mints a fresh APNs token but
+    # reuses the device_id) — the cause of duplicate push banners.
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
     )

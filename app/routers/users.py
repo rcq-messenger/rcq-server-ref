@@ -416,6 +416,9 @@ async def update_me(
 class PushTokenIn(BaseModel):
     token: str
     platform: str = "ios"  # "ios" | "ios-voip"
+    # Stable per-install id (client Keychain, survives reinstall). Optional so
+    # pre-device-id clients keep working via the legacy (uin, token) upsert.
+    device_id: str | None = None
 
 
 @router.post("/me/push-token", status_code=status.HTTP_204_NO_CONTENT)
@@ -438,15 +441,37 @@ async def register_push_token(
     if not body.token.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty token")
     now = datetime.now(timezone.utc)
+    device_id = (body.device_id or "").strip() or None
+    # Upsert on the existing (uin, token) constraint either way — an app
+    # UPDATE keeps the same APNs token, so this just refreshes last_seen (and
+    # backfills device_id on the first device-id-aware launch). A reinstall
+    # mints a NEW token, so this INSERTs a fresh row; the stale-token cleanup
+    # below then drops the OLD row for the same physical device.
     stmt = (
         pg_insert(DeviceToken)
-        .values(uin=uin, token=body.token, platform=body.platform, created_at=now, last_seen=now)
+        .values(
+            uin=uin, token=body.token, platform=body.platform,
+            device_id=device_id, created_at=now, last_seen=now,
+        )
         .on_conflict_do_update(
             index_elements=["uin", "token"],
-            set_={"platform": body.platform, "last_seen": now},
+            set_={"platform": body.platform, "device_id": device_id, "last_seen": now},
         )
     )
     await db.execute(stmt)
+    if device_id:
+        # Drop any other token previously registered by THIS device (same
+        # uin+device_id+platform) under a different token — a reinstall reuses
+        # the Keychain device_id but gets a new APNs token, so without this the
+        # old token row lingers and double-pushes until APNs 410s it.
+        await db.execute(
+            delete(DeviceToken).where(and_(
+                DeviceToken.uin == uin,
+                DeviceToken.device_id == device_id,
+                DeviceToken.platform == body.platform,
+                DeviceToken.token != body.token,
+            ))
+        )
     await db.commit()
 
 

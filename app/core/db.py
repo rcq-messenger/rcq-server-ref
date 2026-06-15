@@ -212,6 +212,15 @@ _INVITE_COLUMNS: list[tuple[str, str]] = [
     ("uin", "BIGINT"),
 ]
 
+# Additive on `device_tokens` — a stable per-install id (kept in the client
+# Keychain across reinstalls) so a reinstall REPLACES that device's token
+# instead of piling up a duplicate row (= duplicate push banners). NULL on
+# existing rows = pre-device-id clients, handled by the legacy (uin, token)
+# upsert.
+_DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
+    ("device_id", "VARCHAR(64)"),
+]
+
 async def init_db() -> None:
     from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor, federation, capability, broker  # noqa: F401  (register tables)
 
@@ -249,6 +258,7 @@ async def init_db() -> None:
         ("reports", _REPORT_COLUMNS),
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
         ("invites", _INVITE_COLUMNS),
+        ("device_tokens", _DEVICE_TOKEN_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:
