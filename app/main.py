@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.core.db import init_db
 from app.core.redis import close_redis, get_redis
-from app.routers import admin, audio_rooms, auth, broker, contacts, devices, federation, groups, hood, hood_banners, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, devices, federation, gate, groups, hood, hood_banners, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.fake_users import seed_fake_users
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
@@ -56,7 +56,13 @@ async def lifespan(_: FastAPI):
         await close_redis()
 
 
-app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+# A masquerade/closed island disables /docs + /openapi.json — they're the
+# loudest "this is RCQ" fingerprint behind the gate.
+_docs_kwargs = (
+    {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    if settings.RCQ_DOCS_DISABLED else {}
+)
+app = FastAPI(title=settings.APP_NAME, lifespan=lifespan, **_docs_kwargs)
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,6 +124,7 @@ app.include_router(public.router)
 app.include_router(server.router)
 app.include_router(link.router)
 app.include_router(devices.router)
+app.include_router(gate.router)
 app.include_router(ws.router)
 
 

@@ -105,5 +105,19 @@ class Settings(BaseSettings):
     # central server and every existing self-host stay open until they opt in.
     REGISTRATION_POLICY: str = "open"
 
+    # Closed-island network gate (masquerade). When the operator runs the
+    # masquerade Caddyfile, Caddy asks /gate/check on every request and serves a
+    # decoy on anything but a 2xx. RCQ_AUTH_TOKEN is the legacy single master
+    # token — historically a Caddy-only var, now ALSO read by the app so
+    # /gate/check can honor it (set it in the APP env too, or single-token
+    # deployments lock out when they move to the forward_auth Caddyfile). Leaving
+    # it set is a permanent, unrevocable, reshareable bypass that sits in front of
+    # the per-user access_tokens machinery — recommend UNSETTING it once you issue
+    # per-user tokens. Empty = no master token (per-user tokens only).
+    RCQ_AUTH_TOKEN: str = ""
+    # Disable FastAPI's /docs + /openapi.json — the loudest "this is RCQ"
+    # fingerprint. Operators running a masquerade/closed island set this true.
+    RCQ_DOCS_DISABLED: bool = False
+
 
 settings = Settings()
