@@ -253,12 +253,15 @@ async def send_request(
             "from_nickname": sender_nick,
         },
     )
-    if not delivered:
+    if not delivered and await should_push_for(
+        body.to_uin, kind="contact_request", sender_uin=uin,
+    ):
         await apns_send(
             body.to_uin,
             alert_title=sender_nick,
             alert_body="wants to add you as a contact",
             thread_id="pending",
+            notif_kind="contact_request",
         )
     return {"id": req.id, "state": "pending"}
 
