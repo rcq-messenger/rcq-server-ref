@@ -8,14 +8,17 @@ can run their own instance instead of trusting `api.rcq.app`.
 
 ## Status
 
-**Early. Reference, not yet production-tested by anyone but the
-maintainer.** The code is the same code that runs on `api.rcq.app`
-today. The included `docker-compose.yml` covers TLS (Caddy + Let's
-Encrypt) and APNs setup is documented in [`docs/apns.md`](docs/apns.md).
-Open items: a wider testing pass on the self-hosted path, and the
-non-Docker relay self-host story. (The Android + iOS clients already
-point at custom islands, and migrations are automated.) Track those in
-[Issues](../../issues).
+**Beta, but live in production.** This is the same code that runs
+`api.rcq.app`, which serves real users today across a federated network
+of islands, with iOS, Android and web clients. It's released open
+source (AGPL-3.0) as the reference implementation and so anyone can run
+their own island. It's still beta — the protocol and features evolve —
+and the *self-hosted* path specifically is the newer surface (fewer
+operators have run it than the flagship). The included
+`docker-compose.yml` covers TLS (Caddy + Let's Encrypt) and APNs setup
+is documented in [`docs/apns.md`](docs/apns.md). Open items: a wider
+testing pass on the self-hosted path, and the non-Docker relay
+self-host story — track those in [Issues](../../issues).
 
 If you have a small VPS, a domain you can point at it, and ten
 minutes, the quick-start below stands a working server up. If you'd
