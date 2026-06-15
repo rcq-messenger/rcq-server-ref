@@ -191,12 +191,27 @@ async def gate_redeem(
     row = (await db.execute(
         select(AccessToken).where(AccessToken.token_hash == h)
     )).scalar_one_or_none()
-    if row is None or not _active(_meta_from_row(row)):
+    if row is None:
         return await _deny()
+    meta = _meta_from_row(row)
     if row.kind in ("device", "standing"):
-        return RedeemOut(token=raw)
+        return RedeemOut(token=raw) if _active(meta) else await _deny()
     if row.kind != "invite":
         return await _deny()
+    # An invite is redeemable while NOT revoked/expired. We deliberately do NOT
+    # block on exhaustion (uses>=max_uses) here: a FRESH device is stopped by the
+    # conditional consume below, while a device that ALREADY redeemed this invite
+    # (a retry after a lost response) re-mints via ON CONFLICT without consuming —
+    # so idempotent retry works without re-opening a spent invite to new devices.
+    if meta.get("revoked"):
+        return await _deny()
+    _exp = meta.get("expires_at")
+    if _exp is not None:
+        try:
+            if datetime.fromisoformat(_exp) <= _now():
+                return await _deny()
+        except ValueError:
+            return await _deny()
 
     # Invite -> device. INSERT the device row ON CONFLICT FIRST; consume only if
     # a NEW row was created (xmax=0). Postgres-only path (matches the codebase's
