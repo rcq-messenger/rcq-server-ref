@@ -201,6 +201,26 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       </div>
     </section>
 
+    <!-- ACCESS TOKENS (closed/private island gate) -->
+    <section class="view" id="v-access">
+      <div class="head"><div><h1>Access tokens</h1><p>For a PRIVATE (closed) island only — per-person, revocable keys to reach this server. Used when you run the masquerade Caddyfile.</p></div></div>
+      <div class="card pad">
+        <div class="row">
+          <input id="a_label" placeholder="Label (e.g. Alice)" style="flex:1;min-width:160px">
+          <select id="a_kind" style="width:150px"><option value="invite">One-time invite</option><option value="standing">Standing</option></select>
+          <input id="a_ttl" type="number" placeholder="Expires (days)" title="Expires after N days" style="width:130px">
+          <button class="btn" onclick="createAccess()">Create</button>
+        </div>
+        <p class="sub" style="margin:10px 0 0">A one-time invite is redeemed by the first device that uses it (a re-posted invite then stops working). A standing token is multi-use. The full token is shown ONCE on creation — copy it then.</p>
+        <div class="err" id="a_err"></div>
+        <div id="a_new" style="display:none;margin-top:10px"></div>
+      </div>
+      <div class="card pad">
+        <table><thead><tr><th>Label</th><th>Kind</th><th>Uses</th><th>Last used</th><th></th></tr></thead>
+          <tbody id="access"></tbody></table>
+      </div>
+    </section>
+
     <!-- USERS -->
     <section class="view" id="v-users">
       <div class="head"><div><h1>Users</h1><p>Search by number or nickname, suspend abusers.</p></div></div>
@@ -268,6 +288,7 @@ $('flower').innerHTML = `<svg width="26" height="26" viewBox="0 0 24 24" fill="#
 const NAV = [
   ['overview','Overview','M3 12l9-8 9 8M5 10v9h5v-5h4v5h5v-9'],
   ['invites','Invites','M4 7h16v10H4zM4 7l8 6 8-6'],
+  ['access','Access tokens','M6 10V7a6 6 0 1112 0v3M5 10h14v10H5zM12 14v3'],
   ['users','Users','M8 11a3 3 0 100-6 3 3 0 000 6zM2 20c0-3 3-5 6-5s6 2 6 5M16 7a3 3 0 110 6'],
   ['reports','Reports','M12 3l9 16H3zM12 10v4M12 17v.5','reports-badge'],
   ['server','Server','M4 5h16v5H4zM4 14h16v5H4zM7 7.5h.5M7 16.5h.5'],
@@ -282,6 +303,7 @@ function go(v) {
   document.querySelectorAll('.view').forEach(e => e.classList.toggle('active', e.id==='v-'+v));
   closeSide();
   if (v==='invites') loadInvites();
+  if (v==='access') loadAccess();
   if (v==='reports') loadReports();
   if (v==='server') loadServer();
 }
@@ -364,6 +386,36 @@ async function mintInvite() {
 }
 async function revoke(code){ try{ await api('DELETE','/invites/'+encodeURIComponent(code)); loadInvites(); }catch(e){ alert(e.message); } }
 
+/* ---- access tokens (closed island) ---- */
+async function loadAccess() {
+  try {
+    const rows = await api('GET','/access-tokens');
+    $('access').innerHTML = rows.map(t=>`<tr>
+      <td>${t.label||'<span style="color:var(--dim)">—</span>'}${t.parent_id?' <span style="color:var(--dim)">(device)</span>':''}</td>
+      <td>${t.kind}</td>
+      <td>${t.uses}${t.max_uses?('/'+t.max_uses):''}</td>
+      <td style="color:var(--dim)">${t.last_used_at?timeago(t.last_used_at):'—'}</td>
+      <td style="text-align:right">${t.revoked?'<span style="color:var(--dim)">revoked</span>':'<button class="btn danger sm" onclick="revokeAccess('+t.id+')">Revoke</button>'}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="empty">No access tokens yet.</td></tr>';
+  } catch(e){ $('access').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
+}
+async function createAccess() {
+  $('a_err').textContent=''; $('a_new').style.display='none';
+  const body = { kind: $('a_kind').value };
+  if ($('a_label').value.trim()) body.label=$('a_label').value.trim();
+  if ($('a_ttl').value.trim()) body.expires_in_days=parseInt($('a_ttl').value);
+  try {
+    const out = await api('POST','/access-tokens',body);
+    $('a_label').value='';
+    const n=$('a_new'); n.style.display='block';
+    n.innerHTML='<p class="sub">Copy this token now — it is shown only once. Give it to the person (and have them paste it in the app under Add account / Add contact).</p>'+
+      '<div class="row"><input class="mono" readonly value="'+out.token+'" style="flex:1" onclick="this.select()">'+
+      '<button class="btn ghost" onclick="navigator.clipboard.writeText(\''+out.token+'\');this.textContent=\'copied ✓\'">Copy</button></div>';
+    loadAccess();
+  } catch(e){ $('a_err').textContent='Could not create: '+e.message; }
+}
+async function revokeAccess(id){ try{ await api('POST','/access-tokens/'+id+'/revoke'); loadAccess(); }catch(e){ alert(e.message); } }
+
 /* ---- users ---- */
 async function searchUsers() {
   const q=$('u_q').value.trim(); if(!q) return;
@@ -421,6 +473,11 @@ function mock(method, path, body) {
     {kind:'report_resolved',uin:710335446,nickname:'nosferatu',summary:'Report #14 dismissed',occurred_at:new Date(Date.now()-1200e3).toISOString()},
     {kind:'report_resolved',uin:901003980,nickname:'q_anon',summary:'Banned + report #12 resolved',occurred_at:new Date(Date.now()-9000e3).toISOString()},
     {kind:'report_resolved',uin:524060806,nickname:'dev',summary:'Report #9 dismissed',occurred_at:new Date(Date.now()-86400e3).toISOString()},
+  ];
+  if (path==='/access-tokens' && method==='POST') return {id:99, kind:body.kind, token:'rcq_demo_'+Math.random().toString(36).slice(2,18), label:body.label};
+  if (path.startsWith('/access-tokens')) return [
+    {id:1, kind:'invite', label:'Alice', uses:1, max_uses:1, revoked:false, last_used_at:new Date(Date.now()-3600e3).toISOString(), parent_id:null},
+    {id:2, kind:'standing', label:'Bridge bot', uses:42, max_uses:null, revoked:false, last_used_at:new Date(Date.now()-600e3).toISOString(), parent_id:null},
   ];
   if (path==='/invites') return [
     {code:'ACME7H2K9Qd1',uin:777777,used_count:0,max_uses:1,label:'Acme HR (vanity)',join_url:'https://island.example/r/ACME7H2K9Qd1'},
