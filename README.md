@@ -199,6 +199,12 @@ To enable:
 Treat the token like a password. Rotating is `docker compose restart
 caddy` after editing `.env`, plus re-issuing to your users.
 
+For a **fully private (closed) island with per-person, one-time, revocable
+access tokens** (mint/revoke them in the admin console instead of one shared
+secret), use `deploy/Caddyfile.masquerade-tokens.compose` instead — see
+**[docs/private-island.md](docs/private-island.md)**. Closed islands are
+native-only (iOS/Android/desktop).
+
 ## What's intentionally NOT in this repo
 
 * **APNs `.p8` key** — Apple ties this to your own developer account,
