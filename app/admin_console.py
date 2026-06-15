@@ -410,7 +410,7 @@ async function createAccess() {
     const n=$('a_new'); n.style.display='block';
     n.innerHTML='<p class="sub">Copy this token now — it is shown only once. Give it to the person (and have them paste it in the app under Add account / Add contact).</p>'+
       '<div class="row"><input class="mono" readonly value="'+out.token+'" style="flex:1" onclick="this.select()">'+
-      '<button class="btn ghost" onclick="navigator.clipboard.writeText(\''+out.token+'\');this.textContent=\'copied ✓\'">Copy</button></div>';
+      `<button class="btn ghost" onclick="navigator.clipboard.writeText('${out.token}');this.textContent='copied ✓'">Copy</button></div>`;
     loadAccess();
   } catch(e){ $('a_err').textContent='Could not create: '+e.message; }
 }
