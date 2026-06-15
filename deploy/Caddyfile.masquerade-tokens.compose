@@ -1,0 +1,86 @@
+# Opt-in Caddyfile: masquerade + PER-USER access tokens (closed island).
+#
+# Like Caddyfile.masquerade.compose (the single-shared-token version) the public
+# surface looks like an ordinary landing page (decoy) — but instead of matching
+# ONE static token, Caddy asks the backend `/gate/check` on EVERY request and
+# serves the decoy on anything but a 2xx. That lets the operator hand out
+# per-person, revocable, one-time-redeemable tokens via the admin console /
+# `POST /admin/access-tokens`. See docs/private-island.md.
+#
+# Requires Caddy >= 2.9.0 (auth-subrequest fixes: method-GET / body-not-consumed
+# / copy-header placeholders, Caddy issues #6610 / #5430).
+#
+# Required .env keys (same dir as docker-compose.yml):
+#   RCQ_DOMAIN        — public hostname.
+#   RCQ_AUTH_TOKEN    — OPTIONAL legacy master token. If set it MUST be in the
+#                       APP container's env too (this Caddyfile no longer matches
+#                       it at the proxy — /gate/check does), and it is a permanent
+#                       unrevocable reshareable bypass: prefer leaving it UNSET
+#                       and issuing per-user tokens instead.
+#   RCQ_DOCS_DISABLED=1 in the APP env (hides /docs + /openapi.json).
+#
+# Enable: drop a generic ./decoy/index.html, bind-mount ./decoy:/srv/decoy:ro,
+# point caddy at this file, `docker compose up -d`. Generate a token in the
+# console (or POST /admin/access-tokens) and give it to your user; they paste it
+# in the app's "Access token" field (add account, or add a contact on this
+# island). Native clients only (a browser can't stamp the gate header).
+
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$RCQ_DOMAIN} {
+	route {
+		# --- network gate: ask /gate/check; decoy on anything but a 2xx grant ---
+		reverse_proxy app:8000 {
+			# Turn THIS request into a plain GET /gate/check subrequest.
+			method GET
+			rewrite /gate/check
+			header_up X-RCQ-Auth {http.request.header.X-RCQ-Auth}
+			header_up X-Forwarded-For {remote_host}
+			# Force a WebSocket upgrade back to a plain GET subrequest, else the
+			# Upgrade/Connection headers make FastAPI 426 the gate check.
+			header_up -Connection
+			header_up -Upgrade
+
+			# 2xx grant -> empty handle_response -> control falls through to the
+			# real proxy below (the gate's own 200 body is NOT sent to the client).
+			@ok status 2xx
+			handle_response @ok {
+			}
+
+			# EVERYTHING that isn't an explicit 2xx grant (1xx/3xx/4xx/5xx, and a
+			# dial error becomes a 502 -> here too) -> the decoy. A wrong / absent
+			# / revoked token, a rate-limit 429, and an app outage are all
+			# indistinguishable from a static landing page.
+			@gate_fail status 1xx 3xx 4xx 5xx
+			handle_response @gate_fail {
+				root * /srv/decoy
+				rewrite * /index.html
+				file_server
+				header {
+					Strict-Transport-Security "max-age=31536000; includeSubDomains"
+					X-Content-Type-Options "nosniff"
+					Referrer-Policy "no-referrer"
+					-Server
+				}
+			}
+		}
+
+		# --- reached ONLY on a 2xx grant from /gate/check ---
+		reverse_proxy app:8000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto https
+		}
+
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			Referrer-Policy "no-referrer"
+			-Server
+		}
+	}
+}
