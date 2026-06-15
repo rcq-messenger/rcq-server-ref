@@ -12,9 +12,10 @@ can run their own instance instead of trusting `api.rcq.app`.
 maintainer.** The code is the same code that runs on `api.rcq.app`
 today. The included `docker-compose.yml` covers TLS (Caddy + Let's
 Encrypt) and APNs setup is documented in [`docs/apns.md`](docs/apns.md).
-Open items: Android client pointing at custom servers, automated
-migrations, and a wider testing pass on the self-hosted path. Track
-those in [Issues](../../issues).
+Open items: a wider testing pass on the self-hosted path, and the
+non-Docker relay self-host story. (The Android + iOS clients already
+point at custom islands, and migrations are automated.) Track those in
+[Issues](../../issues).
 
 If you have a small VPS, a domain you can point at it, and ten
 minutes, the quick-start below stands a working server up. If you'd
@@ -37,6 +38,18 @@ hosted-key tooling), keep an eye on releases.
   VoIP pushes for inbound calls.
 * **Encrypted media blobs** — opaque bytes by mass; per-blob AES key
   exchanged inside the encrypted envelope.
+* **Cross-island federation** — your island joins the wider RCQ network by
+  address (`uin@host`): home-island records, multihoming (backup islands),
+  gossip key/record sync, and cross-island 1:1, media, groups and calls — all
+  bridged client-side, no server-to-server trust.
+* **Sender-keys group broadcast** — encrypt-once group messages
+  (`/messages/group-broadcast` + a per-account capability flag) so a large
+  group doesn't cost an O(N) per-member fan-out.
+* **Relay broker (circumvention)** — built in (`app/routers/broker.py`): a
+  signed `POST /broker/register` lets a community relay self-register, an
+  IP-bucketed `GET /broker/bridges` distributes them with anti-enumeration, and
+  a canary liveness-gates what's served. Pairs with the standalone relay
+  installer.
 * **Account migration + UIN shop** — atomic re-key of every owned-by-uin
   row from old UIN to new. UIN shop uses a mock IAP receipt today; the
   real StoreKit hook lives at one function on the iOS side.
@@ -236,8 +249,9 @@ manually trading hostnames, open a PR against
 That's a small JSON catalogue clients fetch on first launch and
 present as a picker. Each RCQ server is an independent island; the
 directory is for discoverability. (Cross-island messaging —
-federation — is on the roadmap as a separate, client-side layer the
-catalogue will feed; today the islands are still independent.)
+federation — is implemented: a client bridges people across islands by
+`uin@host` using published home-island records + multihoming, no
+server-to-server trust. The catalogue just feeds discovery.)
 
 ## Contributing
 
