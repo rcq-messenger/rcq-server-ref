@@ -257,25 +257,33 @@ async def send_group_sealed(
         payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
         envelope_type = body.envelope_type
         group_id = body.group_id
+        # Title the banner with the group's name + carry it in the payload so
+        # the client shows WHICH group (this sealed path used to send neither,
+        # so small-group pushes always read as the generic "New group message").
+        gname = g.name or "RCQ"
 
         async def _push(target_uin: int) -> None:
             if await is_group_muted(target_uin, group_id):
                 return
             await apns_send(
                 target_uin,
+                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload_by_uin.get(target_uin),
                 envelope_type=envelope_type,
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
+                group_name=gname,
             )
             await up_send(
                 target_uin,
+                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload_by_uin.get(target_uin),
                 envelope_type=envelope_type,
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
+                group_name=gname,
             )
 
         for uin in offline_recipients:
@@ -394,13 +402,16 @@ async def send_group_broadcast(
     if body.envelope_type in _PUSHABLE_TYPES:
         group_id = body.group_id
         payload = body.payload
-        gname = g.name
+        # Title the banner with the group's name (not the generic "RCQ") so the
+        # user can tell which group a push came from at a glance.
+        gname = g.name or "RCQ"
 
         async def _push(target_uin: int) -> None:
             if await is_group_muted(target_uin, group_id):
                 return
             await apns_send(
                 target_uin,
+                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload,
                 envelope_type="gmsg",
@@ -410,6 +421,7 @@ async def send_group_broadcast(
             )
             await up_send(
                 target_uin,
+                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload,
                 envelope_type="gmsg",
