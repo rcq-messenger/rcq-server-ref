@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import current_uin, issue_recover_challenge, issue_token, verify_recover_challenge
+from app.services import server_settings
 from app.models.contact import Contact, ContactRequest
 from app.models.invite import Invite
 from app.models.group import Group, GroupMember
@@ -97,7 +98,7 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         Invite.used_count < Invite.max_uses,
         or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
     )
-    if settings.REGISTRATION_POLICY == "invite":
+    if await server_settings.get("registration_policy") == "invite":
         if not code:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_required"})
         consumed = await db.execute(

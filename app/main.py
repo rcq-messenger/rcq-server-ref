@@ -2,12 +2,13 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.db import init_db
+from app.core.feature_gate import require_feature
 from app.core.redis import close_redis, get_redis
 from app.routers import admin, audio_rooms, auth, broker, contacts, devices, federation, gate, groups, hood, hood_banners, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
@@ -104,19 +105,19 @@ app.include_router(groups.router)
 app.include_router(messages.router)
 app.include_router(keys.router)
 app.include_router(media.router)
-app.include_router(nearby.router)
+app.include_router(nearby.router, dependencies=[Depends(require_feature("nearby_enabled"))])
 app.include_router(presence.router)
-app.include_router(random_chat.router)
+app.include_router(random_chat.router, dependencies=[Depends(require_feature("random_enabled"))])
 app.include_router(audio_rooms.router)
-app.include_router(hood.router)
-app.include_router(hood_banners.router)
+app.include_router(hood.router, dependencies=[Depends(require_feature("hood_enabled"))])
+app.include_router(hood_banners.router, dependencies=[Depends(require_feature("hood_enabled"))])
 app.include_router(reports.router)
 app.include_router(polls.router)
 app.include_router(polls.group_polls_router)
 app.include_router(news.public_router)
 app.include_router(news.admin_router)
 app.include_router(admin.router)
-app.include_router(stories.router)
+app.include_router(stories.router, dependencies=[Depends(require_feature("stories_enabled"))])
 app.include_router(migrate.router)
 app.include_router(uin_shop.router)
 app.include_router(referrals.router)

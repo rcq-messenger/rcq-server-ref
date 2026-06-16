@@ -13,6 +13,7 @@ Surfaces:
 import httpx
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
@@ -26,6 +27,7 @@ from app.core.security import require_admin
 from app.models.invite import Invite
 from app.models.report import Report
 from app.models.user import User, effective_status
+from app.services import server_settings
 from app.services.hof_stats import bug_report_stats
 
 import time as _time
@@ -80,6 +82,32 @@ async def admin_console() -> HTMLResponse:
         f"const SHOW_CRASHES = {'true' if settings.RCQ_ADMIN_SHOW_CRASHES else 'false'};",
     )
     return HTMLResponse(html)
+
+
+# ── operator settings (Features tab) ────────────────────────────────
+# Runtime overrides over the .env baseline so an operator can toggle optional
+# features / limits / branding live without editing .env + restarting (which
+# would kill the worker serving this console). Source of truth =
+# app/services/server_settings (typed registry + DB-backed overrides);
+# /server/info and the feature routers consult the same effective values.
+@router.get("/settings", include_in_schema=False)
+async def get_settings() -> dict[str, Any]:
+    return {"settings": await server_settings.describe()}
+
+
+@router.patch("/settings", include_in_schema=False)
+async def patch_settings(
+    body: dict[str, Any],
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        serialized = server_settings.validate(body)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "bad_setting", "message": str(exc)})
+    if serialized:
+        await server_settings.apply(db, serialized)
+        await db.commit()
+    return {"settings": await server_settings.describe()}
 
 
 # ── self-host update check ──────────────────────────────────────────

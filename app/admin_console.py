@@ -103,6 +103,14 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .btn.danger { background:var(--bg); border:1px solid var(--line); color:var(--red); }
   .btn.danger:hover { background:var(--red-soft); border-color:var(--red); }
   .btn.sm { padding:6px 11px; font-size:12.5px; }
+  /* features tab rows */
+  .frow { display:flex; align-items:flex-start; gap:14px; padding:12px 0; border-top:1px solid var(--line-2); }
+  .frow.first { border-top:none; padding-top:2px; }
+  .frow .finfo { flex:1; min-width:0; }
+  .frow .flabel { font-weight:600; font-size:13.5px; display:flex; align-items:center; gap:8px; }
+  .frow .fhelp { color:var(--mut); font-size:12px; margin-top:2px; }
+  .frow .fctl { flex:none; display:flex; gap:8px; align-items:center; }
+  .ftitle { font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin:0 0 8px; font-weight:600; }
 
   .seg { display:inline-flex; background:var(--line-2); border-radius:10px; padding:3px; gap:2px; }
   .seg button { background:transparent; color:var(--mut); padding:6px 14px; border-radius:8px; }
@@ -252,6 +260,12 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     </section>
 
     <!-- SERVER -->
+    <!-- FEATURES (operator toggles) -->
+    <section class="view" id="v-features">
+      <div class="head"><div><h1>Features</h1><p>Turn optional features on or off, and set limits &amp; branding for your island. Changes apply live — no restart.</p></div></div>
+      <div id="features"><div class="card pad"><div class="empty">Loading…</div></div></div>
+    </section>
+
     <section class="view" id="v-server">
       <div class="head"><div><h1>Server &amp; federation</h1><p>How your island is configured and how it joins the wider RCQ network.</p></div></div>
       <div class="card pad">
@@ -291,6 +305,7 @@ const NAV = [
   ['access','Access tokens','M6 10V7a6 6 0 1112 0v3M5 10h14v10H5zM12 14v3'],
   ['users','Users','M8 11a3 3 0 100-6 3 3 0 000 6zM2 20c0-3 3-5 6-5s6 2 6 5M16 7a3 3 0 110 6'],
   ['reports','Reports','M12 3l9 16H3zM12 10v4M12 17v.5','reports-badge'],
+  ['features','Features','M4 6h16M4 12h16M4 18h16M8 6v0M16 12v0M10 18v0'],
   ['server','Server','M4 5h16v5H4zM4 14h16v5H4zM7 7.5h.5M7 16.5h.5'],
 ];
 let cur = 'overview';
@@ -305,6 +320,7 @@ function go(v) {
   if (v==='invites') loadInvites();
   if (v==='access') loadAccess();
   if (v==='reports') loadReports();
+  if (v==='features') loadFeatures();
   if (v==='server') loadServer();
 }
 function openSide(){ $('side').classList.add('open'); $('scrim').classList.add('on'); }
@@ -465,7 +481,55 @@ async function loadServer() {
 function timeago(iso){ const s=(Date.parse(iso))?(Date.now()-Date.parse(iso))/1000:0; if(s<60)return 'just now'; if(s<3600)return Math.floor(s/60)+'m'; if(s<86400)return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; }
 
 /* ---- mock data for preview ---- */
+/* ---- features (operator toggles) ---- */
+const FGROUPS = { features:'Features', limits:'Limits & policy', branding:'Branding' };
+function escAttr(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+async function loadFeatures(){
+  try { const r = await api('GET','/settings'); renderFeatures((r&&r.settings)||[]); }
+  catch(e){ $('features').innerHTML='<div class="card pad"><span class="err">'+e.message+' — check ADMIN_USERNAME / ADMIN_PASSWORD</span></div>'; }
+}
+function renderFeatures(list){
+  const groups = {}; list.forEach(s=>{ (groups[s.group]=groups[s.group]||[]).push(s); });
+  $('features').innerHTML = Object.keys(FGROUPS).filter(g=>groups[g]).map(g=>`
+    <div class="card pad"><div class="ftitle">${FGROUPS[g]}</div>
+      ${groups[g].map((s,i)=>frow(s,i===0)).join('')}</div>`).join('')
+    || '<div class="card pad"><div class="empty">No settings.</div></div>';
+}
+function frow(s, first){
+  let ctl;
+  if (s.type==='bool')
+    ctl = `<button class="btn sm ${s.value?'':'ghost'}" onclick="setFeature('${s.key}', ${!s.value})">${s.value?'On':'Off'}</button>`;
+  else if (s.type==='int')
+    ctl = `<input type="number" id="f_${s.key}" value="${s.value}"${s.min!=null?' min='+s.min:''}${s.max!=null?' max='+s.max:''} style="width:88px"><button class="btn sm" onclick="setFeature('${s.key}', parseInt($('f_${s.key}').value,10))">Save</button>`;
+  else if (s.choices)
+    ctl = `<select onchange="setFeature('${s.key}', this.value)">${s.choices.map(c=>`<option value="${c}"${c===s.value?' selected':''}>${c}</option>`).join('')}</select>`;
+  else
+    ctl = `<input id="f_${s.key}" value="${escAttr(s.value)}" placeholder="(none)" style="width:220px"><button class="btn sm" onclick="setFeature('${s.key}', $('f_${s.key}').value)">Save</button>`;
+  const badge = s.overridden ? ' <span class="pill green">custom</span>' : '';
+  return `<div class="frow${first?' first':''}"><div class="finfo"><div class="flabel">${s.label}${badge}</div><div class="fhelp">${s.help||''}</div></div><div class="fctl">${ctl}</div></div>`;
+}
+async function setFeature(key, value){
+  if (typeof value==='number' && isNaN(value)) { alert('Enter a number.'); return; }
+  try { const r = await api('PATCH','/settings', {[key]: value}); renderFeatures((r&&r.settings)||[]); }
+  catch(e){ alert('Could not save: '+e.message); loadFeatures(); }
+}
+
+let MOCK_SETTINGS = [
+  {key:'nearby_enabled',type:'bool',group:'features',label:'Nearby',help:'Geo people-near-you discovery.',value:true,default:true,overridden:false,min:null,max:null,choices:null},
+  {key:'random_enabled',type:'bool',group:'features',label:'Random Chat',help:'Anonymous roulette-style chat.',value:true,default:true,overridden:false,min:null,max:null,choices:null},
+  {key:'hood_enabled',type:'bool',group:'features',label:'Hood Chat',help:'Anonymous neighbourhood (geohash) chat.',value:true,default:true,overridden:false,min:null,max:null,choices:null},
+  {key:'stories_enabled',type:'bool',group:'features',label:'Stories',help:'24h ephemeral photo/video stories.',value:false,default:true,overridden:true,min:null,max:null,choices:null},
+  {key:'registration_policy',type:'str',group:'limits',label:'Registration',help:'Who may create an account on this island.',value:'open',default:'open',overridden:false,min:null,max:null,choices:['open','invite']},
+  {key:'max_accounts_per_device',type:'int',group:'limits',label:'Max accounts / device',help:'How many accounts one device may hold.',value:5,default:5,overridden:false,min:1,max:50,choices:null},
+  {key:'island_name',type:'str',group:'branding',label:'Island name',help:'Display name clients read from /server/info.',value:'Example Island',default:'RCQ Backend',overridden:true,min:null,max:null,choices:null},
+  {key:'welcome_text',type:'str',group:'branding',label:'Welcome / rules',help:'Optional welcome or rules text shown in the app.',value:'',default:'',overridden:false,min:null,max:null,choices:null},
+];
+
 function mock(method, path, body) {
+  if (path==='/settings') {
+    if (method==='PATCH' && body) Object.keys(body).forEach(k=>{ const s=MOCK_SETTINGS.find(x=>x.key===k); if(s){ s.value=body[k]; s.overridden=true; } });
+    return { settings: MOCK_SETTINGS };
+  }
   if (path==='/stats') return {total_users:1284, fake_users:0, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
   if (path==='/presence/online-count') return {count:48};
   if (path.startsWith('/timeseries/signups')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(8+14*Math.abs(Math.sin(i/3))+ (i%5===0?10:0))}})};

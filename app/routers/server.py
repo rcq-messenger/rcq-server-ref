@@ -18,6 +18,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.services import server_settings
 
 
 router = APIRouter(prefix="/server", tags=["server"])
@@ -39,20 +40,41 @@ class ServerCapabilities(BaseModel):
     # invite token is required). Clients prompt for an invite when "invite".
     # Defaults to "open" so old clients that ignore the field are unaffected.
     registration_policy: str = "open"
+    # Operator-toggled optional features (admin console -> Features). Each
+    # defaults True so old clients that ignore the field keep showing the tab;
+    # a client that reads these hides the tab when the operator turns it off.
+    # The backing routers are ALSO gated server-side, so flipping these off is
+    # enforced regardless of client version.
+    nearby: bool = True
+    random_chat: bool = True
+    hood: bool = True
+    stories: bool = True
+    # How many accounts one device may hold. Advisory to the client (the server
+    # can't see which accounts share a device); clients cap the account switcher.
+    max_accounts_per_device: int = 5
 
 
 class ServerInfo(BaseModel):
     name: str
+    # Optional operator welcome / rules text ("" = none).
+    welcome: str = ""
     capabilities: ServerCapabilities
 
 
 @router.get("/info", response_model=ServerInfo)
 async def server_info() -> ServerInfo:
+    eff = await server_settings.effective()
     return ServerInfo(
-        name=settings.APP_NAME,
+        name=eff["island_name"] or settings.APP_NAME,
+        welcome=eff["welcome_text"],
         capabilities=ServerCapabilities(
             uin_shop=settings.UIN_SHOP_ENABLED,
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
-            registration_policy=settings.REGISTRATION_POLICY,
+            registration_policy=eff["registration_policy"],
+            nearby=eff["nearby_enabled"],
+            random_chat=eff["random_enabled"],
+            hood=eff["hood_enabled"],
+            stories=eff["stories_enabled"],
+            max_accounts_per_device=eff["max_accounts_per_device"],
         ),
     )
