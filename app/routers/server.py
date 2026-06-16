@@ -52,6 +52,11 @@ class ServerCapabilities(BaseModel):
     # How many accounts one device may hold. Advisory to the client (the server
     # can't see which accounts share a device); clients cap the account switcher.
     max_accounts_per_device: int = 5
+    # F3 deposit-auth: when true the island issues anonymous blinded deposit
+    # tokens (GET /deposit-auth/params + POST /deposit-auth/issue) and clients
+    # mint + attach them to sealed deposits. Default false so old clients ignore
+    # it and self-hosters stay on the open mailbox + per-IP cap.
+    deposit_auth: bool = False
 
 
 class ServerInfo(BaseModel):
@@ -76,5 +81,6 @@ async def server_info() -> ServerInfo:
             hood=eff["hood_enabled"],
             stories=eff["stories_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
+            deposit_auth=settings.DEPOSIT_AUTH_ENABLED,
         ),
     )

@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.db import init_db
 from app.core.feature_gate import require_feature
 from app.core.redis import close_redis, get_redis
-from app.routers import admin, audio_rooms, auth, broker, contacts, devices, federation, gate, groups, hood, hood_banners, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, hood_banners, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.fake_users import seed_fake_users
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
@@ -101,6 +101,7 @@ app.include_router(users.router)
 app.include_router(contacts.router)
 app.include_router(federation.router)
 app.include_router(broker.router)
+app.include_router(deposit_auth.router)
 app.include_router(groups.router)
 app.include_router(messages.router)
 app.include_router(keys.router)

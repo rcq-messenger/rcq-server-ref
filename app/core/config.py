@@ -63,6 +63,18 @@ class Settings(BaseSettings):
     # the UIN shop flag above.
     HALL_OF_FAME_ENABLED: bool = False
 
+    # F3 deposit-auth — anonymous blinded deposit tokens (RFC 9474 RSABSSA) for
+    # sealed-sender spam resistance. OFF by default (the island runs the open
+    # mailbox + per-IP cap). When ENABLED the island serves /deposit-auth/params
+    # + /issue and advertises `deposit_auth=true` in /server/info, so clients mint
+    # + attach tokens; verification stays additive. POW_BITS is the stranger
+    # first-contact cost knob (SHA-256 hashcash leading-zero-bits; raise under
+    # abuse). REQUIRED makes /messages/sealed reject deposits lacking a valid
+    # token — a deliberate flag-day flip ONLY after all clients mint tokens.
+    DEPOSIT_AUTH_ENABLED: bool = False
+    DEPOSIT_AUTH_POW_BITS: int = 20
+    DEPOSIT_AUTH_REQUIRED: bool = False
+
     # APNs config — populated in production via /opt/rcq/.env. Empty values
     # disable push (the sender no-ops cleanly), so dev environments without
     # the .p8 key just don't send pushes — they don't crash.

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_device_id, current_uin, current_uin_optional
@@ -42,6 +43,11 @@ class SealedSendIn(BaseModel):
     # list is informational. New envelope kinds don't need a server change.
     envelope_type: str = Field(default="message")
     payload: str  # base64 LibSignal sealed-sender ciphertext (sender lives inside)
+    # F3 deposit-auth: an OPTIONAL anonymous blinded token {epoch_id, prepared, sig}
+    # the recipient's island issued (RFC 9474 RSABSSA). When present it is verified
+    # + consumed (single-use), letting the island rate-limit deposits without
+    # de-anonymizing the sender. Absent = the legacy per-IP path (back compatible).
+    deposit_token: dict | None = None
 
 
 class SendOut(BaseModel):
@@ -87,7 +93,20 @@ async def send_sealed(
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
 
-    # TODO(sealed-sender-prod): per-recipient delivery-token rate limiting.
+    # F3 deposit-auth (anonymous delivery-token rate limiting). A token, when
+    # present, is verified + atomically consumed (single-use, double-spend
+    # rejected) — sealed sender preserved. Absent = the legacy per-IP cap above.
+    # Enforcement (DEPOSIT_AUTH_REQUIRED) is a deliberate operator flip once
+    # clients mint tokens; until then this is purely additive.
+    token_ok = False
+    if body.deposit_token is not None:
+        from app.core import deposit_auth_store
+        from app.core.redis import get_redis
+        if not await deposit_auth_store.verify_and_consume_token(body.deposit_token, await get_redis()):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid or spent deposit token")
+        token_ok = True
+    if settings.DEPOSIT_AUTH_REQUIRED and not token_ok:
+        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, "a deposit token is required")
 
     now = datetime.now(timezone.utc)
     pkt = {
