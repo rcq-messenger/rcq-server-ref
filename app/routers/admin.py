@@ -75,13 +75,7 @@ async def admin_console() -> HTMLResponse:
     with zero extra hosting."""
     from app.admin_console import ADMIN_CONSOLE_HTML
 
-    # Gate the crash-reports tab: default OFF for self-hosters (the raw HTML
-    # defaults SHOW_CRASHES=true for the file:// design preview).
-    html = ADMIN_CONSOLE_HTML.replace(
-        "const SHOW_CRASHES = true;",
-        f"const SHOW_CRASHES = {'true' if settings.RCQ_ADMIN_SHOW_CRASHES else 'false'};",
-    )
-    return HTMLResponse(html)
+    return HTMLResponse(ADMIN_CONSOLE_HTML)
 
 
 # ── operator settings (Features tab) ────────────────────────────────

@@ -202,7 +202,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 
     <!-- INVITES -->
     <section class="view" id="v-invites">
-      <div class="head"><div><h1>Invites &amp; UINs</h1><p>Mint join codes, or reserve a specific (vanity) number.</p></div></div>
+      <div class="head"><div><h1>Invites &amp; UINs</h1><p>Join codes for an <b>invite-only</b> server. If you set Registration to “invite” (Features tab), new users must enter one of these codes to sign up — otherwise this tab is optional. You can also pre-assign a specific UIN to someone.</p></div></div>
       <div class="card pad">
         <div class="row">
           <input id="i_label" placeholder="Label (e.g. Acme HR)" style="flex:1;min-width:160px">
@@ -211,7 +211,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
           <input id="i_ttl" type="number" placeholder="TTL hrs" title="Expires after N hours" style="width:96px">
           <button class="btn" onclick="mintInvite()">Create</button>
         </div>
-        <p class="sub" style="margin:10px 0 0">Leave the UIN blank for a random number. Set one to hand someone a specific vanity number; use max-uses&nbsp;1 to reserve it.</p>
+        <p class="sub" style="margin:10px 0 0"><b>Label</b> is just a note for you. <b>UIN</b> — leave blank for a random number, or set one to reserve a specific (vanity) number for the holder. <b>Max uses</b> — how many people may register with this code (use 1 for a single person). <b>TTL hrs</b> — auto-expire after N hours (blank = never). After Create, share the code (or its link) with the person; they paste it when signing up.</p>
         <div class="err" id="i_err"></div>
       </div>
       <div class="card pad">
@@ -222,7 +222,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 
     <!-- ACCESS TOKENS (closed/private island gate) -->
     <section class="view" id="v-access">
-      <div class="head"><div><h1>Access tokens</h1><p>For a PRIVATE (closed) island only — per-person, revocable keys to reach this server. Used when you run the masquerade Caddyfile.</p></div></div>
+      <div class="head"><div><h1>Access tokens</h1><p>Only for a <b>closed (private) island</b> — one that runs the masquerade Caddyfile so the server looks like an ordinary website and refuses anyone without a valid token. These are the per-person, revocable keys you hand out. <b>If you haven’t set up the masquerade Caddyfile, ignore this tab.</b></p></div></div>
       <div class="card pad">
         <div class="row">
           <input id="a_label" placeholder="Label (e.g. Alice)" style="flex:1;min-width:160px">
@@ -259,11 +259,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     <!-- REPORTS -->
     <section class="view" id="v-reports">
       <div class="head">
-        <div><h1>Reports</h1><p>User reports.</p></div>
-        <div class="seg" id="report-seg">
-          <button class="on" onclick="setReportKind('user')">User</button>
-          <button onclick="setReportKind('crash')">Crashes</button>
-        </div>
+        <div><h1>Reports</h1><p>Reports your users filed about other users. Review each, then dismiss it or ban the offender.</p></div>
       </div>
       <div class="card pad">
         <table><thead><tr><th>#</th><th>Target</th><th>Reason</th><th>Context</th><th></th></tr></thead>
@@ -293,7 +289,10 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 
     <!-- RELAYS (community circumvention pool) -->
     <section class="view" id="v-relays">
-      <div class="head"><div><h1>Relays</h1><p>Community circumvention relays registered with this island's broker. Enable / disable, set trust tier, or remove a dead one.</p></div></div>
+      <div class="head"><div><h1>Relays</h1><p>Advanced — only relevant if someone runs censorship-circumvention relays for <b>your</b> island. This lists relays registered with <b>your own</b> server’s broker (never another island’s). Most operators can ignore this tab; it stays empty until a relay self-registers.</p></div></div>
+      <div class="card pad">
+        <p class="sub" style="margin:0"><b>Tier</b> — <span class="mono">community</span> relays are handed to clients only after a health check confirms they work; <span class="mono">trusted</span> relays are always offered (use that for relays you run yourself). <b>Promote / Demote</b> moves a relay between those tiers. <b>Remove</b> just drops it from the pool — clients fall back to your other relays or a direct connection; nothing is deleted on the relay’s own host, and removing the last one simply means no circumvention relays are advertised.</p>
+      </div>
       <div class="card pad">
         <table><thead><tr><th>Tag</th><th>Tier</th><th>State</th><th>Last OK</th><th>Fails</th><th></th></tr></thead>
           <tbody id="relays"></tbody></table>
@@ -317,7 +316,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
         <h3>Joining the public network</h3>
         <p class="sub">What makes your server reachable by people on other islands.</p>
         <div class="note" id="fed-note">
-          <p style="margin:0 0 10px"><b>Your island already federates.</b> Anyone can reach a contact or join a group on your server using <span class="mono">number@your-host</span> or a group link <span class="mono">your-host/g/&lt;id&gt;</span> — no central registry is involved, and you do not need to be in any catalogue for this to work.</p>
+          <p style="margin:0 0 10px"><b>Your island already federates.</b> Anyone can reach a contact or join a group on your server using <span class="mono">uin@your-host</span> or a group link <span class="mono">your-host/g/&lt;id&gt;</span> — no central registry is involved, and you do not need to be in any catalogue for this to work.</p>
           <p style="margin:0 0 10px">The <b>public catalogue</b> (the <a href="https://rcq.app/servers" target="_blank">rcq.app/servers</a> list + the in-app auto-backup picker) is <b>only for discovery</b>: it lets strangers find your island and lets the app offer it as a backup. Listing is optional and is a maintainer-reviewed pull request to the <span class="mono">rcq-servers</span> repo.</p>
           <p style="margin:0"><b>To join a group on another island:</b> open that group's invite link (it must carry the host, e.g. <span class="mono">rcq.app/g/42@island.example</span>) in the app and confirm — your client guest-registers you there automatically. If the target island has <b>invite-only</b> registration, you need one of its invite codes first.</p>
         </div>
@@ -329,14 +328,11 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const MOCK = location.protocol === 'file:' || location.search.includes('mock');
-// Crash-reports tab gate. The backend rewrites this to false for self-hosters
-// (RCQ_ADMIN_SHOW_CRASHES, default off); the raw file keeps true for the preview.
-const SHOW_CRASHES = true;
 
-/* ---- brand flower (red daisy, brand mark) ---- */
-$('flower').innerHTML = `<svg width="26" height="26" viewBox="0 0 24 24" fill="#ef3e36" aria-hidden>
-  <g>${Array.from({length:8},(_,i)=>{const a=i*45*Math.PI/180;const x=12+6.2*Math.cos(a);const y=12+6.2*Math.sin(a);return `<ellipse cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" rx="3.1" ry="4.5" transform="rotate(${i*45} ${x.toFixed(2)} ${y.toFixed(2)})"/>`}).join('')}</g>
-  <circle cx="12" cy="12" r="3.1" fill="#fff"/><circle cx="12" cy="12" r="2.1" fill="#ef3e36"/></svg>`;
+/* ---- brand logo + favicon (real RCQ mark, base64-inlined) ---- */
+const LOGO = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAAUGVYSWZNTQAqAAAACAACARIAAwAAAAEAAQAAh2kABAAAAAEAAAAmAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAABAoAMABAAAAAEAAABAAAAAAFSMbK4AAAIyaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIgogICAgICAgICAgICB4bWxuczp0aWZmPSJodHRwOi8vbnMuYWRvYmUuY29tL3RpZmYvMS4wLyI+CiAgICAgICAgIDxleGlmOlBpeGVsWURpbWVuc2lvbj42MTM8L2V4aWY6UGl4ZWxZRGltZW5zaW9uPgogICAgICAgICA8ZXhpZjpQaXhlbFhEaW1lbnNpb24+NjEzPC9leGlmOlBpeGVsWERpbWVuc2lvbj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDx0aWZmOk9yaWVudGF0aW9uPjE8L3RpZmY6T3JpZW50YXRpb24+CiAgICAgIDwvcmRmOkRlc2NyaXB0aW9uPgogICA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgooduQQAAAUTElEQVR4Ae1bC5AlVXk+53TfR987987cmX0AZrdkgSXugiBRjCaCAUkQMAoRiqBUCagE8JVEVhSpbEJhECpiqSREAiZYpnhUEpGwFRYCZCGSSkBY5BEiBAUKln3MzJ376O57b/fJ953TfW/fmZ2ZZYclqQpnqrtPn8f/+M5//vOf03eEeDO9icD/awTk/4b2k0KMFkqjh+QjMS5cEfkqfqnSaDwLYaI3Wp43FIBd3viqshBfkEL+jhByVU4KpYUUPaF9IfQTsdDffbI9+TfvFKL7RgHxhgHQLFdPzOvcX+a0XB1rQaX7OlKInMRdSRHqaFNdhueubLVe7TfYh5k3BIBGceyYonTvdIQY6WiMeaK7HuJuCwtKiUDq+6dau04+QIj2PtTdkFb7moEWK8s56X7LNcpzisfzsCQAWoRxJIpavn+0VP3DeRq+rsX7HIBWMTytIOQRIUYe895cZuSHRn9Yp0jHQgn3M6+MjCwfrnn93/Y5AEqqU9NRl1IJXiZxzg8lCw5BioBQQagV5dj9taEm++BlnwLwMyEKSsu3mbE3Ex85Ywl8sJSJT/oFrA38I0AAh++OUEeaJvvwhqm575InKiNa6DF6fauuVRbuPsM0sYS+Z0QP1gIIR0f7fArsFQANzE2pc/sFUvVUc9fL40LUMxr1s1Uz6fs2j/KBA5TJFBi2hH5XZBAkmP7ZsuF8q1Q6oCPzK1ypOkFTvbhc7GwMt1j87TUBEBSqJzpO7iIdyXfFUkyMaBlJb/zVjtAPRFrf4AXT92VZtkXDHxXjLWPWXP7SSmMIuKHADrzNs3iQYsQKag6w27GaVEu1s5V0fhemst7RYhTPKF+WLwe69k+NqPfN5WHjmQGdhXN9mRZq9qQQ+YPK41e5sfycgwkKZftjibUdI6VEJHUcKXHzjBYXL2/vfDml1/bGt3hCvS+EZ7dznTXpFCACtnxYeTgPWEhbR58qB/W/Smk1ihPHFR15NeQ4imU9yGEsCGSMHOgTSbHT1/FnKv7kLWm/hZ6pJPO22Qhp1xTHv1WI1edjHUtEagjYEbQmVw+Sd6AcQFH5WJ5V1freVmnsHSlBqPeozacqSmGXQbq8QWLeOEE8KRRi4diX+qdpi1Zh9PyiVHdSeVic4BUTADQghIwsO5BNxnpZUaibWqXKh9K+Cz0XBWCDVzsDjM/vwJNxdbZ2mzxJmTaceHiCk5fiUFc4d0zma4ezWkXx/eyZKsi2gAA1AJH9DBpsycQaeH+4DQD6ovbzT7E0KNQuLCr3L9C4SLA1rYlXn7exLdOXmwhYad4R+e9sGxlZwf4LpQUB4DImpHOxIcClyVxW+VQNss5eYRyLvJZvKbvyBzOVykSno+8PtdjmGghSUdjH9kpL+k8oj2iBr5vp1FqF2kmucq4BhGbq2Z6szvLlO5OVsQNwIfjqkSh3ji2f/74gAG/xJo50tXgHzY0ypR7bPlMllEE+y4LzPS+cw3OR+40xUZ9C3SYERHhwhNne9jGGY25pb9gYzBr+hMS/3yyXV7qOug5bxnxM84ZiTAYeZmg9GnAZ8TgktAwrFy0ElnDqrdY9sPVu04IAgOm6nIahcq7R5JBSEJCbRZBiDa4uLCEnnLOb5dHfDKPozzFHM3t99k0FtUpYYlJgScNcFo95wdQDji58LS/Uqm6iuG2TxAn2Zc6dVCkF4cLm8pD3l8sLxhILAgAZxyyHjMBzWJIh/zgSePLCVGEPbvZd7V65uVt/DLvAe/NolaVnpr8ZPgsuR1TiPRbx1c1y7e2ulmcTSII1kGCQs0OPemNFLGeij6CDZLEs5ns9HEHMnxYEAMI0KDPFTkUfkMqUGoUhJIrMRYtBQ259C5hCJ8Mjo8lGWEEMUJDINmGddGJxDkU4Gdla9qduUbH8KoKUHOEwXdgNyXBln6E0AMhKZacDgOx0HQck508LAxDpx7HMIeaZzZAELSsz2onCphSazk5Ku58r+ZM/hinfxoMPM+hZrUCLjg+MEEzEG4Li2GqM/ik9M+1ILyMmlTcjPuBCdWcPkWMGRf5sWbu94MFKhvKAYJp7vjvzWE/q/8glDoxOZhbvtGn/SfOzYS41jEUXD0c4760XqoeEQn8pFNHONPw0tCA7dcrhIATr+A9GwsnN6PhxAOXRaQzG1rLQRjHrRMnB4kgILAxpmZQOYon4FpDO+B5LI3tfEID1sOI47l0e0XT7LLLdbd4qzLxlnzpMltCAc1hOc8r5SC2Y/gWmwYYET1abHvQNOC94rqG6XzReW6rf7nvzpNVgjK3KdsQpvlUhLWV5AcpjJfqvOK9vNN0XuC0IAPuVw5k7Q9270qXpEgRKkkl2hUjZWwBSIGwzdsDCp+UJfB8Jpr+HUPW6PEY8DzfNkDeWuu13w/N4DvhbheoaTIjDGNCkSlsKluqANqShTKhkPRO5k25PiEZXh58aq5sl2NTNd1sUAHa8Oqhf1hLR1x1wyhk2jOySC1y5bPM9TRYqCmZF45KkpTq8LqrYOArxcjDxBV9FZ+6Q0clN0T3d1+qDtV7zX1inlHtUQWgPDsxwYlk2Sa77hi7VtSsErYBlHHnsBbY3ZHRmJWhuyfabL79HAGwEpxF/6hJf9M4Euv/NUcsZIaAgh2B3CYKmiWKi2X69vLsfy4riWe6efj6OnVzecTDBAmzybELgtS7Np5TNSKMwfU+RAe6mLA/iHPlAxnfPyPi48fbUppTGYs8+zcUapvWMr2s993xscT8BENYQfY4Vd4gUiMk4aopG6ig0wsW964vB1EUtr/rRvMx9BSN2GDw9u8PRRF2t1OZuN9gAJ9fLOe7duViu5gaHqS+kJYx3Bky8200RmjzUFb1vb/Jnbj1jEadnCGZufdqZsj3KboN7qOUrJwjHxUcO9W4oemBeqtTBWxqGuhSY8z/5R3/X0aeUxz+fj+SfYeqb1YHqsQl0gUVhFVDilaaMPqB68fIR6d7vEoC0kaHI1jEjxTY6PQPI7+uI7t9V/caPTfVe3Ehxj9OUGBvzinpcxvCvGKlOXk8/0mhMv1UId/9C4ZeEk18nY7Ueh5orYyWXY7HKO0p1o07vm13XVZ6WD4KhM9+6xG8Cvo4e8fzJ90wVaxdXlHpnFMWyq5wQ349exTbpRVjL1ijsPL1N+Ntr4Fvzast6kcDhU1dHyml3gvoObAGbe6rUogBMF0YP8pR7OsztBLi9tRgR8IUFYmxg+h08d2lHPodNzENxHN/zZDD90O4+bQVe7YcFLT/MjRU3Q/MlgtDUnTMqfv222W1wBLa/1IVjlVbHwsX8CgitwkQYA0UjD9pDHrkdXnkr9o63t1v69mQzNptU/31eAHYIUakWRy+R0r0A5gml7Twf9s1UBYeXxpAx+aAXzvR/ge3TplDLm0b9yX8jpxlRmcgXck9Ayv0QUywKQFtEN5Tbk59k30lRG/WK4hRw+TjY/HoeKynLKQ8PYzhDzB3+gcooRFdm54mXrtbPIrj6Eyy93zfNdnPbLQANMbIiV8zdimXlWB47cWORJopvPb9d9rj5MdWcyEh0Ag6EwEhjJsi7fBlfio183RPuU3CXRS6eNmYzzYdu9PYMijq6tykfTH2oWar9Xj5Wvw8vf7BVmDsDpkSgdKUBvzQOtMsxZcFKZRylFA0RXVXFKjboSBo2zbFFkHacUuG7BZk7lqcv/EsZ0glb5dnZMuGpDndwljFGBaLgAARdpFOQ6iSE0ZfEgZqE5bTp8lmF5klIzbdsYgWOtxy5fZsYmcB2+hqcMB3Moy4rC9vP7sP+aTmflItJwwJwsIoBrEhnQ6tUO9+WD9/nAOB7ox/BtznM1YHiw10sM8MmMbu03o7tQAiNrSzO6NZtFVMtAMUpgMT6NFlafLPhNBsAxEjfU3DloQ7OVbijHE6pgmlpWp8+03L7pPVyR42PLBu3l8smDsm2mAOAFs45ZoUF476pmiGzxmc7W2aJ8ZsiU0ITMZEa2qKAn7hgAeuPKlQPxKbqGurCfZ8FIaVuabEO81sEUfT8S4F7OwKk04xnQ7ltYTnzzdCg+SemZOoNULPBQR+cOnexHyoIsdLT7odTKulzCAA6HCB1BIOaxRPaUACTyDgLhxWE54BRrP+9V3Zfrbanb/eVvp5RG30EqvqJPQt4R5TZ7ojogvViR7PjyHuwm+sxZpidjB8yheTPBrhAd8FkWLrvnd1mCACv6I8hrh+lp0/ANcTJxrAiEUNoFhlOBTMdEiHsyIuuEjt7Uee8icnJGZKAZ/90I+peiqhvO50dAid+BDWOsyvFo03d++BoOHMXqTOchQO9wvxwYhY7Iw1G1kybhLcRELdU1uEuVNPYNUKE4TQEAIMbzFWcS4AFbng3rXm3ZWDQH3VLyBoLTB7ltg+DBIypkiHC0/MqneZTbBkUKqeEpbHLdpTVtdvau94WxN2PNaW+vC3ir7Z70fHfa+98Nw4x4nBk4oqZQmUt+8Bq/rip9M1wpn3FsgoOzifBHjxTOTkYwyntJYPhcqtXv+x57FP2L44/ioPIXzYnwaixhk0CBnfzzJK3ByAstocUVB5gRGGsP10OJm9s5saOQHDzR1icT+WBJ/bpL8Qq/tvp1tTl6S9A2l7lPTmRvziW8mR4/TzW72lEi9e+3I6vDsSUv6Y4+g/4hclJ9uuSEcEoa3KZpbAvIQHIDBSlxzG5wI72ypGg/mVLwd6HLOBADJTW0RarA2mkyNnGVNwYknFkSRkbJzAZc5UybMfik1S+7dUuLipnC0A5FV+VzK8/sAFaDWd0yUhx9GOkYA5AdA6/IFGnYsXIhxGnnxzD151LV3nOllVe7eiXgvppONj7UQFbDZWMNHmai5/Wks9rpGdSRnm+02n20M8XEU+bhtIQAKwJY3F9T0fYl8yfLDDD9TRTHGzsCEXvtCiIftj1Jm7DN8GrIFw1TMIX7gx7zAMMRJfvI4XjPe8A8FrLNRs1JtEJ8wMLTpLe7gnnrv1KtfOwmTod0+U6bsNpSUZ/O/GTXukjASZ9RUM6XhywPLQ9aP5rvzjJzNFzrFt/GMdT17rG/c4mxl6wigRhLkj09HRmUPLBeq9zDD6hPVUuqfsQEX7UfDM0jOwUorEwYKKrQv4wVhV0fi0spGpDbNvOdMGNJo8pWCoL59pTyrUryu1dF7bj3gVwUlOYpqjbnXxpbzwxFWAzXF3Cnu58iUd8mVqTnQMAS6fC6Ut9HCjmUYtRQCIj64jSNx6UGuck5Ta03fAjf/J4zOGopNx7sJc/ksqnyQo6eIOVE8bVOAUZAZYHcy9BX9O/MibMvQN/M+Rp54stb+Lacli/bpeKj0Gg9vdAURN8TgvKl5gFnqRlBwaOPMBqcmE1aDyQSpB9sudu08PQfZ03diHm7GfxsfIg4m1OPPCAchyqpzFqt7ZleOOE77/IHys42rsXzuZQO3IEIEue+cEII4e9jL+2o7zzqrFzKdb/jBwWChsdoqUBEwphp9gQ3T+ttutfYePp4uhxBeGcj6O6E8yGjUAkH6Bg8gwAH/R1Z2MtaN6XIT6UzUo4VJG+8GetpcLo0V2h12KfVcSvOyc7Mn56xp/Zusp8xxCCvx9YUxq/vajViXbkaeQ22bHgeFgjZymdEhnPRN2jy65zDvpdkPqJYZhSA7XWYYxeKY0zg7Mq/tTNlgN2jJ63uiQLR+JcYE1Hy5Kn4h0dbImv8Wce3sgTlAXSogAs0LdfRW8PZ3WVVZ6KgiwQMIZtzJN5gMJVxbxbx9RW+gO5qHdWXrrn2p/RsV3WTiwLs8ajK0HlbhMB1qtt3T563PdfsC32/p5CvNcUeGACR/Plfvhs9gJWeauOJW0tAWOYBClUtIfFySCCMhNJso75ZD6nPsEcvVB7XDwux8HKyoIuXGYpL+2+ZADwGfyinFY1OjarMJUgWarIu7EHk0/0MzXcNmOf0JQ4MjMF6Xpu1nR7amAcG2nxSutBCYES9hPOWTsKlUMN4SXclgTALjFehUWfxp+qmGQeSZ6efHaAYozYTklYTFSOwx2BxoHRnEQauBJSs6s5ybB5KpWkc/rsutf6viQAPLfLo+3VXKoGiVZNJbNlGFHzSquwBg5rqDfCcDsOWF9kmRnldLSNSbAp6KQXGaDe4JqYEn4pdrwhyLq9TEsCAB8gGcQkqzY1hLknb1Yeq7BREAXmDes2v9wi/wJ+udDAFHmaYbIFDDT6/bN9kzwfBtjkO4TQa/5TLEvOCFn32tOSAOgoaZnbYTHCmwWQgqYTPn2yiPJhulD9SMYINZDc3k+xZE3aMwILommJfsZ79Psb7S1A4MfTQWBfPKAS8hxlr9OSACjq+BVrk1n+ENQ4rUTgpIp62MCGEQF+VieiO1g10mptw3H6Q/Z7fqYxsoQgTVTYXqTLQxXy0dO7Go1W2mZvnksCAP/YsDUU0rdhzYC9HenBe5pjHMBjLgTkzwbtxr1pOX42chP7ULW5CTXGp6Q1HH1ONcITPXIgdrBpzd48lwRANZx5DqO5yfwEjqOeqGCmMQcoc3HcebEVfnPwjezXm2m/foevxSNYUqHUgI5RaMgnsA5ww48wcO7E4q9NmyXcSHGvE/WLos5GbHHruezhXSK0Nfk+LNg1OjhwiDeXwvoNWaYMqeNe5w8QGwQOKuwYs8VgCtj2tAZ8bAUAgZa3jIb1e2z53t+XBADZ4sjrCT+KP4EZWue+285bCo7LxAfGleHEFx8/hX64Jf1zAdycbWml19ziC/1ZEOhyl5kYU0YzBD+gyTr8hPa+aTe8CHS4fPzfSK1c9V2d4vg/d7xarEvLtPbSa0J3i9gvFsdueEUs/i8wdfwyNPTGH9fexIBGkbQmdKc0Ptn0Jr6Opa/yemkNEF+/tBETdINX+VVHu78B33AgPkfE8APPBFF493in9fiecsLucuSt+crxjuMcAwIrYA/NSMU/6cTh3bUg+Pme0nmz3ZsIvInAogj8DxKvs8DgKn5eAAAAAElFTkSuQmCC';
+$('flower').innerHTML = '<img src="'+LOGO+'" alt="" width="28" height="28" style="border-radius:7px;display:block">';
+(function(){ const l=document.createElement('link'); l.rel='icon'; l.type='image/png'; l.href=LOGO; document.head.appendChild(l); })();
 
 /* ---- nav ---- */
 const NAV = [
@@ -391,14 +387,14 @@ async function serverInfo() {
 async function loadStats() {
   try {
     const s = await api('GET','/stats');
-    let online='—'; try{ online=(await api('GET','/presence/online-count')).count; }catch(e){}
+    let online='—'; try{ const oc=await api('GET','/presence/online-count'); online=(oc&&typeof oc.online==='number')?oc.online:'—'; }catch(e){}
     const cells = [
-      ['Users', s.total_users, false, true], ['Online now', online, false, false],
+      ['Users', s.total_users], ['Online now', online],
       ['New · 24h', s.new_users_24h], ['New · 7d', s.new_users_7d],
-      ['Open reports', s.open_reports, s.open_reports>0], ...(SHOW_CRASHES ? [['Crashes', s.open_crashes||0, (s.open_crashes||0)>0]] : []),
+      ['Open reports', s.open_reports, s.open_reports>0],
     ];
-    $('stats').innerHTML = cells.map(c => `<div class="stat${c[2]?' warn':''}"><div class="n">${c[3]?'<span class="dot"></span>':''}${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
-    const badge = $('reports-badge'); const open=(s.open_reports||0)+(SHOW_CRASHES?(s.open_crashes||0):0);
+    $('stats').innerHTML = cells.map(c => `<div class="stat${c[2]?' warn':''}"><div class="n">${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
+    const badge = $('reports-badge'); const open=(s.open_reports||0);
     badge.textContent = open; badge.classList.toggle('on', open>0);
   } catch (e) { $('stats').innerHTML = '<span class="err">'+e.message+' — check ADMIN_USERNAME / ADMIN_PASSWORD</span>'; }
 }
@@ -484,7 +480,7 @@ async function searchUsers() {
     const r = await api('GET','/users?q='+encodeURIComponent(q));
     $('users').innerHTML = (r.items||[]).map(u=>`<tr>
       <td class="mono">${u.uin}</td><td>${u.nickname||''}</td>
-      <td>${u.is_suspended?'<span class="pill red">suspended</span>':'<span class="pill green">'+u.status+'</span>'}</td>
+      <td>${u.is_suspended?'<span class="pill red">suspended</span>':'<span style="color:var(--mut)">'+(u.status||'active')+'</span>'}</td>
       <td>${u.reports_against}</td>
       <td style="text-align:right"><button class="btn ${u.is_suspended?'ghost':'danger'} sm" onclick="ban(${u.uin},${!u.is_suspended})">${u.is_suspended?'Unban':'Ban'}</button></td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No matches.</td></tr>';
@@ -492,18 +488,16 @@ async function searchUsers() {
 }
 async function ban(uin,suspended){ try{ await api('POST','/users/'+uin+'/ban',{suspended}); searchUsers(); }catch(e){ alert(e.message); } }
 
-/* ---- reports ---- */
-let reportKind='user';
-function setReportKind(k){ reportKind=k; document.querySelectorAll('#report-seg button').forEach((b,i)=>b.classList.toggle('on',(i===0)===(k==='user'))); loadReports(); }
+/* ---- reports (user reports only; crash reports are a maintainer concern) ---- */
 async function loadReports() {
   try {
-    const r = await api('GET','/reports?status=open&kind='+reportKind);
+    const r = await api('GET','/reports?status=open&kind=user');
     $('reports').innerHTML = (r.items||[]).map(rp=>`<tr>
       <td>${rp.id}</td>
       <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+rp.target_nickname+')</span>':''}</td>
       <td>${(rp.reason||'').slice(0,120)}</td><td><span class="pill">${rp.context||'—'}</span></td>
       <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> <button class="btn danger sm" onclick="resolve(${rp.id},true)">Ban</button></td>
-    </tr>`).join('') || '<tr><td colspan="5" class="empty">No open '+(reportKind==='crash'?'crashes':'reports')+'.</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
 }
 async function resolve(id,ban_target){ try{ await api('POST','/reports/'+id+'/resolve',{action:ban_target?'banned':'dismissed',notes:'',ban_target}); loadReports(); loadStats(); }catch(e){ alert(e.message); } }
@@ -682,7 +676,7 @@ function mock(method, path, body) {
   if (path.startsWith('/broker/admin/set')) return {ok:true};
   if (path.startsWith('/broker/admin/') && method==='DELETE') return {ok:true};
   if (path==='/stats') return {total_users:1284, fake_users:0, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
-  if (path==='/presence/online-count') return {count:48};
+  if (path==='/presence/online-count') return {online:48};
   if (path.startsWith('/timeseries/signups')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(8+14*Math.abs(Math.sin(i/3))+ (i%5===0?10:0))}})};
   if (path.startsWith('/activity')) return [
     {kind:'report_resolved',uin:710335446,nickname:'nosferatu',summary:'Report #14 dismissed',occurred_at:new Date(Date.now()-1200e3).toISOString()},
@@ -731,7 +725,6 @@ async function checkUpdate() {
 
 /* ---- boot ---- */
 loadStats(); loadChart(); loadDau(); loadActivity(); loadOnline(); checkUpdate();
-if (!SHOW_CRASHES) { const seg=$('report-seg'); if (seg) seg.style.display='none'; }
 </script>
 </body>
 </html>"""
