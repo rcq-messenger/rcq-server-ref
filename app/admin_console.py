@@ -91,7 +91,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   td.mono { color:var(--fg); }
 
   /* controls */
-  input,select { background:var(--bg); border:1px solid var(--line); color:var(--fg); border-radius:10px; padding:9px 11px; font-size:13px; outline:none; transition:border .12s,box-shadow .12s; }
+  input,select,textarea { background:var(--bg); border:1px solid var(--line); color:var(--fg); border-radius:10px; padding:9px 11px; font-size:13px; outline:none; transition:border .12s,box-shadow .12s; font-family:inherit; }
   input:focus,select:focus { border-color:var(--acc); box-shadow:0 0 0 3px var(--acc-soft); }
   input::placeholder { color:var(--dim); }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
@@ -183,6 +183,17 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
         <div class="chart-x" id="chart-x"></div>
       </div>
       <div class="card pad" style="margin-top:16px">
+        <h3>Active users · last 30 days</h3>
+        <p class="sub">Distinct users active per day.</p>
+        <div class="chart" id="chart-dau"></div>
+        <div class="chart-x" id="chart-dau-x"></div>
+      </div>
+      <div class="card pad" style="margin-top:16px">
+        <h3>Online now</h3>
+        <p class="sub">Users connected to your server right now.</p>
+        <div id="online"></div>
+      </div>
+      <div class="card pad" style="margin-top:16px">
         <h3>Recent activity</h3>
         <p class="sub">Latest moderation actions.</p>
         <div id="activity"></div>
@@ -215,7 +226,8 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       <div class="card pad">
         <div class="row">
           <input id="a_label" placeholder="Label (e.g. Alice)" style="flex:1;min-width:160px">
-          <select id="a_kind" style="width:150px"><option value="invite">One-time invite</option><option value="standing">Standing</option></select>
+          <select id="a_kind" style="width:150px" onchange="$('a_max').style.display=this.value==='standing'?'':'none'"><option value="invite">One-time invite</option><option value="standing">Standing</option></select>
+          <input id="a_max" type="number" min="1" placeholder="Max uses (∞ if blank)" title="Standing token: how many times it may be used" style="width:170px;display:none">
           <input id="a_ttl" type="number" placeholder="Expires (days)" title="Expires after N days" style="width:130px">
           <button class="btn" onclick="createAccess()">Create</button>
         </div>
@@ -260,6 +272,34 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     </section>
 
     <!-- SERVER -->
+    <!-- NEWS / ANNOUNCEMENTS -->
+    <section class="view" id="v-news">
+      <div class="head"><div><h1>News</h1><p>Broadcast an announcement to every user's in-app news feed — patch notes, planned downtime, rules.</p></div></div>
+      <div class="card pad">
+        <textarea id="n_body" rows="4" placeholder="Write an announcement… (up to 4000 chars)" style="width:100%;box-sizing:border-box;resize:vertical"></textarea>
+        <div class="row" style="margin-top:10px">
+          <input id="n_author" placeholder="Author label (optional)" style="flex:1;min-width:150px">
+          <input id="n_files" type="file" multiple accept="image/*,video/*" title="Optional image/video attachments" style="flex:1;min-width:150px">
+          <button class="btn" onclick="publishNews()">Publish</button>
+        </div>
+        <p class="sub" style="margin:10px 0 0">Posts appear in every user's News feed. Attachments are optional (images / video).</p>
+        <div class="err" id="n_err"></div>
+      </div>
+      <div class="card pad">
+        <table><thead><tr><th>Posted</th><th>Body</th><th>Media</th><th></th></tr></thead>
+          <tbody id="news"></tbody></table>
+      </div>
+    </section>
+
+    <!-- RELAYS (community circumvention pool) -->
+    <section class="view" id="v-relays">
+      <div class="head"><div><h1>Relays</h1><p>Community circumvention relays registered with this island's broker. Enable / disable, set trust tier, or remove a dead one.</p></div></div>
+      <div class="card pad">
+        <table><thead><tr><th>Tag</th><th>Tier</th><th>State</th><th>Last OK</th><th>Fails</th><th></th></tr></thead>
+          <tbody id="relays"></tbody></table>
+      </div>
+    </section>
+
     <!-- FEATURES (operator toggles) -->
     <section class="view" id="v-features">
       <div class="head"><div><h1>Features</h1><p>Turn optional features on or off, and set limits &amp; branding for your island. Changes apply live — no restart.</p></div></div>
@@ -305,6 +345,8 @@ const NAV = [
   ['access','Access tokens','M6 10V7a6 6 0 1112 0v3M5 10h14v10H5zM12 14v3'],
   ['users','Users','M8 11a3 3 0 100-6 3 3 0 000 6zM2 20c0-3 3-5 6-5s6 2 6 5M16 7a3 3 0 110 6'],
   ['reports','Reports','M12 3l9 16H3zM12 10v4M12 17v.5','reports-badge'],
+  ['news','News','M4 6h16v12H4zM4 6l8 6 8-6'],
+  ['relays','Relays','M12 20v-7M8.5 13a5 5 0 017 0M6 10.5a9 9 0 0112 0'],
   ['features','Features','M4 6h16M4 12h16M4 18h16M8 6v0M16 12v0M10 18v0'],
   ['server','Server','M4 5h16v5H4zM4 14h16v5H4zM7 7.5h.5M7 16.5h.5'],
 ];
@@ -320,6 +362,8 @@ function go(v) {
   if (v==='invites') loadInvites();
   if (v==='access') loadAccess();
   if (v==='reports') loadReports();
+  if (v==='news') loadNews();
+  if (v==='relays') loadRelays();
   if (v==='features') loadFeatures();
   if (v==='server') loadServer();
 }
@@ -420,6 +464,7 @@ async function createAccess() {
   const body = { kind: $('a_kind').value };
   if ($('a_label').value.trim()) body.label=$('a_label').value.trim();
   if ($('a_ttl').value.trim()) body.expires_in_days=parseInt($('a_ttl').value);
+  if (body.kind==='standing' && $('a_max').value.trim()) body.max_uses=parseInt($('a_max').value);
   try {
     const out = await api('POST','/access-tokens',body);
     $('a_label').value='';
@@ -481,6 +526,93 @@ async function loadServer() {
 function timeago(iso){ const s=(Date.parse(iso))?(Date.now()-Date.parse(iso))/1000:0; if(s<60)return 'just now'; if(s<3600)return Math.floor(s/60)+'m'; if(s<86400)return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; }
 
 /* ---- mock data for preview ---- */
+/* ---- overview: DAU chart + online roster ---- */
+async function loadDau() {
+  try {
+    const t = await api('GET','/timeseries/dau?days=30');
+    const pts = t.points||[]; const max = Math.max(1, ...pts.map(p=>p.count));
+    $('chart-dau').innerHTML = pts.map(p=>`<div class="bar" style="height:${Math.round(p.count/max*100)}%" title="${p.date}: ${p.count}"></div>`).join('');
+    if (pts.length) $('chart-dau-x').innerHTML = `<span>${pts[0].date.slice(5)}</span><span>${pts[pts.length-1].date.slice(5)}</span>`;
+  } catch(e){ $('chart-dau').innerHTML=''; }
+}
+async function loadOnline() {
+  try {
+    const rows = await api('GET','/presence/online');
+    $('online').innerHTML = (rows&&rows.length)
+      ? '<table><thead><tr><th>UIN</th><th>Nickname</th><th>Status</th><th>Last seen</th></tr></thead><tbody>'+rows.map(u=>`<tr>
+          <td class="mono">${u.uin}</td><td>${escAttr(u.nickname||'')}</td><td>${u.status||''}</td>
+          <td class="mono" style="color:var(--dim)">${u.last_seen?timeago(u.last_seen):'—'}</td></tr>`).join('')+'</tbody></table>'
+      : '<div class="empty">Nobody online right now.</div>';
+  } catch(e){ $('online').innerHTML='<div class="empty">'+e.message+'</div>'; }
+}
+
+/* ---- news / announcements ---- */
+async function loadNews() {
+  try {
+    const r = await api('GET','/news');
+    const items = (r&&r.items)||[];
+    $('news').innerHTML = items.length ? items.map(p=>`<tr>
+      <td class="mono" style="color:var(--dim);white-space:nowrap">${timeago(p.published_at)}</td>
+      <td>${escAttr((p.body||'').slice(0,160))}${(p.body||'').length>160?'…':''}</td>
+      <td>${(p.attachments&&p.attachments.length)||0}</td>
+      <td style="text-align:right"><button class="btn danger sm" onclick="deleteNews(${p.id})">Delete</button></td>
+    </tr>`).join('') : '<tr><td colspan="4" class="empty">No announcements yet.</td></tr>';
+  } catch(e){ $('news').innerHTML='<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
+}
+async function uploadNewsMedia(file) {
+  if (MOCK) return {media_id:'mock-'+Math.random().toString(36).slice(2,10), mime:file.type||'image/png', kind:'image'};
+  const fd = new FormData(); fd.append('blob', file);
+  const r = await fetch('/admin/news/upload', {method:'POST', body:fd, credentials:'same-origin'});
+  if (!r.ok) throw new Error('upload failed ('+r.status+')');
+  return r.json();
+}
+async function publishNews() {
+  $('n_err').textContent='';
+  const body = $('n_body').value.trim();
+  if (!body) { $('n_err').textContent='Write something first.'; return; }
+  try {
+    const atts = []; const files = $('n_files').files||[];
+    for (let i=0;i<files.length;i++){ const u = await uploadNewsMedia(files[i]); atts.push({media_id:u.media_id, mime:u.mime}); }
+    const payload = { body, attachments: atts };
+    if ($('n_author').value.trim()) payload.author_label=$('n_author').value.trim();
+    await api('POST','/news',payload);
+    $('n_body').value=''; $('n_author').value=''; $('n_files').value='';
+    loadNews();
+  } catch(e){ $('n_err').textContent='Could not publish: '+e.message; }
+}
+async function deleteNews(id){ if(!confirm('Delete this announcement?'))return; try{ await api('DELETE','/news/'+id); loadNews(); }catch(e){ alert(e.message); } }
+
+/* ---- relays (broker pool — lives under /broker/admin, not /admin) ---- */
+async function rawApi(method, path, body) {
+  if (MOCK) return mock(method, path, body);
+  const opt = { method, headers:{}, credentials:'same-origin' };
+  if (body !== undefined) { opt.headers['Content-Type']='application/json'; opt.body=JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  if (r.status===204) return null;
+  const txt = await r.text(); let data=null; try{ data=txt?JSON.parse(txt):null; }catch(e){}
+  if (!r.ok) { const d=data&&data.detail; throw new Error((d&&(d.code||d))||('HTTP '+r.status)); }
+  return data;
+}
+async function loadRelays() {
+  try {
+    const r = await rawApi('GET','/broker/admin/list');
+    const rows = (r&&r.relays)||[];
+    $('relays').innerHTML = rows.length ? rows.map(x=>`<tr>
+      <td class="mono">${escAttr(x.tag)}</td>
+      <td><span class="pill ${x.tier==='trusted'?'green':''}">${x.tier}</span></td>
+      <td>${x.enabled?'<span class="pill green">on</span>':'<span class="pill red">off</span>'}</td>
+      <td class="mono" style="color:var(--dim)">${x.last_ok?timeago(x.last_ok):'—'}</td>
+      <td>${x.fail_count||0}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{enabled:${!x.enabled}})">${x.enabled?'Disable':'Enable'}</button>
+        <button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{tier:'${x.tier==='trusted'?'community':'trusted'}'})">${x.tier==='trusted'?'Demote':'Promote'}</button>
+        <button class="btn danger sm" onclick="removeRelay('${escAttr(x.tag)}')">Remove</button>
+      </td></tr>`).join('') : '<tr><td colspan="6" class="empty">No relays registered. Community relays self-register via the bootstrap script.</td></tr>';
+  } catch(e){ $('relays').innerHTML='<tr><td colspan="6" class="err">'+e.message+' — the broker may be disabled on this island.</td></tr>'; }
+}
+async function setRelay(tag, patch){ try{ await rawApi('POST','/broker/admin/set', Object.assign({tag}, patch)); loadRelays(); }catch(e){ alert(e.message); } }
+async function removeRelay(tag){ if(!confirm('Remove relay '+tag+'?'))return; try{ await rawApi('DELETE','/broker/admin/'+encodeURIComponent(tag)); loadRelays(); }catch(e){ alert(e.message); } }
+
 /* ---- features (operator toggles) ---- */
 const FGROUPS = { features:'Features', limits:'Limits & policy', branding:'Branding' };
 function escAttr(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
@@ -530,6 +662,25 @@ function mock(method, path, body) {
     if (method==='PATCH' && body) Object.keys(body).forEach(k=>{ const s=MOCK_SETTINGS.find(x=>x.key===k); if(s){ s.value=body[k]; s.overridden=true; } });
     return { settings: MOCK_SETTINGS };
   }
+  if (path.startsWith('/timeseries/dau')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(20+28*Math.abs(Math.sin(i/4)))}})};
+  if (path==='/presence/online') return [
+    {uin:524060806,nickname:'dev',status:'online',last_seen:new Date(Date.now()-60e3).toISOString()},
+    {uin:710335446,nickname:'nosferatu',status:'away',last_seen:new Date(Date.now()-300e3).toISOString()},
+  ];
+  if (path==='/news') {
+    if (method==='POST') return {id:Math.floor(Math.random()*9000), body:(body&&body.body)||'', attachments:(body&&body.attachments)||[], author_label:(body&&body.author_label)||'', published_at:new Date().toISOString()};
+    return {items:[
+      {id:3, body:'Scheduled maintenance tonight 02:00–02:30 UTC. Expect a brief blip.', attachments:[], author_label:'Admin', published_at:new Date(Date.now()-3600e3).toISOString()},
+      {id:2, body:'New build is out — bug fixes and faster chat scrolling.', attachments:[{media_id:'x',mime:'image/png',kind:'image'}], author_label:'', published_at:new Date(Date.now()-86400e3).toISOString()},
+    ], latest_id:3};
+  }
+  if (path.startsWith('/news/') && method==='DELETE') return null;
+  if (path==='/broker/admin/list') return {relays:[
+    {tag:'do-fra', tier:'trusted', enabled:true, last_ok:new Date(Date.now()-120e3).toISOString(), fail_count:0, operator_key:'a1b2c3d4e5f6…'},
+    {tag:'community-7', tier:'community', enabled:false, last_ok:null, fail_count:3, operator_key:'99887766…'},
+  ]};
+  if (path.startsWith('/broker/admin/set')) return {ok:true};
+  if (path.startsWith('/broker/admin/') && method==='DELETE') return {ok:true};
   if (path==='/stats') return {total_users:1284, fake_users:0, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
   if (path==='/presence/online-count') return {count:48};
   if (path.startsWith('/timeseries/signups')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(8+14*Math.abs(Math.sin(i/3))+ (i%5===0?10:0))}})};
@@ -579,7 +730,7 @@ async function checkUpdate() {
 }
 
 /* ---- boot ---- */
-loadStats(); loadChart(); loadActivity(); checkUpdate();
+loadStats(); loadChart(); loadDau(); loadActivity(); loadOnline(); checkUpdate();
 if (!SHOW_CRASHES) { const seg=$('report-seg'); if (seg) seg.style.display='none'; }
 </script>
 </body>
