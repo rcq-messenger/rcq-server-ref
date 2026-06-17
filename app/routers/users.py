@@ -635,6 +635,16 @@ async def turn_credentials(uin: int = Depends(current_uin)) -> TurnCredentialsOu
         f"turn:{settings.TURN_HOST}:3478?transport=udp",
         f"turn:{settings.TURN_HOST}:3478?transport=tcp",
     ]
+    # TURN-over-TLS (turns:) — the path that survives DPI/UDP-blocking on
+    # hostile mobile networks (e.g. RU CGNAT), where plain UDP and plain-TCP:3478
+    # are exactly what gets dropped, leaving symmetric-NAT peers with no relay
+    # candidate (call UI "connects" on the SDP answer but no media ever flows).
+    # On 443 the allocation is indistinguishable from ordinary HTTPS. Emitted
+    # only when the operator has configured coturn to actually listen with TLS
+    # (see deploy docs); listed last so clients still prefer the cheaper UDP path
+    # when it works.
+    if settings.TURN_TLS_PORT:
+        urls.append(f"turns:{settings.TURN_HOST}:{settings.TURN_TLS_PORT}?transport=tcp")
     return TurnCredentialsOut(
         urls=urls,
         username=username,
