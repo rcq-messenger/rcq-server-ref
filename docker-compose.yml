@@ -90,6 +90,48 @@ services:
     volumes:
       - redis_data:/data
 
+  # TURN relay for WebRTC calls behind symmetric NAT / CGNAT. Without it, calls
+  # fall back to STUN-only: the UI "connects" (on the SDP answer) but no media
+  # ever flows for peers on hard NATs (common on mobile carriers). OPT-IN — it
+  # only starts with `docker compose --profile turn up -d`, so the default stack
+  # is unchanged. Requires TURN_HOST + TURN_SECRET in .env (the same secret the
+  # app signs credentials with). Uses host networking because coturn needs the
+  # host's real public IP and a wide UDP relay-port range, which Docker's NAT
+  # can't bridge efficiently. Open the firewall for 3478/tcp+udp and
+  # 49152-65535/udp (and 5349 if you enable TLS below).
+  #
+  # TURN-over-TLS is the path that survives DPI/UDP-blocking (e.g. RU). To enable
+  # it, mount a cert whose SAN covers TURN_HOST, uncomment the tls flags below,
+  # and set TURN_TLS_PORT in .env. Caddy already owns 443 on this host, so use
+  # 5349 here (or run coturn on a separate box to claim 443). See docs/bare-metal.md.
+  coturn:
+    image: coturn/coturn:4
+    restart: unless-stopped
+    profiles: ["turn"]
+    network_mode: host
+    command:
+      - "-n"
+      - "--realm=${TURN_HOST}"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SECRET}"
+      - "--listening-port=3478"
+      - "--min-port=49152"
+      - "--max-port=65535"
+      - "--no-cli"
+      - "--no-loopback-peers"
+      - "--no-multicast-peers"
+      - "--fingerprint"
+      # coturn auto-detects the public IP on most cloud hosts. If your box only
+      # sees a private IP on its NIC (true 1:1 NAT), set TURN_EXTERNAL_IP in .env
+      # to the public IP and uncomment the next line.
+      # - "--external-ip=${TURN_EXTERNAL_IP}"
+      # TURN-over-TLS (set TURN_TLS_PORT=5349 in .env + mount the cert below):
+      # - "--tls-listening-port=5349"
+      # - "--cert=/certs/turn.crt"
+      # - "--pkey=/certs/turn.key"
+    # volumes:
+    #   - ./certs:/certs:ro
+
 volumes:
   postgres_data:
   redis_data:

@@ -175,6 +175,12 @@ realm=island.example.com
 min-port=49152
 max-port=65535
 no-cli
+# REQUIRED on a cloud host behind 1:1 NAT (DigitalOcean, most VPS): coturn must
+# advertise the PUBLIC IP in its relay candidates, or the relayed candidate
+# points at an unroutable address and the call connects in the UI but carries no
+# media. Use `external-ip=<public>` — or `external-ip=<public>/<private>` when
+# the NIC only sees a private address.
+external-ip=PUBLIC_IP_OF_THIS_HOST
 ```
 
 ```bash
@@ -192,6 +198,47 @@ TURN_SECRET=CHANGE_ME_TURN_SECRET
 Open the firewall for TURN: TCP+UDP **3478** (control) and UDP **49152-65535**
 (the relay range above). The backend mints short-lived HMAC credentials per call
 (TURN REST API pattern), so no per-user TURN accounts are needed.
+
+### TURN-over-TLS (calls on censored / DPI'd mobile networks)
+
+Plain TURN on UDP/TCP **3478** is exactly what DPI and CGNAT firewalls on hostile
+mobile networks (e.g. RU carriers) drop — so calls there "connect" in the UI (on
+the SDP answer) but no media ever flows. **TURN-over-TLS** fixes this: a `turns:`
+allocation rides TLS and, on port **443**, is indistinguishable from ordinary
+HTTPS, so it gets through. This is the single biggest reliability win for calls
+on censored networks.
+
+Add a cert whose SAN covers `TURN_HOST` (reuse the island's existing TLS cert)
+and a TLS listener to `/etc/turnserver.conf`:
+
+```ini
+tls-listening-port=5349
+cert=/path/to/fullchain.pem
+pkey=/path/to/privkey.pem
+```
+
+Then advertise it to clients — set in `/opt/rcq/.env` and restart the app:
+
+```ini
+TURN_TLS_PORT=5349
+```
+
+**Which port?** Use **443** for maximum reach (looks like HTTPS) *only on a host
+where 443 is free* — i.e. a dedicated TURN box. If coturn shares the host with
+the web server (Caddy/nginx already own 443), use **5349** here; it still rides
+TLS, just on a non-443 port. Open the chosen port in the firewall (TCP+UDP).
+
+**Verify the relay actually works** (don't trust `nc -z 3478` — that only proves
+the port is open, not that a relay allocation succeeds). From a machine *outside*
+the host's network:
+
+```bash
+turnutils_uclient -t -u <user> -w <cred> -p 3478 TURN_HOST     # plain TCP
+turnutils_uclient -t -S -p 5349 TURN_HOST                       # TURN-over-TLS
+```
+
+A successful run prints round-trip packet stats; a hang or auth error means the
+relay isn't reachable end-to-end (check `external-ip`, the firewall, and the cert).
 
 ## Files and media
 

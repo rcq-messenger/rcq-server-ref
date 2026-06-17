@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     # networks.
     TURN_HOST: str = ""
     TURN_SECRET: str = ""
+    # TURN-over-TLS (turns:) port. 0 = disabled (plain UDP/TCP 3478 only).
+    # Set to 443 — to a DPI censor a turns:443 allocation looks like ordinary
+    # HTTPS, so it survives the UDP/plain-TCP blocking that breaks calls on
+    # hostile mobile networks (e.g. RU CGNAT). Requires coturn to actually
+    # listen with TLS on this port (tls-listening-port) using a cert whose SAN
+    # covers TURN_HOST. 5349 is the IANA-standard turns port if 443 is taken.
+    TURN_TLS_PORT: int = 0
     # Single-call TTL — coturn issues fresh credentials on every call and
     # they're discarded once the call ends, but 24h gives plenty of slack
     # for long calls or weak clocks. Don't push much higher; a leaked

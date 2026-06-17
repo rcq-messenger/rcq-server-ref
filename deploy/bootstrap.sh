@@ -54,9 +54,12 @@ ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 # coturn — TURN server for WebRTC NAT-traversal. UDP/TCP 3478 for the
-# control channel, UDP 49152-65535 for the relay range.
+# control channel, UDP 49152-65535 for the relay range. 5349 is the TURN-over-TLS
+# control port (the path that survives DPI/UDP-blocking — enabled in the conf below).
 ufw allow 3478/tcp
 ufw allow 3478/udp
+ufw allow 5349/tcp
+ufw allow 5349/udp
 ufw allow 49152:65535/udp
 ufw --force enable
 
@@ -89,6 +92,17 @@ syslog
 fingerprint
 no-tlsv1
 no-tlsv1_1
+
+# ── TURN-over-TLS (turns:) ───────────────────────────────────────────────
+# The path that survives DPI/UDP-blocking on hostile mobile networks (e.g. RU
+# CGNAT): a turns: allocation looks like ordinary HTTPS, where plain UDP/TCP:3478
+# gets dropped. Requires a cert whose SAN covers TURN_HOST. If this box also runs
+# the web server on 443 (Caddy), keep coturn TLS on 5349 (below); to use 443
+# instead, run coturn on a separate host that doesn't serve web. After enabling,
+# set TURN_TLS_PORT=5349 (or 443) in /opt/rcq/.env so the app advertises it.
+#tls-listening-port=5349
+#cert=/etc/letsencrypt/live/${PUBLIC_IP}/fullchain.pem
+#pkey=/etc/letsencrypt/live/${PUBLIC_IP}/privkey.pem
 EOTURN
 sed -i "s/^#TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/" /etc/default/coturn
 grep -q "^TURNSERVER_ENABLED=1" /etc/default/coturn || echo "TURNSERVER_ENABLED=1" >> /etc/default/coturn
