@@ -46,6 +46,7 @@ from app.core.rate_limit import _client_ip, rate_limit
 from app.core.redis import get_redis
 from app.core.security import require_admin
 from app.models.broker import BrokerRelay
+from app.services.geoip import country_of
 
 router = APIRouter(prefix="/broker", tags=["broker"])
 
@@ -55,6 +56,15 @@ _MAX_ROWS_PER_KEY = 8          # one operator key can list at most this many rel
 _MAX_TOTAL_ROWS = 1000         # global pool cap (DB-bloat floor)
 _BUCKET_PERIOD = 86400         # ring reshuffles daily
 _LIVENESS_WINDOW = 2700        # a community relay is served only if probed-alive within this many seconds (canary runs ~every 10 min)
+# Region-scoped liveness (the FRA canary is single-vantage: it wrongly drops a
+# relay reachable from a censored region but not FRA, and wrongly serves one
+# reachable from FRA but blocked in-region). Clients report reachability; a relay
+# counts as alive/dead IN A REGION only when QUORUM distinct networks there agree
+# within the window. Distinct-/24 quorum over the OBSERVED source IP is the sybil
+# resistance — no client signature needed (a client can't forge N real networks).
+_REACH_WINDOW = 7200           # a region report stays fresh this long (client reports are sparser than the canary)
+_REACH_QUORUM = 2              # distinct reporter /24s in a region needed to flip its in-region liveness
+_MAX_REACH_REPORTS = 25        # per request body
 
 # Per-proto descriptor schema: required + optional keys, each with a charset.
 _RE = {
@@ -308,16 +318,58 @@ async def get_bridges(
     reaches a client. TRUSTED relays (admin-set, and independently monitored by the
     signed-config canary) are exempt — promoting one is instant, with no gap."""
     now = int(time.time())
-    rows = (
+    client_ip = _client_ip(request)
+    region = country_of(client_ip)
+    all_rows = (
         await db.execute(select(BrokerRelay).where(BrokerRelay.enabled.is_(True)))
     ).scalars().all()
-    rows = [
-        r for r in rows
-        if r.tier == "trusted" or (r.last_ok is not None and now - r.last_ok <= _LIVENESS_WINDOW)
-    ]
+
+    # Region quorum (best-effort): count DISTINCT reporter /24s in THIS requester's
+    # region that recently called each community relay reachable / unreachable.
+    community_all = [r for r in all_rows if r.tier != "trusted"]
+    sp_of: dict[str, str] = {}
+    for r in community_all:
+        try:
+            d = json.loads(r.descriptor)
+        except ValueError:
+            continue
+        if d.get("server") and d.get("port") is not None:
+            sp_of[r.tag] = f"{d['server']}:{d['port']}"
+    ok_count: dict[str, int] = {}
+    fail_count: dict[str, int] = {}
+    try:
+        redis = await get_redis()
+        min_score = now - _REACH_WINDOW
+        probed = [r for r in community_all if r.tag in sp_of]
+        async with redis.pipeline(transaction=False) as pipe:
+            for r in probed:
+                sp = sp_of[r.tag]
+                pipe.zcount(f"broker:reach:ok:{sp}:{region}", min_score, "+inf")
+                pipe.zcount(f"broker:reach:fail:{sp}:{region}", min_score, "+inf")
+            res = await pipe.execute()
+        for idx, r in enumerate(probed):
+            ok_count[r.tag] = int(res[2 * idx] or 0)
+            fail_count[r.tag] = int(res[2 * idx + 1] or 0)
+    except Exception:
+        pass  # Redis hiccup: fall back to the canary-only gate below.
+
+    def _serve(r: BrokerRelay) -> bool:
+        # Trusted (admin-set, signed-config canary-monitored): always served.
+        if r.tier == "trusted":
+            return True
+        canary_alive = r.last_ok is not None and now - r.last_ok <= _LIVENESS_WINDOW
+        region_ok = ok_count.get(r.tag, 0) >= _REACH_QUORUM
+        region_fail = fail_count.get(r.tag, 0) >= _REACH_QUORUM
+        # In-region reachability (quorum) is the strongest signal: it rescues a
+        # relay the FRA canary can't reach but a censored region can, and it
+        # overrides region-fail noise. Otherwise fall back to the canary, unless
+        # the region quorum says it's blocked here.
+        return region_ok or (canary_alive and not region_fail)
+
+    rows = [r for r in all_rows if _serve(r)]
     if not rows:
         return {"relays": [], "ts": now}
-    bucket = f"{_ip_block(_client_ip(request))}:{now // _BUCKET_PERIOD}"
+    bucket = f"{_ip_block(client_ip)}:{now // _BUCKET_PERIOD}"
     secret = _bucket_secret()
 
     def score(r: BrokerRelay) -> str:
@@ -349,6 +401,76 @@ async def get_bridges(
     except Exception:
         pass
     return {"relays": out, "ts": now}
+
+
+@router.post(
+    "/reachability",
+    dependencies=[Depends(rate_limit("broker_reachability", 30, 60))],
+)
+async def report_reachability(
+    request: Request,
+    body: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Client reachability reports for region-scoped liveness. Body:
+    `{reports: [{server, port, ok}, …]}`. The server derives the reporter's REGION
+    (country, from its source IP) and NETWORK (/24) and records a fresh OK/FAIL
+    vote in a rolling per-(relay, region) set. /bridges then serves a community
+    relay in region R once QUORUM distinct networks there recently reported it
+    reachable — so a relay raised in a censored country reaches users there even
+    when the FRA canary can't — and suppresses a canary-alive community relay in R
+    once a quorum reports it UNREACHABLE there.
+
+    No client signature: the trust anchor is the OBSERVED source IP (a client can't
+    forge being on many distinct real /24s in a region), so quorum over distinct
+    networks IS the sybil resistance. Reports for relays not in the pool are ignored
+    (bounds the Redis keyspace to real relays × regions). Fully best-effort — a
+    Redis hiccup never errors the client, and distribution keeps working."""
+    reports = body.get("reports")
+    if not isinstance(reports, list) or not reports:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "reports must be a non-empty list")
+    if len(reports) > _MAX_REACH_REPORTS:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "too many reports")
+
+    ip = _client_ip(request)
+    region = country_of(ip)
+    net = _ip_block(ip)
+    now = int(time.time())
+
+    # Accept reports ONLY for relays actually in the pool (keyed by server:port),
+    # so a client can't mint arbitrary Redis keys.
+    known: set[str] = set()
+    for r in (await db.execute(select(BrokerRelay).where(BrokerRelay.enabled.is_(True)))).scalars().all():
+        try:
+            d = json.loads(r.descriptor)
+        except ValueError:
+            continue
+        if d.get("server") and d.get("port") is not None:
+            known.add(f"{d['server']}:{d['port']}")
+
+    accepted = 0
+    try:
+        redis = await get_redis()
+        async with redis.pipeline(transaction=False) as pipe:
+            for rep in reports:
+                if not isinstance(rep, dict):
+                    continue
+                server, port, ok = rep.get("server"), rep.get("port"), rep.get("ok")
+                if (not isinstance(server, str) or not isinstance(port, int)
+                        or isinstance(port, bool) or not isinstance(ok, bool)):
+                    continue
+                sp = f"{server}:{port}"
+                if sp not in known:
+                    continue
+                key = f"broker:reach:{'ok' if ok else 'fail'}:{sp}:{region}"
+                pipe.zadd(key, {net: now})
+                pipe.zremrangebyscore(key, 0, now - _REACH_WINDOW)
+                pipe.expire(key, _REACH_WINDOW)
+                accepted += 1
+            await pipe.execute()
+    except Exception:
+        pass
+    return {"ok": True, "accepted": accepted, "region": region, "ts": now}
 
 
 @router.post(
