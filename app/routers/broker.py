@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import _client_ip, rate_limit
+from app.core.redis import get_redis
 from app.core.security import require_admin
 from app.models.broker import BrokerRelay
 
@@ -179,6 +180,30 @@ def _verify_reg_sig(descriptor: dict, ts: int, canon_key_b64: str, sig_b64: str)
         return False
 
 
+def _status_signed_bytes(ts: int) -> bytes:
+    """Bytes an operator signs to query THEIR OWN relay status: canonical JSON of
+    {action:"status", ts}. A DISTINCT payload from registration, so a register
+    signature can't be replayed against /status (and vice-versa)."""
+    return json.dumps(
+        {"action": "status", "ts": ts},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _verify_status_sig(ts: int, canon_key_b64: str, sig_b64: str) -> bool:
+    """True iff `sig` is a valid Ed25519 signature over the status bytes under the
+    (already-canonicalized) operator key."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(canon_key_b64))
+        pub.verify(sig, _status_signed_bytes(ts))
+        return True
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        return False
+
+
 def _relay_tag(canon_key_b64: str, server: str, port: int) -> str:
     """Stable, un-squattable id from the CANONICAL operator key + endpoint. A
     different key yields a different row; the same operator re-registering the
@@ -309,7 +334,94 @@ async def get_bridges(
             continue
         d["tier"] = r.tier
         out.append(d)
+    # Best-effort reach telemetry: bump a rolling ~24h served-count per relay so an
+    # operator can confirm via /broker/status that their relay is actually being
+    # handed out. Per-relay aggregate only (no requester identity), and fully
+    # swallowed — a redis hiccup must NEVER break relay distribution.
+    try:
+        redis = await get_redis()
+        async with redis.pipeline(transaction=False) as pipe:
+            for r in chosen:
+                k = f"broker:served:{r.tag}"
+                pipe.incr(k)
+                pipe.expire(k, 86400)
+            await pipe.execute()
+    except Exception:
+        pass
     return {"relays": out, "ts": now}
+
+
+@router.post(
+    "/status",
+    dependencies=[Depends(rate_limit("broker_status", 30, 60))],
+)
+async def operator_status(
+    body: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Let an OPERATOR see the status of THEIR OWN relays — is each one being
+    served to users right now, when the canary last verified it alive, how many
+    times it's been handed out lately. Auth is the SAME Ed25519 operator key used
+    at /register: the body `{key, sig, ts}` signs `{action:"status", ts}`, and the
+    server returns ONLY rows whose operator_key matches the verified key.
+
+    NB the broker distributes DESCRIPTORS, not traffic, so it cannot report actual
+    end-user connection counts (those never touch the broker — the relay's own
+    sing-box sees them). `serving` answers the real question ("is my relay live and
+    being handed to clients"); `served_recent` is how many times it was handed out
+    in the last ~24h (a reach proxy, best-effort)."""
+    raw_key = body.get("key")
+    sig_b64 = body.get("sig")
+    ts = body.get("ts")
+    if not isinstance(raw_key, str) or not isinstance(sig_b64, str):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing key or sig")
+    # Bound ts BOTH directions (anti-replay) — tighter than register's future-only check.
+    if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0 or abs(int(time.time()) - ts) > _MAX_TS_SKEW:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing or invalid ts")
+    key_b64 = _canon_key(raw_key)
+    if key_b64 is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid operator key")
+    if not _verify_status_sig(ts, key_b64, sig_b64):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "bad signature")
+
+    now = int(time.time())
+    rows = (
+        await db.execute(select(BrokerRelay).where(BrokerRelay.operator_key == key_b64))
+    ).scalars().all()
+
+    # Best-effort reach counts (never fail the status read on a redis hiccup).
+    served: dict[str, int] = {}
+    try:
+        redis = await get_redis()
+        for r in rows:
+            v = await redis.get(f"broker:served:{r.tag}")
+            served[r.tag] = int(v) if v is not None else 0
+    except Exception:
+        served = {}
+
+    relays = []
+    for r in rows:
+        try:
+            d = json.loads(r.descriptor)
+        except ValueError:
+            d = {}
+        is_serving = bool(r.enabled) and (
+            r.tier == "trusted" or (r.last_ok is not None and now - r.last_ok <= _LIVENESS_WINDOW)
+        )
+        relays.append({
+            "tag": r.tag,
+            "proto": d.get("proto"),
+            "server": d.get("server"),
+            "port": d.get("port"),
+            "tier": r.tier,
+            "enabled": bool(r.enabled),
+            "serving": is_serving,
+            "last_ok": r.last_ok,
+            "last_ok_age_sec": (now - r.last_ok) if r.last_ok is not None else None,
+            "fail_count": r.fail_count,
+            "served_recent": served.get(r.tag, 0),
+        })
+    return {"relays": relays, "ts": now, "liveness_window_sec": _LIVENESS_WINDOW}
 
 
 # ── admin (HTTP Basic) ────────────────────────────────────────────────────────
