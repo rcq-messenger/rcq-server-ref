@@ -34,10 +34,30 @@ def issue_device_token(uin: int, device_id: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
+def _decode_session_payload(token: str) -> dict:
+    """Decode + verify a session token. The HMAC signature IS the credential;
+    `exp` is NOT enforced for a plain phone token — a messenger must not log a
+    phone out for being offline past the TTL (the 30-day exp stranded every
+    long-idle native user on 401, and iOS builds up to 2026-07 reacted to that
+    401 by silently re-registering a fresh UIN). Linked-web-device tokens
+    (`dev` claim) keep strict expiry: they are shorter-lived, independently
+    revocable guest sessions."""
+    payload = jwt.decode(
+        token,
+        settings.JWT_SECRET,
+        algorithms=[settings.JWT_ALG],
+        options={"verify_exp": False},
+    )
+    if payload.get("dev"):
+        exp = payload.get("exp")
+        if exp is None or float(exp) <= datetime.now(timezone.utc).timestamp():
+            raise JWTError("device token expired")
+    return payload
+
+
 def decode_token(token: str) -> int:
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
-        return int(payload["sub"])
+        return int(_decode_session_payload(token)["sub"])
     except (JWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
 
@@ -83,7 +103,7 @@ async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) ->
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
     try:
-        payload = jwt.decode(creds.credentials, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
+        payload = _decode_session_payload(creds.credentials)
         uin = int(payload["sub"])
     except (JWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
