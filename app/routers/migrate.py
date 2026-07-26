@@ -1,6 +1,6 @@
 """Account migration — move ALL of a user's valuable data from their
 current UIN onto another UIN (freshly allocated by default, or a
-specific target supplied by /uin/purchase). Profile + contacts +
+specific target supplied by an operator-side flow). Profile + contacts +
 groups move atomically; libsignal material is deliberately NOT moved
 (the new account starts with no signal sessions, peers re-handshake
 on next message via the standard prekey flow).

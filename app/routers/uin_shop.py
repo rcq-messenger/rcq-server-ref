@@ -1,5 +1,10 @@
-"""UIN shop — buy any free 3-9 digit UIN via IAP, then migrate the
-account to it.
+"""UIN shop — pricing + availability for vanity 3-9 digit UINs.
+
+Read-only: this router quotes prices and suggests free numbers. It does
+NOT sell anything; see the note above `/quote` for why the old
+`/purchase` endpoint was removed rather than gated. Fulfilment is
+out-of-band via `POST /admin/invites` (reserve a specific UIN against an
+invite, which is collision-checked against other live invites).
 
 Pricing tier table (shorter UIN = scarcer = pricier):
     9 digits → $0.99
@@ -15,29 +20,28 @@ The ladder roughly triples per digit drop so the 3-digit ceiling
 tier below it. The 5-digit / 6-digit tiers are the practical sweet
 spot for a "nice handle without burning a month's coffee budget".
 
-Receipt verification is currently a mock — any non-empty `receipt`
-string is accepted. Real StoreKit receipt validation slots in here
-when we wire the production IAP entitlement.
+The ladder is public (this file ships under AGPL), so treat a quoted
+price as a public fact about a UIN's digit length, not as a secret.
 """
 
 from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.security import current_uin, issue_token
+from app.core.rate_limit import rate_limit
+from app.core.security import current_uin
 from app.models.user import User
-from app.routers.migrate import _perform_migration, MigrateOut
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
 
 # Hard ICQ-style bounds. Anything outside the [3, 9] digit window is
-# rejected by both /quote and /purchase up-front; the iOS picker
+# rejected by /quote up-front; the iOS picker
 # enforces the same range client-side so server-side this is the
 # defense-in-depth gate.
 MIN_LEN = 3
@@ -78,7 +82,11 @@ class QuoteOut(BaseModel):
     reason: str | None = None
 
 
-@router.post("/quote", response_model=QuoteOut)
+@router.post(
+    "/quote",
+    response_model=QuoteOut,
+    dependencies=[Depends(rate_limit("uin_quote", 30, 60))],
+)
 async def quote(
     body: QuoteIn,
     me: int = Depends(current_uin),
@@ -112,7 +120,11 @@ class SuggestionOut(BaseModel):
     price_display: str
 
 
-@router.get("/suggestions", response_model=list[SuggestionOut])
+@router.get(
+    "/suggestions",
+    response_model=list[SuggestionOut],
+    dependencies=[Depends(rate_limit("uin_suggestions", 20, 60))],
+)
 async def suggestions(
     count: int = Query(6, ge=1, le=20),
     me: int = Depends(current_uin),
@@ -124,9 +136,9 @@ async def suggestions(
 
     The bias is toward the interesting middle (4-7 digits) — that's
     where rarity feels meaningful without being prohibitively expensive.
-    Availability is a point-in-time snapshot; the actual /purchase call
-    re-checks atomically so a tap on a stale suggestion lands a clean
-    409 instead of a successful overwrite."""
+    Availability is a point-in-time snapshot and nothing here reserves a
+    number: a suggestion can be registered by someone else a moment
+    later. Fulfilment re-checks when the operator mints the invite."""
     target_lengths = [4, 5, 5, 6, 6, 7, 7, 8]
     out: list[SuggestionOut] = []
     seen: set[int] = set()
@@ -158,34 +170,25 @@ def _price_display_for(cents: int) -> str:
     return f"${cents / 100:.2f}"
 
 
-class PurchaseIn(BaseModel):
-    uin: int = Field(gt=0)
-    # Mock IAP receipt. Any non-empty string is accepted while we ship
-    # the placeholder. When StoreKit lands, validate this against the
-    # Apple receipt-validation endpoint + match the product id against
-    # `_PRICES_CENTS[length]`.
-    receipt: str = Field(min_length=1)
-
-
-@router.post("/purchase", response_model=MigrateOut)
-async def purchase(
-    body: PurchaseIn,
-    me: int = Depends(current_uin),
-    db: AsyncSession = Depends(get_db),
-) -> MigrateOut:
-    length = _length(body.uin)
-    if length < MIN_LEN or length > MAX_LEN:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
-    if body.uin == me:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "self_target"})
-
-    taken = await db.scalar(select(User.uin).where(User.uin == body.uin)) is not None
-    if taken:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
-
-    user = await db.get(User, me)
-    if user is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
-
-    new_uin = await _perform_migration(db, user, target_uin=body.uin)
-    return MigrateOut(new_uin=new_uin, token=issue_token(new_uin))
+# NOTE: there is deliberately NO `/uin/purchase` endpoint.
+#
+# It existed until 2026-07-24 and was a hole, not a feature: its only
+# payment check was `receipt: str = Field(min_length=1)` (any non-empty
+# string passed) and it never consulted `UIN_SHOP_ENABLED` — that flag is
+# read solely by `/server/info` to advertise the capability. So on EVERY
+# island, including self-hosted ones, any authenticated caller could take
+# a free 3-digit UIN — the top of this price ladder.
+#
+# It is deleted rather than feature-gated because there is no payment
+# layer behind it to gate: a gate would still be a purchase path guarded
+# by a flag, and the flag was already ignored once. Sales happen
+# out-of-band (the operator reserves a specific UIN against an invite via
+# `POST /admin/invites`, which — unlike this router ever did — checks for
+# collisions with other live invites). Re-add a purchase endpoint only
+# together with real receipt/settlement verification.
+#
+# `/quote` and `/suggestions` stay: they are read-only pricing helpers.
+# Both are now rate-limited — `/quote` is a registration oracle (it
+# reports whether any 3-9 digit UIN is taken), so an unmetered version
+# enumerates the user base of a product whose pitch is having no
+# public identifiers.

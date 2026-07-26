@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import rate_limit
 from app.core.security import current_uin, issue_recover_challenge, issue_token, verify_recover_challenge
 from app.services import server_settings
 from app.models.contact import Contact, ContactRequest
@@ -83,7 +84,23 @@ class SessionOut(BaseModel):
     ws_url: str
 
 
-@router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=RegisterOut,
+    status_code=status.HTTP_201_CREATED,
+    # Registration is unauthenticated and mints an identity, so it is the one
+    # endpoint an attacker can call for free in a loop. This limiter is
+    # DEFENCE IN DEPTH only — the actual vanity-UIN hole is closed by the
+    # UIN_MIN/UIN_MAX clamp on `desired_uin` below, not here.
+    #
+    # Deliberately loose (and keyed by IP, since there is no UIN yet): mobile
+    # carriers across the CIS put many subscribers behind one CGNAT address,
+    # so a tight cap would turn a launch spike into "can't sign up" for real
+    # users. Failing a legitimate registration is a worse outcome than letting
+    # someone create a few junk accounts, which invite-only islands gate
+    # anyway. Do not tighten this without checking that trade again.
+    dependencies=[Depends(rate_limit("auth_register", 20, 3600))],
+)
 async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
     # Invite gate (default-open servers skip this entirely). Validate + consume
     # one use ATOMICALLY: a single UPDATE that only matches an unexpired,
@@ -127,9 +144,18 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         select(User.uin).where(User.uin == reserved_uin)
     ) is None:
         uin = reserved_uin
-    if uin is None and body.desired_uin is not None and body.desired_uin > 0 and await db.scalar(
-        select(User.uin).where(User.uin == body.desired_uin)
-    ) is None:
+    # `desired_uin` is attacker-controlled on an UNAUTHENTICATED endpoint, so
+    # it must be clamped to the same window `allocate_uin` mints from. Without
+    # the bound, "any free positive integer" included the 3-6 digit vanity
+    # range the shop prices at $199-$999 — free, to anyone, in one request.
+    # The multihoming intent (federation §5a: keep your number on a backup
+    # island) is preserved: real UINs are all inside this window.
+    if (
+        uin is None
+        and body.desired_uin is not None
+        and settings.UIN_MIN <= body.desired_uin <= settings.UIN_MAX
+        and await db.scalar(select(User.uin).where(User.uin == body.desired_uin)) is None
+    ):
         uin = body.desired_uin
     if uin is None:
         uin = await allocate_uin(db)
@@ -347,7 +373,7 @@ async def delete_account(
     )
 
     # Wipe every other per-UIN row so a RECYCLED UIN (re-registered, or
-    # bought through /uin/purchase) never inherits the burned owner's
+    # re-registered after a burn) never inherits the burned owner's
     # data. one_time_prekeys and devices ON DELETE CASCADE off the user
     # row, but these tables key on UIN with no FK cascade — exactly the
     # rows /account migration re-keys. Without this the new owner of a
