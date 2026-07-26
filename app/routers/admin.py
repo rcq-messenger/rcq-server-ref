@@ -318,10 +318,15 @@ async def resolve_report(
     if report is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such report")
 
+    # Accept both vocabularies: the admin console posts "banned"/"dismissed"
+    # (admin_console.py), older/API callers post "ban"/"no_action"/"rejected".
+    # "dismissed" was missing from the dismissal set, so pressing Dismiss filed
+    # the report as `resolved` and inflated the resolved-reports stat with
+    # reports nobody acted on.
     action = body.action.strip().lower()
     if action == "duplicate":
         new_status = "duplicate"
-    elif action in {"no_action", "rejected"}:
+    elif action in {"no_action", "rejected", "dismissed"}:
         new_status = "dismissed"
     else:
         new_status = "resolved"
@@ -331,7 +336,14 @@ async def resolve_report(
     report.status = new_status
     report.resolved_at = datetime.now(timezone.utc)
 
-    if body.ban_target and action == "ban":
+    # `ban_target` is the caller's explicit intent and is the only thing that
+    # gates the suspend. It used to ALSO require `action == "ban"`, but the
+    # admin console sends `action: "banned"` (admin_console.py, resolve()), so
+    # the two never matched: pressing Ban suspended nobody while still moving
+    # the report to `resolved` and dropping it out of the open queue. The
+    # operator got no error and every ban silently no-opped — on the one
+    # workflow that is used under time pressure.
+    if body.ban_target:
         target = await db.get(User, report.target_uin)
         if target is not None:
             target.is_suspended = True

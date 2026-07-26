@@ -442,7 +442,20 @@ async def search_groups(
     if len(needle) < 2:
         return []
     capped = max(1, min(limit, 50))
-    clauses = [Group.name.ilike(f"%{needle}%")]
+    # CLOSED groups must never come back from a name search. A closed group is
+    # invite-only, and this endpoint is reachable by any registered caller
+    # (registration needs no phone/email), so an unfiltered substring match let
+    # anyone sweep a dictionary of words and enumerate an island's private
+    # communities — together with each one's owner UIN and nickname, i.e. the
+    # person to lean on. Android already discarded closed rows client-side
+    # (HomeScreen.kt), which is where the intent is documented; iOS did not
+    # filter at all, so they rendered in its Add view. Enforced here instead,
+    # because the client is not the security boundary.
+    #
+    # Exact-id lookup keeps working for closed groups: that path is how a
+    # share link resolves, and there the LINK is the capability (same rule as
+    # `/{group_id}/preview` below).
+    clauses = [and_(Group.name.ilike(f"%{needle}%"), Group.is_closed.is_(False))]
     if needle.isdigit():
         try:
             clauses.append(Group.id == int(needle))
