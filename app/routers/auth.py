@@ -10,7 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import current_uin, issue_recover_challenge, issue_token, verify_recover_challenge
+from app.core.security import (
+    bump_uin_epoch,
+    cache_uin_epoch,
+    current_uin,
+    issue_recover_challenge,
+    issue_token,
+    uin_epoch,
+    verify_recover_challenge,
+)
 from app.services import server_settings
 from app.models.contact import Contact
 from app.models.invite import Invite
@@ -207,12 +215,14 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
                 {"type": "group_membership_changed", "group": payload},
             )
 
-    return RegisterOut(uin=uin, token=issue_token(uin))
+    # Mint under the number's CURRENT epoch: a recycled UIN starts above 0,
+    # which is what stops a previous holder's saved bearer from working.
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin)))
 
 
 @router.post("/session", response_model=SessionOut)
 async def session(uin: int = Depends(current_uin)) -> SessionOut:
-    return SessionOut(token=issue_token(uin), ws_url=f"/ws/{uin}")
+    return SessionOut(token=issue_token(uin, await uin_epoch(uin)), ws_url=f"/ws/{uin}")
 
 
 # ── account recovery (seed-phrase) ──────────────────────────────────────────
@@ -270,7 +280,7 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     ).scalar_one_or_none()
     if uin is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
-    return RegisterOut(uin=uin, token=issue_token(uin))
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin)))
 
 
 # ── identity key re-issue (in-place rotation) ───────────────────────────────
@@ -308,7 +318,7 @@ async def reissue(
     user.identity_key = ik
     user.signing_key = sk
     await db.commit()
-    return RegisterOut(uin=uin, token=issue_token(uin))
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin)))
 
 
 @router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
@@ -382,5 +392,11 @@ async def delete_account(
     await purge_uin_rows(db, uin)
     await db.execute(delete(DeviceToken).where(DeviceToken.uin == uin))
 
+    # The number goes back into circulation, so retire every token minted for
+    # THIS holder: otherwise a saved bearer keeps authenticating as whoever
+    # gets the number next (see app/models/uin_epoch.py).
+    new_epoch = await bump_uin_epoch(db, uin)
+
     await db.delete(user)
     await db.commit()
+    await cache_uin_epoch(uin, new_epoch)
