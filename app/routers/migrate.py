@@ -20,21 +20,17 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import delete, update
+from sqlalchemy import delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.security import current_uin, issue_token
-from app.models.contact import Contact, ContactRequest
 from app.models.device_token import DeviceToken
-from app.models.audio_room import AudioRoom, AudioRoomMembership, AudioRoomMute
-from app.models.group import Group, GroupMember
-from app.models.message import OfflineMessage
-from app.models.poll import Poll, PollVote
-from app.models.story import Story
 from app.models.user import User
 from app.services.connection_manager import manager
 from app.services.uin import allocate_uin
+from app.services.uin_rows import rekey_uin_rows
 
 router = APIRouter(prefix="/account", tags=["account"])
 
@@ -97,6 +93,10 @@ async def _perform_migration(
         homepage=user.homepage,
         status_message=user.status_message,
         status="offline",
+        # Suspension follows the PERSON. Without this, migrating minted a
+        # clean account and a ban lasted exactly as long as it took the
+        # banned user to press "new number".
+        is_suspended=user.is_suspended,
         last_seen_visibility=user.last_seen_visibility,
         gender_visibility=user.gender_visibility,
         profile_visibility=user.profile_visibility,
@@ -106,57 +106,29 @@ async def _perform_migration(
         push_preferences=user.push_preferences,
     )
     db.add(new_user)
-    await db.flush()  # surface the new user before FK swaps
+    try:
+        await db.flush()  # surface the new user before FK swaps
+    except IntegrityError as exc:
+        # Two callers raced onto the same target UIN (or it was registered
+        # between the availability check and here). The loser used to get an
+        # unhandled 500 that no client maps to anything useful.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "taken"}
+        ) from exc
 
     # Step 2: re-key every owned-by-uin row. UPDATEs rather than
     # insert+delete so we don't have to worry about cascading deletes
     # wiping rows mid-flight.
-    await db.execute(
-        update(Contact).where(Contact.owner_uin == old_uin).values(owner_uin=target_uin)
-    )
-    await db.execute(
-        update(Contact).where(Contact.contact_uin == old_uin).values(contact_uin=target_uin)
-    )
-    await db.execute(
-        update(ContactRequest).where(ContactRequest.from_uin == old_uin).values(from_uin=target_uin)
-    )
-    await db.execute(
-        update(ContactRequest).where(ContactRequest.to_uin == old_uin).values(to_uin=target_uin)
-    )
-
-    await db.execute(
-        update(OfflineMessage).where(OfflineMessage.to_uin == old_uin).values(to_uin=target_uin)
-    )
-
-    await db.execute(
-        update(Group).where(Group.owner_uin == old_uin).values(owner_uin=target_uin)
-    )
-    await db.execute(
-        update(GroupMember).where(GroupMember.uin == old_uin).values(uin=target_uin)
-    )
-
-    await db.execute(
-        update(AudioRoom).where(AudioRoom.owner_uin == old_uin).values(owner_uin=target_uin)
-    )
-    await db.execute(
-        update(AudioRoomMembership)
-        .where(AudioRoomMembership.uin == old_uin)
-        .values(uin=target_uin)
-    )
-    await db.execute(
-        update(AudioRoomMute).where(AudioRoomMute.uin == old_uin).values(uin=target_uin)
-    )
-
-    await db.execute(
-        update(Poll).where(Poll.creator_uin == old_uin).values(creator_uin=target_uin)
-    )
-    await db.execute(
-        update(PollVote).where(PollVote.voter_uin == old_uin).values(voter_uin=target_uin)
-    )
-
-    await db.execute(
-        update(Story).where(Story.owner_uin == old_uin).values(owner_uin=target_uin)
-    )
+    #
+    # The table list lives in `app/services/uin_rows.py` because the burn path
+    # (`DELETE /auth/account`) has to agree with it row for row. Both used to
+    # keep private, hand-maintained lists and both had gaps: this path silently
+    # stranded queued GROUP ciphertext, the queue drain cursor, moderation
+    # reports and the signed federation record, none of which carry a foreign
+    # key and so survived the old user row pointing at a number that had just
+    # changed hands.
+    await rekey_uin_rows(db, old_uin, target_uin)
 
     # Device push tokens belong to the device, not the account. After
     # migration the iOS client re-registers under the new UIN, so we
@@ -164,16 +136,19 @@ async def _perform_migration(
     # next legitimate notification (same APNs token, two UINs).
     await db.execute(delete(DeviceToken).where(DeviceToken.uin == old_uin))
 
-    # Step 3: tell anyone still connected under old_uin that we're
-    # done — same `account_burned` event the burn flow uses. Multi-
-    # device clients hit it and tear down their local state.
-    await manager.broadcast([old_uin], {"type": "account_burned"})
-
-    # Step 4: drop the old User row. Anything still referencing
-    # old_uin cascades.
+    # Step 3: drop the old User row. FK-cascading rows (prekeys, devices,
+    # nearby check-ins) go with it; everything without an FK was re-keyed
+    # above.
     await db.delete(user)
     await db.flush()
     await db.commit()
+
+    # Step 4: only NOW tell anyone still connected under old_uin that we're
+    # done — same `account_burned` event the burn flow uses. Multi-device
+    # clients hit it and tear down their local state, so it must not fire
+    # until the swap is durable: broadcasting before the commit meant a failed
+    # commit left clients wiping state for a migration that never happened.
+    await manager.broadcast([old_uin], {"type": "account_burned"})
 
     return target_uin
 
@@ -186,6 +161,12 @@ async def migrate(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    # A suspended account may not mint a fresh identity. `is_suspended` now
+    # rides along in `_perform_migration` too, so this is belt-and-braces:
+    # refuse outright rather than hand out a new number and rely on the flag
+    # having been copied correctly.
+    if user.is_suspended:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
 
     if MIGRATION_COOLDOWN_SECONDS > 0:
         from app.core.redis import get_redis
