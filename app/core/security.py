@@ -11,12 +11,21 @@ _bearer = HTTPBearer(auto_error=False)
 _basic = HTTPBasic(auto_error=False)
 
 
-def issue_token(uin: int) -> str:
+def issue_token(uin: int, epoch: int = 0) -> str:
+    """Mint a session token for `uin`.
+
+    `epoch` binds the token to the current holder of the number (see
+    `app.models.uin_epoch`). It is omitted from the claims when 0 so tokens for
+    numbers that have never changed hands are byte-identical to the ones this
+    function produced before the epoch existed.
+    """
     payload = {
         "sub": str(uin),
         "iat": datetime.now(timezone.utc),
         "exp": datetime.now(timezone.utc) + timedelta(seconds=settings.JWT_TTL_SECONDS),
     }
+    if epoch:
+        payload["ep"] = epoch
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
@@ -116,9 +125,101 @@ async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) ->
         redis = await get_redis()
         if await redis.sismember(f"dev_revoked:{uin}", dev):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "device revoked")
+    # Reject a token minted for a PREVIOUS holder of this number. Absent claim
+    # and absent row both read as epoch 0, so sessions predating this check are
+    # unaffected — only a number that actually changed hands invalidates.
+    if int(payload.get("ep") or 0) != await uin_epoch(uin):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "stale token")
     if await is_suspended(uin):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
     return uin
+
+
+# ── UIN recycling guard ──────────────────────────────────────────────
+#
+# See `app.models.uin_epoch` for the takeover primitive this closes. Cached in
+# Redis because it is consulted on every authenticated request; the DB row is
+# authoritative and the cache is written through on bump.
+_EPOCH_KEY = "uin_epochs"
+_EPOCH_LOADED_KEY = "uin_epochs:loaded"
+_EPOCH_TTL_SECONDS = 300
+
+
+async def _ensure_epochs_loaded(redis) -> None:
+    if await redis.exists(_EPOCH_LOADED_KEY):
+        return
+    from sqlalchemy import select
+
+    from app.core.db import SessionLocal
+    from app.models.uin_epoch import UinEpoch
+
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(select(UinEpoch.uin, UinEpoch.epoch).where(UinEpoch.epoch > 0))
+        ).all()
+    pipe = redis.pipeline()
+    pipe.delete(_EPOCH_KEY)
+    if rows:
+        pipe.hset(_EPOCH_KEY, mapping={str(u): str(e) for u, e in rows})
+    pipe.set(_EPOCH_LOADED_KEY, "1", ex=_EPOCH_TTL_SECONDS)
+    await pipe.execute()
+
+
+async def uin_epoch(uin: int) -> int:
+    """Current epoch of `uin`. Falls back to the DB, then to 0.
+
+    Unlike the suspension gate this must NOT fail open into "reject": a Redis
+    outage returning 0 would refuse every token that legitimately carries an
+    epoch. It therefore degrades to the database, and only to 0 if that is
+    unreachable too — at which point nothing else works either.
+    """
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        await _ensure_epochs_loaded(redis)
+        raw = await redis.hget(_EPOCH_KEY, str(uin))
+        return int(raw) if raw else 0
+    except Exception:  # noqa: BLE001
+        try:
+            from sqlalchemy import select
+
+            from app.core.db import SessionLocal
+            from app.models.uin_epoch import UinEpoch
+
+            async with SessionLocal() as db:
+                return int(
+                    await db.scalar(select(UinEpoch.epoch).where(UinEpoch.uin == uin)) or 0
+                )
+        except Exception:  # noqa: BLE001
+            return 0
+
+
+async def bump_uin_epoch(db, uin: int) -> int:
+    """Called when `uin` is released (burn) so every token minted for the
+    outgoing holder stops authenticating. Returns the new epoch. The caller
+    owns the commit; the cache is refreshed after it."""
+    from sqlalchemy import select
+
+    from app.models.uin_epoch import UinEpoch
+
+    row = await db.get(UinEpoch, uin)
+    if row is None:
+        row = UinEpoch(uin=uin, epoch=1)
+        db.add(row)
+    else:
+        row.epoch = int(row.epoch or 0) + 1
+    await db.flush()
+    return int(row.epoch)
+
+
+async def cache_uin_epoch(uin: int, epoch: int) -> None:
+    """Write-through so a bump takes effect without waiting for the reload."""
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        await redis.hset(_EPOCH_KEY, str(uin), str(epoch))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ── suspension gate ──────────────────────────────────────────────────

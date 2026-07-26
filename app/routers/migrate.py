@@ -25,7 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.security import current_uin, issue_token
+from app.core.security import bump_uin_epoch, cache_uin_epoch, current_uin, issue_token, uin_epoch
 from app.models.device_token import DeviceToken
 from app.models.user import User
 from app.services.connection_manager import manager
@@ -136,14 +136,20 @@ async def _perform_migration(
     # next legitimate notification (same APNs token, two UINs).
     await db.execute(delete(DeviceToken).where(DeviceToken.uin == old_uin))
 
-    # Step 3: drop the old User row. FK-cascading rows (prekeys, devices,
+    # Step 3: old_uin goes back into circulation, so retire every token minted
+    # for THIS holder — otherwise the migrating user's own saved bearer keeps
+    # authenticating as whoever is handed the number next.
+    old_epoch = await bump_uin_epoch(db, old_uin)
+
+    # Step 4: drop the old User row. FK-cascading rows (prekeys, devices,
     # nearby check-ins) go with it; everything without an FK was re-keyed
     # above.
     await db.delete(user)
     await db.flush()
     await db.commit()
+    await cache_uin_epoch(old_uin, old_epoch)
 
-    # Step 4: only NOW tell anyone still connected under old_uin that we're
+    # Step 5: only NOW tell anyone still connected under old_uin that we're
     # done — same `account_burned` event the burn flow uses. Multi-device
     # clients hit it and tear down their local state, so it must not fire
     # until the swap is durable: broadcasting before the commit meant a failed
@@ -194,4 +200,4 @@ async def migrate(
             ex=MIGRATION_COOLDOWN_SECONDS,
         )
 
-    return MigrateOut(new_uin=new_uin, token=issue_token(new_uin))
+    return MigrateOut(new_uin=new_uin, token=issue_token(new_uin, await uin_epoch(new_uin)))
