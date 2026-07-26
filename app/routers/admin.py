@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.security import require_admin
+from app.core.security import mark_suspended, require_admin
 from app.models.invite import Invite
 from app.models.report import Report
 from app.models.user import User, effective_status
@@ -343,12 +343,16 @@ async def resolve_report(
     # the report to `resolved` and dropping it out of the open queue. The
     # operator got no error and every ban silently no-opped — on the one
     # workflow that is used under time pressure.
+    banned_uin: int | None = None
     if body.ban_target:
         target = await db.get(User, report.target_uin)
         if target is not None:
             target.is_suspended = True
+            banned_uin = target.uin
 
     await db.commit()
+    if banned_uin is not None:
+        await mark_suspended(banned_uin, True)
     await db.refresh(report)
 
     target_user = await db.get(User, report.target_uin)
@@ -414,6 +418,9 @@ async def set_ban(uin: int, body: BanIn, db: AsyncSession = Depends(get_db)) -> 
     user.is_suspended = body.suspended
     await db.commit()
     await db.refresh(user)
+    # Mirror into the Redis set `current_uin` consults, so the ban takes effect
+    # on the REST surface immediately instead of at the next cache refresh.
+    await mark_suspended(uin, body.suspended)
     return await _summarize(db, user)
 
 

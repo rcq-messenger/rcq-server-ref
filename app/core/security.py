@@ -116,7 +116,80 @@ async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) ->
         redis = await get_redis()
         if await redis.sismember(f"dev_revoked:{uin}", dev):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "device revoked")
+    if await is_suspended(uin):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
     return uin
+
+
+# ── suspension gate ──────────────────────────────────────────────────
+#
+# `users.is_suspended` used to be enforced in exactly ONE runtime place:
+# the WebSocket handshake (`routers/ws.py`). Everything else that read the
+# column was the admin UI or a public-listing filter, so a banned account
+# holding a live bearer token kept working over plain HTTP — it could still
+# POST stories, upload media and file reports; it just could not hold a
+# socket. Since phone tokens deliberately never expire, "banned" was closer
+# to "logged out of the socket" than to "banned".
+#
+# The set is mirrored into Redis rather than read from Postgres because this
+# runs on every authenticated request. Same idiom as the `dev_revoked`
+# denylist above. It is a CACHE with no TTL, authoritative-on-write: the
+# admin ban/unban paths update it, and a cold Redis is warmed on demand from
+# the DB by `refresh_suspended`.
+_SUSPENDED_KEY = "suspended_uins"
+# Freshness marker for the set above. Without it, a Redis restart would drop
+# the set and silently un-ban everyone until the next app restart; with it the
+# set rebuilds itself from Postgres within the TTL. Costs one small query per
+# worker per window, not per request.
+_SUSPENDED_LOADED_KEY = "suspended_uins:loaded"
+_SUSPENDED_TTL_SECONDS = 300
+
+
+async def _ensure_suspended_loaded(redis) -> None:
+    if await redis.exists(_SUSPENDED_LOADED_KEY):
+        return
+    from sqlalchemy import select
+
+    from app.core.db import SessionLocal
+    from app.models.user import User
+
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(select(User.uin).where(User.is_suspended.is_(True)))
+        ).scalars().all()
+    pipe = redis.pipeline()
+    pipe.delete(_SUSPENDED_KEY)
+    if rows:
+        pipe.sadd(_SUSPENDED_KEY, *[str(u) for u in rows])
+    pipe.set(_SUSPENDED_LOADED_KEY, "1", ex=_SUSPENDED_TTL_SECONDS)
+    await pipe.execute()
+
+
+async def is_suspended(uin: int) -> bool:
+    """True when `uin` is banned. Fails OPEN (returns False) if Redis is
+    unreachable — consistent with the rate limiter, and preferable to
+    locking every user out of the product during a Redis blip."""
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        await _ensure_suspended_loaded(redis)
+        return bool(await redis.sismember(_SUSPENDED_KEY, str(uin)))
+    except Exception:  # noqa: BLE001 - cache miss must not break auth
+        return False
+
+
+async def mark_suspended(uin: int, suspended: bool) -> None:
+    """Mirror a ban/unban into the Redis set. Best-effort: the DB column
+    stays the source of truth and `refresh_suspended` can rebuild from it."""
+    try:
+        from app.core.redis import get_redis
+        redis = await get_redis()
+        if suspended:
+            await redis.sadd(_SUSPENDED_KEY, str(uin))
+        else:
+            await redis.srem(_SUSPENDED_KEY, str(uin))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def current_device_id(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:

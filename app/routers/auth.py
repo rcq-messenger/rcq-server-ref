@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -12,19 +12,16 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin, issue_recover_challenge, issue_token, verify_recover_challenge
 from app.services import server_settings
-from app.models.contact import Contact, ContactRequest
+from app.models.contact import Contact
 from app.models.invite import Invite
 from app.models.group import Group, GroupMember
-from app.models.message import OfflineMessage
-from app.models.audio_room import AudioRoom, AudioRoomMembership, AudioRoomMute
-from app.models.poll import Poll, PollVote
-from app.models.story import Story
 from app.models.device_token import DeviceToken
 from app.models.user import User
 from app.routers.groups import _load_group, _members_with_users, _serialize
 from app.routers.referrals import record_referral
 from app.services.connection_manager import manager
 from app.services.uin import allocate_uin
+from app.services.uin_rows import purge_uin_rows
 
 log = logging.getLogger(__name__)
 
@@ -373,27 +370,16 @@ async def delete_account(
     )
 
     # Wipe every other per-UIN row so a RECYCLED UIN (re-registered, or
-    # re-registered after a burn) never inherits the burned owner's
-    # data. one_time_prekeys and devices ON DELETE CASCADE off the user
-    # row, but these tables key on UIN with no FK cascade — exactly the
-    # rows /account migration re-keys. Without this the new owner of a
-    # recycled UIN sees the previous owner's contacts, pending requests,
-    # queued ciphertext, owned rooms/polls/stories, etc.
-    await db.execute(
-        delete(Contact).where(or_(Contact.owner_uin == uin, Contact.contact_uin == uin))
-    )
-    await db.execute(
-        delete(ContactRequest).where(
-            or_(ContactRequest.from_uin == uin, ContactRequest.to_uin == uin)
-        )
-    )
-    await db.execute(delete(OfflineMessage).where(OfflineMessage.to_uin == uin))
-    await db.execute(delete(AudioRoomMembership).where(AudioRoomMembership.uin == uin))
-    await db.execute(delete(AudioRoomMute).where(AudioRoomMute.uin == uin))
-    await db.execute(delete(AudioRoom).where(AudioRoom.owner_uin == uin))
-    await db.execute(delete(PollVote).where(PollVote.voter_uin == uin))
-    await db.execute(delete(Poll).where(Poll.creator_uin == uin))
-    await db.execute(delete(Story).where(Story.owner_uin == uin))
+    # re-registered after a burn) never inherits the burned owner's data.
+    # one_time_prekeys and devices ON DELETE CASCADE off the user row, but a
+    # long tail of tables key on UIN with no FK cascade.
+    #
+    # The list lives in `app/services/uin_rows.py`, shared with the migration
+    # path so the two can no longer drift: this block and that one were both
+    # hand-maintained and both had gaps (queued GROUP ciphertext, the queue
+    # drain cursor, story views, capabilities, referrals, hood posts and the
+    # signed federation record were missed here).
+    await purge_uin_rows(db, uin)
     await db.execute(delete(DeviceToken).where(DeviceToken.uin == uin))
 
     await db.delete(user)
