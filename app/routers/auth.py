@@ -149,16 +149,33 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         select(User.uin).where(User.uin == reserved_uin)
     ) is None:
         uin = reserved_uin
-    # `desired_uin` is attacker-controlled on an UNAUTHENTICATED endpoint, so
-    # it must be clamped to the same window `allocate_uin` mints from. Without
-    # the bound, "any free positive integer" included the 3-6 digit vanity
-    # range the shop prices at $199-$999 — free, to anyone, in one request.
-    # The multihoming intent (federation §5a: keep your number on a backup
-    # island) is preserved: real UINs are all inside this window.
+    # `desired_uin` is attacker-controlled on an UNAUTHENTICATED endpoint, so it
+    # is bounded — but the ceiling is what matters, not a floor at UIN_MIN.
+    #
+    # A floor of UIN_MIN looks right (it is the window `allocate_uin` mints
+    # from) and is wrong in practice: 901 live accounts on the flagship hold
+    # numbers BELOW it, 250 of them active in the last month, issued before the
+    # range was raised. Since every client sends `desired_uin` only for
+    # multihoming (federation §5a — Android Multihome.kt, iOS Multihome.swift,
+    # web multihome.ts all pass the user's OWN uin and nothing else), a floor
+    # silently downgrades exactly those users: they add a backup island and
+    # quietly stop having one number everywhere.
+    #
+    # The scarce-number worry that motivated a floor is handled elsewhere and
+    # better: the shop is gone, and `POST /admin/invites` already refuses to
+    # reserve anything outside UIN_MIN..UIN_MAX, so a short number cannot be
+    # sold through the supported path regardless. Bulk squatting is bounded by
+    # the registration limiter above.
+    #
+    # The real fix, when vanity numbers become sellable, is to require PROOF of
+    # prior tenure rather than a numeric guess: a signed federation
+    # island-record (`GET /federation/island-record/{uin}`) already binds a UIN
+    # to its holder's keys, so a multihoming client can present one and a
+    # squatter cannot.
     if (
         uin is None
         and body.desired_uin is not None
-        and settings.UIN_MIN <= body.desired_uin <= settings.UIN_MAX
+        and 0 < body.desired_uin <= settings.UIN_MAX
         and await db.scalar(select(User.uin).where(User.uin == body.desired_uin)) is None
     ):
         uin = body.desired_uin
