@@ -10,6 +10,10 @@ Surfaces:
   • Live presence: who's connected right now
 """
 
+import logging
+import os
+from pathlib import Path
+
 import httpx
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -31,6 +35,8 @@ from app.services import server_settings
 from app.services.hof_stats import bug_report_stats
 
 import time as _time
+
+log = logging.getLogger(__name__)
 
 # In-memory TTL cache for the read-heavy analytics endpoints. The admin
 # dashboard polls these on a short interval; without caching, each poll
@@ -166,6 +172,12 @@ class ReportOut(BaseModel):
     created_at: datetime
     resolved_at: datetime | None
     attachments: list[ReportAttachmentOut] = []
+    # True when this report carries DECRYPTED media the reporter consented to
+    # share. The file itself is fetched separately from
+    # `GET /admin/reports/{id}/evidence` so it is never inlined into a list
+    # response (and so every view of it is logged individually).
+    has_evidence: bool = False
+    evidence_mime: str | None = None
 
 
 class ReportsListOut(BaseModel):
@@ -275,6 +287,8 @@ async def list_reports(
             created_at=r.created_at,
             resolved_at=r.resolved_at,
             attachments=_coerce_attachments(r.attachments),
+            has_evidence=bool(r.evidence_path),
+            evidence_mime=r.evidence_mime,
         )
         for r in rows
     ]
@@ -371,6 +385,57 @@ async def resolve_report(
         created_at=report.created_at,
         resolved_at=report.resolved_at,
         attachments=_coerce_attachments(report.attachments),
+        has_evidence=bool(report.evidence_path),
+        evidence_mime=report.evidence_mime,
+    )
+
+
+# ── Report evidence (decrypted media) ───────────────────────────────
+
+
+@router.get("/reports/{report_id}/evidence", include_in_schema=False)
+async def get_report_evidence(
+    report_id: int,
+    admin: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve the decrypted media a reporter consented to attach.
+
+    This is the read half that `POST /reports/with_evidence` was written
+    against and that never existed: the upload path stored files under
+    `evidence/` and recorded the path, but nothing could open them, so the
+    feature collected other people's decrypted pictures and gave moderators
+    nothing. Retention is handled by `services/evidence_sweep`.
+
+    Every fetch is logged with the admin username. Looking at content a user
+    surrendered under a consent prompt should leave a trace naming who looked,
+    and it is the difference between 'we hold evidence' and 'we hold evidence
+    with an access record' in any conversation where that distinction matters.
+    """
+    from fastapi.responses import FileResponse
+
+    report = await db.get(Report, report_id)
+    if report is None or not report.evidence_path:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no evidence for this report")
+
+    # `evidence_path` is written as a bare UUID filename, but resolve and
+    # re-anchor it anyway so a malformed/legacy row can never walk out of the
+    # directory.
+    base = Path(os.environ.get("RCQ_EVIDENCE_DIR", "evidence")).resolve()
+    target = (base / Path(report.evidence_path).name).resolve()
+    if not target.is_relative_to(base) or not target.exists():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "evidence file is gone")
+
+    log.warning(
+        "[evidence-access] admin=%s report=%s target_uin=%s reporter_uin=%s mime=%s",
+        admin, report.id, report.target_uin, report.reporter_uin, report.evidence_mime,
+    )
+    return FileResponse(
+        target,
+        media_type=report.evidence_mime or "application/octet-stream",
+        # inline so the console can render it in an <img>/<video> rather than
+        # forcing a download onto the moderator's disk.
+        content_disposition_type="inline",
     )
 
 
