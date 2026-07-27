@@ -1,3 +1,23 @@
+"""Groups: create/join/manage, plus the two discovery surfaces.
+
+⚠️ OPEN DESIGN ISSUE — closed-group discoverability.
+`/{group_id}/preview` is deliberately optional-auth because a share link is
+meant to be the whole capability: a cross-island client with no token on this
+island still has to be able to render the join card. That only holds if the
+link is unguessable, and it is not — group ids are sequential integers, so the
+"capability" is a number an attacker can count to. `/search` no longer returns
+closed groups (they were enumerable by name substring together with their
+owner's UIN and nickname), and preview is now rate-limited down to a human join
+flow, but neither is a fix: a patient scan of the id space still enumerates
+every closed group on an island.
+
+Closing it properly needs an unguessable component in the share link for closed
+groups (a per-group token in `rcq://group/<id>?k=<token>`, checked here when the
+group is closed), which is a client-visible change to the link format and the
+join flow on all three clients, plus a migration for links already in the wild.
+Not something to bolt on quietly — it needs a deliberate decision.
+"""
+
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -385,7 +405,18 @@ class GroupPreviewOut(BaseModel):
 @router.get(
     "/{group_id}/preview",
     response_model=GroupPreviewOut,
-    dependencies=[Depends(rate_limit("group_preview", 120, 60))],
+    # 120/min let one caller walk ~7200 group ids an hour. Group ids are
+    # SEQUENTIAL and this route is optional-auth, so that was a full catalogue
+    # dump — names, member counts and owner identity — for closed groups too,
+    # i.e. the same exposure `/search` had, through a second door. Narrowed to
+    # a human join flow (a share-link tap previews one group, occasionally a
+    # few); anything above this is enumeration, not use.
+    #
+    # ⚠️ This only shrinks the window, it does not close it: as long as ids are
+    # guessable and the share LINK is the whole capability, a patient scan
+    # still works. The real fix is an unguessable component in the share link
+    # for closed groups; see the note in the module docstring.
+    dependencies=[Depends(rate_limit("group_preview", 30, 60))],
 )
 async def preview_group(
     group_id: int,
