@@ -495,10 +495,27 @@ async function loadReports() {
     $('reports').innerHTML = (r.items||[]).map(rp=>`<tr>
       <td>${rp.id}</td>
       <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+rp.target_nickname+')</span>':''}</td>
-      <td>${(rp.reason||'').slice(0,120)}</td><td><span class="pill">${rp.context||'—'}</span></td>
+      <td>${(rp.reason||'').slice(0,120)}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}</td><td><span class="pill">${rp.context||'—'}</span></td>
       <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> <button class="btn danger sm" onclick="resolve(${rp.id},true)">Ban</button></td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
+}
+/* Report evidence = DECRYPTED media the reporter consented to hand over.
+   Fetched one report at a time (never inlined into the list) and every fetch
+   is logged server-side with the admin username. Expires on its own; see
+   services/evidence_sweep. */
+async function viewEvidence(id){
+  try{
+    // Same-origin + Basic session the rest of the console rides on (see api()).
+    const res = await fetch('/admin/reports/'+id+'/evidence', {credentials:'same-origin'});
+    if(!res.ok){ alert(res.status===404?'Evidence is gone (expired or already swept).':'HTTP '+res.status); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const w = window.open('', '_blank');
+    if(!w){ URL.revokeObjectURL(url); alert('Popup blocked.'); return; }
+    const tag = blob.type.startsWith('video/') ? 'video controls autoplay' : 'img';
+    w.document.write('<title>report '+id+' evidence</title><body style="margin:0;background:#111;display:flex;align-items:center;justify-content:center;height:100vh"><'+tag+' src="'+url+'" style="max-width:100%;max-height:100%"></body>');
+  }catch(e){ alert(e.message); }
 }
 async function resolve(id,ban_target){ try{ await api('POST','/reports/'+id+'/resolve',{action:ban_target?'banned':'dismissed',notes:'',ban_target}); loadReports(); loadStats(); }catch(e){ alert(e.message); } }
 
