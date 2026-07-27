@@ -58,6 +58,18 @@ class Group(Base):
     pinned_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pinned_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Unguessable half of a share link, so that "the link IS the capability"
+    # actually holds. Group ids are sequential integers, which made the
+    # capability a number an attacker could count to: walking the id space
+    # enumerated every CLOSED group on the island together with its name and
+    # its owner's UIN + nickname. A share link becomes
+    # `.../g/<id>?k=<share_token>` and `/{id}/preview` requires the token
+    # before it will describe a closed group to a non-member.
+    #
+    # NULL for legacy rows until the backfill in `init_db` fills them; the
+    # preview gate treats NULL as "no token issued yet" and falls back to the
+    # redacted card rather than locking members' existing links out.
+    share_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

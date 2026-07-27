@@ -1,3 +1,5 @@
+import secrets
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -176,6 +178,9 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     ("pinned_text", "VARCHAR(500)"),
     ("pinned_at", "TIMESTAMP WITH TIME ZONE"),
     ("pinned_by", "BIGINT"),
+    # Unguessable half of a share link (see the model comment). Backfilled
+    # for existing rows by `_backfill_group_share_tokens` below.
+    ("share_token", "VARCHAR(32)"),
 ]
 
 # Additive on `group_members` — granular moderator capabilities the owner
@@ -307,6 +312,25 @@ async def init_db() -> None:
                         ))
                     except Exception:
                         pass
+
+    # Backfill share tokens for groups created before the column existed, so
+    # every group has an unguessable half to its share link. Done here (rather
+    # than lazily on first share) because the preview gate treats a NULL token
+    # as "cannot verify" and falls back to the redacted card — leaving legacy
+    # groups permanently un-shareable would be a worse bug than the one the
+    # token closes. Idempotent: only touches rows still NULL.
+    async with engine.begin() as conn:
+        try:
+            rows = (await conn.execute(
+                text("SELECT id FROM groups WHERE share_token IS NULL")
+            )).fetchall()
+            for (gid,) in rows:
+                await conn.execute(
+                    text("UPDATE groups SET share_token = :t WHERE id = :i"),
+                    {"t": secrets.token_urlsafe(16)[:22], "i": gid},
+                )
+        except Exception:
+            pass
 
     # Account-recovery lookup: /auth/recover finds the UIN by signing_key.
     # Without an index that's a seq scan holding one of the (deliberately tiny)

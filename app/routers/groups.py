@@ -1,23 +1,33 @@
 """Groups: create/join/manage, plus the two discovery surfaces.
 
-⚠️ OPEN DESIGN ISSUE — closed-group discoverability.
-`/{group_id}/preview` is deliberately optional-auth because a share link is
-meant to be the whole capability: a cross-island client with no token on this
-island still has to be able to render the join card. That only holds if the
-link is unguessable, and it is not — group ids are sequential integers, so the
-"capability" is a number an attacker can count to. `/search` no longer returns
-closed groups (they were enumerable by name substring together with their
-owner's UIN and nickname), and preview is now rate-limited down to a human join
-flow, but neither is a fix: a patient scan of the id space still enumerates
-every closed group on an island.
+CLOSED-GROUP DISCOVERABILITY — how the share link became a real capability.
 
-Closing it properly needs an unguessable component in the share link for closed
-groups (a per-group token in `rcq://group/<id>?k=<token>`, checked here when the
-group is closed), which is a client-visible change to the link format and the
-join flow on all three clients, plus a migration for links already in the wild.
-Not something to bolt on quietly — it needs a deliberate decision.
+`/{group_id}/preview` is optional-auth on purpose: a cross-island client with
+no account on this island still has to render the join card, so possession of
+the link is what authorises the read. That reasoning only holds if the link is
+unguessable, and originally it was not — group ids are sequential integers, so
+the "capability" was a number an attacker could count to. Walking the id space
+enumerated every CLOSED group on the island, each with its name and its owner's
+UIN and nickname; `/search` leaked the same set by name substring.
+
+Now: `/search` never returns closed groups, and every group carries a
+`share_token`. A link is `.../g/<id>?k=<token>`, and a closed group is only
+described to a member or to someone presenting the token.
+
+ROLLOUT (this is the part to finish):
+Clients build share links themselves, so links already in the wild — and links
+made by client builds that predate the token — carry no `k`. Until token-aware
+clients ship on iOS, Android and web, a tokenless preview of a closed group
+gets a REDACTED card (no name, no owner, no member count) rather than a 404:
+enumeration returns nothing worth having, while a legitimate invitee with an
+old link still sees that there is a closed group to ask about.
+Once those clients are out, set `RCQ_REQUIRE_CLOSED_GROUP_TOKEN=true` and a
+tokenless preview becomes an ordinary 404 — indistinguishable from a group that
+does not exist, which is the end state.
 """
 
+import os
+import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -33,6 +43,15 @@ from app.models.contact import Contact
 from app.models.group import Group, GroupMember, GroupMessageView
 from app.models.user import User
 from app.services.connection_manager import manager
+
+# Hard-enforce the closed-group share token (404 for a tokenless preview)
+# instead of serving the redacted card. Stays FALSE until token-aware
+# clients have shipped on iOS, Android and web — see the module docstring.
+_REQUIRE_CLOSED_GROUP_TOKEN: bool = (
+    os.environ.get("RCQ_REQUIRE_CLOSED_GROUP_TOKEN", "false").strip().lower()
+    in {"1", "true", "yes"}
+)
+
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -66,6 +85,12 @@ class GroupOut(BaseModel):
     # for legacy groups — iOS falls back to the generic glyph.
     avatar_media_id: str | None = None
     avatar_media_key: str | None = None
+    # Unguessable half of this group's share link. Only ever sent on
+    # member-facing payloads (this model is never returned to a non-member),
+    # so it behaves like a capability the members hold and can pass on.
+    # Clients append it as `?k=` when building an invite link; the preview
+    # endpoint requires it before describing a CLOSED group to a stranger.
+    share_token: str | None = None
     created_at: datetime
     members: list["GroupMemberOut"]
 
@@ -319,7 +344,14 @@ async def create_group(
             f"these users don't accept group invites from you: {sorted(blocked_by_policy)}",
         )
 
-    group = Group(name=body.name, owner_uin=uin, avatar_seed=hash(body.name) & 0x7FFFFFFF)
+    group = Group(
+        name=body.name,
+        owner_uin=uin,
+        avatar_seed=hash(body.name) & 0x7FFFFFFF,
+        # Minted at creation so a group is shareable the moment it exists, and
+        # so the token predates any decision to close the group later.
+        share_token=secrets.token_urlsafe(16)[:22],
+    )
     db.add(group)
     await db.flush()
 
@@ -356,6 +388,7 @@ def _serialize(g: Group, members: list[GroupMemberOut]) -> GroupOut:
         pinned_by=g.pinned_by,
         avatar_media_id=g.avatar_media_id,
         avatar_media_key=g.avatar_media_key,
+        share_token=g.share_token,
         created_at=g.created_at,
         members=members,
     )
@@ -420,15 +453,59 @@ class GroupPreviewOut(BaseModel):
 )
 async def preview_group(
     group_id: int,
+    # The unguessable half of the share link (`.../g/<id>?k=<token>`). Supplied
+    # by clients that know about it; absent from links shared before the token
+    # existed and from older client builds.
+    k: str | None = None,
     # Optional auth: the invite LINK is the capability, so a cross-island /
     # not-yet-joined client (no token on this island) can still read the public
     # card (name / avatar / member count / open-closed) to render the join card.
-    # Rate-limited above. Nothing private is exposed.
     _viewer_uin: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> GroupPreviewOut:
     g = await _load_group(db, group_id)
     owner = await db.get(User, g.owner_uin)
+
+    # ── closed-group gate ────────────────────────────────────────────
+    # For a CLOSED group we only describe it to someone who has actually been
+    # let in: a member, or the holder of the share token. Everyone else is
+    # walking sequential ids, which is how the whole catalogue of an island's
+    # private communities leaked.
+    entitled = True
+    if g.is_closed:
+        is_member = _viewer_uin is not None and await db.scalar(
+            select(GroupMember.id).where(
+                GroupMember.group_id == group_id, GroupMember.uin == _viewer_uin
+            )
+        ) is not None
+        has_token = bool(g.share_token) and bool(k) and secrets.compare_digest(k, g.share_token)
+        entitled = is_member or has_token
+
+    if not entitled:
+        if _REQUIRE_CLOSED_GROUP_TOKEN:
+            # Indistinguishable from a group that does not exist — confirming
+            # existence is most of the leak.
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+        # Rollout window: links already in the wild carry no token and the
+        # shipped clients do not add one yet, so a hard 404 here would break
+        # every closed-group invite in flight. Serve a card that still lets a
+        # legitimate invitee see there IS a closed group to ask about, minus
+        # everything worth harvesting — no name, no description, no owner, no
+        # member count, no avatar. Flip RCQ_REQUIRE_CLOSED_GROUP_TOKEN=true
+        # once token-aware clients are out.
+        return GroupPreviewOut(
+            id=g.id,
+            name="",
+            description=None,
+            member_count=0,
+            is_closed=True,
+            # 0 rather than null: iOS models owner_uin as a non-optional Int,
+            # so nulling it fails decoding and breaks the join sheet outright.
+            owner_uin=0,
+            owner_nickname=None,
+            avatar_media_id=None,
+            avatar_media_key=None,
+        )
     # Ghost-member filter via join with users — same reasoning as the
     # search counter above. Without it, paid-group previews advertised
     # inflated member counts that vanished the moment the user joined.
