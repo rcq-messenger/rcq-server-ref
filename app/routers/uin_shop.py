@@ -1,10 +1,14 @@
 """UIN shop — pricing + availability for vanity 3-9 digit UINs.
 
-Read-only: this router quotes prices and suggests free numbers. It does
-NOT sell anything; see the note above `/quote` for why the old
-`/purchase` endpoint was removed rather than gated. Fulfilment is
-out-of-band via `POST /admin/invites` (reserve a specific UIN against an
-invite, which is collision-checked against other live invites).
+BETA BEHAVIOUR: `/purchase` currently GRANTS a number for free. Testers are
+meant to be able to take whatever number they like while the product is in
+testing, so the price table below is decoration until a real payment path
+exists. The endpoint is gated on `UIN_SHOP_ENABLED` and 404s when it is off,
+so an island only hands out numbers if its operator asked for that.
+
+Operators can also fulfil a specific number out-of-band via
+`POST /admin/invites`, which reserves it against an invite and is
+collision-checked against other live invites.
 
 Pricing tier table (shorter UIN = scarcer = pricier):
     9 digits → $0.99
@@ -28,20 +32,22 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import current_uin
+from app.core.security import current_uin, issue_token, uin_epoch
 from app.models.user import User
+from app.routers.migrate import MigrateOut, _perform_migration
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
 
 # Hard ICQ-style bounds. Anything outside the [3, 9] digit window is
-# rejected by /quote up-front; the iOS picker
+# rejected by /quote and /purchase up-front; the iOS picker
 # enforces the same range client-side so server-side this is the
 # defense-in-depth gate.
 MIN_LEN = 3
@@ -170,25 +176,64 @@ def _price_display_for(cents: int) -> str:
     return f"${cents / 100:.2f}"
 
 
-# NOTE: there is deliberately NO `/uin/purchase` endpoint.
-#
-# It existed until 2026-07-24 and was a hole, not a feature: its only
-# payment check was `receipt: str = Field(min_length=1)` (any non-empty
-# string passed) and it never consulted `UIN_SHOP_ENABLED` — that flag is
-# read solely by `/server/info` to advertise the capability. So on EVERY
-# island, including self-hosted ones, any authenticated caller could take
-# a free 3-digit UIN — the top of this price ladder.
-#
-# It is deleted rather than feature-gated because there is no payment
-# layer behind it to gate: a gate would still be a purchase path guarded
-# by a flag, and the flag was already ignored once. Sales happen
-# out-of-band (the operator reserves a specific UIN against an invite via
-# `POST /admin/invites`, which — unlike this router ever did — checks for
-# collisions with other live invites). Re-add a purchase endpoint only
-# together with real receipt/settlement verification.
-#
-# `/quote` and `/suggestions` stay: they are read-only pricing helpers.
-# Both are now rate-limited — `/quote` is a registration oracle (it
-# reports whether any 3-9 digit UIN is taken), so an unmetered version
-# enumerates the user base of a product whose pitch is having no
+class ClaimIn(BaseModel):
+    uin: int = Field(gt=0)
+    # Shipped clients still post a `receipt` string. It is deliberately NOT
+    # declared here and is ignored: it was never validated against anything,
+    # and a field that looks like a payment check but is not is worse than no
+    # field at all. Pydantic drops unknown keys, so old clients keep working.
+
+
+@router.post("/purchase", response_model=MigrateOut)
+async def claim(
+    body: ClaimIn,
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> MigrateOut:
+    """BETA: claim any free 3-9 digit UIN and move this account onto it.
+
+    This grants the number for FREE. That is the intended behaviour while the
+    product is in testing — testers are meant to be able to take whatever
+    number they like — and the price table above is decoration until a real
+    payment path exists.
+
+    It is gated on UIN_SHOP_ENABLED, and the gate is the whole point of this
+    rewrite. The previous version of this endpoint ignored that flag entirely
+    (only `/server/info` read it), so every island running this code, including
+    self-hosted ones, silently handed out free vanity numbers whether or not
+    its operator had switched the shop on. Free-on-the-flagship-during-beta is
+    a product decision; free-everywhere-by-accident was a bug.
+
+    Before this is ever framed to a user as a purchase, a real receipt /
+    settlement check goes here, and the docstring above stops saying FREE.
+    """
+    if not settings.UIN_SHOP_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
+
+    length = _length(body.uin)
+    if length < MIN_LEN or length > MAX_LEN:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
+    if body.uin == me:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "self_target"})
+    if await db.scalar(select(User.uin).where(User.uin == body.uin)) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
+
+    user = await db.get(User, me)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    # A suspended account does not get to reroll its identity, same rule the
+    # migrate route enforces.
+    if user.is_suspended:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+
+    new_uin = await _perform_migration(db, user, target_uin=body.uin)
+    # The freed number's tokens are retired inside _perform_migration, so the
+    # old bearer cannot follow the number to whoever claims it next.
+    return MigrateOut(new_uin=new_uin, token=issue_token(new_uin, await uin_epoch(new_uin)))
+
+
+# `/quote` and `/suggestions` are read-only pricing helpers and stay open
+# regardless of the flag. Both are rate-limited: `/quote` is a registration
+# oracle (it reports whether any 3-9 digit UIN is taken), so an unmetered
+# version enumerates the user base of a product whose pitch is having no
 # public identifiers.
