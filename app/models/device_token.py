@@ -46,3 +46,13 @@ class DeviceToken(Base):
     last_seen: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
     )
+    # Push health, written by the UnifiedPush sender (and only when the state
+    # CHANGES, so a working endpoint costs no writes). `push_last_error` holds
+    # the last permanent failure — an HTTP status ("507", "429") or an
+    # exception name — and is cleared on the next success. Surfaced to the
+    # owner via GET /users/me/push-health so a user whose distributor stopped
+    # delivering can SEE that, instead of silently receiving nothing.
+    push_last_error: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    push_last_ok: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )

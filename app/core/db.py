@@ -17,16 +17,28 @@ class Base(DeclarativeBase):
 # (5 + 10 overflow) is *per process*, so 4 uvicorn workers can demand up
 # to 60 connections and exhaust the DB — surfacing as
 # asyncpg.TooManyConnectionsError turned into an HTTP 500 on EVERY
-# endpoint (sends AND reads), intermittently under load. Cap each
-# worker's pool so all 4 stay well under budget (4 × (2 + 1) = 12),
-# pre-ping to drop connections DO closed under us, and recycle before
-# the idle timeout. The pooling kwargs are Postgres-only: the SQLite
-# self-host / test path uses a pool class that rejects them.
+# endpoint (sends AND reads), intermittently under load.
+#
+# BUT that budget applies to *backend* connections, and prod does not talk
+# to Postgres directly: DATABASE_URL points at DO's PgBouncer pool
+# (`rcq-pool`, TRANSACTION mode, port 25061, backend size 15). PgBouncer's
+# whole job is to multiplex many client connections onto those 15 backends,
+# so sizing the app pool as if each client connection were a backend one
+# left the workers strangled: 4 × (2 + 1) = 12 client connections total,
+# and prod logged 423 `QueuePool limit of size 2 overflow 1 reached` timeouts
+# in 24h — each one an HTTP request or a background job (story sweep, push
+# fan-out) dying at the checkout, not at the database.
+#
+# 4 × (5 + 5) = 40 client connections queue at PgBouncer instead of erroring
+# at SQLAlchemy, which is what PgBouncer is for. Pre-ping drops connections
+# DO closed under us, and recycle beats the idle timeout. The pooling kwargs
+# are Postgres-only: the SQLite self-host / test path uses a pool class that
+# rejects them.
 _engine_kwargs: dict = {"echo": False, "future": True}
 if settings.DATABASE_URL.startswith(("postgresql", "postgres")):
     _engine_kwargs.update(
-        pool_size=2,
-        max_overflow=1,
+        pool_size=5,
+        max_overflow=5,
         pool_timeout=20,
         pool_pre_ping=True,
         pool_recycle=1800,
@@ -224,6 +236,9 @@ _INVITE_COLUMNS: list[tuple[str, str]] = [
 # upsert.
 _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "VARCHAR(64)"),
+    # Push health (UnifiedPush sender). NULL error = healthy / never tried.
+    ("push_last_error", "VARCHAR(32)"),
+    ("push_last_ok", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 async def init_db() -> None:

@@ -12,6 +12,7 @@ from app.models.contact import Contact, ContactRequest
 from app.models.user import User, visible_status
 from app.services.apns import send_to_user as apns_send, should_push_for
 from app.services.connection_manager import manager
+from app.services.unifiedpush import send_to_user as up_send
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
 
@@ -190,13 +191,16 @@ async def send_request(
             # their next wake. thread-id "peer-<UIN>" routes the
             # tap straight into the new chat.
             accepter = await db.get(User, uin)
-            await apns_send(
-                reverse.from_uin,
+            push_args = dict(
                 alert_title=accepter.nickname if accepter else f"#{uin}",
                 alert_body="accepted your contact request",
                 thread_id=f"peer-{uin}",
                 notif_kind="contact_response_accepted",
             )
+            await apns_send(reverse.from_uin, **push_args)
+            # Android rides UnifiedPush, not APNs — without this an Android
+            # user simply never heard about a contact request or an accept.
+            await up_send(reverse.from_uin, **push_args)
         return {"id": reverse.id, "state": "accepted", "auto": True}
 
     existing = await db.scalar(
@@ -229,13 +233,14 @@ async def send_request(
         if not delivered and await should_push_for(
             body.to_uin, kind="contact_request", sender_uin=uin,
         ):
-            await apns_send(
-                body.to_uin,
+            push_args = dict(
                 alert_title=sender_nick,
                 alert_body="wants to add you as a contact",
                 thread_id="pending",
                 notif_kind="contact_request",
             )
+            await apns_send(body.to_uin, **push_args)
+            await up_send(body.to_uin, **push_args)
         return {"id": existing.id, "state": "pending"}
 
     req = ContactRequest(from_uin=uin, to_uin=body.to_uin, state="pending")
@@ -256,13 +261,14 @@ async def send_request(
     if not delivered and await should_push_for(
         body.to_uin, kind="contact_request", sender_uin=uin,
     ):
-        await apns_send(
-            body.to_uin,
+        push_args = dict(
             alert_title=sender_nick,
             alert_body="wants to add you as a contact",
             thread_id="pending",
             notif_kind="contact_request",
         )
+        await apns_send(body.to_uin, **push_args)
+        await up_send(body.to_uin, **push_args)
     return {"id": req.id, "state": "pending"}
 
 
@@ -375,13 +381,14 @@ async def respond(
         req.from_uin, kind="contact_response_accepted", sender_uin=uin,
     ):
         accepter = await db.get(User, uin)
-        await apns_send(
-            req.from_uin,
+        push_args = dict(
             alert_title=accepter.nickname if accepter else f"#{uin}",
             alert_body="accepted your contact request",
             thread_id=f"peer-{uin}",
             notif_kind="contact_response_accepted",
         )
+        await apns_send(req.from_uin, **push_args)
+        await up_send(req.from_uin, **push_args)
     return {"state": req.state}
 
 

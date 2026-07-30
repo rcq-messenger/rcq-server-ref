@@ -455,7 +455,13 @@ async def register_push_token(
         )
         .on_conflict_do_update(
             index_elements=["uin", "token"],
-            set_={"platform": body.platform, "device_id": device_id, "last_seen": now},
+            # Clear any recorded push failure: the client is demonstrably alive
+            # and re-registering, so the old verdict is stale. The next failed
+            # wake re-records it.
+            set_={
+                "platform": body.platform, "device_id": device_id, "last_seen": now,
+                "push_last_error": None,
+            },
         )
     )
     await db.execute(stmt)
@@ -473,6 +479,54 @@ async def register_push_token(
             ))
         )
     await db.commit()
+
+
+class PushHealthRow(BaseModel):
+    platform: str
+    # Host only — never the full endpoint URL. The path segment IS the wake
+    # secret for a UnifiedPush topic, and this response travels to a client
+    # that already knows its own endpoint anyway.
+    host: str | None = None
+    last_error: str | None = None
+    last_ok: datetime | None = None
+    registered_at: datetime
+
+
+class PushHealthOut(BaseModel):
+    devices: list[PushHealthRow]
+
+
+@router.get("/me/push-health", response_model=PushHealthOut)
+async def push_health(
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> PushHealthOut:
+    """What the server's last wake attempt did, per registered device.
+
+    Android push rides a third-party distributor (ntfy, …) the user chose,
+    and when that distributor stops accepting wakes — ntfy.sh answers `507`
+    once the topic has no connected subscriber, `429` once the rate bucket
+    behind the subscriber's NAT is drained — the user's experience is simply
+    "notifications stopped", with nothing anywhere to explain it. The client
+    reads this to say so out loud in the notification settings."""
+    rows = (
+        await db.execute(
+            select(
+                DeviceToken.platform, DeviceToken.token, DeviceToken.push_last_error,
+                DeviceToken.push_last_ok, DeviceToken.created_at,
+            ).where(DeviceToken.uin == uin)
+        )
+    ).all()
+    out: list[PushHealthRow] = []
+    for platform, token, last_error, last_ok, created_at in rows:
+        host: str | None = None
+        if platform == "android-up" and "://" in token:
+            host = token.split("://", 1)[1].split("/", 1)[0]
+        out.append(PushHealthRow(
+            platform=platform, host=host, last_error=last_error,
+            last_ok=last_ok, registered_at=created_at,
+        ))
+    return PushHealthOut(devices=out)
 
 
 @router.delete("/me/push-token", status_code=status.HTTP_204_NO_CONTENT)
