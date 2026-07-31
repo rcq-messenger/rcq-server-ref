@@ -37,6 +37,7 @@ from sqlalchemy import or_, select
 
 from app.core.db import SessionLocal
 from app.models.report import Report
+from app.services.periodic_leader import lead_this_cycle
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +95,9 @@ async def sweep_once() -> int:
 async def evidence_sweep_loop() -> None:
     while True:
         try:
-            await sweep_once()
+            # One worker per cycle (see services/periodic_leader).
+            if await lead_this_cycle("evidence-sweep", SWEEP_INTERVAL_SECONDS):
+                await sweep_once()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
