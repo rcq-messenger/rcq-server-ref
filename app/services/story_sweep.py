@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from app.core.db import SessionLocal
 from app.models.story import Story
+from app.services.periodic_leader import lead_this_cycle
 
 SWEEP_INTERVAL_SECONDS: int = 5 * 60
 
@@ -59,7 +60,9 @@ async def story_sweep_loop() -> None:
     """Forever-running task. Wired into `main.py` lifespan startup."""
     while True:
         try:
-            await sweep_once()
+            # One worker per cycle (see services/periodic_leader).
+            if await lead_this_cycle("story-sweep", SWEEP_INTERVAL_SECONDS):
+                await sweep_once()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
