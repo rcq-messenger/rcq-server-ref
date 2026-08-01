@@ -12,6 +12,7 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.models.capability import UserCapability
+from app.models.device_token import DeviceToken
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
@@ -34,6 +35,22 @@ log = logging.getLogger(__name__)
 _PUSHABLE_TYPES = {"message", "system", "secscreen"}
 
 router = APIRouter(prefix="/messages", tags=["messages"])
+
+
+async def _sender_device_tokens(db: AsyncSession, caller: int | None) -> frozenset[str]:
+    """Every push token/endpoint registered by `caller`, any platform.
+
+    Used to keep the PHYSICAL sending device out of a push fan-out: on a
+    multi-account phone each local account registers the same token string,
+    so a `uin == caller` check alone still wakes the author's own phone
+    through a sibling account that looks offline server-side. Matching by
+    token identifies "same device" regardless of which account is targeted."""
+    if caller is None:
+        return frozenset()
+    rows = (
+        await db.execute(select(DeviceToken.token).where(DeviceToken.uin == caller))
+    ).scalars().all()
+    return frozenset(rows)
 
 
 class SealedSendIn(BaseModel):
@@ -280,6 +297,7 @@ async def send_group_sealed(
         # the client shows WHICH group (this sealed path used to send neither,
         # so small-group pushes always read as the generic "New group message").
         gname = g.name or "RCQ"
+        sender_tokens = await _sender_device_tokens(db, caller)
 
         async def _push(target_uin: int) -> None:
             if await is_group_muted(target_uin, group_id):
@@ -293,6 +311,7 @@ async def send_group_sealed(
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
                 group_name=gname,
+                exclude_tokens=sender_tokens,
             )
             await up_send(
                 target_uin,
@@ -303,9 +322,14 @@ async def send_group_sealed(
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
                 group_name=gname,
+                exclude_tokens=sender_tokens,
             )
 
         for uin in offline_recipients:
+            # Never push the sender their OWN message (they backgrounded right
+            # after sending); their other devices still get the queue carbon.
+            if uin == caller:
+                continue
             asyncio.create_task(_push(uin))
     log.warning(
         "[group-sealed] gid=%s type=%s payloads=%d delivered_any=%s offline=%d",
@@ -424,6 +448,7 @@ async def send_group_broadcast(
         # Title the banner with the group's name (not the generic "RCQ") so the
         # user can tell which group a push came from at a glance.
         gname = g.name or "RCQ"
+        sender_tokens = await _sender_device_tokens(db, caller)
 
         async def _push(target_uin: int) -> None:
             if await is_group_muted(target_uin, group_id):
@@ -437,6 +462,7 @@ async def send_group_broadcast(
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
                 group_name=gname,
+                exclude_tokens=sender_tokens,
             )
             await up_send(
                 target_uin,
@@ -447,6 +473,7 @@ async def send_group_broadcast(
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
                 group_name=gname,
+                exclude_tokens=sender_tokens,
             )
 
         for uin in offline_recipients:
