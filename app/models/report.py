@@ -85,6 +85,17 @@ class Report(Base):
     # Free-text admin notes — why the decision was made. Internal
     # only, never surfaced back to the reporter or the target.
     resolution_notes: Mapped[str] = mapped_column(Text, default="")
+    # The one field on this table the REPORTER is allowed to read back.
+    # Reports were a one-way box: people wrote careful, hour-long feedback
+    # and could not be answered at all, because a reply cannot go into a
+    # chat (the server holds no keys and must never be able to write into
+    # a conversation). So the answer lives here, next to the report, and
+    # the reporter fetches it over their own authenticated session via
+    # GET /reports/mine. Empty = not answered yet.
+    reply_text: Mapped[str] = mapped_column(Text, default="")
+    replied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )

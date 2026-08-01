@@ -220,6 +220,11 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
     # blob in /media + carries the AES key for client-side decrypt in
     # the admin queue. NULL for legacy reason-only reports.
     ("attachments", "JSON"),
+    # Operator's answer to the reporter + when it was written. See
+    # Report.reply_text: this is the only column on `reports` that the
+    # reporter can read back, through GET /reports/mine.
+    ("reply_text", "TEXT DEFAULT ''"),
+    ("replied_at", "TIMESTAMPTZ"),
 ]
 
 # Additive on `invites` — an optional reserved UIN so an invite can grant a

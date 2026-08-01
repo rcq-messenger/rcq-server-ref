@@ -25,6 +25,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -268,3 +269,55 @@ async def create_report_with_evidence(
     await db.commit()
     await db.refresh(report)
     return CreateReportOut(id=report.id, created_at=report.created_at)
+
+
+class MyReportOut(BaseModel):
+    id: int
+    reason: str
+    status: str
+    created_at: datetime
+    # The operator's answer, empty until one is written. This is the whole
+    # point of the endpoint: before it existed a report was a one-way box.
+    reply: str
+    replied_at: datetime | None
+
+
+@router.get("/mine", response_model=list[MyReportOut])
+async def my_reports(
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> list[MyReportOut]:
+    """The reporter's own reports, with the operator's answer when there is one.
+
+    Why a fetch and not a message: a reply cannot be delivered into a chat.
+    Chats are sealed on the sending device and the server holds no keys, so
+    the only way for the server to put text in front of a user would be a
+    channel that lets it write into conversations — exactly the capability
+    this project promises it does not have. Instead the answer stays server
+    data, attached to the report, and the reporter reads it back over their
+    own authenticated session. Nothing here claims to be an encrypted
+    message, and a compromised server gains no ability to impersonate anyone.
+
+    Only the reporter's own rows, and only the reader-safe columns:
+    `resolution_notes` is the operator's internal reasoning and never leaves
+    the admin side.
+    """
+    rows = (
+        await db.execute(
+            select(Report)
+            .where(Report.reporter_uin == uin)
+            .order_by(Report.created_at.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+    return [
+        MyReportOut(
+            id=r.id,
+            reason=r.reason,
+            status=r.status,
+            created_at=r.created_at,
+            reply=r.reply_text or "",
+            replied_at=r.replied_at,
+        )
+        for r in rows
+    ]

@@ -32,6 +32,8 @@ from app.models.invite import Invite
 from app.models.report import Report
 from app.models.user import User, effective_status
 from app.services import server_settings
+from app.services.apns import send_to_user as apns_send
+from app.services.unifiedpush import send_to_user as up_send
 from app.services.hof_stats import bug_report_stats
 
 import time as _time
@@ -169,6 +171,10 @@ class ReportOut(BaseModel):
     status: str
     resolution_action: str
     resolution_notes: str
+    # What was said back to the reporter, so the queue shows at a glance
+    # which reports have been answered and which are still silent.
+    reply_text: str = ""
+    replied_at: datetime | None = None
     created_at: datetime
     resolved_at: datetime | None
     attachments: list[ReportAttachmentOut] = []
@@ -193,6 +199,11 @@ class ResolveReportIn(BaseModel):
     action: str = Field(..., min_length=1, max_length=32)
     notes: str = Field(default="", max_length=2000)
     ban_target: bool = False
+
+
+class ReplyReportIn(BaseModel):
+    # Kept short on purpose: this is an answer to a reporter, not a chat.
+    text: str = Field(..., min_length=1, max_length=4000)
 
 
 class UserSummary(BaseModel):
@@ -284,6 +295,8 @@ async def list_reports(
             status=r.status,
             resolution_action=r.resolution_action,
             resolution_notes=r.resolution_notes,
+            reply_text=r.reply_text or "",
+            replied_at=r.replied_at,
             created_at=r.created_at,
             resolved_at=r.resolved_at,
             attachments=_coerce_attachments(r.attachments),
@@ -382,6 +395,71 @@ async def resolve_report(
         status=report.status,
         resolution_action=report.resolution_action,
         resolution_notes=report.resolution_notes,
+        reply_text=report.reply_text or "",
+        replied_at=report.replied_at,
+        created_at=report.created_at,
+        resolved_at=report.resolved_at,
+        attachments=_coerce_attachments(report.attachments),
+        has_evidence=bool(report.evidence_path),
+        evidence_mime=report.evidence_mime,
+    )
+
+
+@router.post("/reports/{report_id}/reply", response_model=ReportOut)
+async def reply_to_report(
+    report_id: int,
+    body: ReplyReportIn,
+    db: AsyncSession = Depends(get_db),
+) -> ReportOut:
+    """Answer the person who filed the report.
+
+    Separate from /resolve on purpose: most thoughtful reports deserve an
+    answer BEFORE anyone decides whether to ban, dismiss or ship a fix, and
+    tying the two together would mean an operator has to pick a verdict just
+    to say "we read this, here is what we think".
+
+    Delivery: the text is stored on the report and the reporter reads it back
+    through GET /reports/mine on their own session. It is deliberately NOT a
+    chat message. Chats are sealed on the sending device and this server holds
+    no keys, so putting an answer into a conversation would require giving the
+    server the ability to write into one, which is the exact capability the
+    project promises it lacks. The push below is only a doorbell: it carries
+    no part of the answer, because a push traverses APNs and our push host in
+    the clear. The client fetches the text over its authenticated session.
+    """
+    report = await db.get(Report, report_id)
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such report")
+
+    report.reply_text = body.text.strip()
+    report.replied_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(report)
+
+    push_args = dict(
+        alert_title="RCQ",
+        alert_body="We answered your report",
+        thread_id="reports",
+        notif_kind="report_reply",
+    )
+    await apns_send(report.reporter_uin, **push_args)
+    await up_send(report.reporter_uin, **push_args)
+
+    target_user = await db.get(User, report.target_uin)
+    reporter_user = await db.get(User, report.reporter_uin)
+    return ReportOut(
+        id=report.id,
+        reporter_uin=report.reporter_uin,
+        reporter_nickname=reporter_user.nickname if reporter_user else None,
+        target_uin=report.target_uin,
+        target_nickname=target_user.nickname if target_user else None,
+        reason=report.reason,
+        context=report.context,
+        status=report.status,
+        resolution_action=report.resolution_action,
+        resolution_notes=report.resolution_notes,
+        reply_text=report.reply_text or "",
+        replied_at=report.replied_at,
         created_at=report.created_at,
         resolved_at=report.resolved_at,
         attachments=_coerce_attachments(report.attachments),
