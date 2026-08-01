@@ -319,10 +319,17 @@ async def send_to_user(
     notif_kind: str | None = None,
     group_id: int | None = None,
     group_name: str | None = None,
+    exclude_tokens: frozenset[str] = frozenset(),
 ) -> int:
     """Regular APNs push to every iOS device of `uin`. Skips VoIP tokens —
     those have a separate code path (`send_voip_to_user`) with a different
     topic and push type. No-op when APNs isn't configured.
+
+    `exclude_tokens` = tokens registered by the AUTHOR of the event being
+    pushed. APNs tokens are per-physical-device, so on a multi-account phone
+    every local account registers the same token — skipping the author's
+    tokens keeps the sending device from being woken about its own action
+    through a sibling account.
 
     Always sends a `mutable-content: 1` alert so the iOS Notification
     Service Extension can intercept, decrypt the envelope, and replace
@@ -355,6 +362,13 @@ async def send_to_user(
                 )
             )
         ).all()
+    if exclude_tokens:
+        before = len(tokens)
+        tokens = [row for row in tokens if row[1] not in exclude_tokens]
+        if len(tokens) != before:
+            log.info(
+                "[apns] uin=%s skipping %d sender-device token(s)", uin, before - len(tokens)
+            )
     log.warning("[apns] send_to_user uin=%s tokens=%d", uin, len(tokens))
     if not tokens:
         return 0

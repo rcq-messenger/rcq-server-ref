@@ -212,15 +212,31 @@ async def _record_health(
         log.exception("[up] failed to record push health")
 
 
-async def _fan_out(uin: int, payload: dict[str, Any], ttl: int, what: str) -> None:
+async def _fan_out(
+    uin: int,
+    payload: dict[str, Any],
+    ttl: int,
+    what: str,
+    exclude_tokens: frozenset[str] = frozenset(),
+) -> None:
     """Deliver `payload` to every UnifiedPush endpoint of `uin`. Runs as a
     background task; nothing awaits the result but the log line and the
-    health columns."""
+    health columns.
+
+    `exclude_tokens` skips endpoints that are also registered by the SENDER
+    of the event being pushed: on a multi-account device every local account
+    registers the same endpoint, so without this the author's own phone gets
+    woken about their own group post through a sibling account."""
     try:
         endpoints = await _endpoints_for(uin)
     except Exception:  # noqa: BLE001 — a pool timeout must not kill the task loudly
         log.exception("[up] endpoint lookup failed uin=%s", uin)
         return
+    if exclude_tokens:
+        skipped = [e for _, e, _ in endpoints if e in exclude_tokens]
+        if skipped:
+            endpoints = [row for row in endpoints if row[1] not in exclude_tokens]
+            log.info("[up] %s uin=%s skipping %d sender-device endpoint(s)", what, uin, len(skipped))
     if not endpoints:
         return
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -253,11 +269,17 @@ async def _fan_out(uin: int, payload: dict[str, Any], ttl: int, what: str) -> No
     await _record_health(ok_ids, failed, dead_ids)
 
 
-def _schedule(uin: int, payload: dict[str, Any], ttl: int, what: str) -> None:
+def _schedule(
+    uin: int,
+    payload: dict[str, Any],
+    ttl: int,
+    what: str,
+    exclude_tokens: frozenset[str] = frozenset(),
+) -> None:
     """Fire the fan-out as a background task. Deliberately NOT awaited by the
     caller: retries span ~30s and the sender's HTTP request (or the WS call
     relay) must not wait on a third-party push server."""
-    task = asyncio.create_task(_fan_out(uin, payload, ttl, what))
+    task = asyncio.create_task(_fan_out(uin, payload, ttl, what, exclude_tokens))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
@@ -273,11 +295,17 @@ async def send_to_user(
     notif_kind: str | None = None,
     group_id: int | None = None,
     group_name: str | None = None,
+    exclude_tokens: frozenset[str] = frozenset(),
 ) -> int:
     """Wake every Android UnifiedPush device of `uin`. No-op when the user has
     no Android endpoints (the common case for an iOS-only account). Same
     keyword signature as apns.send_to_user so the offline-push hook sites can
     fire both with parallel one-liners.
+
+    `exclude_tokens` = endpoints registered by the event's AUTHOR; matching
+    endpoints are skipped so the sending device is never woken about its own
+    action through a sibling local account (multi-account phones register one
+    shared endpoint per device).
 
     Returns 1 once the wake is SCHEDULED (delivery happens in the background),
     not the number of devices reached — the callers only use it for a log
@@ -299,7 +327,7 @@ async def send_to_user(
         payload["group_id"] = group_id
     if group_name:
         payload["group_name"] = group_name
-    _schedule(uin, payload, _TTL_MESSAGE, "msg")
+    _schedule(uin, payload, _TTL_MESSAGE, "msg", exclude_tokens)
     return 1
 
 
