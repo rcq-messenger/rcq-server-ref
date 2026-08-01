@@ -225,8 +225,14 @@ async def send_group_sealed(
     # reads, typing, edits and deletes still fan out from any member so a
     # broadcast group keeps its reaction/read interactions (and web clients,
     # which always send a token, don't get their member reactions rejected).
+    # Fetched unconditionally: the push block below titles its banner with
+    # `g.name` for EVERY pushable type, so binding this only under the
+    # "message" gate left `g` unbound on a "system"/"secscreen" group send —
+    # an UnboundLocalError 500 raised AFTER the commit, i.e. recipients got
+    # the message and the sender saw a failure. iOS types systemNotice as
+    # "system", so that path is reachable from a shipped client.
+    g = await db.get(Group, body.group_id)
     if body.envelope_type == "message":
-        g = await db.get(Group, body.group_id)
         if g is not None and g.post_policy == "owner_only" and caller is not None and caller != g.owner_uin:
             # An authenticated caller who is NOT the owner tried to post to a
             # broadcast group. Web clients always send their token, so this
@@ -296,7 +302,7 @@ async def send_group_sealed(
         # Title the banner with the group's name + carry it in the payload so
         # the client shows WHICH group (this sealed path used to send neither,
         # so small-group pushes always read as the generic "New group message").
-        gname = g.name or "RCQ"
+        gname = (g.name if g is not None else None) or "RCQ"
         sender_tokens = await _sender_device_tokens(db, caller)
 
         async def _push(target_uin: int) -> None:
