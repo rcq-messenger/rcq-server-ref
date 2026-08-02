@@ -12,6 +12,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.report import Report
+from app.models.user import User
 
 # Confirmed-bug count that fills the effort ring to full green. Tuned high on
 # purpose: the founder wants a fully-green ring to be rare ("находил баги и они
@@ -39,6 +40,12 @@ async def bug_report_stats(
     feed the score. uins with no qualifying reports are simply absent from the
     result; callers default them to (0, 0). One grouped query regardless of how
     many uins.
+
+    Founder-granted credit for reports filed OUTSIDE the in-app form
+    (`users.hof_bonus_*`) is added on top, so a tester who does the work in the
+    closed tester chat is not shown as having contributed nothing. That credit
+    is not derived from anything, which is the point — nobody can earn it by
+    filing reports, only the founder can grant it.
     """
     if not uins:
         return {}
@@ -60,7 +67,21 @@ async def bug_report_stats(
             .group_by(Report.reporter_uin)
         )
     ).all()
-    return {r.reporter_uin: (int(r.total), int(r.confirmed)) for r in rows}
+    stats = {r.reporter_uin: (int(r.total), int(r.confirmed)) for r in rows}
+
+    bonus = (
+        await db.execute(
+            select(User.uin, User.hof_bonus_reports, User.hof_bonus_confirmed)
+            .where(
+                User.uin.in_(uins),
+                (User.hof_bonus_reports > 0) | (User.hof_bonus_confirmed > 0),
+            )
+        )
+    ).all()
+    for uin, extra_total, extra_confirmed in bonus:
+        total, confirmed = stats.get(uin, (0, 0))
+        stats[uin] = (total + (extra_total or 0), confirmed + (extra_confirmed or 0))
+    return stats
 
 
 def effort_score(confirmed: int) -> float:

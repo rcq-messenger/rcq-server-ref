@@ -94,6 +94,18 @@ class User(Base):
     # people who helped (not all of them report bugs). Defaults to "gold" so
     # the existing all-gold wall looks unchanged until the founder grades.
     hof_tier: Mapped[str] = mapped_column(String(8), default="gold")
+    # Credit for bug reports filed OFF the in-app form. Some of the most
+    # useful testers never touch it — they report in the closed tester chat,
+    # in comments, by voice — so the computed counters read 0 next to a gold
+    # flower and the wall understates exactly the people it exists to thank.
+    # These are ADDED to the counts derived from real `reports` rows.
+    #
+    # A separate column rather than synthesised report rows on purpose: fake
+    # rows would show up on that person's own "My reports" screen as
+    # submissions they never filed, land in the admin queue, and distort the
+    # resolved-this-week stats.
+    hof_bonus_reports: Mapped[int] = mapped_column(Integer, default=0)
+    hof_bonus_confirmed: Mapped[int] = mapped_column(Integer, default=0)
 
     first_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
