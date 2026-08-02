@@ -17,7 +17,10 @@ from app.services.unifiedpush import send_call_to_user as up_call
 from app.services.connection_manager import manager
 
 router = APIRouter(tags=["ws"])
-_log = logging.getLogger(__name__)
+# uvicorn owns the handlers in this process; the app-level logger has none,
+# so a plain getLogger(__name__) would write the reconnect counter into a
+# void — which is worse than not counting it, because it looks counted.
+_log = logging.getLogger("uvicorn.error")
 
 # Concurrent-call guard. Per-uin → (call_id, counterparty_uin). When a
 # call_offer arrives, we check both endpoints — if either side is already
