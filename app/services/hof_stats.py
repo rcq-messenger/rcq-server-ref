@@ -89,3 +89,25 @@ def effort_score(confirmed: int) -> float:
     if HOF_EFFORT_TARGET <= 0:
         return 0.0
     return min(confirmed / HOF_EFFORT_TARGET, 1.0)
+
+
+def podium_score(reports: int, confirmed: int) -> float:
+    """Ranking number for the top-three podium. Higher is better; 0 for anyone
+    who has never had a bug confirmed.
+
+    `confirmed² / reports` — confirmed bugs weighted by the share of reports
+    that turned out to be real. Volume alone must not win, or the way to reach
+    the podium is to file everything that crosses your mind and let the
+    maintainers sort it out. Founder's own example holds:
+
+        50 filed / 10 confirmed → 100/50  =  2.0
+        10 filed /  9 confirmed →  81/10  =  8.1   ← wins, as it should
+
+    Nobody can lose points by filing: a rejected report lowers the ratio but
+    `confirmed` never falls, so the score only ever moves up when a bug is
+    confirmed. That matters — a scoreboard that punishes reporting would
+    quietly teach people not to report.
+    """
+    if confirmed <= 0 or reports <= 0:
+        return 0.0
+    return (confirmed * confirmed) / reports

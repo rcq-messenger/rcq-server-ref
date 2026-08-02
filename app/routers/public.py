@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.models.user import User
-from app.services.hof_stats import bug_report_stats, effort_score
+from app.services.hof_stats import bug_report_stats, effort_score, podium_score
 
 router = APIRouter(prefix="/public", tags=["public"])
 
@@ -76,6 +76,11 @@ class HofEntry(BaseModel):
     reports: int = 0
     confirmed: int = 0
     effort: float = 0.0
+    # 1, 2 or 3 for the podium, null for everyone else. The wall draws the top
+    # three separately; the rest of the list is unchanged. Only gold-flower
+    # members are eligible, so the podium is never something a person can climb
+    # onto by volume alone without the founder's own judgement first.
+    rank: int | None = None
 
 
 class HofResponse(BaseModel):
@@ -117,7 +122,23 @@ async def hall_of_fame(
                 effort=effort_score(confirmed),
             )
         )
-    members.sort(key=lambda m: (_TIER_RANK.get(m.tier, 0), m.nickname.lower()))
+    # Podium: the three highest-scoring GOLD members who have had at least one
+    # bug confirmed. Gold is a prerequisite rather than a tiebreak — the flower
+    # is the founder's call, and the score only ranks people he already vouched
+    # for. Ties fall back to confirmed count, then nickname, so the order is
+    # stable between requests instead of wobbling with dict order.
+    contenders = sorted(
+        (m for m in members if m.tier == "gold" and m.confirmed > 0),
+        key=lambda m: (-podium_score(m.reports, m.confirmed), -m.confirmed, m.nickname.lower()),
+    )
+    for place, m in enumerate(contenders[:3], start=1):
+        m.rank = place
+    # Podium first in the order it was earned, then the wall as it always was.
+    members.sort(key=lambda m: (
+        m.rank if m.rank is not None else 99,
+        _TIER_RANK.get(m.tier, 0),
+        m.nickname.lower(),
+    ))
     response.headers["Cache-Control"] = "public, max-age=300"
     return HofResponse(members=members)
 

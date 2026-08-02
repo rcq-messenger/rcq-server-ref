@@ -53,6 +53,34 @@ TTL_DAYS = int(os.environ.get("OFFLINE_QUEUE_TTL_DAYS", "30"))
 # them (see the module docstring). 0 disables the rule entirely.
 DORMANT_DAYS = int(os.environ.get("OFFLINE_GROUP_DORMANT_DAYS", "14"))
 
+# Sender-key RECOVERY requests (`sknack`) get their own, very short TTL.
+#
+# A client that receives a group message under a key id it does not hold asks
+# the group for that key. It cannot tell whose key id it is, so it asks EVERY
+# sender-keys-capable member: on the flagship group that is ~537 queued rows to
+# find one person. Measured on prod 2026-08-02, sknack was 73k of the 115k rows
+# in this table, four times the volume of the actual group messages, and the
+# driver is new members: 38 people joined the flagship group on 1 August and
+# that day saw 137 recovery broadcasts, because each newcomer must ask once per
+# distinct sender they encounter.
+#
+# The requests themselves are worthless once stale. The asking client re-fires
+# per key id every ten minutes and again after a restart, so an hour-old copy
+# will never be the one that recovers anybody — it only makes a returning
+# member decrypt hundreds of envelopes addressed to a question that has already
+# been asked and answered. Delivery is unaffected: anyone online gets it live,
+# anyone draining within the hour still finds it.
+#
+# ⚠ The sweep itself only runs every SWEEP_INTERVAL_SECONDS, so in practice a
+# request survives up to that long rather than exactly this TTL. That is fine
+# for the purpose (retention drops from a fortnight to hours); tightening it
+# further would mean a separate, faster loop for one envelope type.
+#
+# This does NOT fix the broadcast itself; that needs a protocol change so a
+# newcomer is handed the current keys on join instead of discovering their
+# absence by failing to read a message.
+SKNACK_TTL_SECONDS = int(os.environ.get("OFFLINE_SKNACK_TTL_SECONDS", str(3600)))
+
 # Rows per DELETE statement, and a ceiling per sweep. Batching keeps each
 # transaction short — a single unbounded DELETE of half a million rows would
 # hold locks (and one of the few pooled connections) for the whole run.
@@ -114,8 +142,8 @@ async def _sweep_dormant(cutoff: datetime) -> int:
     return deleted
 
 
-async def _sweep_once() -> tuple[int, int, int]:
-    """One pass. Returns (direct_deleted, group_deleted, dormant_deleted) for
+async def _sweep_once() -> tuple[int, int, int, int]:
+    """One pass. Returns (direct, group, dormant, sknack) deleted counts for
     the log line.
 
     Each table sweep runs in its own short transaction so a long-running
@@ -125,6 +153,7 @@ async def _sweep_once() -> tuple[int, int, int]:
 
     direct_deleted = 0
     group_deleted = 0
+    sknack_deleted = 0
 
     async with SessionLocal() as db:
         async with db.begin():
@@ -139,20 +168,31 @@ async def _sweep_once() -> tuple[int, int, int]:
             )
             group_deleted = result.rowcount or 0
 
+        if SKNACK_TTL_SECONDS > 0:
+            async with db.begin():
+                result = await db.execute(
+                    delete(OfflineGroupMessage).where(
+                        OfflineGroupMessage.envelope_type == "sknack",
+                        OfflineGroupMessage.received_at
+                        < datetime.now(timezone.utc) - timedelta(seconds=SKNACK_TTL_SECONDS),
+                    )
+                )
+                sknack_deleted = result.rowcount or 0
+
     dormant_deleted = 0
     if DORMANT_DAYS > 0:
         dormant_deleted = await _sweep_dormant(
             datetime.now(timezone.utc) - timedelta(days=DORMANT_DAYS)
         )
 
-    return direct_deleted, group_deleted, dormant_deleted
+    return direct_deleted, group_deleted, dormant_deleted, sknack_deleted
 
 
 async def offline_queue_sweep_loop() -> None:
     """Forever loop. Cancelled by the FastAPI lifespan on shutdown."""
     log.info(
-        "[offline-queue-sweep] starting (ttl=%dd, dormant=%dd, interval=%ds)",
-        TTL_DAYS, DORMANT_DAYS, SWEEP_INTERVAL_SECONDS,
+        "[offline-queue-sweep] starting (ttl=%dd, dormant=%dd, sknack=%ds, interval=%ds)",
+        TTL_DAYS, DORMANT_DAYS, SKNACK_TTL_SECONDS, SWEEP_INTERVAL_SECONDS,
     )
     while True:
         try:
@@ -161,13 +201,14 @@ async def offline_queue_sweep_loop() -> None:
             if not await lead_this_cycle("offline-queue-sweep", SWEEP_INTERVAL_SECONDS):
                 await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
                 continue
-            direct, group, dormant = await _sweep_once()
-            if direct or group or dormant:
+            direct, group, dormant, sknack = await _sweep_once()
+            if direct or group or dormant or sknack:
                 # warning, not info: prod runs at WARNING and this number is
                 # exactly what you want in the journal when the table grows.
                 log.warning(
-                    "[offline-queue-sweep] reaped direct=%d group=%d dormant=%d (ttl=%dd, dormant=%dd)",
-                    direct, group, dormant, TTL_DAYS, DORMANT_DAYS,
+                    "[offline-queue-sweep] reaped direct=%d group=%d dormant=%d sknack=%d "
+                    "(ttl=%dd, dormant=%dd, sknack=%ds)",
+                    direct, group, dormant, sknack, TTL_DAYS, DORMANT_DAYS, SKNACK_TTL_SECONDS,
                 )
         except asyncio.CancelledError:
             raise

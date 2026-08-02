@@ -117,8 +117,20 @@ async def _get_daily_count(uin: int) -> int:
 
 
 class _PeerInfo(BaseModel):
+    """What the other side of a roulette pairing is allowed to learn.
+
+    The uin and the two public keys are load-bearing: sealed 1:1 delivery is
+    addressed by uin and encrypted to the identity key, so a pairing cannot
+    work without them. The NICKNAME is not — nothing needs it except a label on
+    screen, and a label on screen is exactly the thing that makes an anonymous
+    stranger identifiable. It is emptied here rather than removed so that
+    already-shipped clients, which expect the field, keep parsing and simply
+    have nothing to draw. Fail-closed: an old build cannot leak what it is
+    never sent.
+    """
+
     uin: int
-    nickname: str
+    nickname: str = ""
     identity_key: str
     signing_key: str
 
@@ -140,7 +152,10 @@ async def _fetch_peer(db: AsyncSession, uin: int) -> _PeerInfo | None:
         return None
     return _PeerInfo(
         uin=user.uin,
-        nickname=user.nickname,
+        # Deliberately not `user.nickname` — see _PeerInfo. Random chat promises
+        # a stranger; handing over the name they use everywhere else in the app
+        # breaks that before the first message is typed.
+        nickname="",
         identity_key=user.identity_key,
         signing_key=user.signing_key,
     )
