@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import mark_suspended, require_admin
 from app.models.invite import Invite
+from app.models.owned_uin import OwnedUin
 from app.models.report import Report
 from app.models.user import User, effective_status
 from app.services import server_settings
@@ -989,6 +990,60 @@ async def _online_users(db: AsyncSession) -> list[OnlineUser]:
 @router.get("/presence/online", response_model=list[OnlineUser])
 async def online_users(db: AsyncSession = Depends(get_db)) -> list[OnlineUser]:
     return await _online_users(db)
+
+
+# ── Handing out numbers by arrangement ──────────────────────────────
+# Self-hosted islands have no shop (the storefront is flagship-only), so an
+# operator who agrees to give someone a number needs a way to do it. An invite
+# with a reserved `uin` already covers a NEW member, but there was nothing at
+# all for an EXISTING one — which is the normal case, because the arrangement
+# usually happens after somebody has been on the island a while.
+
+
+class GrantUinIn(BaseModel):
+    # The number to hand over.
+    uin: int = Field(gt=0)
+    # Who gets it, by their current number.
+    to_uin: int = Field(gt=0)
+
+
+class GrantUinOut(BaseModel):
+    uin: int
+    to_uin: int
+    owned: list[int]
+
+
+@router.post("/uin/grant", response_model=GrantUinOut)
+async def grant_uin(
+    body: GrantUinIn,
+    db: AsyncSession = Depends(get_db),
+) -> GrantUinOut:
+    """Put a number into an existing member's collection.
+
+    It lands in the collection, NOT on their account: the operator decides who
+    gets a number, the person decides when (and whether) to answer as it. That
+    also means this can never yank somebody's identity out from under them
+    mid-conversation.
+
+    Works whether or not the shop is enabled — this is the operator acting
+    directly, which is the whole point on an island with no storefront.
+    """
+    if await db.scalar(select(User.uin).where(User.uin == body.uin)) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "in_use"})
+    if await db.scalar(select(OwnedUin.uin).where(OwnedUin.uin == body.uin)) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "already_held"})
+    if await db.get(User, body.to_uin) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "no_such_user"})
+
+    db.add(OwnedUin(uin=body.uin, owner_uin=body.to_uin, source="granted"))
+    await db.commit()
+    owned = (
+        await db.execute(
+            select(OwnedUin.uin).where(OwnedUin.owner_uin == body.to_uin).order_by(OwnedUin.uin)
+        )
+    ).scalars().all()
+    log.warning("[uin-grant] %s -> %s", body.uin, body.to_uin)
+    return GrantUinOut(uin=body.uin, to_uin=body.to_uin, owned=[int(u) for u in owned])
 
 
 # ── Server-join invites ─────────────────────────────────────────────
