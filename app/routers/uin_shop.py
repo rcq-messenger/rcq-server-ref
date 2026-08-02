@@ -102,10 +102,23 @@ class QuoteOut(BaseModel):
     reason: str | None = None
 
 
+async def require_shop_open() -> None:
+    """The shop is a FLAGSHIP surface. A self-hosted island hands numbers out
+    by arrangement (see `POST /admin/uin/grant`) and has no storefront at all,
+    so the pricing endpoints have to be absent there, not merely unused: a
+    private island quoting "$999.00" for a number it will never sell is
+    advertising somebody else's shop.
+
+    `UIN_SHOP_ENABLED` defaults to false and prod sets it true in its .env.
+    """
+    if not settings.UIN_SHOP_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
+
+
 @router.post(
     "/quote",
     response_model=QuoteOut,
-    dependencies=[Depends(rate_limit("uin_quote", 30, 60))],
+    dependencies=[Depends(require_shop_open), Depends(rate_limit("uin_quote", 30, 60))],
 )
 async def quote(
     body: QuoteIn,
@@ -143,7 +156,7 @@ class SuggestionOut(BaseModel):
 @router.get(
     "/suggestions",
     response_model=list[SuggestionOut],
-    dependencies=[Depends(rate_limit("uin_suggestions", 20, 60))],
+    dependencies=[Depends(require_shop_open), Depends(rate_limit("uin_suggestions", 20, 60))],
 )
 async def suggestions(
     count: int = Query(6, ge=1, le=20),
@@ -272,7 +285,13 @@ async def activate(
     numbers is reversible and never loses one.
 
     Separate from `/purchase` on purpose: buying and changing who you are were
-    the same button, which is a bad thing to be one tap away from."""
+    the same button, which is a bad thing to be one tap away from.
+
+    Deliberately NOT gated on UIN_SHOP_ENABLED. The gate belongs on acquiring a
+    number, and it is already there; this only lets somebody use what they
+    already hold. A self-hosted island that granted a member a second number by
+    hand must still let them switch to it, and an operator who closes their
+    shop afterwards must not strand people on the wrong number."""
     held = await db.get(OwnedUin, body.uin)
     if held is None or int(held.owner_uin) != me:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_owned"})
@@ -361,8 +380,9 @@ async def claim(
     return await _take(db, user, body.uin, switch=body.switch)
 
 
-# `/quote` and `/suggestions` are read-only pricing helpers and stay open
-# regardless of the flag. Both are rate-limited: `/quote` is a registration
+# `/quote` and `/suggestions` are pricing helpers for a shop that only the
+# flagship runs, so they 404 with it (see require_shop_open). Both are also
+# rate-limited: `/quote` is a registration
 # oracle (it reports whether any 3-9 digit UIN is taken), so an unmetered
 # version enumerates the user base of a product whose pitch is having no
 # public identifiers.
