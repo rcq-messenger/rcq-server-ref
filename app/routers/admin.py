@@ -908,15 +908,21 @@ async def recent_activity(
 
 
 @router.get("/presence/online-count")
-async def online_count() -> dict[str, int]:
-    """Cluster-wide count of currently-connected UINs."""
-    from app.core.redis import get_redis
-    try:
-        redis = await get_redis()
-        n = await redis.scard("ws:online_uins")
-        return {"online": int(n or 0)}
-    except Exception:
-        return {"online": 0}
+async def online_count(db: AsyncSession = Depends(get_db)) -> dict[str, int]:
+    """Cluster-wide count of currently-connected UINs.
+
+    Deliberately the LENGTH of the same list `/presence/online` returns, not a
+    separate SCARD. The two used to disagree in the console for two reasons and
+    both were real: the list is cached for a few seconds while the raw count was
+    not, and the count included set members with no `users` row at all, which
+    the list quietly dropped when it joined. Ghost members happen because the
+    SREM on disconnect is best-effort (see connection_manager) — a worker that
+    dies mid-flight leaves its UINs behind.
+
+    One source, one number. `_online_users` also prunes the ghosts it finds, so
+    the set heals instead of drifting upward forever.
+    """
+    return {"online": len(await _online_users(db))}
 
 
 class OnlineUser(BaseModel):
@@ -927,10 +933,12 @@ class OnlineUser(BaseModel):
     is_fake: bool
 
 
-@router.get("/presence/online", response_model=list[OnlineUser])
-async def online_users(
-    db: AsyncSession = Depends(get_db),
-) -> list[OnlineUser]:
+async def _online_users(db: AsyncSession) -> list[OnlineUser]:
+    """Everyone with a live socket somewhere in the cluster, as rows.
+
+    Shared by the list endpoint and the count so the console cannot show two
+    different numbers for the same thing.
+    """
     cached = _cache_get("online_users")
     if cached is not None:
         return cached
@@ -953,6 +961,17 @@ async def online_users(
         .where(User.uin.in_(uins))
         .order_by(User.last_seen.desc())
     )).scalars().all()
+    # Members of the set with no account behind them: burned accounts, or a
+    # worker that went away without running its SREM. Drop them so the set
+    # stops counting people who are not there. Best-effort — a failure here
+    # must not turn the console blank.
+    ghosts = set(uins) - {int(u.uin) for u in rows}
+    if ghosts:
+        try:
+            await redis.srem("ws:online_uins", *[str(g) for g in ghosts])
+            log.warning("[presence] pruned %d stale online member(s)", len(ghosts))
+        except Exception:  # noqa: BLE001
+            pass
     result = [
         OnlineUser(
             uin=int(u.uin),
@@ -965,6 +984,11 @@ async def online_users(
     ]
     _cache_put("online_users", result)
     return result
+
+
+@router.get("/presence/online", response_model=list[OnlineUser])
+async def online_users(db: AsyncSession = Depends(get_db)) -> list[OnlineUser]:
+    return await _online_users(db)
 
 
 # ── Server-join invites ─────────────────────────────────────────────
