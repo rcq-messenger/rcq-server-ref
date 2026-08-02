@@ -253,7 +253,7 @@ _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 
@@ -382,7 +382,13 @@ async def init_db() -> None:
         # casino / inventory leaves
         "item_history", "item_instances", "kind_mint_slots",
         "trades", "marketplace_listings",
-        "owned_uins", "uin_auction_bids", "uin_auctions",
+        # `owned_uins` was on this list from the 2026-05-27 cut and is BACK in
+        # use as the UIN vault (app/models/owned_uin.py). Leaving it here meant
+        # create_all built the table on boot and the very next statement
+        # dropped it again — silently, every restart, taking everyone's held
+        # numbers with it. The rest of the old marketplace tables are still
+        # dead and still dropped.
+        "uin_auction_bids", "uin_auctions",
         "uin_marketplace_listings",
         "pet_hunt_state",
         "premium_unlocks",

@@ -50,6 +50,7 @@ from app.models.group import (
 from app.models.hood_banner import HoodBanner
 from app.models.hood_message import HoodMessage
 from app.models.message import OfflineMessage
+from app.models.owned_uin import OwnedUin
 from app.models.poll import Poll, PollVote
 from app.models.queue_cursor import QueueCursor
 from app.models.referral import Referral
@@ -78,6 +79,11 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (QueueCursor, QueueCursor.uin),
     (UserCapability, UserCapability.uin),
     (Referral, Referral.inviter_uin),
+    # The vault follows its holder when they move between their own
+    # numbers, and empties when the account is burned — a released
+    # number goes back in the pool rather than staying reserved by a
+    # person who no longer exists.
+    (OwnedUin, OwnedUin.owner_uin),
     (Referral, Referral.invitee_uin),
     (HoodMessage, HoodMessage.owner_uin),
     (HoodBanner, HoodBanner.owner_uin),

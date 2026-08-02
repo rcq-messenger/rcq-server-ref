@@ -31,6 +31,7 @@ price as a public fact about a UIN's digit length, not as a secret.
 from __future__ import annotations
 
 import secrets
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -41,8 +42,9 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin, issue_token, uin_epoch
+from app.models.owned_uin import OwnedUin
 from app.models.user import User
-from app.routers.migrate import MigrateOut, _perform_migration
+from app.routers.migrate import _perform_migration
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
 
@@ -68,6 +70,18 @@ _PRICES_CENTS: dict[int, int] = {
 
 def _length(uin: int) -> int:
     return len(str(uin))
+
+
+async def _is_taken(db: AsyncSession, uin: int) -> bool:
+    """A number is unavailable if somebody is USING it or HOLDING it.
+
+    The vault half is new and load-bearing: a held number has no `users` row,
+    so without this check the shop would happily sell #111 to a second person
+    while the first one still had it in their collection.
+    """
+    if await db.scalar(select(User.uin).where(User.uin == uin)) is not None:
+        return True
+    return await db.scalar(select(OwnedUin.uin).where(OwnedUin.uin == uin)) is not None
 
 
 class QuoteIn(BaseModel):
@@ -106,7 +120,7 @@ async def quote(
     if body.uin == me:
         return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="self")
 
-    taken = await db.scalar(select(User.uin).where(User.uin == body.uin)) is not None
+    taken = await _is_taken(db, body.uin)
     cents = _PRICES_CENTS[length]
     display = f"${cents / 100:.2f}"
     return QuoteOut(
@@ -159,8 +173,7 @@ async def suggestions(
         if candidate == me or candidate in seen:
             continue
         seen.add(candidate)
-        taken = await db.scalar(select(User.uin).where(User.uin == candidate)) is not None
-        if taken:
+        if await _is_taken(db, candidate):
             continue
         cents = _PRICES_CENTS[length]
         out.append(SuggestionOut(
@@ -178,18 +191,135 @@ def _price_display_for(cents: int) -> str:
 
 class ClaimIn(BaseModel):
     uin: int = Field(gt=0)
+    # Take the number WITHOUT becoming it. Defaults to true so every already
+    # shipped client keeps the behaviour it was written against; new clients
+    # send false and the number simply joins the buyer's collection.
+    switch: bool = True
     # Shipped clients still post a `receipt` string. It is deliberately NOT
     # declared here and is ignored: it was never validated against anything,
     # and a field that looks like a payment check but is not is worse than no
     # field at all. Pydantic drops unknown keys, so old clients keep working.
 
 
-@router.post("/purchase", response_model=MigrateOut)
+class PurchaseOut(BaseModel):
+    """Superset of MigrateOut. `new_uin`/`token` are populated exactly when the
+    caller asked to switch, so a client written against the old shape reads it
+    unchanged; `switched` and `owned` are what the new screen renders."""
+
+    new_uin: int | None = None
+    token: str | None = None
+    switched: bool = False
+    # The caller's collection after this call: numbers held but not in use.
+    owned: list[int] = []
+
+
+class OwnedUinOut(BaseModel):
+    uin: int
+    length: int
+    acquired_at: datetime
+
+
+class MyUinsOut(BaseModel):
+    # The number this account is answering as right now.
+    active: int
+    owned: list[OwnedUinOut]
+
+
+async def _owned_uins(db: AsyncSession, owner: int) -> list[int]:
+    rows = (
+        await db.execute(
+            select(OwnedUin.uin).where(OwnedUin.owner_uin == owner).order_by(OwnedUin.uin)
+        )
+    ).scalars().all()
+    return [int(u) for u in rows]
+
+
+@router.get("/mine", response_model=MyUinsOut)
+async def my_uins(
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> MyUinsOut:
+    """This account's number and everything else it holds.
+
+    Open regardless of UIN_SHOP_ENABLED: an operator switching the shop off
+    should stop new sales, not hide from people what they already own."""
+    rows = (
+        await db.execute(
+            select(OwnedUin).where(OwnedUin.owner_uin == me).order_by(OwnedUin.acquired_at.desc())
+        )
+    ).scalars().all()
+    return MyUinsOut(
+        active=me,
+        owned=[
+            OwnedUinOut(uin=int(r.uin), length=_length(int(r.uin)), acquired_at=r.acquired_at)
+            for r in rows
+        ],
+    )
+
+
+class ActivateIn(BaseModel):
+    uin: int = Field(gt=0)
+
+
+@router.post("/activate", response_model=PurchaseOut)
+async def activate(
+    body: ActivateIn,
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> PurchaseOut:
+    """Answer as a number you already hold. Your current number goes into the
+    collection rather than back into the pool, so switching between your own
+    numbers is reversible and never loses one.
+
+    Separate from `/purchase` on purpose: buying and changing who you are were
+    the same button, which is a bad thing to be one tap away from."""
+    held = await db.get(OwnedUin, body.uin)
+    if held is None or int(held.owner_uin) != me:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_owned"})
+    user = await db.get(User, me)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    if user.is_suspended:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+
+    # Free the target first: migrating ONTO a number that is still recorded as
+    # held would leave a row claiming the number the account now occupies.
+    await db.delete(held)
+    await db.flush()
+    return await _take(db, user, body.uin, switch=True)
+
+
+async def _take(db: AsyncSession, user: User, target: int, *, switch: bool) -> PurchaseOut:
+    """Give `target` to `user`, either as their new identity or as a held
+    number. Shared by /purchase and /activate so the collection bookkeeping
+    cannot drift between the two."""
+    owner = int(user.uin)
+    if not switch:
+        db.add(OwnedUin(uin=target, owner_uin=owner, source="purchase"))
+        await db.commit()
+        return PurchaseOut(switched=False, owned=await _owned_uins(db, owner))
+
+    previous = owner
+    new_uin = await _perform_migration(db, user, target_uin=target)
+    # Keep the number they were using. Before the vault existed a migration
+    # released it back into the pool, so buying a second number silently cost
+    # you the first one.
+    db.add(OwnedUin(uin=previous, owner_uin=new_uin, source="previous"))
+    await db.commit()
+    return PurchaseOut(
+        new_uin=new_uin,
+        token=issue_token(new_uin, await uin_epoch(new_uin)),
+        switched=True,
+        owned=await _owned_uins(db, new_uin),
+    )
+
+
+@router.post("/purchase", response_model=PurchaseOut)
 async def claim(
     body: ClaimIn,
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
-) -> MigrateOut:
+) -> PurchaseOut:
     """BETA: claim any free 3-9 digit UIN and move this account onto it.
 
     This grants the number for FREE. That is the intended behaviour while the
@@ -215,7 +345,7 @@ async def claim(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
     if body.uin == me:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "self_target"})
-    if await db.scalar(select(User.uin).where(User.uin == body.uin)) is not None:
+    if await _is_taken(db, body.uin):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
 
     user = await db.get(User, me)
@@ -226,10 +356,9 @@ async def claim(
     if user.is_suspended:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
 
-    new_uin = await _perform_migration(db, user, target_uin=body.uin)
     # The freed number's tokens are retired inside _perform_migration, so the
     # old bearer cannot follow the number to whoever claims it next.
-    return MigrateOut(new_uin=new_uin, token=issue_token(new_uin, await uin_epoch(new_uin)))
+    return await _take(db, user, body.uin, switch=body.switch)
 
 
 # `/quote` and `/suggestions` are read-only pricing helpers and stay open

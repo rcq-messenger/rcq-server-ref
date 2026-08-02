@@ -5,6 +5,7 @@ from .group import Group, GroupMember, OfflineGroupMessage
 from .device_token import DeviceToken
 from .audio_room import AudioRoom, AudioRoomMembership
 from .story import Story, StoryView
+from .owned_uin import OwnedUin
 
 __all__ = [
     "User",
@@ -19,4 +20,5 @@ __all__ = [
     "AudioRoomMembership",
     "Story",
     "StoryView",
+    "OwnedUin",
 ]
