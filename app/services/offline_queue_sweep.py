@@ -81,6 +81,20 @@ _DORMANT_SQL = text(
 )
 
 
+def dormant_cutoff() -> datetime | None:
+    """The instant before which a recipient counts as absent for GROUP
+    backlog, or None when the rule is switched off.
+
+    Shared with the group fan-out in `app.routers.messages` so the WRITE side
+    uses the same definition this sweep deletes by. Queueing a row we are
+    going to reap within the hour is pure cost — the insert, the WAL, the
+    index churn and the table bloat — for a copy nobody will ever drain.
+    """
+    if DORMANT_DAYS <= 0:
+        return None
+    return datetime.now(timezone.utc) - timedelta(days=DORMANT_DAYS)
+
+
 async def _sweep_dormant(cutoff: datetime) -> int:
     """Drop group backlog for recipients absent since `cutoff`, in bounded
     batches. Stops at the first empty batch or the per-sweep ceiling, so a

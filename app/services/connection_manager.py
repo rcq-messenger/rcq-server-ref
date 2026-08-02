@@ -322,9 +322,10 @@ class ConnectionManager:
             for uin in uins:
                 await self._deliver_user_local(uin, text)
 
-    async def fanout(self, uins: list[int], payload: dict[str, Any]) -> None:
+    async def fanout(self, uins: list[int], payload: dict[str, Any]) -> set[int]:
         """Publish `payload` to the ONLINE subset of `uins` in a single
-        pipelined Redis round-trip.
+        pipelined Redis round-trip. Returns the UINs that were online at
+        publish time (callers that only want the delivery may ignore it).
 
         The per-uin `send()` loop is O(N) round-trips (a publish + a
         sismember each) which, on a large group (1000+ members), turned a
@@ -335,15 +336,15 @@ class ConnectionManager:
         identical (the same users actually get the message).
         """
         if not uins:
-            return
+            return set()
         await self._ensure_pubsub()
         text = json.dumps(payload)
         try:
             redis = await get_redis()
-            online = await redis.smembers(_ONLINE_KEY)  # set[str] (decode_responses=True)
-            targets = [u for u in uins if str(u) in online]
+            online_raw = await redis.smembers(_ONLINE_KEY)  # set[str] (decode_responses=True)
+            targets = [u for u in uins if str(u) in online_raw]
             if not targets:
-                return
+                return set()
             async with redis.pipeline(transaction=False) as pipe:
                 for uin in targets:
                     pipe.publish(
@@ -351,10 +352,63 @@ class ConnectionManager:
                         json.dumps({"target": "user", "uin": uin, "payload_text": text}),
                     )
                 await pipe.execute()
+            return set(targets)
         except Exception:  # noqa: BLE001
             # Redis blip: best-effort local delivery, same fallback as send/broadcast.
+            delivered: set[int] = set()
             for uin in uins:
+                if uin in self._conns:
+                    delivered.add(uin)
                 await self._deliver_user_local(uin, text)
+            return delivered
+
+    async def fanout_each(self, items: list[tuple[int, dict[str, Any]]]) -> set[int]:
+        """Publish a DIFFERENT payload per recipient in one pipelined Redis
+        round-trip. Returns the subset of UINs that were online at publish
+        time — i.e. exactly what a `send()` per recipient would have reported.
+
+        `fanout` above covers the one-payload-for-everyone case. The group
+        sealed-sender path can't use it: every member gets their own
+        ciphertext (each envelope is sealed to one identity key), so the
+        payload differs per recipient. It used a `send()` loop instead, which
+        is a publish AND a sismember per member — on the 1700-member flagship
+        group that's ~3400 sequential round-trips inside the sender's own
+        request, and it is what put /messages/group-sealed at a 153s p95 on
+        prod. Same shape as `fanout`: one smembers, one pipeline, O(1)
+        round-trips regardless of N.
+
+        Offline members get nothing here (no live socket to receive it) —
+        their copy rides the offline queue, exactly as before.
+        """
+        if not items:
+            return set()
+        await self._ensure_pubsub()
+        try:
+            redis = await get_redis()
+            online_raw = await redis.smembers(_ONLINE_KEY)  # set[str] (decode_responses=True)
+            online = {uin for uin, _ in items if str(uin) in online_raw}
+            targets = [(uin, payload) for uin, payload in items if uin in online]
+            if targets:
+                async with redis.pipeline(transaction=False) as pipe:
+                    for uin, payload in targets:
+                        pipe.publish(
+                            _FANOUT_CHANNEL,
+                            json.dumps({
+                                "target": "user",
+                                "uin": uin,
+                                "payload_text": json.dumps(payload),
+                            }),
+                        )
+                    await pipe.execute()
+            return online
+        except Exception:  # noqa: BLE001
+            # Redis blip: best-effort local delivery, same fallback as send().
+            delivered: set[int] = set()
+            for uin, payload in items:
+                if uin in self._conns:
+                    await self._deliver_user_local(uin, json.dumps(payload))
+                    delivered.add(uin)
+            return delivered
 
     async def broadcast_all(self, payload: dict[str, Any]) -> None:
         """Fan out to every connected UIN across the cluster. Used by

@@ -124,6 +124,48 @@ async def is_group_muted(recipient_uin: int, group_id: int) -> bool:
         muted = _pref(user.push_preferences, "muted_group_ids") or []
     return int(group_id) in {int(g) for g in muted}
 
+
+async def group_push_targets(
+    db: AsyncSession, uins: list[int], group_id: int
+) -> list[int]:
+    """The subset of `uins` worth waking about a post in `group_id`: they have
+    at least one registered push endpoint AND have not silenced this group.
+
+    Two queries for the whole fan-out, on the CALLER's session. The
+    per-recipient path this replaces (`is_group_muted` + the token reads
+    inside each sender) opened three separate short-lived sessions PER
+    RECIPIENT, so one post to a 1700-member group asked the pool for
+    thousands of connections at once — while the pool is deliberately small
+    (PgBouncer, transaction mode). Reading tokens first also means we never
+    spawn a delivery task for the majority of members, who have no push
+    endpoint registered at all.
+    """
+    if not uins:
+        return []
+    with_tokens = set(
+        (
+            await db.execute(
+                select(DeviceToken.uin).where(DeviceToken.uin.in_(uins)).distinct()
+            )
+        ).scalars().all()
+    )
+    if not with_tokens:
+        return []
+    rows = (
+        await db.execute(
+            select(User.uin, User.push_preferences).where(User.uin.in_(list(with_tokens)))
+        )
+    ).all()
+    gid = int(group_id)
+    unmuted = {
+        uin
+        for uin, prefs in rows
+        if gid not in {int(g) for g in (_pref(prefs, "muted_group_ids") or [])}
+    }
+    # Preserve the caller's ordering; a user row missing entirely is treated
+    # as unmuted only if it exists (a token without a user is a dead row).
+    return [uin for uin in uins if uin in unmuted]
+
 # JWT cache. Apple's docs say tokens may be reused for up to 1 hour, but they
 # rate-limit if you re-sign too often. Refresh comfortably under the limit.
 _JWT_TTL_SECONDS = 50 * 60
