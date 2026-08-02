@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
@@ -16,6 +17,7 @@ from app.services.unifiedpush import send_call_to_user as up_call
 from app.services.connection_manager import manager
 
 router = APIRouter(tags=["ws"])
+_log = logging.getLogger(__name__)
 
 # Concurrent-call guard. Per-uin → (call_id, counterparty_uin). When a
 # call_offer arrives, we check both endpoints — if either side is already
@@ -266,6 +268,17 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
             await _handle_client_message(uin, msg)
     except WebSocketDisconnect:
         pass
+    except RuntimeError as exc:
+        # Starlette raises a bare RuntimeError when receive_json() is entered
+        # on a socket whose state has already left CONNECTED. That is exactly
+        # what happens to the OLD socket when a reconnect supersedes it:
+        # manager.connect() closes it with 4000 while this task is still
+        # parked in receive. It is an ordinary disconnect, not a fault, but it
+        # surfaced as a full traceback ~3.5k times a day and buried every real
+        # error in the log. Count it as a disconnect; anything else re-raises.
+        if "not connected" not in str(exc):
+            raise
+        _log.info("ws uin=%s: socket closed under receive (superseded)", uin)
     finally:
         await manager.disconnect(uin, ws)
         await _on_disconnect(uin)
