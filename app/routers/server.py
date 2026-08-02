@@ -49,6 +49,11 @@ class ServerCapabilities(BaseModel):
     random_chat: bool = True
     hood: bool = True
     stories: bool = True
+    # Abuse + bug reports to this island's operator, and reading their answers
+    # back. Off means the client hides "Report" and "Report a bug" entirely;
+    # reports already filed stay readable on both sides, so switching it off
+    # closes the desk without cutting off a conversation in progress.
+    reports: bool = True
     # How many accounts one device may hold. Advisory to the client (the server
     # can't see which accounts share a device); clients cap the account switcher.
     max_accounts_per_device: int = 5
@@ -80,6 +85,7 @@ async def server_info() -> ServerInfo:
             random_chat=eff["random_enabled"],
             hood=eff["hood_enabled"],
             stories=eff["stories_enabled"],
+            reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
             deposit_auth=settings.DEPOSIT_AUTH_ENABLED,
         ),

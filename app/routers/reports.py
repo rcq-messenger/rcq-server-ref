@@ -33,8 +33,26 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.report import Report
+from app.services import server_settings
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+async def require_reports_open() -> None:
+    """Reject new submissions when the operator has switched reports off
+    (admin console → Features, advertised as `reports` on /server/info).
+
+    Only INTAKE is gated. `GET /reports/mine` stays open on purpose: someone
+    who filed a report before the operator closed the desk must still be able
+    to read the answer, and taking that away would make the off switch a way
+    to silently drop a conversation already in progress.
+    """
+    if not await server_settings.get_bool("reports_enabled"):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={"code": "reports_disabled",
+                    "message": "this island does not accept reports"},
+        )
 
 # Anti-spam guard rails. Reasons are short user-typed text — caps
 # keep the queue readable + bound disk usage. The context tag is
@@ -102,7 +120,10 @@ class CreateReportOut(BaseModel):
     # innocent people would drown the queue and become a
     # harassment vector. 5/hr per UIN is plenty for a real user
     # who hits a bad day on Hood.
-    dependencies=[Depends(rate_limit("reports_create", 5, 3600))],
+    dependencies=[
+        Depends(require_reports_open),
+        Depends(rate_limit("reports_create", 5, 3600)),
+    ],
 )
 async def create_report(
     body: CreateReportIn,
@@ -165,7 +186,10 @@ async def create_report(
     # the same admin-queue scarcity. A single user mass-uploading
     # spurious evidence files would otherwise drain disk; the cap
     # bounds that.
-    dependencies=[Depends(rate_limit("reports_create", 5, 3600))],
+    dependencies=[
+        Depends(require_reports_open),
+        Depends(rate_limit("reports_create", 5, 3600)),
+    ],
 )
 async def create_report_with_evidence(
     target_uin: int = Form(...),
