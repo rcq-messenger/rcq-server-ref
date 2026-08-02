@@ -18,6 +18,7 @@ reason text. The server stores it under `evidence/<uuid>.<ext>`
 (admin-only path) and records the path on the Report row.
 """
 
+import contextlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -321,3 +322,45 @@ async def my_reports(
         )
         for r in rows
     ]
+
+
+@router.delete("/mine/{report_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_my_report(
+    report_id: int,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Let a reporter drop their own report.
+
+    A tester asked for this the obvious way: the list shows a stale piece of
+    feedback from weeks ago and there is no way to be rid of it. The text is
+    theirs, so they may take it back.
+
+    One exception, and it is not a technicality: a still-open report ABOUT
+    ANOTHER user is the only record moderation has of that complaint, and a
+    "delete" button over it would let someone file an accusation, watch the
+    consequences land, and then erase the evidence. Those wait for a verdict;
+    everything else (feedback, bug reports, anything already resolved) goes.
+    Deleting is a real DELETE — no tombstone, nothing kept "just in case".
+    """
+    report = await db.get(Report, report_id)
+    if report is None or report.reporter_uin != uin:
+        # Same answer either way: a wrong id must not confirm that some other
+        # user's report exists.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+    if report.target_uin != uin and report.status == "open":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "under_review"},
+        )
+    if report.evidence_path:
+        # The decrypted evidence blob outlives the row otherwise: the sweep
+        # only ever looked at expiry, never at deletions. Resolve by NAME under
+        # the evidence dir, the way the sweep does — `evidence_path` is stored
+        # relative and must never be able to point outside it.
+        target = (_EVIDENCE_DIR / Path(report.evidence_path).name).resolve()
+        if target.parent == _EVIDENCE_DIR:
+            with contextlib.suppress(OSError):
+                target.unlink()
+    await db.delete(report)
+    await db.commit()
