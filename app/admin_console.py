@@ -259,7 +259,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     <!-- REPORTS -->
     <section class="view" id="v-reports">
       <div class="head">
-        <div><h1>Reports</h1><p>Reports your users filed about other users. Review each, then dismiss it or ban the offender.</p></div>
+        <div><h1>Reports</h1><p>What your users sent you: abuse reports about other members, and bug reports about the island itself. Answer, then dismiss or ban. Your answer is delivered to the reporter in the app, so it is worth writing one even when you dismiss.</p></div>
       </div>
       <div class="card pad">
         <table><thead><tr><th>#</th><th>Target</th><th>Reason</th><th>Context</th><th></th></tr></thead>
@@ -488,17 +488,29 @@ async function searchUsers() {
 }
 async function ban(uin,suspended){ try{ await api('POST','/users/'+uin+'/ban',{suspended}); searchUsers(); }catch(e){ alert(e.message); } }
 
-/* ---- reports (user reports only; crash reports are a maintainer concern) ---- */
+/* ---- reports (user + bug reports; auto crash dumps are a maintainer concern) ---- */
 async function loadReports() {
   try {
     const r = await api('GET','/reports?status=open&kind=user');
     $('reports').innerHTML = (r.items||[]).map(rp=>`<tr>
       <td>${rp.id}</td>
       <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+rp.target_nickname+')</span>':''}</td>
-      <td>${(rp.reason||'').slice(0,120)}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}</td><td><span class="pill">${rp.context||'—'}</span></td>
-      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> <button class="btn danger sm" onclick="resolve(${rp.id},true)">Ban</button></td>
+      <td>${(rp.reason||'').slice(0,120)}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${rp.context||'—'}</span></td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> <button class="btn danger sm" onclick="resolve(${rp.id},true)">Ban</button></td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+/* Answer the reporter. The text is stored on the report and the reporter reads
+   it back over their own authenticated session; the push we send is only a
+   doorbell and carries none of it. Replying does NOT resolve the report — you
+   can answer first and decide the verdict after. */
+async function reply(id){
+  const text = prompt('Reply to the reporter. They read this in the app, under "My reports".');
+  if(text===null) return;
+  if(!text.trim()){ alert('Empty reply not sent.'); return; }
+  try{ await api('POST','/reports/'+id+'/reply',{text}); loadReports(); }
+  catch(e){ alert(e.message); }
 }
 /* Report evidence = DECRYPTED media the reporter consented to hand over.
    Fetched one report at a time (never inlined into the list) and every fetch

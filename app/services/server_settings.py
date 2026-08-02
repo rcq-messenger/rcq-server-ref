@@ -54,6 +54,10 @@ _reg(SettingSpec("hood_enabled", "bool", lambda: True, "features", "Hood Chat",
                  "Anonymous neighbourhood (geohash) chat."))
 _reg(SettingSpec("stories_enabled", "bool", lambda: True, "features", "Stories",
                  "24h ephemeral photo/video stories."))
+_reg(SettingSpec("reports_enabled", "bool", lambda: True, "features", "Reports",
+                 "Let members report abuse and file bug reports to you, and read "
+                 "your answers back. Turning this off closes intake; reports "
+                 "already filed stay readable to both sides."))
 
 # ── Limits & policy
 _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY, "limits",
