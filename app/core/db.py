@@ -154,6 +154,12 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # 'gold' so the pre-existing all-gold wall is unchanged after the migration
     # (every current member keeps a gold flower until the founder re-grades).
     ("hof_tier", "VARCHAR(8) DEFAULT 'gold'"),
+    # Founder-granted credit for bug reports filed outside the in-app form
+    # (closed tester chat, comments). Added to the counts derived from real
+    # report rows — see the note on User.hof_bonus_reports for why this is a
+    # column and not synthesised rows.
+    ("hof_bonus_reports", "INTEGER DEFAULT 0"),
+    ("hof_bonus_confirmed", "INTEGER DEFAULT 0"),
 ]
 
 # Additive columns on `nearby_checkins`. Same idempotent

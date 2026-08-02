@@ -601,9 +601,14 @@ class HofRow(BaseModel):
     tier: str = "gold"
     # Bug-bounty effort, so the founder can see contribution before grading.
     # `reports` = total bug reports filed; `bugs_confirmed` = of those, how
-    # many were confirmed as real bugs (status=resolved).
+    # many were confirmed as real bugs (status=resolved). Both INCLUDE the
+    # founder-granted off-form credit below, i.e. they are what the wall shows.
     reports: int = 0
     bugs_confirmed: int = 0
+    # The granted part of those two, so the console can show what was typed in
+    # rather than making the founder subtract to find it.
+    bonus_reports: int = 0
+    bonus_confirmed: int = 0
 
 
 class HofListOut(BaseModel):
@@ -616,10 +621,16 @@ _HOF_TIERS = {"bronze", "silver", "gold"}
 
 
 class HofApproveIn(BaseModel):
-    # Both optional so the founder can toggle wall membership and set the rating
-    # independently through the same endpoint. A request sets whatever it sends.
+    # All optional so the founder can toggle wall membership, set the rating and
+    # grant off-form report credit independently through the same endpoint. A
+    # request sets whatever it sends.
     approved: bool | None = None
     tier: str | None = None
+    # Credit for bug reports filed outside the in-app form (closed tester chat,
+    # comments). ADDED to the counts computed from real report rows, so a
+    # contributor who also uses the form keeps earning on top of the grant.
+    bonus_reports: int | None = Field(default=None, ge=0, le=10_000)
+    bonus_confirmed: int | None = Field(default=None, ge=0, le=10_000)
 
 
 @router.get("/hof", response_model=HofListOut)
@@ -649,6 +660,8 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
                 tier=(u.hof_tier or "gold"),
                 reports=stats.get(u.uin, (0, 0))[0],
                 bugs_confirmed=stats.get(u.uin, (0, 0))[1],
+                bonus_reports=u.hof_bonus_reports or 0,
+                bonus_confirmed=u.hof_bonus_confirmed or 0,
             )
             for u in rows
         ],
@@ -658,9 +671,15 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
 
 @router.post("/hof/{uin}", response_model=HofRow)
 async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depends(get_db)) -> HofRow:
-    """Founder controls for one member: flip wall membership (`approved`) and/or
-    set the rating tier (`tier`). Both optional — a request changes only what it
-    sends. Does not touch the user's own opt-in consent."""
+    """Founder controls for one member: flip wall membership (`approved`), set
+    the rating tier (`tier`), and grant credit for reports filed off the in-app
+    form (`bonus_*`). All optional — a request changes only what it sends. Does
+    not touch the user's own opt-in consent.
+
+    `bonus_confirmed` above `bonus_reports` would draw a ring claiming more
+    confirmed bugs than reports filed, so it is rejected rather than clamped —
+    a typo in the console should not silently become a wrong number on a public
+    wall."""
     if body.tier is not None and body.tier not in _HOF_TIERS:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -669,10 +688,23 @@ async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depe
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    new_bonus_reports = (
+        body.bonus_reports if body.bonus_reports is not None else user.hof_bonus_reports
+    )
+    new_bonus_confirmed = (
+        body.bonus_confirmed if body.bonus_confirmed is not None else user.hof_bonus_confirmed
+    )
+    if (new_bonus_confirmed or 0) > (new_bonus_reports or 0):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "bonus_confirmed cannot exceed bonus_reports",
+        )
     if body.approved is not None:
         user.hof_approved = body.approved
     if body.tier is not None:
         user.hof_tier = body.tier
+    user.hof_bonus_reports = new_bonus_reports
+    user.hof_bonus_confirmed = new_bonus_confirmed
     await db.commit()
     await db.refresh(user)
     stats = await bug_report_stats(db, [user.uin])
@@ -688,6 +720,8 @@ async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depe
         tier=(user.hof_tier or "gold"),
         reports=total,
         bugs_confirmed=confirmed,
+        bonus_reports=user.hof_bonus_reports or 0,
+        bonus_confirmed=user.hof_bonus_confirmed or 0,
     )
 
 
