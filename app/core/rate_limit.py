@@ -110,6 +110,34 @@ def _identity(request: Request, creds: HTTPAuthorizationCredentials | None) -> s
     return f"ip:{_client_ip(request)}"
 
 
+async def enforce_rate_limit(
+    identity: str, rule: str, limit: int, window_seconds: int
+) -> None:
+    """The limiter as a plain call, for routes whose budget depends on
+    something only the handler can see (e.g. a report's `context`, which
+    lives in the request body and so is not available to a dependency).
+
+    `identity` is the already-built identity string, usually `f"uin:{uin}"`.
+    Same fail-soft, same 429 shape as the dependency below.
+    """
+    key = f"rl:{rule}:{identity}"
+    now = time.time()
+    try:
+        redis = await get_redis()
+        result = await redis.eval(_LIMITER_SCRIPT, 1, key, now, window_seconds, limit)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[rate_limit] redis unavailable, allowing: %s", exc)
+        return
+    if int(result[0]) == 1:
+        return
+    retry_after = int(result[1]) if len(result) > 1 else 1
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={"code": "rate_limited", "retry_after": retry_after},
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
     """Build a FastAPI dependency that enforces `limit` calls per
     `window_seconds` keyed by (rule, identity).
