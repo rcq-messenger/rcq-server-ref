@@ -30,7 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.rate_limit import rate_limit
+from app.core.rate_limit import enforce_rate_limit, rate_limit
 from app.core.security import current_uin
 from app.models.report import Report
 from app.services import server_settings
@@ -59,6 +59,12 @@ async def require_reports_open() -> None:
 # even shorter (it's a surface code like "contact" or "hood").
 MAX_REASON_LEN: int = 1000
 MAX_CONTEXT_LEN: int = 64
+
+# Per-hour submission budgets, per UIN. Reports ABOUT another member are
+# rate-limited as a harassment guard (see create_report). Bug reports are
+# limited only so a broken client can't loop forever.
+ABUSE_REPORTS_PER_HOUR: int = 5
+BUG_REPORTS_PER_HOUR: int = 20
 
 # Evidence file caps. 25 MB matches the in-app media size limit;
 # larger files would exceed both a sane memory budget for the upload
@@ -116,20 +122,31 @@ class CreateReportOut(BaseModel):
     "",
     response_model=CreateReportOut,
     status_code=status.HTTP_201_CREATED,
-    # Reports queue is admin-managed; a single user mass-flagging
-    # innocent people would drown the queue and become a
-    # harassment vector. 5/hr per UIN is plenty for a real user
-    # who hits a bad day on Hood.
-    dependencies=[
-        Depends(require_reports_open),
-        Depends(rate_limit("reports_create", 5, 3600)),
-    ],
+    # The per-hour budget is applied INSIDE the handler, because it depends on
+    # what kind of report this is and that only exists in the body. See
+    # BUG_REPORTS_PER_HOUR.
+    dependencies=[Depends(require_reports_open)],
 )
 async def create_report(
     body: CreateReportIn,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> CreateReportOut:
+    # Two different things ride this endpoint and they deserve different caps.
+    # Flagging OTHER PEOPLE is a harassment vector: mass-flagging drowns the
+    # queue and can be used against someone, so it stays tight. Writing to the
+    # maintainers about the app is the opposite — it is the thing we ask people
+    # to do, and 5/hour punished exactly the person who takes it seriously.
+    # user-9547 sent 24 reports in five days; on 2026-08-02 the access log
+    # shows 26 rejections against 8 accepted, i.e. he spent a quarter of an
+    # hour retrying a button that told him nothing.
+    is_bug_report = body.context == "bug_bounty"
+    await enforce_rate_limit(
+        f"uin:{uin}",
+        "reports_bug" if is_bug_report else "reports_create",
+        BUG_REPORTS_PER_HOUR if is_bug_report else ABUSE_REPORTS_PER_HOUR,
+        3600,
+    )
     # Self-target is rejected for normal abuse reports (no meaningful
     # action an admin can take) but PERMITTED for bug-bounty
     # submissions, which ride this same endpoint with `context =
@@ -188,7 +205,7 @@ async def create_report(
     # bounds that.
     dependencies=[
         Depends(require_reports_open),
-        Depends(rate_limit("reports_create", 5, 3600)),
+        Depends(rate_limit("reports_create", ABUSE_REPORTS_PER_HOUR, 3600)),
     ],
 )
 async def create_report_with_evidence(
