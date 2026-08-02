@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -17,9 +17,10 @@ from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
-from app.services.apns import is_group_muted, send_to_user as apns_send
+from app.services.apns import group_push_targets, send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
 from app.services.connection_manager import manager
+from app.services.offline_queue_sweep import dormant_cutoff
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +176,31 @@ async def send_sealed(
     return SendOut(delivered=delivered, queued=queued, server_time=now)
 
 
+def _queueable(member_rows: list[tuple[int, datetime | None]]) -> set[int]:
+    """Of `(uin, last_seen)`, the members whose group backlog we actually
+    keep — everyone the dormant sweep would not immediately delete again.
+
+    Group fan-out writes one row PER MEMBER, so the flagship's 1733-member
+    group turns a single post into 1733 inserts. `offline_queue_sweep` has
+    reaped the dormant share of those since 2026-07-31 (tens of thousands per
+    six-hour cycle on prod) precisely because nobody drains them. Deciding the
+    same thing at write time costs one already-needed join and skips the
+    insert entirely.
+
+    `users.last_seen` is refreshed on WS connect, heartbeat and disconnect, so
+    a member who is online right now is never in the skipped set — and one who
+    comes back later is woken by push (the fan-out below still targets them)
+    and starts accumulating backlog again from that moment.
+    """
+    cutoff = dormant_cutoff()
+    if cutoff is None:
+        return {uin for uin, _ in member_rows}
+    return {
+        uin for uin, last_seen in member_rows
+        if last_seen is not None and last_seen >= cutoff
+    }
+
+
 class GroupRecipientPayload(BaseModel):
     to_uin: int
     payload: str
@@ -243,46 +269,59 @@ async def send_group_sealed(
         # for 'all' groups), drop the `caller is not None` clause so an
         # anonymous owner_only post is rejected too — closing the
         # modified-native-client bypass.
-    members = set(
-        (
-            await db.execute(select(GroupMember.uin).where(GroupMember.group_id == body.group_id))
-        ).scalars().all()
-    )
-    if not members:
+    # Membership AND recency in one read: whether we hold offline backlog for
+    # a member depends on how long they have been away (see `_queueable`).
+    member_rows = (
+        await db.execute(
+            select(GroupMember.uin, User.last_seen)
+            .outerjoin(User, User.uin == GroupMember.uin)
+            .where(GroupMember.group_id == body.group_id)
+        )
+    ).all()
+    if not member_rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "group has no members")
+    members = {uin for uin, _ in member_rows}
+    queueable = _queueable(member_rows)
 
     now = datetime.now(timezone.utc)
-    delivered_any = False
-    offline_recipients: list[int] = []
-    for entry in body.payloads:
-        # Drop entries that don't correspond to real group members. Cheap
-        # client mistake guard — we don't error on it because the client
-        # is anonymous (sealed sender) and we can't tell who they are.
-        if entry.to_uin not in members:
-            continue
-        pkt = {
-            "type": body.envelope_type,
-            "payload": entry.payload,
+    # Drop entries that don't correspond to real group members. Cheap client
+    # mistake guard — we don't error on it because the client is anonymous
+    # (sealed sender) and we can't tell who they are.
+    entries = [e for e in body.payloads if e.to_uin in members]
+    # One pipelined publish for the whole group instead of a `manager.send()`
+    # per member (two Redis round-trips each, awaited in series).
+    online = await manager.fanout_each([
+        (
+            e.to_uin,
+            {
+                "type": body.envelope_type,
+                "payload": e.payload,
+                "group_id": body.group_id,
+                "server_time": now.isoformat(),
+            },
+        )
+        for e in entries
+    ])
+    # Queue regardless of the live send: being online at publish time is
+    # optimistic (bytes in an OS buffer != client ingested them), so the
+    # recipient drains anything they missed on their next /messages/queue
+    # fetch and dedupes by UUID.
+    rows = [
+        {
+            "to_uin": e.to_uin,
             "group_id": body.group_id,
-            "server_time": now.isoformat(),
+            "envelope_type": body.envelope_type,
+            "payload": e.payload,
+            "received_at": now,
         }
-        # Always queue + WS-attempt. `manager.send()` returning True is
-        # optimistic (bytes in OS buffer != client got them) so we
-        # queue regardless so the recipient drains anything they
-        # missed on next /messages/queue fetch. Client dedupes by UUID.
-        delivered = await manager.send(entry.to_uin, pkt)
-        if delivered:
-            delivered_any = True
-        else:
-            offline_recipients.append(entry.to_uin)
-        db.add(OfflineGroupMessage(
-            to_uin=entry.to_uin,
-            group_id=body.group_id,
-            envelope_type=body.envelope_type,
-            payload=entry.payload,
-            received_at=now,
-        ))
+        for e in entries
+        if e.to_uin in queueable
+    ]
+    if rows:
+        await db.execute(insert(OfflineGroupMessage), rows)
     await db.commit()
+    delivered_any = bool(online)
+    offline_recipients = [e.to_uin for e in entries if e.to_uin not in online]
     # Group fan-out: same per-recipient encrypted-envelope pattern as
     # 1:1. Each offline member needs THEIR ciphertext (each is sealed to
     # one identity key), so we look up the matching payload entry from
@@ -293,8 +332,8 @@ async def send_group_sealed(
     # the awaited loop was holding the sender's HTTP response for
     # multiple seconds, leaving the sender's bubble stuck on the
     # "sending" clock icon while recipients had already received the
-    # message via WS. Each task opens its own DB session inside
-    # is_group_muted + apns_send, so detaching is safe.
+    # message via WS. Each task opens its own short DB session inside
+    # apns_send / up_send, so detaching is safe.
     if body.envelope_type in _PUSHABLE_TYPES:
         payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
         envelope_type = body.envelope_type
@@ -304,10 +343,16 @@ async def send_group_sealed(
         # so small-group pushes always read as the generic "New group message").
         gname = (g.name if g is not None else None) or "RCQ"
         sender_tokens = await _sender_device_tokens(db, caller)
+        # Never push the sender their OWN message (they backgrounded right
+        # after sending); their other devices still get the queue carbon.
+        # `group_push_targets` then drops everyone with no registered endpoint
+        # and everyone who muted this group — two queries for the whole group,
+        # where the old per-recipient shape opened three sessions EACH.
+        wake = await group_push_targets(
+            db, [uin for uin in offline_recipients if uin != caller], group_id
+        )
 
         async def _push(target_uin: int) -> None:
-            if await is_group_muted(target_uin, group_id):
-                return
             await apns_send(
                 target_uin,
                 alert_title=gname,
@@ -331,15 +376,11 @@ async def send_group_sealed(
                 exclude_tokens=sender_tokens,
             )
 
-        for uin in offline_recipients:
-            # Never push the sender their OWN message (they backgrounded right
-            # after sending); their other devices still get the queue carbon.
-            if uin == caller:
-                continue
+        for uin in wake:
             asyncio.create_task(_push(uin))
     log.warning(
-        "[group-sealed] gid=%s type=%s payloads=%d delivered_any=%s offline=%d",
-        body.group_id, body.envelope_type, len(body.payloads),
+        "[group-sealed] gid=%s type=%s payloads=%d queued=%d delivered_any=%s offline=%d",
+        body.group_id, body.envelope_type, len(body.payloads), len(rows),
         delivered_any, len(offline_recipients),
     )
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
@@ -400,18 +441,18 @@ async def send_group_broadcast(
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
 
-    recipients = (
-        (
-            await db.execute(
-                select(GroupMember.uin)
-                .join(UserCapability, UserCapability.uin == GroupMember.uin)
-                .where(
-                    GroupMember.group_id == body.group_id,
-                    UserCapability.sender_keys.is_(True),
-                )
+    recipient_rows = (
+        await db.execute(
+            select(GroupMember.uin, User.last_seen)
+            .join(UserCapability, UserCapability.uin == GroupMember.uin)
+            .outerjoin(User, User.uin == GroupMember.uin)
+            .where(
+                GroupMember.group_id == body.group_id,
+                UserCapability.sender_keys.is_(True),
             )
-        ).scalars().all()
-    )
+        )
+    ).all()
+    recipients = [uin for uin, _ in recipient_rows]
     if not recipients:
         # A capable client always advertises before its first broadcast, so
         # at minimum the sender's own uin matches. Empty therefore means a
@@ -419,31 +460,33 @@ async def send_group_broadcast(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no broadcast-capable members")
 
     now = datetime.now(timezone.utc)
-    delivered_any = False
-    offline_recipients: list[int] = []
+    queueable = _queueable(recipient_rows)
     # The sender's own uin is included on purpose: their other devices get
     # the broadcast as the carbons copy (the sending device dedupes by
     # message UUID, same as the WS/queue double-delivery case).
-    for uin in recipients:
-        pkt = {
-            "type": "gmsg",
-            "payload": body.payload,
+    pkt = {
+        "type": "gmsg",
+        "payload": body.payload,
+        "group_id": body.group_id,
+        "server_time": now.isoformat(),
+    }
+    online = await manager.fanout(recipients, pkt)
+    rows = [
+        {
+            "to_uin": uin,
             "group_id": body.group_id,
-            "server_time": now.isoformat(),
+            "envelope_type": "gmsg",
+            "payload": body.payload,
+            "received_at": now,
         }
-        delivered = await manager.send(uin, pkt)
-        if delivered:
-            delivered_any = True
-        else:
-            offline_recipients.append(uin)
-        db.add(OfflineGroupMessage(
-            to_uin=uin,
-            group_id=body.group_id,
-            envelope_type="gmsg",
-            payload=body.payload,
-            received_at=now,
-        ))
+        for uin in recipients
+        if uin in queueable
+    ]
+    if rows:
+        await db.execute(insert(OfflineGroupMessage), rows)
     await db.commit()
+    delivered_any = bool(online)
+    offline_recipients = [uin for uin in recipients if uin not in online]
     # Push offline members for real posts only (mirrors _PUSHABLE_TYPES
     # gating on the declared inner type). Everyone gets the SAME envelope —
     # that's the whole point. The iOS NSE shows a generic group banner for
@@ -455,10 +498,16 @@ async def send_group_broadcast(
         # user can tell which group a push came from at a glance.
         gname = g.name or "RCQ"
         sender_tokens = await _sender_device_tokens(db, caller)
+        # Never push the sender their OWN message: they backgrounded right
+        # after sending and fell into offline_recipients. Their other devices
+        # still get the WS/queue carbon — just no APNs banner. The rest of the
+        # filtering (no endpoint registered, group muted) is batched, not one
+        # short-lived DB session per recipient.
+        wake = await group_push_targets(
+            db, [uin for uin in offline_recipients if uin != caller], group_id
+        )
 
         async def _push(target_uin: int) -> None:
-            if await is_group_muted(target_uin, group_id):
-                return
             await apns_send(
                 target_uin,
                 alert_title=gname,
@@ -482,16 +531,11 @@ async def send_group_broadcast(
                 exclude_tokens=sender_tokens,
             )
 
-        for uin in offline_recipients:
-            # Never push the sender their OWN message: they backgrounded right
-            # after sending and fell into offline_recipients. Their other
-            # devices still get the WS/queue carbon — just no APNs banner.
-            if uin == caller:
-                continue
+        for uin in wake:
             asyncio.create_task(_push(uin))
     log.warning(
-        "[group-broadcast] gid=%s type=%s recipients=%d delivered_any=%s offline=%d",
-        body.group_id, body.envelope_type, len(recipients),
+        "[group-broadcast] gid=%s type=%s recipients=%d queued=%d delivered_any=%s offline=%d",
+        body.group_id, body.envelope_type, len(recipients), len(rows),
         delivered_any, len(offline_recipients),
     )
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
