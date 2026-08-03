@@ -245,6 +245,10 @@ _INVITE_COLUMNS: list[tuple[str, str]] = [
 # instead of piling up a duplicate row (= duplicate push banners). NULL on
 # existing rows = pre-device-id clients, handled by the legacy (uin, token)
 # upsert.
+_QUEUE_CURSOR_COLUMNS: list[tuple[str, str]] = [
+    ("updated_at", "TIMESTAMP WITH TIME ZONE"),
+]
+
 _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "VARCHAR(64)"),
     # Push health (UnifiedPush sender). NULL error = healthy / never tried.
@@ -290,6 +294,7 @@ async def init_db() -> None:
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
         ("invites", _INVITE_COLUMNS),
         ("device_tokens", _DEVICE_TOKEN_COLUMNS),
+        ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:

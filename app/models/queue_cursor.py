@@ -1,4 +1,6 @@
-from sqlalchemy import BigInteger, String
+from datetime import datetime
+
+from sqlalchemy import BigInteger, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -27,3 +29,11 @@ class QueueCursor(Base):
     # Highest acked OfflineMessage.id / OfflineGroupMessage.id for this device.
     last_direct_id: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     last_group_id: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Last time this device drained. Reinstalling an app mints a NEW device id
+    # (the old one is gone with its keys), so without this the abandoned cursor
+    # would sit at its old id forever and hold the whole account's queue above
+    # the reap floor. Nullable because rows written before this column existed
+    # have no stamp; those are treated as "seen just now" until they next ack.
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, server_default=func.now()
+    )
