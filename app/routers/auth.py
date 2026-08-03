@@ -27,7 +27,12 @@ from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
-from app.routers.groups import _load_group, _members_with_users, _serialize
+from app.routers.groups import (
+    SNAPSHOT_BROADCAST_LIMIT,
+    _load_group,
+    _members_with_users,
+    _serialize,
+)
 from app.routers.referrals import record_referral
 from app.services.connection_manager import manager
 from app.services.uin import allocate_uin
@@ -233,9 +238,18 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
             # One pipelined fanout to the ONLINE members instead of a sequential
             # per-member send(): on the 1300+ member beta group the old loop was
             # ~2N sequential Redis round-trips IN the register path = ~15s sign-up.
+            #
+            # And on a group this size the payload itself is the problem: the
+            # snapshot is ~600 KB, so shipping it to every online member turned
+            # each sign-up into tens of megabytes through the pub/sub channel,
+            # which every worker parses. Above the limit, send the id alone —
+            # nobody is watching a 1750-member roster update live, and the
+            # stall it caused was showing up as broken calls.
             await manager.fanout(
                 [m.uin for m in members],
-                {"type": "group_membership_changed", "group": payload},
+                {"type": "group_membership_changed", "group": payload}
+                if len(members) <= SNAPSHOT_BROADCAST_LIMIT
+                else {"type": "group_membership_changed", "group_id": beta_group_id},
             )
 
     # Mint under the number's CURRENT epoch: a recycled UIN starts above 0,
