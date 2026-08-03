@@ -51,6 +51,12 @@ log = logging.getLogger(__name__)
 _FANOUT_CHANNEL = "ws:fanout"
 # Set of UINs currently connected to ANY worker. Used by `is_online()`.
 _ONLINE_KEY = "ws:online_uins"
+# How long the subscriber may sit without a publish before it PINGs to prove
+# the connection is still there. Quiet is normal on a small island, so this is
+# a liveness check rather than a timeout: too short and every idle worker
+# chats to Redis all day, too long and a deaf worker stays deaf that much
+# longer. 15s costs 4 PINGs a minute per worker.
+_PUBSUB_HEALTH_INTERVAL = 15.0
 
 
 class ConnectionManager:
@@ -101,14 +107,35 @@ class ConnectionManager:
         """Long-lived task that listens for fanout publishes and
         delivers them to LOCAL websockets. Reconnects on transient
         Redis failures so a worker keeps participating in the cluster
-        even through a Redis blip."""
+        even through a Redis blip.
+
+        The quiet-stretch PING is not decoration. A worker whose pub/sub
+        connection Redis has dropped can sit inside the read forever without
+        raising: the task looks alive, `_ensure_pubsub` sees a task that is
+        not done and returns, and the worker goes permanently deaf while
+        still holding websockets. Measured on prod 2026-08-03 — three
+        subscribers for four workers, and only three of eight sockets on one
+        account ever saw a message. Nothing recovers a silence you never
+        check, so we check it.
+        """
         while True:
+            pubsub = None
             try:
                 redis = await get_redis()
                 pubsub = redis.pubsub()
                 await pubsub.subscribe(_FANOUT_CHANNEL)
                 self._pubsub_started.set()
-                async for message in pubsub.listen():
+                while True:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=_PUBSUB_HEALTH_INTERVAL,
+                    )
+                    if message is None:
+                        # Nothing published for a while. Prove the connection
+                        # is still ours; a dead one raises here and we
+                        # resubscribe below instead of listening to silence.
+                        await pubsub.ping()
+                        continue
                     if message.get("type") != "message":
                         continue
                     raw = message.get("data")
@@ -158,9 +185,18 @@ class ConnectionManager:
             except Exception:  # noqa: BLE001
                 # Reconnect after a short backoff. Reset the started
                 # event so callers wait for the next subscribe to land.
-                log.exception("ws fanout loop hiccup; reconnecting in 2s")
+                log.exception("ws fanout loop hiccup; resubscribing in 2s")
+            finally:
+                # Drop the old subscriber explicitly. Leaving it to the garbage
+                # collector leaked a Redis connection per hiccup, and a worker
+                # that hiccups all day accumulates them.
                 self._pubsub_started.clear()
-                await asyncio.sleep(2.0)
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+            await asyncio.sleep(2.0)
 
     async def _deliver_user_local(
         self, uin: int, text: str, except_device: str | None = None
