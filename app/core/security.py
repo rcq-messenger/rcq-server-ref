@@ -11,13 +11,25 @@ _bearer = HTTPBearer(auto_error=False)
 _basic = HTTPBasic(auto_error=False)
 
 
-def issue_token(uin: int, epoch: int = 0) -> str:
+def issue_token(uin: int, epoch: int = 0, device_id: str | None = None) -> str:
     """Mint a session token for `uin`.
 
     `epoch` binds the token to the current holder of the number (see
     `app.models.uin_epoch`). It is omitted from the claims when 0 so tokens for
     numbers that have never changed hands are byte-identical to the ones this
     function produced before the epoch existed.
+
+    `device_id` names the INSTALL this token belongs to. Without it every
+    install of an account keys as "primary", and since a websocket supersedes
+    the one holding the same device id, two phones on one account evicted each
+    other forever: the loser redialled, evicted the winner, and back around
+    (measured on prod at 707 reconnects in three hours from a single address).
+    The same collision made them share one offline-queue cursor, so whichever
+    device drained the queue first left the other with nothing to read.
+
+    It carries `k="phone"` next to it so `_decode_session_payload` can tell an
+    install token from a linked-web guest token: those also carry `dev`, but
+    they expire hard, and a phone must not be logged out for being offline.
     """
     payload = {
         "sub": str(uin),
@@ -26,6 +38,9 @@ def issue_token(uin: int, epoch: int = 0) -> str:
     }
     if epoch:
         payload["ep"] = epoch
+    if device_id:
+        payload["dev"] = device_id
+        payload["k"] = "phone"
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
@@ -57,7 +72,9 @@ def _decode_session_payload(token: str) -> dict:
         algorithms=[settings.JWT_ALG],
         options={"verify_exp": False},
     )
-    if payload.get("dev"):
+    # A linked-web guest token expires hard; an install token (`k="phone"`)
+    # does not, for the same reason a plain phone token does not.
+    if payload.get("dev") and payload.get("k") != "phone":
         exp = payload.get("exp")
         if exp is None or float(exp) <= datetime.now(timezone.utc).timestamp():
             raise JWTError("device token expired")
@@ -77,7 +94,16 @@ def decode_device_id(token: str) -> str:
     device so a phone and a connect-to-web linked browser coexist instead
     of superseding each other. Never raises — falls back to "primary"."""
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
+        # verify_exp off deliberately: an install token outlives its `exp` (see
+        # _decode_session_payload), and reading its device id must not start
+        # failing on day 31 — that would silently drop the account back to
+        # "primary" and bring the mutual-eviction loop right back.
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=[settings.JWT_ALG],
+            options={"verify_exp": False},
+        )
         dev = payload.get("dev")
         return dev if isinstance(dev, str) and dev else "primary"
     except JWTError:

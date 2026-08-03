@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -567,17 +567,37 @@ async def _advance_cursor(
         cursor.last_direct_id = max_direct
     if max_group > cursor.last_group_id:
         cursor.last_group_id = max_group
+    cursor.updated_at = datetime.now(timezone.utc)
     await db.flush()
     return await _reap_below_min(db, uin)
 
 
+# How long a drain cursor may go untouched before it stops holding the queue
+# back. Comfortably longer than a holiday with the phone off, short enough that
+# a reinstalled device does not pin an account's queue for a season.
+STALE_CURSOR_DAYS = 30
+
+
 async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     """Delete queued rows every one of the user's devices has already drained
-    (id <= the minimum cursor across the user's devices). The TTL sweep is the
-    backstop for rows held up by a device that went away without unlinking."""
+    (id <= the minimum cursor across the user's LIVE devices). The TTL sweep is
+    the backstop for rows held up by a device that went away without
+    unlinking."""
     cursors = (
         await db.execute(select(QueueCursor).where(QueueCursor.uin == uin))
     ).scalars().all()
+    # Drop cursors nobody is behind any more. Reinstalling mints a NEW device
+    # id, so the abandoned one would otherwise sit at its old position forever
+    # and hold every later row above the reap floor — the queue would then only
+    # ever be cleared by the TTL sweep. A stamp-less row predates the column and
+    # is left alone until it next acks (which stamps it).
+    cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_CURSOR_DAYS)
+    stale = [c for c in cursors if c.updated_at is not None and c.updated_at < cutoff]
+    if stale:
+        for c in stale:
+            await db.delete(c)
+        await db.flush()
+        cursors = [c for c in cursors if c not in stale]
     if not cursors:
         return 0
     min_direct = min(c.last_direct_id for c in cursors)

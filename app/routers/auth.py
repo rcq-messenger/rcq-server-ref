@@ -13,6 +13,7 @@ from app.core.rate_limit import rate_limit
 from app.core.security import (
     bump_uin_epoch,
     cache_uin_epoch,
+    current_device_id,
     current_uin,
     issue_recover_challenge,
     issue_token,
@@ -24,6 +25,7 @@ from app.models.contact import Contact
 from app.models.invite import Invite
 from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
+from app.models.queue_cursor import QueueCursor
 from app.models.user import User
 from app.routers.groups import _load_group, _members_with_users, _serialize
 from app.routers.referrals import record_referral
@@ -77,6 +79,10 @@ class RegisterIn(BaseModel):
     # minted (uin is per-island and is NOT identity — the key is). A redeemed
     # vanity invite still wins over this.
     desired_uin: int | None = None
+    # Stable per-INSTALL id, minted by the client on first launch. Optional:
+    # clients that predate it get "primary" and the old shared behaviour.
+    # See `issue_token` for what it buys.
+    device_id: str | None = Field(default=None, max_length=64)
 
 
 class RegisterOut(BaseModel):
@@ -234,12 +240,56 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
 
     # Mint under the number's CURRENT epoch: a recycled UIN starts above 0,
     # which is what stops a previous holder's saved bearer from working.
-    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin)))
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
 
 
 @router.post("/session", response_model=SessionOut)
 async def session(uin: int = Depends(current_uin)) -> SessionOut:
     return SessionOut(token=issue_token(uin, await uin_epoch(uin)), ws_url=f"/ws/{uin}")
+
+
+class ClaimDeviceIn(BaseModel):
+    # The install's own id, minted client-side on first launch and kept for
+    # the life of the install.
+    device_id: str = Field(min_length=8, max_length=64)
+
+
+@router.post("/device", response_model=SessionOut)
+async def claim_device(
+    body: ClaimDeviceIn,
+    uin: int = Depends(current_uin),
+    old_device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> SessionOut:
+    """Exchange this session for one that names the install it runs on.
+
+    Every already-installed client holds a token with no `dev` claim, which
+    means they all key as "primary": their websockets supersede each other in
+    a loop, and they share one offline-queue cursor so the first device to
+    drain leaves the others with nothing. They cannot be fixed by re-issuing
+    tokens server-side — the client has to say which install it is — so this
+    is the upgrade path: call it once after updating, keep the token you get.
+
+    The current cursor is copied onto the new device id, otherwise the install
+    would look brand new and be handed the whole queue again (harmless —
+    clients dedupe by envelope id — but a pointless re-download of everything
+    still on the server).
+    """
+    existing = await db.get(QueueCursor, (uin, body.device_id))
+    if existing is None:
+        old = await db.get(QueueCursor, (uin, old_device_id))
+        db.add(QueueCursor(
+            uin=uin,
+            device_id=body.device_id,
+            last_direct_id=old.last_direct_id if old else 0,
+            last_group_id=old.last_group_id if old else 0,
+            updated_at=datetime.now(timezone.utc),
+        ))
+        await db.commit()
+    return SessionOut(
+        token=issue_token(uin, await uin_epoch(uin), body.device_id),
+        ws_url=f"/ws/{uin}",
+    )
 
 
 # ── account recovery (seed-phrase) ──────────────────────────────────────────
