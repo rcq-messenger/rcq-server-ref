@@ -37,6 +37,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -59,6 +60,10 @@ _PUBSUB_HEALTH_INTERVAL = 15.0
 # is no longer receiving. Three intervals of slack so a GC pause or a slow
 # delivery never triggers a needless reconnect.
 _PUBSUB_DEAF_AFTER = 3 * _PUBSUB_HEALTH_INTERVAL
+# A publish→delivery step slower than this is worth a log line. Everything in
+# this path is microseconds when healthy, so anything above a second is a
+# stall, and the whole worker is behind the channel while it lasts.
+_SLOW_STEP = 1.0
 
 
 class ConnectionManager:
@@ -91,6 +96,17 @@ class ConnectionManager:
         # from "deaf". Zero means the loop has not started yet.
         self._pubsub_seen_at: float = 0.0
         self._watchdog_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _envelope(**fields: Any) -> str:
+        """Serialise a fanout envelope, stamped with the publish time.
+
+        The stamp is what lets the receiving worker say whether a late
+        delivery was late on the channel or late in its own dispatch — all
+        workers share one clock, so the comparison is exact.
+        """
+        fields["ts"] = time.time()
+        return json.dumps(fields)
 
     async def _ensure_pubsub(self) -> None:
         """Spin up the pub/sub listener once per worker. Called from
@@ -137,7 +153,7 @@ class ConnectionManager:
                 redis = await get_redis()
                 await redis.publish(
                     _FANOUT_CHANNEL,
-                    json.dumps({"target": "heartbeat", "pid": os.getpid()}),
+                    self._envelope(target="heartbeat", pid=os.getpid()),
                 )
             except Exception:  # noqa: BLE001
                 # Redis itself is unreachable; the loop's own error handling
@@ -212,13 +228,21 @@ class ConnectionManager:
                     # the other workers, each still fed by the `user` fanout.
                     if target in ("all", "user") and not isinstance(payload_text, str):
                         continue
+                    # Split the delay into the two halves that have different
+                    # cures: `transit` is publish→here (Redis and this loop
+                    # getting round to the frame), `dispatch` is here→handed to
+                    # every local socket. A big transit with a small dispatch
+                    # means the loop was busy with the PREVIOUS frame.
+                    published_at = envelope.get("ts")
+                    began = time.time()
+                    fanned = 0
                     if target == "all":
-                        await self._deliver_all_local(payload_text)
+                        fanned = await self._deliver_all_local(payload_text)
                     elif target == "user":
                         uin = envelope.get("uin")
                         except_device = envelope.get("except_device")
                         if isinstance(uin, int):
-                            await self._deliver_user_local(
+                            fanned = await self._deliver_user_local(
                                 uin,
                                 payload_text,
                                 except_device if isinstance(except_device, str) else None,
@@ -236,6 +260,19 @@ class ConnectionManager:
                             await self._close_local_sockets_for_device(
                                 uin, dev if isinstance(dev, str) else "primary"
                             )
+                    ended = time.time()
+                    transit = began - published_at if isinstance(published_at, (int, float)) else 0.0
+                    if transit > _SLOW_STEP or ended - began > _SLOW_STEP:
+                        log.warning(
+                            "ws fanout slow: transit=%.2fs dispatch=%.2fs "
+                            "target=%s uin=%s sockets=%d pid=%d",
+                            transit,
+                            ended - began,
+                            target,
+                            envelope.get("uin"),
+                            fanned,
+                            os.getpid(),
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -254,7 +291,7 @@ class ConnectionManager:
                         pass
             await asyncio.sleep(2.0)
 
-    async def _fan_local(self, sockets: list[WebSocket], text: str) -> None:
+    async def _fan_local(self, sockets: list[WebSocket], text: str, uin: Any = None) -> int:
         """Push `text` to every socket at once, and never let one of them hold
         up the rest.
 
@@ -274,20 +311,34 @@ class ConnectionManager:
         return to the channel, not the other deliveries.
         """
         if not sockets:
-            return
+            return 0
 
         async def deliver(ws: WebSocket) -> None:
+            began = time.time()
             try:
                 await ws.send_text(text)
             except Exception:  # noqa: BLE001
                 pass
+            took = time.time() - began
+            if took > _SLOW_STEP:
+                # Names the socket that held the gather — i.e. the one that
+                # kept this worker from reading the next fanout frame.
+                log.warning(
+                    "ws send took %.2fs uin=%s dev=%s bytes=%d pid=%d",
+                    took,
+                    uin,
+                    self._device_of.get(ws, "?"),
+                    len(text),
+                    os.getpid(),
+                )
 
         await asyncio.gather(*(deliver(ws) for ws in sockets))
+        return len(sockets)
 
     async def _deliver_user_local(
         self, uin: int, text: str, except_device: str | None = None
-    ) -> None:
-        await self._fan_local(
+    ) -> int:
+        return await self._fan_local(
             [
                 ws
                 for ws in list(self._conns.get(uin, ()))
@@ -295,6 +346,7 @@ class ConnectionManager:
                 or self._device_of.get(ws, "primary") != except_device
             ],
             text,
+            uin,
         )
 
     async def _close_local_sockets(self, uin: int) -> None:
@@ -330,10 +382,10 @@ class ConnectionManager:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _deliver_all_local(self, text: str) -> None:
+    async def _deliver_all_local(self, text: str) -> int:
         # Same head-of-line problem as the per-user path, only worse: here one
         # stuck client would hold up every socket on the worker.
-        await self._fan_local(
+        return await self._fan_local(
             [ws for conns in list(self._conns.values()) for ws in list(conns)], text
         )
 
@@ -373,12 +425,12 @@ class ConnectionManager:
         try:
             redis = await get_redis()
             await redis.sadd(_ONLINE_KEY, uin)
-            envelope = json.dumps({
-                "target": "supersede",
-                "uin": uin,
-                "device_id": device_id,
-                "pid": os.getpid(),
-            })
+            envelope = self._envelope(
+                target="supersede",
+                uin=uin,
+                device_id=device_id,
+                pid=os.getpid(),
+            )
             await redis.publish(_FANOUT_CHANNEL, envelope)
         except Exception:  # noqa: BLE001
             log.warning("Could not mark uin=%d online in redis", uin)
@@ -437,13 +489,11 @@ class ConnectionManager:
         """
         await self._ensure_pubsub()
         text = json.dumps(payload)
-        envelope = json.dumps(
-            {
-                "target": "user",
-                "uin": uin,
-                "payload_text": text,
-                "except_device": except_device,
-            }
+        envelope = self._envelope(
+            target="user",
+            uin=uin,
+            payload_text=text,
+            except_device=except_device,
         )
         try:
             redis = await get_redis()
@@ -467,8 +517,8 @@ class ConnectionManager:
             # localhost Redis). For room broadcasts of <100 members
             # this is fine.
             for uin in uins:
-                envelope = json.dumps(
-                    {"target": "user", "uin": uin, "payload_text": text}
+                envelope = self._envelope(
+                    target="user", uin=uin, payload_text=text
                 )
                 await redis.publish(_FANOUT_CHANNEL, envelope)
         except Exception:  # noqa: BLE001
@@ -503,7 +553,7 @@ class ConnectionManager:
                 for uin in targets:
                     pipe.publish(
                         _FANOUT_CHANNEL,
-                        json.dumps({"target": "user", "uin": uin, "payload_text": text}),
+                        self._envelope(target="user", uin=uin, payload_text=text),
                     )
                 await pipe.execute()
             return set(targets)
@@ -547,11 +597,11 @@ class ConnectionManager:
                     for uin, payload in targets:
                         pipe.publish(
                             _FANOUT_CHANNEL,
-                            json.dumps({
-                                "target": "user",
-                                "uin": uin,
-                                "payload_text": json.dumps(payload),
-                            }),
+                            self._envelope(
+                                target="user",
+                                uin=uin,
+                                payload_text=json.dumps(payload),
+                            ),
                         )
                     await pipe.execute()
             return online
@@ -570,7 +620,7 @@ class ConnectionManager:
         """
         await self._ensure_pubsub()
         text = json.dumps(payload)
-        envelope = json.dumps({"target": "all", "payload_text": text})
+        envelope = self._envelope(target="all", payload_text=text)
         try:
             redis = await get_redis()
             await redis.publish(_FANOUT_CHANNEL, envelope)
