@@ -59,11 +59,6 @@ _PUBSUB_HEALTH_INTERVAL = 15.0
 # is no longer receiving. Three intervals of slack so a GC pause or a slow
 # delivery never triggers a needless reconnect.
 _PUBSUB_DEAF_AFTER = 3 * _PUBSUB_HEALTH_INTERVAL
-# Longest we will wait on one websocket before moving on. A healthy send
-# finishes in microseconds, so this only ever fires on a client whose TCP
-# window is full — and waiting on that client is exactly what used to stall
-# everyone else on the worker.
-_SEND_TIMEOUT = 2.0
 
 
 class ConnectionManager:
@@ -271,15 +266,19 @@ class ConnectionManager:
         received both messages at once, because they had been sitting in a
         buffer nobody was reading.
 
-        A socket that cannot take a message within the timeout is skipped, not
-        waited on. Its own endpoint task notices the breakage and cleans up.
+        Deliberately NO timeout around the send. Cancelling a write part-way
+        through leaves the connection mid-frame, which is the same mistake that
+        wrapping the Redis read in a timeout turned out to be. Concurrency
+        alone already fixes the head-of-line problem: every send is in flight
+        before any of them is waited on, so a stuck socket delays only the
+        return to the channel, not the other deliveries.
         """
         if not sockets:
             return
 
         async def deliver(ws: WebSocket) -> None:
             try:
-                await asyncio.wait_for(ws.send_text(text), timeout=_SEND_TIMEOUT)
+                await ws.send_text(text)
             except Exception:  # noqa: BLE001
                 pass
 
