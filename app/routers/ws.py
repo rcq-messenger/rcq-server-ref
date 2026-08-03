@@ -268,7 +268,7 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
         await _on_connect(uin)
         while True:
             msg = await ws.receive_json()
-            await _handle_client_message(uin, msg)
+            await _handle_client_message(uin, msg, device_id)
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -441,7 +441,9 @@ async def _debounced_offline(uin: int) -> None:
         _pending_offline_tasks.pop(uin, None)
 
 
-async def _handle_client_message(uin: int, msg: dict) -> None:
+async def _handle_client_message(
+    uin: int, msg: dict, device_id: str = "primary"
+) -> None:
     """The WS channel is mostly server→client (presence + delivery). Clients send most
     things over HTTP. We accept a tiny client-initiated set: ping, typing relays,
     Hood-Chat presence, and call signalling (offer / answer / ICE / end)."""
@@ -549,6 +551,26 @@ async def _handle_client_message(uin: int, msg: dict) -> None:
             if key in msg:
                 relay[key] = msg[key]
         delivered = await manager.send(target, relay)
+
+        # Bind the call to the device that answered. `call_offer` is delivered
+        # to every device of the callee on purpose — all of them should ring —
+        # but until per-install device ids landed, an account only ever held ONE
+        # socket, so nothing had to un-ring the others. Now they keep ringing to
+        # their own timeout and keep trickling ICE into the same call_id, which
+        # the caller adds to a peer connection those candidates were never part
+        # of. Tell the callee's OTHER devices the call is over; the one that
+        # answered is skipped so it doesn't cancel itself.
+        if kind == "call_answer":
+            await manager.send(
+                uin,
+                {
+                    "type": "call_end",
+                    "from_uin": target,
+                    "call_id": call_id,
+                    "reason": "answered_elsewhere",
+                },
+                except_device=device_id,
+            )
 
         # Clear the active-call registration on call_end from either side.
         # Done after the relay so the remote peer sees the end first; the
