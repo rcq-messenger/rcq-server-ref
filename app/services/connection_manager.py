@@ -51,12 +51,14 @@ log = logging.getLogger(__name__)
 _FANOUT_CHANNEL = "ws:fanout"
 # Set of UINs currently connected to ANY worker. Used by `is_online()`.
 _ONLINE_KEY = "ws:online_uins"
-# How long the subscriber may sit without a publish before it PINGs to prove
-# the connection is still there. Quiet is normal on a small island, so this is
-# a liveness check rather than a timeout: too short and every idle worker
-# chats to Redis all day, too long and a deaf worker stays deaf that much
-# longer. 15s costs 4 PINGs a minute per worker.
+# How often each worker publishes a heartbeat on the fanout channel, so that
+# "heard nothing" means deaf rather than merely quiet. Costs one tiny publish
+# per worker per interval.
 _PUBSUB_HEALTH_INTERVAL = 15.0
+# Silence longer than this, while heartbeats are going out, means this worker
+# is no longer receiving. Three intervals of slack so a GC pause or a slow
+# delivery never triggers a needless reconnect.
+_PUBSUB_DEAF_AFTER = 3 * _PUBSUB_HEALTH_INTERVAL
 # Longest we will wait on one websocket before moving on. A healthy send
 # finishes in microseconds, so this only ever fires on a client whose TCP
 # window is full — and waiting on that client is exactly what used to stall
@@ -89,10 +91,21 @@ class ConnectionManager:
         # lazily on first connect; survives forever per worker.
         self._pubsub_task: asyncio.Task | None = None
         self._pubsub_started = asyncio.Event()
+        # Event-loop time of the last frame received on the fanout channel.
+        # The watchdog compares it against the heartbeats to tell "quiet"
+        # from "deaf". Zero means the loop has not started yet.
+        self._pubsub_seen_at: float = 0.0
+        self._watchdog_task: asyncio.Task | None = None
 
     async def _ensure_pubsub(self) -> None:
         """Spin up the pub/sub listener once per worker. Called from
-        every public method that publishes — cheap idempotent check."""
+        every public method that publishes — cheap idempotent check.
+
+        Note this check alone cannot notice a subscriber that is alive but no
+        longer receiving; that is what the watchdog is for.
+        """
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._pubsub_watchdog())
         if self._pubsub_task is not None and not self._pubsub_task.done():
             return
         self._pubsub_task = asyncio.create_task(self._pubsub_loop())
@@ -108,20 +121,68 @@ class ConnectionManager:
                 "race with subscribe. Continuing anyway."
             )
 
+    async def _pubsub_watchdog(self) -> None:
+        """Restart the subscriber when this worker has gone deaf.
+
+        The failure it exists for: Redis closes the pub/sub connection, the
+        blocking read never raises, and the worker keeps its websockets while
+        receiving nothing — for good, because `_ensure_pubsub` only sees a
+        task that is not done. Measured on prod 2026-08-03: three subscribers
+        for four workers.
+
+        Every worker publishes a heartbeat, and every worker sees every
+        publish, so on a cluster of any size the channel is never quiet for
+        long. A worker that has heard nothing across several heartbeat
+        intervals is not in a quiet cluster, it is deaf, and the only reliable
+        cure is a fresh connection.
+        """
+        while True:
+            await asyncio.sleep(_PUBSUB_HEALTH_INTERVAL)
+            try:
+                redis = await get_redis()
+                await redis.publish(
+                    _FANOUT_CHANNEL,
+                    json.dumps({"target": "heartbeat", "pid": os.getpid()}),
+                )
+            except Exception:  # noqa: BLE001
+                # Redis itself is unreachable; the loop's own error handling
+                # will deal with it when it notices. Nothing to restart yet.
+                continue
+
+            silent_for = asyncio.get_running_loop().time() - self._pubsub_seen_at
+            if silent_for < _PUBSUB_DEAF_AFTER:
+                continue
+            log.warning(
+                "ws fanout heard nothing for %.0fs despite heartbeats; "
+                "restarting the subscriber",
+                silent_for,
+            )
+            task = self._pubsub_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            self._pubsub_started.clear()
+            self._pubsub_seen_at = asyncio.get_running_loop().time()
+            self._pubsub_task = asyncio.create_task(self._pubsub_loop())
+
     async def _pubsub_loop(self) -> None:
         """Long-lived task that listens for fanout publishes and
         delivers them to LOCAL websockets. Reconnects on transient
         Redis failures so a worker keeps participating in the cluster
         even through a Redis blip.
 
-        The quiet-stretch PING is not decoration. A worker whose pub/sub
-        connection Redis has dropped can sit inside the read forever without
-        raising: the task looks alive, `_ensure_pubsub` sees a task that is
-        not done and returns, and the worker goes permanently deaf while
-        still holding websockets. Measured on prod 2026-08-03 — three
-        subscribers for four workers, and only three of eight sockets on one
-        account ever saw a message. Nothing recovers a silence you never
-        check, so we check it.
+        The read here is deliberately UNBOUNDED. Wrapping it in a timeout was
+        tried on 2026-08-03 and made things worse: fanout carries messages of
+        several hundred KB (a group snapshot for a 1750-member group is ~600
+        KB), a timeout that expires while one is still arriving cancels the
+        read mid-message, and the stream is then desynchronised —
+        `IncompleteReadError: 513586 bytes read on a total of 600948` in the
+        logs. You cannot put a stopwatch on a framed protocol stream.
+
+        Deafness is detected out of band instead, by `_pubsub_watchdog`.
         """
         while True:
             pubsub = None
@@ -130,17 +191,12 @@ class ConnectionManager:
                 pubsub = redis.pubsub()
                 await pubsub.subscribe(_FANOUT_CHANNEL)
                 self._pubsub_started.set()
-                while True:
-                    message = await pubsub.get_message(
-                        ignore_subscribe_messages=True,
-                        timeout=_PUBSUB_HEALTH_INTERVAL,
-                    )
-                    if message is None:
-                        # Nothing published for a while. Prove the connection
-                        # is still ours; a dead one raises here and we
-                        # resubscribe below instead of listening to silence.
-                        await pubsub.ping()
-                        continue
+                self._pubsub_seen_at = asyncio.get_running_loop().time()
+                async for message in pubsub.listen():
+                    # Any frame at all proves we are still connected — the
+                    # watchdog reads this, and it must be updated before the
+                    # type filter so heartbeats count too.
+                    self._pubsub_seen_at = asyncio.get_running_loop().time()
                     if message.get("type") != "message":
                         continue
                     raw = message.get("data")
