@@ -133,8 +133,13 @@ class ConnectionManager:
                         await self._deliver_all_local(payload_text)
                     elif target == "user":
                         uin = envelope.get("uin")
+                        except_device = envelope.get("except_device")
                         if isinstance(uin, int):
-                            await self._deliver_user_local(uin, payload_text)
+                            await self._deliver_user_local(
+                                uin,
+                                payload_text,
+                                except_device if isinstance(except_device, str) else None,
+                            )
                     elif target == "supersede":
                         # Another worker accepted a new socket for this
                         # UIN+device — close any stale sockets WE still hold
@@ -157,8 +162,12 @@ class ConnectionManager:
                 self._pubsub_started.clear()
                 await asyncio.sleep(2.0)
 
-    async def _deliver_user_local(self, uin: int, text: str) -> None:
+    async def _deliver_user_local(
+        self, uin: int, text: str, except_device: str | None = None
+    ) -> None:
         for ws in list(self._conns.get(uin, ())):
+            if except_device is not None and self._device_of.get(ws, "primary") == except_device:
+                continue
             try:
                 await ws.send_text(text)
             except Exception:  # noqa: BLE001
@@ -288,16 +297,33 @@ class ConnectionManager:
             # Fall back to local-only knowledge if Redis is down.
             return uin in self._conns
 
-    async def send(self, uin: int, payload: dict[str, Any]) -> bool:
+    async def send(
+        self,
+        uin: int,
+        payload: dict[str, Any],
+        except_device: str | None = None,
+    ) -> bool:
         """Deliver `payload` to every WS for `uin` across the cluster.
         Returns True if the user is online (somewhere) at publish time,
         False otherwise. Note: True doesn't guarantee delivery — it
         means we asked Redis whether they're online and they were. The
         actual deliveries happen async in the receiving workers.
+
+        `except_device` skips one device of the account. Needed for
+        "this was handled on another device of yours": the device that
+        handled it must not be told to undo it, and the delivery has to
+        skip it on every worker, not just this one.
         """
         await self._ensure_pubsub()
         text = json.dumps(payload)
-        envelope = json.dumps({"target": "user", "uin": uin, "payload_text": text})
+        envelope = json.dumps(
+            {
+                "target": "user",
+                "uin": uin,
+                "payload_text": text,
+                "except_device": except_device,
+            }
+        )
         try:
             redis = await get_redis()
             await redis.publish(_FANOUT_CHANNEL, envelope)
@@ -305,7 +331,7 @@ class ConnectionManager:
         except Exception:  # noqa: BLE001
             # Redis blip: fall back to local-only delivery so at least
             # users on this worker still receive the message.
-            await self._deliver_user_local(uin, text)
+            await self._deliver_user_local(uin, text, except_device)
             return uin in self._conns
         return online
 
