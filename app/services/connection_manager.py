@@ -120,7 +120,14 @@ class ConnectionManager:
                         continue
                     target = envelope.get("target")
                     payload_text = envelope.get("payload_text")
-                    if not isinstance(payload_text, str):
+                    # Only the delivery targets carry a payload. A supersede
+                    # envelope does not, and this guard used to sit ABOVE the
+                    # dispatch — so every cross-worker supersede was dropped
+                    # here and eviction silently worked only within the worker
+                    # that accepted the socket (one in four, at four workers).
+                    # An account could therefore hold a stale socket on each of
+                    # the other workers, each still fed by the `user` fanout.
+                    if target in ("all", "user") and not isinstance(payload_text, str):
                         continue
                     if target == "all":
                         await self._deliver_all_local(payload_text)
