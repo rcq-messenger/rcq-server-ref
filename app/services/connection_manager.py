@@ -96,6 +96,10 @@ class ConnectionManager:
         # from "deaf". Zero means the loop has not started yet.
         self._pubsub_seen_at: float = 0.0
         self._watchdog_task: asyncio.Task | None = None
+        # Strong refs to in-flight close tasks. A close is fire-and-forget
+        # (see `_close_soon`) and asyncio only keeps a weak ref, so without
+        # this the handshake can be garbage-collected half-done.
+        self._closing: set[asyncio.Task] = set()
 
     @staticmethod
     def _envelope(**fields: Any) -> str:
@@ -349,18 +353,38 @@ class ConnectionManager:
             uin,
         )
 
-    async def _close_local_sockets(self, uin: int) -> None:
-        old: list[WebSocket] = []
-        async with self._lock:
-            old = list(self._conns.get(uin, set()))
-            self._conns.pop(uin, None)
-            for ws in old:
-                self._device_of.pop(ws, None)
-        for ws in old:
-            try:
-                await ws.close(code=4000, reason="superseded")
-            except Exception:  # noqa: BLE001
-                pass
+    def _close_soon(self, ws: WebSocket) -> None:
+        """Start closing a superseded socket, and do NOT wait for it.
+
+        ★ Closing a websocket is a handshake, not a hang-up: the library sends
+        its close frame and then waits for the peer's answer, up to
+        `close_timeout` — 10 seconds by default. A socket being superseded is
+        very often a ghost (the phone that moved networks, the tab that went
+        away without a FIN), and a ghost never answers, so the wait runs the
+        full 10 seconds every time.
+
+        This used to be awaited inside the pub/sub read loop. Measured on prod
+        2026-08-03: 146 closes of exactly 10.00s in eight minutes, during which
+        the loop read nothing — frames queued in Redis behind them and arrived
+        up to 136 SECONDS late. That is the whole "delivery spikes" symptom,
+        and it is also where the deaf subscribers came from: a subscriber that
+        stops reading for two minutes is one Redis kills for overrunning its
+        output buffer.
+
+        The caller has already unregistered the socket, so nothing else will
+        be sent to it; whether the handshake completes is of no interest to
+        anyone. Its own endpoint task cleans up regardless.
+        """
+        task = asyncio.create_task(self._close_quietly(ws))
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+
+    @staticmethod
+    async def _close_quietly(ws: WebSocket) -> None:
+        try:
+            await ws.close(code=4000, reason="superseded")
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _close_local_sockets_for_device(self, uin: int, device_id: str) -> None:
         """Close only the sockets we hold for one (uin, device) — used by
@@ -377,10 +401,7 @@ class ConnectionManager:
                 if not conns:
                     self._conns.pop(uin, None)
         for ws in old:
-            try:
-                await ws.close(code=4000, reason="superseded")
-            except Exception:  # noqa: BLE001
-                pass
+            self._close_soon(ws)
 
     async def _deliver_all_local(self, text: str) -> int:
         # Same head-of-line problem as the per-user path, only worse: here one
@@ -412,10 +433,11 @@ class ConnectionManager:
             self._conns[uin] = existing
             self._device_of[ws] = device_id
         for old in old_sockets:
-            try:
-                await old.close(code=4000, reason="superseded")
-            except Exception:  # noqa: BLE001
-                pass
+            # Not awaited: a ghost takes the full close_timeout to answer, and
+            # this runs before the new socket is marked online — waiting here
+            # left a just-reconnected client looking offline (so pushed to
+            # instead of delivered to) for ten seconds. See `_close_soon`.
+            self._close_soon(old)
         await self._ensure_pubsub()
         # Mark UIN as online cluster-wide so APNs decisions and
         # `is_online` checks on other workers see them. Also broadcast
