@@ -57,6 +57,11 @@ _ONLINE_KEY = "ws:online_uins"
 # chats to Redis all day, too long and a deaf worker stays deaf that much
 # longer. 15s costs 4 PINGs a minute per worker.
 _PUBSUB_HEALTH_INTERVAL = 15.0
+# Longest we will wait on one websocket before moving on. A healthy send
+# finishes in microseconds, so this only ever fires on a client whose TCP
+# window is full — and waiting on that client is exactly what used to stall
+# everyone else on the worker.
+_SEND_TIMEOUT = 2.0
 
 
 class ConnectionManager:
@@ -198,18 +203,44 @@ class ConnectionManager:
                         pass
             await asyncio.sleep(2.0)
 
+    async def _fan_local(self, sockets: list[WebSocket], text: str) -> None:
+        """Push `text` to every socket at once, and never let one of them hold
+        up the rest.
+
+        These sends used to run one after another with a bare `await`. A client
+        whose TCP window is full blocks that await, and because this runs
+        INSIDE the pub/sub read loop, the whole worker stops reading: every
+        other socket on it goes quiet until the slow one drains. Measured on
+        prod 2026-08-03 — sockets that heard nothing for two rounds and then
+        received both messages at once, because they had been sitting in a
+        buffer nobody was reading.
+
+        A socket that cannot take a message within the timeout is skipped, not
+        waited on. Its own endpoint task notices the breakage and cleans up.
+        """
+        if not sockets:
+            return
+
+        async def deliver(ws: WebSocket) -> None:
+            try:
+                await asyncio.wait_for(ws.send_text(text), timeout=_SEND_TIMEOUT)
+            except Exception:  # noqa: BLE001
+                pass
+
+        await asyncio.gather(*(deliver(ws) for ws in sockets))
+
     async def _deliver_user_local(
         self, uin: int, text: str, except_device: str | None = None
     ) -> None:
-        for ws in list(self._conns.get(uin, ())):
-            if except_device is not None and self._device_of.get(ws, "primary") == except_device:
-                continue
-            try:
-                await ws.send_text(text)
-            except Exception:  # noqa: BLE001
-                # Broken sockets get cleaned up by their own WS endpoint
-                # task; we only need to not blow up here.
-                pass
+        await self._fan_local(
+            [
+                ws
+                for ws in list(self._conns.get(uin, ()))
+                if except_device is None
+                or self._device_of.get(ws, "primary") != except_device
+            ],
+            text,
+        )
 
     async def _close_local_sockets(self, uin: int) -> None:
         old: list[WebSocket] = []
@@ -245,12 +276,11 @@ class ConnectionManager:
                 pass
 
     async def _deliver_all_local(self, text: str) -> None:
-        for conns in list(self._conns.values()):
-            for ws in list(conns):
-                try:
-                    await ws.send_text(text)
-                except Exception:  # noqa: BLE001
-                    pass
+        # Same head-of-line problem as the per-user path, only worse: here one
+        # stuck client would hold up every socket on the worker.
+        await self._fan_local(
+            [ws for conns in list(self._conns.values()) for ws in list(conns)], text
+        )
 
     # ── Public API ──────────────────────────────────────────────────
 
