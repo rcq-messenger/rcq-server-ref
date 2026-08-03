@@ -371,6 +371,41 @@ async def create_group(
     return payload
 
 
+# Above this many members the full group snapshot is too expensive to push.
+# It runs about 350 bytes per member and the broadcast sends it once PER
+# member, so on the 1750-member beta group a single join turned into roughly
+# a gigabyte through the pub/sub channel — which every worker then parses,
+# stalling delivery of everything else behind it. Measured 2026-08-03: fanout
+# latency spiking to 29 seconds during group churn, which for call signalling
+# (no REST fallback) is indistinguishable from the message being lost.
+SNAPSHOT_BROADCAST_LIMIT = 100
+
+
+async def _broadcast_membership(
+    group_id: int,
+    members: list[GroupMemberOut],
+    payload: GroupOut,
+    extra_uins: set[int] | None = None,
+) -> None:
+    """Tell a group that its membership changed.
+
+    Small groups get the whole snapshot, which is what clients upsert
+    directly. Large ones get the group id alone: a client that does not know
+    the compact form reads `group`, finds nothing and does nothing, picking
+    the change up on its next refresh. A slightly stale member list beats
+    stalling the whole cluster for seconds.
+    """
+    uins = [m.uin for m in members] + sorted(extra_uins or ())
+    if len(members) <= SNAPSHOT_BROADCAST_LIMIT:
+        body: dict = {
+            "type": "group_membership_changed",
+            "group": payload.model_dump(mode="json"),
+        }
+    else:
+        body = {"type": "group_membership_changed", "group_id": group_id}
+    await manager.fanout(uins, body)
+
+
 def _serialize(g: Group, members: list[GroupMemberOut]) -> GroupOut:
     """Single-source serializer so post_policy / entry_price land on
     every payload (list / get / patch / add-member / etc.)."""
@@ -677,8 +712,7 @@ async def join_group(
 
     members = await _members_with_users(db, group_id)
     payload = _serialize(g, members)
-    for m in members:
-        await manager.send(m.uin, {"type": "group_membership_changed", "group": payload.model_dump(mode="json")})
+    await _broadcast_membership(group_id, members, payload)
     return payload
 
 
@@ -732,8 +766,7 @@ async def add_member(
     g = await _load_group(db, group_id)
     members = await _members_with_users(db, group_id)
     payload = _serialize(g, members)
-    for m in members:
-        await manager.send(m.uin, {"type": "group_membership_changed", "group": payload.model_dump(mode="json")})
+    await _broadcast_membership(group_id, members, payload)
     return payload
 
 
@@ -789,8 +822,9 @@ async def remove_member(
     # raw uins.
     notify_uins = {m.uin for m in members}
     notify_uins.add(member_uin)
-    for to_uin in notify_uins:
-        await manager.send(to_uin, {"type": "group_membership_changed", "group": payload.model_dump(mode="json")})
+    await _broadcast_membership(
+        group_id, members, payload, extra_uins=notify_uins - {m.uin for m in members}
+    )
     return {"deleted": False, "left_uin": member_uin}
 
 
@@ -868,8 +902,7 @@ async def patch_group(
     await db.commit()
     members = await _members_with_users(db, group_id)
     payload = _serialize(g, members)
-    for m in members:
-        await manager.send(m.uin, {"type": "group_membership_changed", "group": payload.model_dump(mode="json")})
+    await _broadcast_membership(group_id, members, payload)
     return payload
 
 
@@ -911,8 +944,7 @@ async def set_member_permissions(
         await db.commit()
     members = await _members_with_users(db, group_id)
     payload = _serialize(g, members)
-    for m in members:
-        await manager.send(m.uin, {"type": "group_membership_changed", "group": payload.model_dump(mode="json")})
+    await _broadcast_membership(group_id, members, payload)
     return payload
 
 
