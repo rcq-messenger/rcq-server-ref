@@ -146,21 +146,25 @@ def _semaphore() -> asyncio.Semaphore:
     return _sem
 
 
-async def _endpoints_for(uin: int) -> list[tuple[int, str, str | None]]:
+async def _endpoints_for(uin: int) -> list[tuple[int, str, str | None, str | None]]:
     """Read this user's Android UnifiedPush endpoints in a SHORT session,
     then release the DB connection BEFORE any network I/O — same no-DB-across-
     network rule apns.py follows to avoid pinning a pool connection across a
     stalled push. Carries the last recorded health so the writer below can
-    skip the UPDATE when nothing changed."""
+    skip the UPDATE when nothing changed, and the device id so the caller can
+    leave a device that is already connected alone."""
     async with SessionLocal() as db:  # type: AsyncSession
         rows = (
             await db.execute(
-                select(DeviceToken.id, DeviceToken.token, DeviceToken.push_last_error).where(
-                    DeviceToken.uin == uin, DeviceToken.platform == _PLATFORM
-                )
+                select(
+                    DeviceToken.id,
+                    DeviceToken.token,
+                    DeviceToken.push_last_error,
+                    DeviceToken.device_id,
+                ).where(DeviceToken.uin == uin, DeviceToken.platform == _PLATFORM)
             )
         ).all()
-    return [(r[0], r[1], r[2]) for r in rows]
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
 async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
@@ -257,6 +261,7 @@ async def _fan_out(
     ttl: int,
     what: str,
     exclude_tokens: frozenset[str] = frozenset(),
+    skip_devices: frozenset[str] = frozenset(),
 ) -> None:
     """Deliver `payload` to every UnifiedPush endpoint of `uin`. Runs as a
     background task; nothing awaits the result but the log line and the
@@ -265,29 +270,50 @@ async def _fan_out(
     `exclude_tokens` skips endpoints that are also registered by the SENDER
     of the event being pushed: on a multi-account device every local account
     registers the same endpoint, so without this the author's own phone gets
-    woken about their own group post through a sibling account."""
+    woken about their own group post through a sibling account.
+
+    `skip_devices` (non-empty only when some device of the account IS
+    connected) narrows delivery to endpoints that can be positively placed on a
+    device WITHOUT a live socket. Endpoints registered before device-aware
+    registration carry no device id and are skipped in that case, because they
+    might belong to the connected device — same conservative answer the old
+    account-wide check gave. When nothing is connected this is empty and every
+    endpoint is woken as before."""
     try:
         endpoints = await _endpoints_for(uin)
     except Exception:  # noqa: BLE001 — a pool timeout must not kill the task loudly
         log.exception("[up] endpoint lookup failed uin=%s", uin)
         return
     if exclude_tokens:
-        skipped = [e for _, e, _ in endpoints if e in exclude_tokens]
+        skipped = [e for _, e, _, _ in endpoints if e in exclude_tokens]
         if skipped:
             endpoints = [row for row in endpoints if row[1] not in exclude_tokens]
             log.info("[up] %s uin=%s skipping %d sender-device endpoint(s)", what, uin, len(skipped))
+    if skip_devices:
+        before = len(endpoints)
+        # Keep ONLY endpoints we can positively place on a device that is not
+        # connected. An endpoint with no device id could belong to the device
+        # that is online right now, and this branch runs precisely when one is
+        # — so leaving it in would resurrect the double-buzz the old
+        # account-wide suppression avoided.
+        endpoints = [row for row in endpoints if row[3] and row[3] not in skip_devices]
+        if len(endpoints) != before:
+            log.info(
+                "[up] %s uin=%s skipping %d connected/unattributed endpoint(s)",
+                what, uin, before - len(endpoints),
+            )
     if not endpoints:
         return
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     results = await asyncio.gather(
-        *(_deliver(endpoint, body, ttl) for _, endpoint, _ in endpoints),
+        *(_deliver(endpoint, body, ttl) for _, endpoint, _, _ in endpoints),
         return_exceptions=True,
     )
     ok_ids: list[int] = []
     failed: list[tuple[int, str]] = []
     dead_ids: list[int] = []
     sent = 0
-    for (token_id, endpoint, prev_error), result in zip(endpoints, results):
+    for (token_id, endpoint, prev_error, _device), result in zip(endpoints, results):
         if isinstance(result, BaseException):
             log.warning("[up] delivery task error for %s…: %r", endpoint[:48], result)
             continue
@@ -314,11 +340,12 @@ def _schedule(
     ttl: int,
     what: str,
     exclude_tokens: frozenset[str] = frozenset(),
+    skip_devices: frozenset[str] = frozenset(),
 ) -> None:
     """Fire the fan-out as a background task. Deliberately NOT awaited by the
     caller: retries span ~30s and the sender's HTTP request (or the WS call
     relay) must not wait on a third-party push server."""
-    task = asyncio.create_task(_fan_out(uin, payload, ttl, what, exclude_tokens))
+    task = asyncio.create_task(_fan_out(uin, payload, ttl, what, exclude_tokens, skip_devices))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
@@ -335,6 +362,7 @@ async def send_to_user(
     group_id: int | None = None,
     group_name: str | None = None,
     exclude_tokens: frozenset[str] = frozenset(),
+    skip_devices: frozenset[str] = frozenset(),
 ) -> int:
     """Wake every Android UnifiedPush device of `uin`. No-op when the user has
     no Android endpoints (the common case for an iOS-only account). Same
@@ -345,6 +373,10 @@ async def send_to_user(
     endpoints are skipped so the sending device is never woken about its own
     action through a sibling local account (multi-account phones register one
     shared endpoint per device).
+
+    `skip_devices` = device ids that already hold a live socket and were handed
+    the envelope over it. Endpoints without a recorded device id are always
+    woken (see `_fan_out`).
 
     Returns 1 once the wake is SCHEDULED (delivery happens in the background),
     not the number of devices reached — the callers only use it for a log
@@ -366,7 +398,7 @@ async def send_to_user(
         payload["group_id"] = group_id
     if group_name:
         payload["group_name"] = group_name
-    _schedule(uin, payload, _TTL_MESSAGE, "msg", exclude_tokens)
+    _schedule(uin, payload, _TTL_MESSAGE, "msg", exclude_tokens, skip_devices)
     return 1
 
 

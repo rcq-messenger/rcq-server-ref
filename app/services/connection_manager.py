@@ -52,6 +52,22 @@ log = logging.getLogger(__name__)
 _FANOUT_CHANNEL = "ws:fanout"
 # Set of UINs currently connected to ANY worker. Used by `is_online()`.
 _ONLINE_KEY = "ws:online_uins"
+# Per-account set of the DEVICE ids currently connected to any worker, so a
+# push decision can be made per device instead of per account. Without it
+# `manager.send()`'s single "is this user online" answer suppressed the wake
+# for EVERY device as soon as ONE was connected: a desktop left open meant the
+# phone in your pocket was never woken at all (found 2026-08-04).
+#
+# Deliberately expiring, unlike `_ONLINE_KEY`: a worker that dies takes its
+# SREMs with it, and a device wrongly believed to be online is a message the
+# user never hears about. The TTL is refreshed on connect and on every client
+# frame (iOS pings ~25s), so a live device never lapses, while a dead worker's
+# leftovers age out on their own.
+_ONLINE_DEVS_TTL = 180
+
+
+def _online_devs_key(uin: int) -> str:
+    return f"ws:online_devs:{uin}"
 # How often each worker publishes a heartbeat on the fanout channel, so that
 # "heard nothing" means deaf rather than merely quiet. Costs one tiny publish
 # per worker per interval.
@@ -447,6 +463,8 @@ class ConnectionManager:
         try:
             redis = await get_redis()
             await redis.sadd(_ONLINE_KEY, uin)
+            await redis.sadd(_online_devs_key(uin), device_id)
+            await redis.expire(_online_devs_key(uin), _ONLINE_DEVS_TTL)
             envelope = self._envelope(
                 target="supersede",
                 uin=uin,
@@ -459,13 +477,30 @@ class ConnectionManager:
 
     async def disconnect(self, uin: int, ws: WebSocket) -> None:
         async with self._lock:
-            self._device_of.pop(ws, None)
+            gone_device = self._device_of.pop(ws, None)
+            # Another socket of the SAME device (a reconnect racing the old
+            # socket's teardown) means the device is still here — dropping it
+            # from the online set would push to a device that is connected.
+            device_still_local = gone_device is not None and any(
+                self._device_of.get(other) == gone_device
+                for other in self._conns.get(uin, ())
+                if other is not ws
+            )
             conns = self._conns.get(uin)
             if conns:
                 conns.discard(ws)
                 if not conns:
                     self._conns.pop(uin, None)
             still_local = uin in self._conns
+        # Device-scoped first, and BEFORE the early return below: this device
+        # left even when other devices of the account are still on this worker,
+        # and that is exactly the case the per-device push decision exists for.
+        if gone_device and not device_still_local:
+            try:
+                redis = await get_redis()
+                await redis.srem(_online_devs_key(uin), gone_device)
+            except Exception:  # noqa: BLE001
+                pass
         if still_local:
             return
         # Last LOCAL connection for this UIN dropped. We can't tell
@@ -477,6 +512,39 @@ class ConnectionManager:
         try:
             redis = await get_redis()
             await redis.srem(_ONLINE_KEY, uin)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def online_devices(self, uin: int) -> set[str]:
+        """Device ids of `uin` with a live socket somewhere in the cluster.
+
+        The push paths subtract this from the account's registered push tokens,
+        so a device that IS connected is not also woken, while every device
+        that is not connected still is. Falls back to this worker's own view if
+        Redis is unreachable — worst case we wake a device that was reachable
+        anyway, which is the safe direction to be wrong in.
+        """
+        try:
+            redis = await get_redis()
+            raw = await redis.smembers(_online_devs_key(uin))
+            # Refresh the TTL while someone is asking: an account that is being
+            # messaged is an account whose sockets are demonstrably in use.
+            if raw:
+                await redis.expire(_online_devs_key(uin), _ONLINE_DEVS_TTL)
+            return {d.decode() if isinstance(d, bytes) else d for d in raw}
+        except Exception:  # noqa: BLE001
+            return {
+                self._device_of.get(ws, "primary") for ws in self._conns.get(uin, ())
+            }
+
+    async def touch_device(self, uin: int, device_id: str) -> None:
+        """Keep a live device's online marker from expiring. Called on every
+        client frame (iOS pings ~25s), which is what makes the TTL safe to keep
+        short enough that a dead worker's leftovers age out quickly."""
+        try:
+            redis = await get_redis()
+            await redis.sadd(_online_devs_key(uin), device_id)
+            await redis.expire(_online_devs_key(uin), _ONLINE_DEVS_TTL)
         except Exception:  # noqa: BLE001
             pass
 
