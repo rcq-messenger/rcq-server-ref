@@ -15,6 +15,7 @@ Redis-backed — these are ephemeral session state, not durable account data:
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 from datetime import datetime, timezone
 
@@ -27,6 +28,9 @@ from app.core.db import get_db
 from app.core.redis import get_redis
 from app.core.security import current_device_id, current_uin, issue_device_token
 from app.models.queue_cursor import QueueCursor
+from app.services.connection_manager import manager
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -74,6 +78,7 @@ async def link_device(body: LinkIn, uin: int = Depends(current_uin)) -> LinkOut:
     })
     await redis.hset(_devices_key(uin), device_id, entry)
     await redis.expire(_devices_key(uin), DEVICE_TTL_SECONDS)
+    await _announce(uin, "device_linked", device_id, body.label)
     return LinkOut(device_id=device_id, token=issue_device_token(uin, device_id))
 
 
@@ -147,6 +152,30 @@ async def revoke_device(
     return await _revoke(uin, device_id, db)
 
 
+async def _announce(uin: int, kind: str, device_id: str, label: str | None = None) -> None:
+    """Tell every session of this account that the device registry changed.
+
+    Without this the phone's "linked devices" screen only ever refreshed when
+    the user left it and came back: signing out on the desktop (which now calls
+    `DELETE /devices/me`) left the phone listing it as connected until then —
+    the tail of the 2026-08-04 report. The registry lived entirely outside the
+    socket, so there was nothing for a client to listen to.
+
+    Sent to ALL devices INCLUDING the one being revoked: it carries the
+    `device_id`, so a web session can recognise its own revocation and sign
+    itself out instead of dying at the next 401. Best-effort — the registry
+    write is the source of truth, and a failed announcement must never fail the
+    link or the revoke.
+    """
+    payload: dict[str, object] = {"type": kind, "device_id": device_id}
+    if label is not None:
+        payload["label"] = label
+    try:
+        await manager.send(uin, payload)
+    except Exception:  # noqa: BLE001 — bookkeeping must not break the operation
+        log.exception("[devices] failed to announce %s uin=%s", kind, uin)
+
+
 async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
     redis = await get_redis()
     await redis.hdel(_devices_key(uin), device_id)
@@ -159,4 +188,5 @@ async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
         delete(QueueCursor).where(QueueCursor.uin == uin, QueueCursor.device_id == device_id)
     )
     await db.commit()
+    await _announce(uin, "device_revoked", device_id)
     return {"ok": True}
