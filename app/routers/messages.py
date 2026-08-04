@@ -151,24 +151,36 @@ async def send_sealed(
     await db.commit()
     queued = True
     pushed = 0
-    # APNs push only when WS thought it was offline — otherwise the
-    # active client gets the envelope via WS already and a redundant
-    # push would buzz the user twice.
-    if not delivered and body.envelope_type in _PUSHABLE_TYPES:
-        pushed = await apns_send(
-            body.to_uin,
-            alert_body="New message",
-            envelope_b64=body.payload,
-            envelope_type=body.envelope_type,
-        )
-        # Android has no APNs — fire the parallel UnifiedPush wake (no-op when
-        # the recipient has no Android endpoints, the iOS-only common case).
-        pushed += await up_send(
-            body.to_uin,
-            alert_body="New message",
-            envelope_b64=body.payload,
-            envelope_type=body.envelope_type,
-        )
+    # Wake the devices that did NOT get it over the socket.
+    #
+    # `delivered` answers "is this ACCOUNT online anywhere", not "did every
+    # device get it" — so a desktop left open used to suppress the wake for the
+    # phone in the user's pocket, and the message only surfaced when the app was
+    # next opened ("сообщения пропускаются, когда приложение выключено",
+    # 2026-08-04). Asking which DEVICES hold a socket lets the other ones be
+    # woken while the connected one is left alone (it already has the envelope).
+    # Endpoints that predate device-aware registration carry no device id; when
+    # something IS connected they are skipped, exactly as before, since they
+    # might belong to that connected device.
+    if body.envelope_type in _PUSHABLE_TYPES:
+        online_devices = frozenset(await manager.online_devices(body.to_uin))
+        if not delivered or online_devices:
+            pushed = await apns_send(
+                body.to_uin,
+                alert_body="New message",
+                envelope_b64=body.payload,
+                envelope_type=body.envelope_type,
+                skip_devices=online_devices,
+            )
+            # Android has no APNs — fire the parallel UnifiedPush wake (no-op when
+            # the recipient has no Android endpoints, the iOS-only common case).
+            pushed += await up_send(
+                body.to_uin,
+                alert_body="New message",
+                envelope_b64=body.payload,
+                envelope_type=body.envelope_type,
+                skip_devices=online_devices,
+            )
     log.warning(
         "[sealed] to=%s type=%s ws_delivered=%s queued=%s pushed=%s",
         body.to_uin, body.envelope_type, delivered, queued, pushed,

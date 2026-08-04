@@ -362,6 +362,7 @@ async def send_to_user(
     group_id: int | None = None,
     group_name: str | None = None,
     exclude_tokens: frozenset[str] = frozenset(),
+    skip_devices: frozenset[str] = frozenset(),
 ) -> int:
     """Regular APNs push to every iOS device of `uin`. Skips VoIP tokens —
     those have a separate code path (`send_voip_to_user`) with a different
@@ -372,6 +373,12 @@ async def send_to_user(
     every local account registers the same token — skipping the author's
     tokens keeps the sending device from being woken about its own action
     through a sibling account.
+
+    `skip_devices` (non-empty only when some device of the account IS
+    connected) narrows delivery to tokens that can be positively placed on a
+    device WITHOUT a live socket. A token with no recorded device id predates
+    device-aware registration and might belong to the connected device, so it
+    is skipped in that case — the same answer the old account-wide check gave.
 
     Always sends a `mutable-content: 1` alert so the iOS Notification
     Service Extension can intercept, decrypt the envelope, and replace
@@ -399,7 +406,7 @@ async def send_to_user(
     async with SessionLocal() as db:  # type: AsyncSession
         tokens = (
             await db.execute(
-                select(DeviceToken.id, DeviceToken.token).where(
+                select(DeviceToken.id, DeviceToken.token, DeviceToken.device_id).where(
                     DeviceToken.uin == uin, DeviceToken.platform == "ios"
                 )
             )
@@ -410,6 +417,16 @@ async def send_to_user(
         if len(tokens) != before:
             log.info(
                 "[apns] uin=%s skipping %d sender-device token(s)", uin, before - len(tokens)
+            )
+    if skip_devices:
+        before = len(tokens)
+        # Keep ONLY tokens we can place on a device that is not connected —
+        # see unifiedpush._fan_out for why an unattributed token is skipped
+        # rather than woken here.
+        tokens = [row for row in tokens if row[2] and row[2] not in skip_devices]
+        if len(tokens) != before:
+            log.info(
+                "[apns] uin=%s skipping %d connected device(s)", uin, before - len(tokens)
             )
     log.warning("[apns] send_to_user uin=%s tokens=%d", uin, len(tokens))
     if not tokens:
@@ -462,7 +479,7 @@ async def send_to_user(
 
     sent = 0
     dead_ids: list[int] = []
-    for token_id, token in tokens:
+    for token_id, token, _device_id in tokens:
         ok, drop = await _send_one(
             token, payload, push_type="alert", topic=settings.APNS_BUNDLE_ID,
         )

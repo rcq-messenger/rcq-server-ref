@@ -448,6 +448,10 @@ async def _handle_client_message(
     things over HTTP. We accept a tiny client-initiated set: ping, typing relays,
     Hood-Chat presence, and call signalling (offer / answer / ICE / end)."""
     kind = msg.get("type")
+    # Any frame proves this DEVICE is still here, which is what the per-device
+    # push decision reads. Cheap (one SADD + EXPIRE) and it keeps the online
+    # marker's TTL short enough that a dead worker's leftovers age out.
+    await manager.touch_device(uin, device_id)
     if kind == "ping":
         await manager.send(uin, {"type": "pong", "t": datetime.now(timezone.utc).isoformat()})
         # Heartbeat. Online-state is DERIVED from `last_seen` freshness, so
