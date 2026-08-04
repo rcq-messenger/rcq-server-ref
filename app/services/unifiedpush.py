@@ -54,9 +54,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import delete, select, update
@@ -90,6 +92,35 @@ _RETRY_DELAYS = (6.0, 24.0)
 # touch hundreds of endpoints at once; without a cap those all become live
 # sockets (and, with retries, live tasks) simultaneously.
 _MAX_INFLIGHT = 24
+
+# OUTBOUND RELAY (2026-08-01). `ntfy.sh` stopped accepting TCP from this
+# droplet's IP — v4 hangs to timeout, v6 is refused, while google/github answer
+# in milliseconds from the same host; it looks like the public instance blocked
+# us once the v0.76 rollout raised our POST volume. 732 of 877 Android
+# endpoints on record point at ntfy.sh, so ~83% of Android devices simply
+# stopped being woken ("сообщения пропускаются, когда приложение выключено",
+# 2026-08-04; 10 075 ConnectTimeouts on 08-03 alone, zero before 08-01).
+#
+# Cloudflare's edge is not blocked, so POSTs to the blocked hosts — and only
+# those — are forwarded through a narrow Worker (deploy/push-relay). Everything
+# else, including our own push.rcq.app, keeps going direct. Unset
+# PUSH_RELAY_URL and every push goes direct again, which is what a self-hosted
+# island that nobody blocks should run.
+_RELAY_URL = os.getenv("PUSH_RELAY_URL", "").strip()
+_RELAY_KEY = os.getenv("PUSH_RELAY_KEY", "").strip()
+_RELAY_HOSTS = frozenset(
+    h.strip().lower() for h in os.getenv("PUSH_RELAY_HOSTS", "ntfy.sh").split(",") if h.strip()
+)
+
+
+def _needs_relay(endpoint: str) -> bool:
+    if not _RELAY_URL or not _RELAY_KEY:
+        return False
+    try:
+        return (urlparse(endpoint).hostname or "").lower() in _RELAY_HOSTS
+    except ValueError:
+        return False
+
 
 _client: httpx.AsyncClient | None = None
 _sem: asyncio.Semaphore | None = None
@@ -150,8 +181,16 @@ async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
         "TTL": str(ttl),
         "Urgency": "high",
     }
+    # A blocked host goes through the edge relay, which forwards the same body
+    # and headers and hands back the upstream status verbatim — so the retry
+    # rules below read the same 429/507 they would have read directly.
+    url = endpoint
+    if _needs_relay(endpoint):
+        url = _RELAY_URL
+        headers["X-Relay-Target"] = endpoint
+        headers["X-Relay-Key"] = _RELAY_KEY
     try:
-        resp = await client.post(endpoint, content=body, headers=headers)
+        resp = await client.post(url, content=body, headers=headers)
     except (httpx.HTTPError, asyncio.TimeoutError) as exc:
         return "retry", type(exc).__name__
     if 200 <= resp.status_code < 300:
