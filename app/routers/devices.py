@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.redis import get_redis
-from app.core.security import current_uin, issue_device_token
+from app.core.security import current_device_id, current_uin, issue_device_token
 from app.models.queue_cursor import QueueCursor
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -103,6 +103,37 @@ async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
     return out
 
 
+@router.delete("/me")
+async def revoke_own_device(
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Let a linked session disconnect ITSELF.
+
+    Until now only the phone could take a device out of the registry, so
+    signing out of the desktop or the web cleared local state and left the
+    entry standing: the phone went on listing a device that no longer exists,
+    and its token stayed valid. Reported 2026-08-04 — "на компе вышел из
+    профиля и удалил, а в телефоне всё равно показывает, что десктоп
+    подключён".
+
+    Declared ABOVE `/{device_id}`: FastAPI matches routes in declaration order,
+    and the parameterised one would otherwise swallow "me".
+
+    ⚠ Revokes ONLY a device that is actually in this account's registry. A
+    phone's token also carries a `dev` claim — the per-install id — and acting
+    on that would denylist the phone's own token and sign it out. The registry
+    hash holds linked sessions and nothing else, so membership in it is the
+    exact test for "is this a linked session revoking itself". Anything else is
+    a no-op rather than an error: sign-out must never fail on bookkeeping.
+    """
+    redis = await get_redis()
+    if not device_id or not await redis.hexists(_devices_key(uin), device_id):
+        return {"ok": True}
+    return await _revoke(uin, device_id, db)
+
+
 @router.delete("/{device_id}")
 async def revoke_device(
     device_id: str,
@@ -113,6 +144,10 @@ async def revoke_device(
     token. When the last device is removed the hash disappears, so the account
     is single-device again and `GET /keys/{uin}/bundle` resumes serving v=2.
     Returns 200 {ok:true} (any 2xx satisfies the clients)."""
+    return await _revoke(uin, device_id, db)
+
+
+async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
     redis = await get_redis()
     await redis.hdel(_devices_key(uin), device_id)
     await redis.sadd(_revoked_key(uin), device_id)
