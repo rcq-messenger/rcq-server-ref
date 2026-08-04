@@ -294,7 +294,8 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
         <p class="sub" style="margin:0"><b>Tier</b> — <span class="mono">community</span> relays are handed to clients only after a health check confirms they work; <span class="mono">trusted</span> relays are always offered (use that for relays you run yourself). <b>Promote / Demote</b> moves a relay between those tiers. <b>Remove</b> just drops it from the pool — clients fall back to your other relays or a direct connection; nothing is deleted on the relay’s own host, and removing the last one simply means no circumvention relays are advertised.</p>
       </div>
       <div class="card pad">
-        <table><thead><tr><th>Tag</th><th>Tier</th><th>State</th><th>Last OK</th><th>Fails</th><th></th></tr></thead>
+        <p class="sub" id="relays-summary" style="margin:0 0 8px"></p>
+        <table><thead><tr><th>Health</th><th>Endpoint</th><th>Tag</th><th>Tier</th><th>State</th><th>Last OK</th><th>Fails</th><th></th></tr></thead>
           <tbody id="relays"></tbody></table>
       </div>
     </section>
@@ -546,7 +547,25 @@ async function loadServer() {
 }
 
 /* ---- utils ---- */
-function timeago(iso){ const s=(Date.parse(iso))?(Date.now()-Date.parse(iso))/1000:0; if(s<60)return 'just now'; if(s<3600)return Math.floor(s/60)+'m'; if(s<86400)return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; }
+function timeago(v){
+  /* Accepts an ISO string OR unix SECONDS. The relay list sends seconds, and
+     Date.parse(1785000000) is NaN — which fell through to s=0 and printed
+     "just now" for every relay the canary had ever seen, including ones dead
+     since June. That single NaN is why the Relays tab was unreadable. */
+  if(v==null||v==='') return '—';
+  const ms = (typeof v==='number') ? v*1000 : (/^[0-9]+$/.test(String(v)) ? Number(v)*1000 : Date.parse(v));
+  if(!ms || Number.isNaN(ms)) return '—';
+  const s=(Date.now()-ms)/1000;
+  if(s<0) return 'just now';
+  if(s<60)return 'just now'; if(s<3600)return Math.floor(s/60)+'m'; if(s<86400)return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d';
+}
+/* A relay is servable only while its last successful probe is fresh; the
+   broker uses the same 45-minute window when it decides what to hand out. */
+function relayLive(v){
+  if(v==null||v==='') return false;
+  const ms = (typeof v==='number') ? v*1000 : (/^[0-9]+$/.test(String(v)) ? Number(v)*1000 : Date.parse(v));
+  return !!ms && !Number.isNaN(ms) && (Date.now()-ms) < 2700*1000;
+}
 
 /* ---- mock data for preview ---- */
 /* ---- overview: DAU chart + online roster ---- */
@@ -620,18 +639,45 @@ async function loadRelays() {
   try {
     const r = await rawApi('GET','/broker/admin/list');
     const rows = (r&&r.relays)||[];
-    $('relays').innerHTML = rows.length ? rows.map(x=>`<tr>
+    /* Live first, then by freshness. Without an order the list came back in
+       whatever order Postgres felt like, which for a pool that is mostly dead
+       means the one working relay hides in the middle. */
+    rows.sort((a,b)=>(relayLive(b.last_ok)-relayLive(a.last_ok)) || ((b.last_ok||0)-(a.last_ok||0)));
+    const live = rows.filter(x=>relayLive(x.last_ok)).length;
+    const dead = rows.length - live;
+    $('relays-summary').innerHTML = rows.length
+      ? `<b>${live}</b> serving · <b>${dead}</b> not answering${dead?' · <button class="btn ghost sm" onclick="pruneDeadRelays()">Remove dead</button>':''}`
+      : '';
+    $('relays').innerHTML = rows.length ? rows.map(x=>{
+      const alive = relayLive(x.last_ok);
+      const d = x.descriptor||{};
+      const ep = d.server ? (d.server+':'+(d.port||'')) : '—';
+      return `<tr>
+      <td>${alive?'<span class="pill green">serving</span>':'<span class="pill red">no answer</span>'}</td>
+      <td class="mono" style="color:var(--dim)">${escAttr(ep)}</td>
       <td class="mono">${escAttr(x.tag)}</td>
       <td><span class="pill ${x.tier==='trusted'?'green':''}">${x.tier}</span></td>
       <td>${x.enabled?'<span class="pill green">on</span>':'<span class="pill red">off</span>'}</td>
-      <td class="mono" style="color:var(--dim)">${x.last_ok?timeago(x.last_ok):'—'}</td>
+      <td class="mono" style="color:var(--dim)">${timeago(x.last_ok)}</td>
       <td>${x.fail_count||0}</td>
       <td style="text-align:right;white-space:nowrap">
         <button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{enabled:${!x.enabled}})">${x.enabled?'Disable':'Enable'}</button>
         <button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{tier:'${x.tier==='trusted'?'community':'trusted'}'})">${x.tier==='trusted'?'Demote':'Promote'}</button>
         <button class="btn danger sm" onclick="removeRelay('${escAttr(x.tag)}')">Remove</button>
-      </td></tr>`).join('') : '<tr><td colspan="6" class="empty">No relays registered. Community relays self-register via the bootstrap script.</td></tr>';
-  } catch(e){ $('relays').innerHTML='<tr><td colspan="6" class="err">'+e.message+' — the broker may be disabled on this island.</td></tr>'; }
+      </td></tr>`;}).join('') : '<tr><td colspan="8" class="empty">No relays registered. Community relays self-register via the bootstrap script.</td></tr>';
+  } catch(e){ $('relays').innerHTML='<tr><td colspan="8" class="err">'+e.message+' — the broker may be disabled on this island.</td></tr>'; }
+}
+/* Dead rows never disappear on their own: a relay that moves to a new IP
+   registers a NEW tag and the old one stays forever. Seventeen of them had
+   piled up by August, all last seen in June, and every one of them still ate a
+   canary probe every ten minutes. */
+async function pruneDeadRelays(){
+  const r = await rawApi('GET','/broker/admin/list');
+  const dead = ((r&&r.relays)||[]).filter(x=>!relayLive(x.last_ok));
+  if(!dead.length) return;
+  if(!confirm('Remove '+dead.length+' relay(s) that are not answering?')) return;
+  for(const x of dead){ try{ await rawApi('DELETE','/broker/admin/'+encodeURIComponent(x.tag)); }catch(e){} }
+  loadRelays();
 }
 async function setRelay(tag, patch){ try{ await rawApi('POST','/broker/admin/set', Object.assign({tag}, patch)); loadRelays(); }catch(e){ alert(e.message); } }
 async function removeRelay(tag){ if(!confirm('Remove relay '+tag+'?'))return; try{ await rawApi('DELETE','/broker/admin/'+encodeURIComponent(tag)); loadRelays(); }catch(e){ alert(e.message); } }

@@ -564,6 +564,10 @@ async def admin_list(db: AsyncSession = Depends(get_db)) -> dict:
             "last_ok": r.last_ok,
             "fail_count": r.fail_count,
             "operator_key": (r.operator_key or "")[:12] + "…",
+            # Server-side registration time, in unix seconds like last_ok. The
+            # canary's prune step needs it to judge a row that has NEVER
+            # answered, where last_ok gives it nothing to measure from.
+            "created_at": int(r.created_at.timestamp()) if r.created_at else None,
             "descriptor": desc,
         })
     return {"relays": out}
