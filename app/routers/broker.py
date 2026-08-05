@@ -296,6 +296,39 @@ async def register_relay(
     return {"ok": True, "tag": tag, "enabled": True}
 
 
+def _disclosure_cap(pool: int, requested: int) -> int:
+    """How many relays one network may learn, given how many exist.
+
+    The bucket is deterministic per (IP block, day), so a censor's cost is
+    counted in distinct network vantage points, not requests — the per-IP rate
+    limit does not touch them. Each vantage point yields a k-subset of the pool
+    of N, so the expected number of relays still unseen after t of them is
+    N(1-k/N)^t, and full enumeration costs roughly (N/k)·ln(N) networks.
+
+    That ratio is the whole game, and `n` was chosen when the pool was expected
+    to be large. Measured against what actually exists:
+
+        pool  k=1  k=2  k=3  k=5      (networks needed to see everything)
+           6   10    5    3    1
+          10   22   11    7    4
+          20   59   29   19   11
+
+    Six relays with the old ceiling of five meant ONE network learned the entire
+    fleet. Holding k at about N/5 keeps the cost near ten networks or more,
+    which is where it stops being a single curl.
+
+    Two things this deliberately does not claim. A state censor has effectively
+    unlimited vantage points, so this raises the cost of casual scraping and
+    makes enumeration a visible pattern; it does not stop ТСПУ. And while the
+    signed config still publishes the whole fleet to anyone who asks, none of it
+    binds at all — the broker only starts mattering once that list degrades to a
+    minimal seed. Tuning it now is free and sets the right default for then.
+    """
+    if pool <= 0:
+        return 0
+    return max(1, min(requested, pool // 5))
+
+
 @router.get(
     "/bridges",
     dependencies=[Depends(rate_limit("broker_bridges", 30, 60))],
@@ -377,7 +410,7 @@ async def get_bridges(
 
     trusted = sorted((r for r in rows if r.tier == "trusted"), key=score)
     community = sorted((r for r in rows if r.tier != "trusted"), key=score)
-    chosen = (trusted + community)[:n]
+    chosen = (trusted + community)[:_disclosure_cap(len(rows), n)]
     out = []
     for r in chosen:
         try:
