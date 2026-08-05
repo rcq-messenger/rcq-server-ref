@@ -122,6 +122,42 @@ def _needs_relay(endpoint: str) -> bool:
         return False
 
 
+# SHORTCUT TO OUR OWN PUSH SERVER (2026-08-05). Clients mint their endpoint
+# from a public name, and that name now sits behind Cloudflare so that blocking
+# the island's address cannot take push down with it. Delivering to it verbatim
+# would send every wake out to the CF edge and straight back to this same box:
+# a hop that can rate-limit us, can be down while we are up, and costs ~90ms
+# against ~9ms on loopback (measured).
+#
+# It also silently unpicked ntfy's `visitor-request-limit-exempt-hosts`, which
+# names this droplet's address — arriving from a CF edge instead, the island's
+# own deliveries stopped being exempt and started spending a shared bucket.
+#
+# So an endpoint that names our own push host is sent to the local instance,
+# with the path and query untouched. Unset PUSH_LOCAL_BASE and everything goes
+# out over the public name again, which is what an island whose push server
+# lives on another host should do.
+_LOCAL_BASE = os.getenv("PUSH_LOCAL_BASE", "").strip().rstrip("/")
+_LOCAL_HOSTS = frozenset(
+    h.strip().lower()
+    for h in os.getenv("PUSH_LOCAL_HOSTS", "push.rcq.app").split(",")
+    if h.strip()
+)
+
+
+def _localize(endpoint: str) -> str | None:
+    """The loopback URL for an endpoint on our own push host, else None."""
+    if not _LOCAL_BASE:
+        return None
+    try:
+        parts = urlparse(endpoint)
+    except ValueError:
+        return None
+    if (parts.hostname or "").lower() not in _LOCAL_HOSTS:
+        return None
+    return f"{_LOCAL_BASE}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+
+
 _client: httpx.AsyncClient | None = None
 _sem: asyncio.Semaphore | None = None
 # Strong refs to in-flight delivery tasks — asyncio only holds a weak ref, so
@@ -185,11 +221,15 @@ async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
         "TTL": str(ttl),
         "Urgency": "high",
     }
+    # Our own push host is answered on loopback — checked first, because it is
+    # never a host the edge relay exists for and the relay would only add the
+    # trip this shortcut removes.
+    #
     # A blocked host goes through the edge relay, which forwards the same body
     # and headers and hands back the upstream status verbatim — so the retry
     # rules below read the same 429/507 they would have read directly.
-    url = endpoint
-    if _needs_relay(endpoint):
+    url = _localize(endpoint) or endpoint
+    if url == endpoint and _needs_relay(endpoint):
         url = _RELAY_URL
         headers["X-Relay-Target"] = endpoint
         headers["X-Relay-Key"] = _RELAY_KEY
