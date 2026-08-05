@@ -10,6 +10,7 @@ Surfaces:
   • Live presence: who's connected right now
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -727,6 +728,36 @@ async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depe
 
 
 # ── Stats ───────────────────────────────────────────────────────────
+
+
+# ── Transport mix ───────────────────────────────────────────────────
+#
+# How people actually reach the island: direct, through the Cloudflare front,
+# or out of one of our relays. The numbers come from Caddy's own access log,
+# which this process cannot read (caddy-owned, mode 600) — so a root timer
+# (rcq-telemetry.timer) runs scripts/transport-mix.py hourly and leaves a
+# readable JSONL snapshot behind. Serving the file rather than recomputing also
+# means the admin view is instant and the log parse happens once an hour.
+TRANSPORT_SNAPSHOTS = os.getenv("TRANSPORT_SNAPSHOTS", "/var/lib/rcq-telemetry/transport.jsonl")
+
+
+@router.get("/transport-mix")
+async def transport_mix(limit: int = Query(48, le=720)) -> dict:
+    """Recent snapshots, newest last. Empty list when the timer has not run yet
+    or the file is missing — the panel says so rather than showing zeros, which
+    would read as "nobody is using relays"."""
+    try:
+        with open(TRANSPORT_SNAPSHOTS) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {"snapshots": [], "available": False}
+    out = []
+    for line in lines[-limit:]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return {"snapshots": out, "available": True}
 
 
 @router.get("/stats", response_model=StatsOut)
