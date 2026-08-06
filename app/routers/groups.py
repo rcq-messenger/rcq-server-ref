@@ -182,6 +182,11 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
             )
         ).scalars().all()
     ) if rows else set()
+    # One presence lookup for the whole roster. Per-member `is_online` here was
+    # a Redis round trip each, so serialising the 1800-member beta group cost
+    # 1800 of them, on an endpoint every client polls. Prod was doing ~6900
+    # SISMEMBER/s with twenty people online, which was most of the CPU.
+    online = await manager.online_subset(u.uin for _, u in rows)
     out: list[GroupMemberOut] = []
     for m, u in rows:
         # Live presence: only show as their saved status if they currently have
@@ -191,8 +196,7 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
         if u.is_fake:
             raw_status = u.status
         else:
-            # is_online is async now (Redis-backed for cross-worker visibility).
-            raw_status = u.status if await manager.is_online(u.uin) else "offline"
+            raw_status = u.status if u.uin in online else "offline"
         visible = "offline" if raw_status == "invisible" else raw_status
         out.append(GroupMemberOut(
             uin=m.uin,

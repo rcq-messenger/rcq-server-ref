@@ -39,6 +39,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from typing import Any
 
 from fastapi import WebSocket
@@ -559,6 +560,36 @@ class ConnectionManager:
         except Exception:  # noqa: BLE001
             # Fall back to local-only knowledge if Redis is down.
             return uin in self._conns
+
+    async def online_subset(self, uins: Iterable[int]) -> set[int]:
+        """Which of `uins` are online right now, in ONE Redis round trip.
+
+        `is_online` per member is fine for a single check and ruinous in a
+        loop: serialising a group's roster called it once per member, so one
+        `GET /groups` for an account in the 1800-member beta group cost 1800
+        sequential SISMEMBERs. Measured on prod at ~6900 SISMEMBER/s against
+        twenty people actually online, which was most of the box's CPU.
+
+        The online set is bounded by concurrent users, not by roster size, so
+        pulling it whole and intersecting locally is cheaper than any
+        per-member query and stays cheap as groups grow.
+        """
+        wanted = {int(u) for u in uins}
+        if not wanted:
+            return set()
+        try:
+            redis = await get_redis()
+            raw = await redis.smembers(_ONLINE_KEY)
+        except Exception:  # noqa: BLE001
+            # Same fallback as is_online: local knowledge beats guessing.
+            return {u for u in wanted if u in self._conns}
+        online: set[int] = set()
+        for m in raw:
+            try:
+                online.add(int(m if isinstance(m, (int, str)) else m.decode()))
+            except (TypeError, ValueError):
+                continue
+        return wanted & online
 
     async def send(
         self,
