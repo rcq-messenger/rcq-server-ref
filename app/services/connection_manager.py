@@ -71,6 +71,8 @@ _ONLINE_DEVS_TTL = 180
 # person, four dozen is a client that has lost the plot. Tunable without a
 # deploy for the day one is needed.
 _MAX_SOCKETS_PER_UIN = int(os.getenv("RCQ_MAX_SOCKETS_PER_UIN", "8"))
+# Above this, every dial says how many this worker is holding.
+_BUSY_ACCOUNT_HINT = 4
 
 
 def _online_devs_key(uin: int) -> str:
@@ -480,16 +482,23 @@ class ConnectionManager:
                     existing.discard(extra)
                     self._device_of.pop(extra, None)
                     self._opened_at.pop(extra, None)
-                log.warning(
-                    "ws uin=%s: %d sockets over the cap of %d — closing the %d oldest",
-                    uin,
-                    len(existing) + len(surplus),
-                    _MAX_SOCKETS_PER_UIN,
-                    len(surplus),
+                # print() and not log.warning(): the logger's output does not
+                # reach the journal under the current uvicorn config, so a
+                # warning here would be written and never read — which is the
+                # same class of mistake as the mechanism that is never checked.
+                print(
+                    f"[ws] uin={uin}: {len(existing) + len(surplus)} sockets over "
+                    f"the cap of {_MAX_SOCKETS_PER_UIN} — closing {len(surplus)} oldest",
+                    flush=True,
                 )
             self._conns[uin] = existing
             self._device_of[ws] = device_id
             self._opened_at[ws] = time.monotonic()
+            held = len(existing)
+        if held >= _BUSY_ACCOUNT_HINT:
+            # One line per dial once an account is holding an unusual number,
+            # so "is it accumulating or is it redialing?" stops being a guess.
+            print(f"[ws] uin={uin} dev={device_id}: now holding {held} sockets on this worker", flush=True)
         for old in old_sockets:
             # Not awaited: a ghost takes the full close_timeout to answer, and
             # this runs before the new socket is marked online — waiting here
