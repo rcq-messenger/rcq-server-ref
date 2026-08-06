@@ -66,9 +66,17 @@ _ONLINE_KEY = "ws:online_uins"
 # leftovers age out on their own.
 _ONLINE_DEVS_TTL = 180
 
+# Most sockets one account may hold on ONE worker at a time. Generous on
+# purpose: a phone, a tablet, a desktop and a couple of browser tabs is a real
+# person, four dozen is a client that has lost the plot. Tunable without a
+# deploy for the day one is needed.
+_MAX_SOCKETS_PER_UIN = int(os.getenv("RCQ_MAX_SOCKETS_PER_UIN", "8"))
+
 
 def _online_devs_key(uin: int) -> str:
     return f"ws:online_devs:{uin}"
+
+
 # How often each worker publishes a heartbeat on the fanout channel, so that
 # "heard nothing" means deaf rather than merely quiet. Costs one tiny publish
 # per worker per interval.
@@ -102,6 +110,9 @@ class ConnectionManager:
         # receive live. A regular phone session has no `dev` claim → keyed
         # "primary", which preserves the old single-device behaviour exactly.
         self._device_of: dict[WebSocket, str] = {}
+        # When each socket was accepted, so the per-account ceiling can drop the
+        # OLDEST rather than an arbitrary member of a set.
+        self._opened_at: dict[WebSocket, float] = {}
         self._lock = asyncio.Lock()
         # Background task that subscribes to the fanout channel and
         # delivers received messages to LOCAL connections only. Started
@@ -415,6 +426,7 @@ class ConnectionManager:
                         old.append(ws)
                         conns.discard(ws)
                         self._device_of.pop(ws, None)
+                        self._opened_at.pop(ws, None)
                 if not conns:
                     self._conns.pop(uin, None)
         for ws in old:
@@ -446,9 +458,38 @@ class ConnectionManager:
                     old_sockets.append(old)
                     existing.discard(old)
                     self._device_of.pop(old, None)
+                    self._opened_at.pop(old, None)
             existing.add(ws)
+            # Ceiling on how many sockets one account may hold at once.
+            #
+            # The per-device supersede above assumes a device keeps its id. A
+            # client that mints a fresh one on every dial supersedes nothing and
+            # piles up instead: one real account reached 38 live sockets and 2.7
+            # full boot chains a second, which was 73% of everything this server
+            # was doing. Whatever the client is doing wrong, no account has a
+            # legitimate use for dozens, and the server should not be the part
+            # that falls over. Oldest go first, so the socket the person is
+            # actually looking at is the one that survives.
+            if len(existing) > _MAX_SOCKETS_PER_UIN:
+                surplus = sorted(
+                    (w for w in existing if w is not ws),
+                    key=lambda w: self._opened_at.get(w, 0.0),
+                )[: len(existing) - _MAX_SOCKETS_PER_UIN]
+                for extra in surplus:
+                    old_sockets.append(extra)
+                    existing.discard(extra)
+                    self._device_of.pop(extra, None)
+                    self._opened_at.pop(extra, None)
+                log.warning(
+                    "ws uin=%s: %d sockets over the cap of %d — closing the %d oldest",
+                    uin,
+                    len(existing) + len(surplus),
+                    _MAX_SOCKETS_PER_UIN,
+                    len(surplus),
+                )
             self._conns[uin] = existing
             self._device_of[ws] = device_id
+            self._opened_at[ws] = time.monotonic()
         for old in old_sockets:
             # Not awaited: a ghost takes the full close_timeout to answer, and
             # this runs before the new socket is marked online — waiting here
@@ -479,6 +520,7 @@ class ConnectionManager:
     async def disconnect(self, uin: int, ws: WebSocket) -> None:
         async with self._lock:
             gone_device = self._device_of.pop(ws, None)
+            self._opened_at.pop(ws, None)
             # Another socket of the SAME device (a reconnect racing the old
             # socket's teardown) means the device is still here — dropping it
             # from the online set would push to a device that is connected.
