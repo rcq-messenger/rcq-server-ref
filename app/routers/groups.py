@@ -106,6 +106,11 @@ class GroupMemberOut(BaseModel):
     # Live presence — online/away/dnd/offline. Invisible is reported as offline,
     # like everywhere else in the API.
     status: str = "offline"
+    # Profile picture. Gated by MEMBERSHIP rather than by the contact list:
+    # sharing a group is the relationship here, the same one that already
+    # exposes the nickname on this row.
+    avatar_media_id: str | None = None
+    avatar_media_key: str | None = None
     # Long-term X25519 ECDH public key + Ed25519 signing public key, base64.
     # The client uses these to encrypt-per-recipient when sending into the
     # group (Stage 2 e2ee — every member gets their own ciphertext, the
@@ -201,6 +206,8 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
         out.append(GroupMemberOut(
             uin=m.uin,
             nickname=u.nickname,
+            avatar_media_id=u.avatar_media_id,
+            avatar_media_key=u.avatar_media_key,
             role=m.role,
             permissions=_perm_list(m.permissions),
             status=visible,

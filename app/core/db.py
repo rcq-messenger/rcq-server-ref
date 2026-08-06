@@ -127,6 +127,10 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # referral activation; additive so existing rows start at 0/NULL.
     ("active_days", "INTEGER DEFAULT 0"),
     ("last_active_day", "VARCHAR(10)"),
+    # Profile picture (see models/user.py). Additive: NULL on every existing
+    # row means "no picture", which is exactly the old behaviour.
+    ("avatar_media_id", "VARCHAR(64)"),
+    ("avatar_media_key", "VARCHAR(96)"),
     # Note: GroupMessageView is a fresh table created via create_all
     # on first boot; no ALTER needed for additive-column case.
     # When TRUE, the user's chosen `status` (online/away/dnd) is
