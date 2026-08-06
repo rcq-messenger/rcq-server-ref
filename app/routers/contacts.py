@@ -43,6 +43,11 @@ class ContactRow(BaseModel):
     # "nobody" hides the call buttons. The server still enforces the policy on
     # the call_offer itself; this just keeps the UI honest.
     callable: bool = True
+    # Profile picture. The viewer is always a mutual contact on this row, which
+    # is exactly the relationship the picture is handed out for, so it needs no
+    # gate of its own here.
+    avatar_media_id: str | None = None
+    avatar_media_key: str | None = None
 
 
 class RequestRow(BaseModel):
@@ -111,6 +116,8 @@ async def list_contacts(
                 nickname=u.nickname,
                 status=live_status,
                 status_message=u.status_message,
+                avatar_media_id=u.avatar_media_id,
+                avatar_media_key=u.avatar_media_key,
                 blocked=c.blocked,
                 identity_key=u.identity_key,
                 signing_key=u.signing_key,

@@ -88,6 +88,19 @@ class User(Base):
     # Optional public HoF avatar as a data-URI (see db.py note). Served only
     # for approved members; NULL falls back to the initial-letter circle.
     hof_avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Uploaded profile picture, same model as a group's: the blob at
+    # `/media/{avatar_media_id}` is AES-encrypted and `avatar_media_key` is the
+    # base64 key handed to whoever is allowed to see it. Both NULL = no picture,
+    # clients fall back to the status glyph they have always drawn.
+    #
+    # Who may see it is deliberately NARROWER than the rest of the profile: a
+    # picture is handed to people you have a relationship with (mutual
+    # contacts, and members of a group you are in), never to a stranger who
+    # merely found you in search, in Random, or in Nearby, and never on a
+    # contact request you have not accepted — otherwise an incoming request
+    # becomes a channel for pushing an image onto someone's screen.
+    avatar_media_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    avatar_media_key: Mapped[str | None] = mapped_column(String(96), nullable=True)
     # Founder-assigned rating tier — which flower shows next to the member on
     # the wall: "bronze" | "silver" | "gold". Independent of the auto-computed
     # bug-report effort ring; this is the founder's manual "thank you" for

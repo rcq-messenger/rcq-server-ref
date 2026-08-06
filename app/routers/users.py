@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -118,6 +118,12 @@ class PublicUser(BaseModel):
     # Owner-only echo of the uploaded HoF avatar data-URI so the client can
     # preview its current image (incl. before approval). Null for third parties.
     hof_avatar: str | None = None
+    # Profile picture. Handed out only to people with an established
+    # relationship (see the model): a mutual contact, or yourself. Group
+    # co-members get it through GroupMemberOut instead, which is gated by
+    # membership rather than by the contact list.
+    avatar_media_id: str | None = None
+    avatar_media_key: str | None = None
 
     @classmethod
     def from_model_for_viewer(
@@ -137,9 +143,15 @@ class PublicUser(BaseModel):
         # but ALSO falls under profile_visibility — if profile is
         # hidden, gender is hidden regardless of its own setting.
         profile_visible = _profile_visible_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
+        # A picture is not part of the profile card gate: it follows the
+        # relationship, not the "who may see my details" setting. Strangers get
+        # nothing here regardless of how open the rest of the profile is.
+        avatar_ok = owner_self or is_contact
         return cls(
             uin=u.uin,
             nickname=u.nickname,
+            avatar_media_id=u.avatar_media_id if avatar_ok else None,
+            avatar_media_key=u.avatar_media_key if avatar_ok else None,
             first_name=u.first_name if profile_visible else None,
             last_name=u.last_name if profile_visible else None,
             age=u.age if profile_visible else None,
@@ -289,6 +301,12 @@ class ProfileUpdate(BaseModel):
     # Optional public HoF avatar as a data-URI. Empty string clears it.
     # Validated (mime allow-list + base64 + size cap) in update_me.
     hof_avatar: str | None = None
+    # Profile picture: the id + key of an already-uploaded encrypted blob.
+    # Both empty strings clear it; leaving them unset leaves the picture
+    # alone, so a PATCH that only changes a nickname cannot wipe it. Same
+    # convention as a group's avatar.
+    avatar_media_id: str | None = Field(default=None, max_length=64)
+    avatar_media_key: str | None = Field(default=None, max_length=96)
 
 
 @router.get(
@@ -395,6 +413,18 @@ async def update_me(
             data["hof_avatar"] = None
         else:
             data["hof_avatar"] = _validate_hof_avatar(raw)
+    if "avatar_media_id" in data or "avatar_media_key" in data:
+        # The pair only makes sense whole: an id without a key is a blob
+        # nobody can open, and a key without an id points at nothing. Sending
+        # both blank is how a client removes the picture.
+        new_id = (data.get("avatar_media_id") or "").strip() or None
+        new_key = (data.get("avatar_media_key") or "").strip() or None
+        if (new_id is None) != (new_key is None):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "avatar_media_id and avatar_media_key go together"
+            )
+        data["avatar_media_id"] = new_id
+        data["avatar_media_key"] = new_key
     if "presence_ttl_minutes" in data and data["presence_ttl_minutes"] is not None:
         # Allowlist matches the iOS picker options so we don't accept
         # arbitrary values from a poked client. 0 = forever; the rest
