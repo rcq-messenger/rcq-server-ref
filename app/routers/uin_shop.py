@@ -54,6 +54,14 @@ router = APIRouter(prefix="/uin", tags=["uin_shop"])
 # defense-in-depth gate.
 MIN_LEN = 3
 MAX_LEN = 9
+# How many numbers one account may hold at once. While claiming is free during
+# the beta there is nothing but this stopping one person from sweeping every
+# short number on the island: the scarce ones are exactly the ones a script
+# would take first, and a number sitting in someone's collection is a number no
+# new user can ever have. Ten is generous for a person and useless for a
+# hoarder. Not configurable per-island yet; self-hosters inherit the same cap,
+# which is the safe direction.
+MAX_OWNED_UINS = 10
 
 # Price cents keyed by UIN length. Roughly geometric: ~3x per
 # digit drop until the 3-digit trophy tier at the Apple $999 cap.
@@ -374,6 +382,14 @@ async def claim(
     # migrate route enforces.
     if user.is_suspended:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+    # Cap the collection. Counted here rather than at activation, because
+    # taking is what removes a number from everyone else.
+    held = len(await _owned_uins(db, me))
+    if held >= MAX_OWNED_UINS:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "too_many_uins", "max": MAX_OWNED_UINS},
+        )
 
     # The freed number's tokens are retired inside _perform_migration, so the
     # old bearer cannot follow the number to whoever claims it next.
