@@ -7,13 +7,18 @@ from app.core.db import Base
 
 
 class HoodBanner(Base):
-    """One paid district-banner placement. Lives in a geohash-level-6
-    bucket (same key the /nearby surface uses); auto-expires when
-    `expires_at` passes.
+    """Rows of a district banner board that no longer exists.
 
-    Pricing is enforced on the create endpoint: a mock IAP receipt
-    is currently accepted blindly, real StoreKit verification slots
-    in there later.
+    ⚠ The surface and its endpoints were removed: in three months the board
+    took eight posts from seven people, every one of them a test, and none was
+    alive at the end. It also showed dollar prices while the purchase check
+    accepted any non-empty string, so the price was a fiction the screen told
+    with a straight face.
+
+    The table stays for one reason: burning an account has to delete what that
+    account left behind, and `services/uin_rows.py` sweeps these rows by
+    `owner_uin`. Dropping the model would quietly leave someone's rows behind
+    after they asked to be erased.
     """
 
     __tablename__ = "hood_banners"

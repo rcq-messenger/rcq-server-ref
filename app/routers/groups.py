@@ -440,7 +440,22 @@ def _serialize(g: Group, members: list[GroupMemberOut]) -> GroupOut:
     )
 
 
-@router.get("", response_model=list[GroupOut])
+# The most expensive read this server serves: it renders every member of every
+# group the caller is in, keys included, which on the beta group alone is a
+# 700 KB body before compression and seconds of database time.
+#
+# One account with a client stuck in a boot loop reached roughly 130 of these a
+# minute and, with the rest of its boot chain, was two thirds of everything this
+# server was doing — the symptom everyone else saw was a slow app and a sluggish
+# admin panel. The ceiling here is far above any honest use (an app boot plus
+# ordinary refreshes is single digits a minute, and the busiest real account
+# measured sat under 30) and exists only so one broken client cannot do that
+# again while we find out why it broke.
+@router.get(
+    "",
+    response_model=list[GroupOut],
+    dependencies=[Depends(rate_limit("groups_list", 60, 60))],
+)
 async def list_groups(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),

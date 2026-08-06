@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.db import init_db
 from app.core.feature_gate import require_feature
 from app.core.redis import close_redis, get_redis
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, hood_banners, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.fake_users import seed_fake_users
 from app.services.evidence_sweep import evidence_sweep_loop
@@ -115,7 +115,6 @@ app.include_router(presence.router)
 app.include_router(random_chat.router, dependencies=[Depends(require_feature("random_enabled"))])
 app.include_router(audio_rooms.router)
 app.include_router(hood.router, dependencies=[Depends(require_feature("hood_enabled"))])
-app.include_router(hood_banners.router, dependencies=[Depends(require_feature("hood_enabled"))])
 app.include_router(reports.router)
 app.include_router(polls.router)
 app.include_router(polls.group_polls_router)
