@@ -244,6 +244,10 @@ class MyUinsOut(BaseModel):
     # The number this account is answering as right now.
     active: int
     owned: list[OwnedUinOut]
+    # How many one account may hold here. Sent so the client can show "3 of 10"
+    # instead of only finding out at the eleventh attempt, and so a self-hoster
+    # who changes the cap does not need a client release to reflect it.
+    max_owned: int = MAX_OWNED_UINS
 
 
 async def _owned_uins(db: AsyncSession, owner: int) -> list[int]:
@@ -271,6 +275,7 @@ async def my_uins(
     ).scalars().all()
     return MyUinsOut(
         active=me,
+        max_owned=MAX_OWNED_UINS,
         owned=[
             OwnedUinOut(uin=int(r.uin), length=_length(int(r.uin)), acquired_at=r.acquired_at)
             for r in rows
