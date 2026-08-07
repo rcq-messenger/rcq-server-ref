@@ -23,6 +23,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# VERSION is read at runtime by app/core/config.py, two levels up from
+# itself — without it in the image every /health and /server/info reports
+# an unknown version, which is exactly what a self-hoster is asked for
+# when they report a problem.
+COPY VERSION ./VERSION
 COPY app ./app
 
 # Media / news / evidence dirs are per-deployment data. Mount these
