@@ -178,7 +178,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       <div class="stats" id="stats"><span class="empty">Loading…</span></div>
       <div class="card pad" style="margin-top:16px">
         <h3>New users · last 30 days</h3>
-        <p class="sub">Signups per day (fake accounts excluded).</p>
+        <p class="sub">Signups per day.</p>
         <div class="chart" id="chart"></div>
         <div class="chart-x" id="chart-x"></div>
       </div>
@@ -197,6 +197,24 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
         <h3>Recent activity</h3>
         <p class="sub">Latest moderation actions.</p>
         <div id="activity"></div>
+      </div>
+    </section>
+
+    <!-- INSTRUMENTS -->
+    <section class="view" id="v-instruments">
+      <div class="head"><div><h1>Instruments</h1><p>What your server is doing to itself, last hour. Counted inside the process, so on a multi-worker install these are <b>one worker&rsquo;s</b> numbers, and they reset whenever the server restarts. Read the shape, not the absolute.</p></div></div>
+      <div class="stats" id="inst-stats"><span class="empty">Loading…</span></div>
+      <div class="card pad" style="margin-top:16px">
+        <h3>Requests · last hour</h3>
+        <p class="sub">One bar per minute. Hover a bar for the count.</p>
+        <div class="chart" id="inst-chart"></div>
+        <div class="chart-x" id="inst-chart-x"></div>
+      </div>
+      <div class="card pad" style="margin-top:16px">
+        <h3>Where the time goes</h3>
+        <p class="sub">Sorted by total time spent, not by how often it is called: the endpoint worth fixing is the one the server spends its life in. &ldquo;Worst&rdquo; is the slowest single call, which an average hides.</p>
+        <table><thead><tr><th>Path</th><th style="text-align:right">Calls/min</th><th style="text-align:right">Typical</th><th style="text-align:right">Worst</th><th style="text-align:right">5xx</th></tr></thead>
+          <tbody id="inst-paths"></tbody></table>
       </div>
     </section>
 
@@ -338,6 +356,7 @@ $('flower').innerHTML = '<img src="'+LOGO+'" alt="" width="28" height="28" style
 /* ---- nav ---- */
 const NAV = [
   ['overview','Overview','M3 12l9-8 9 8M5 10v9h5v-5h4v5h5v-9'],
+  ['instruments','Instruments','M4 18a8 8 0 1116 0M12 18l4-6'],
   ['invites','Invites','M4 7h16v10H4zM4 7l8 6 8-6'],
   ['access','Access tokens','M6 10V7a6 6 0 1112 0v3M5 10h14v10H5zM12 14v3'],
   ['users','Users','M8 11a3 3 0 100-6 3 3 0 000 6zM2 20c0-3 3-5 6-5s6 2 6 5M16 7a3 3 0 110 6'],
@@ -356,6 +375,7 @@ function go(v) {
   document.querySelectorAll('.navlink').forEach(e => e.classList.toggle('active', e.dataset.v===v));
   document.querySelectorAll('.view').forEach(e => e.classList.toggle('active', e.id==='v-'+v));
   closeSide();
+  if (v==='instruments') loadInstruments();
   if (v==='invites') loadInvites();
   if (v==='access') loadAccess();
   if (v==='reports') loadReports();
@@ -407,6 +427,55 @@ async function loadChart() {
     if (pts.length) $('chart-x').innerHTML = `<span>${pts[0].date.slice(5)}</span><span>${pts[pts.length-1].date.slice(5)}</span>`;
   } catch(e){ $('chart').innerHTML=''; }
 }
+/* ---- instruments ---- */
+async function loadInstruments() {
+  try {
+    const m = await api('GET','/metrics?minutes=60');
+    const series = m.series || [];
+    // The last FULL minute: the one in progress is only partly counted and
+    // always reads low, which looks like a sudden drop every refresh.
+    const last = series.length > 1 ? series[series.length-2] : null;
+    const peak = Math.max(0, ...series.map(s=>s.pool_peak_in_use||0));
+    const waits = series.reduce((a,s)=>a+(s.pool_waits||0),0);
+    const churn = series.reduce((a,s)=>a+(s.sockets_opened||0),0);
+    const busiest = Math.max(0, ...series.map(s=>s.busiest_account_chains||0));
+    const ceiling = (m.pool && m.pool.ceiling) || 0;
+    const groups = (m.paths||[]).find(p=>p.path==='/groups');
+    const cells = [
+      ['Requests / sec', last ? (last.requests/60).toFixed(1) : '—'],
+      ['/groups typical', groups ? groups.mean_ms+' ms' : '—', groups && groups.mean_ms>1000],
+      ['DB pool peak', ceiling ? peak+' / '+ceiling : String(peak), waits>0 || (ceiling>0 && peak>=ceiling)],
+      ['Sockets opened / h', churn],
+      // Value and label this way round on purpose: "9 boot chains/min" as the
+      // big number wrapped onto three lines and stopped reading as a number.
+      ['Busiest account · boot chains/min', busiest, busiest>20],
+    ];
+    $('inst-stats').innerHTML = cells.map(c=>`<div class="stat${c[2]?' warn':''}"><div class="n">${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
+
+    const max = Math.max(1, ...series.map(s=>s.requests||0));
+    $('inst-chart').innerHTML = series.map(s=>{
+      const t = new Date(s.minute*60000);
+      const hhmm = String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0');
+      return `<div class="bar" style="height:${Math.round((s.requests||0)/max*100)}%" title="${hhmm}: ${s.requests||0} requests, ${s.errors||0} 5xx"></div>`;
+    }).join('');
+    if (series.length) {
+      const fmt = mn => { const t=new Date(mn*60000); return String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0'); };
+      $('inst-chart-x').innerHTML = `<span>${fmt(series[0].minute)}</span><span>${fmt(series[series.length-1].minute)}</span>`;
+    }
+
+    const rows = m.paths || [];
+    $('inst-paths').innerHTML = rows.length ? rows.map(p=>`<tr>
+      <td class="mono">${p.path}</td>
+      <td style="text-align:right">${p.per_min}</td>
+      <td style="text-align:right">${p.mean_ms} ms</td>
+      <td style="text-align:right${p.worst_ms>2000?';color:var(--amber)':''}">${p.worst_ms} ms</td>
+      <td style="text-align:right${p.errors?';color:var(--red)':''}">${p.errors}</td></tr>`).join('')
+      : '<tr><td colspan="5" class="empty">Nothing recorded yet.</td></tr>';
+  } catch(e) {
+    $('inst-stats').innerHTML = '<span class="err">'+e.message+'</span>';
+  }
+}
+
 async function loadActivity() {
   try {
     const rows = await api('GET','/activity?limit=12');
@@ -732,6 +801,21 @@ function mock(method, path, body) {
     return { settings: MOCK_SETTINGS };
   }
   if (path.startsWith('/timeseries/dau')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(20+28*Math.abs(Math.sin(i/4)))}})};
+  if (path.startsWith('/metrics')) {
+    const now = Math.floor(Date.now()/60000);
+    return {
+      minutes:60,
+      series:Array.from({length:60},(_,i)=>({minute:now-59+i, requests:Math.round(38+26*Math.sin(i/6)), errors:i%17===0?1:0,
+        accounts:11+(i%5), boot_chains:13+(i%7), sockets_opened:8+(i%4), sockets_closed:8+(i%4),
+        pool_peak_in_use:2+(i%3), pool_waits:0, busiest_account_chains:i%11===0?9:2})),
+      paths:[
+        {path:'/messages/queue', calls:900, errors:0, mean_ms:44.2, worst_ms:820.1, per_min:15},
+        {path:'/contacts', calls:340, errors:0, mean_ms:161.5, worst_ms:2470.9, per_min:5.7},
+        {path:'/groups', calls:120, errors:0, mean_ms:283.5, worst_ms:1210.2, per_min:2},
+      ],
+      pool:{configured:5, in_use:2, ceiling:10},
+    };
+  }
   if (path==='/presence/online') return [
     {uin:524060806,nickname:'dev',status:'online',last_seen:new Date(Date.now()-60e3).toISOString()},
     {uin:710335446,nickname:'nosferatu',status:'away',last_seen:new Date(Date.now()-300e3).toISOString()},
@@ -750,7 +834,7 @@ function mock(method, path, body) {
   ]};
   if (path.startsWith('/broker/admin/set')) return {ok:true};
   if (path.startsWith('/broker/admin/') && method==='DELETE') return {ok:true};
-  if (path==='/stats') return {total_users:1284, fake_users:0, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
+  if (path==='/stats') return {total_users:1284, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
   if (path==='/presence/online-count') return {online:48};
   if (path.startsWith('/timeseries/signups')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(8+14*Math.abs(Math.sin(i/3))+ (i%5===0?10:0))}})};
   if (path.startsWith('/activity')) return [

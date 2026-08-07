@@ -14,7 +14,6 @@ from app.core.feature_gate import require_feature
 from app.core.redis import close_redis, get_redis
 from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
-from app.services.fake_users import seed_fake_users
 from app.services.evidence_sweep import evidence_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
 from app.services.story_sweep import story_sweep_loop
@@ -43,11 +42,6 @@ async def lifespan(_: FastAPI):
     # missing Redis is a hard error we want to surface at boot, not on
     # the first user request.
     await get_redis()
-    # Demo fakes are opt-in (default off) so self-hosted islands never seed
-    # phantom accounts. The flagship keeps its long-ago-seeded fakes regardless
-    # (seeding is idempotent); this just stops new islands from getting any.
-    if settings.SEED_FAKE_USERS:
-        await seed_fake_users()
     expire_task = asyncio.create_task(random_chat.expire_loop())
     story_sweep_task = asyncio.create_task(story_sweep_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
