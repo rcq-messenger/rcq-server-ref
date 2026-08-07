@@ -607,7 +607,25 @@ async function loadServer() {
   try {
     const info = await serverInfo();
     const reg = info.capabilities.registration_policy;
+    // Version, always — not only when there is bad news about it. The update
+    // banner shows it when you are behind, which meant an operator who was up
+    // to date had no way to answer "what am I running?" at the exact moment it
+    // is asked: in a bug report. The console ships with the server, so this
+    // number is the panel's version too; there is no second one.
+    let ver = '<span style="color:var(--dim)">…</span>';
+    try {
+      const u = await api('GET','/update-check');
+      if (u && u.disabled) {
+        ver = `<span class="mono">${u.current}</span> &nbsp;<span style="color:var(--mut)">update check off</span>`;
+      } else if (u && u.update_available) {
+        ver = `<span class="mono">${u.current}</span> &nbsp;<span class="pill">${u.latest} available</span>`
+            + ` &nbsp;<a href="${u.repo_url}" target="_blank" rel="noopener" style="color:var(--acc)">what changed</a>`;
+      } else if (u) {
+        ver = `<span class="mono">${u.current}</span> &nbsp;<span class="pill green">up to date</span>`;
+      }
+    } catch(e) { ver = '<span style="color:var(--dim)">unknown</span>'; }
     $('srv-kv').innerHTML = `
+      <dt>Version</dt><dd>${ver}</dd>
       <dt>Name</dt><dd>${info.name||'—'}</dd>
       <dt>Host</dt><dd class="mono">${MOCK?'island.example':location.host}</dd>
       <dt>Registration</dt><dd>${reg==='invite'?'<span class="pill">invite-only</span> &nbsp;<span style="color:var(--mut)">new users need an invite code</span>':'<span class="pill green">open</span> &nbsp;<span style="color:var(--mut)">anyone can register</span>'}</dd>
@@ -802,6 +820,7 @@ function mock(method, path, body) {
     return { settings: MOCK_SETTINGS };
   }
   if (path.startsWith('/timeseries/dau')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(20+28*Math.abs(Math.sin(i/4)))}})};
+  if (path === '/update-check') return {current:'2026.08.07', latest:'2026.08.07', update_available:false, repo_url:'https://github.com/rcq-messenger/rcq-server-ref'};
   if (path.startsWith('/metrics')) {
     const now = Math.floor(Date.now()/60000);
     return {
