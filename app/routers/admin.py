@@ -27,7 +27,8 @@ from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.db import get_db
+from app.core import metrics
+from app.core.db import engine, get_db
 from app.core.security import mark_suspended, require_admin
 from app.models.invite import Invite
 from app.models.owned_uin import OwnedUin
@@ -758,6 +759,37 @@ async def transport_mix(limit: int = Query(48, le=720)) -> dict:
         except ValueError:
             continue
     return {"snapshots": out, "available": True}
+
+
+@router.get("/metrics")
+async def instrument_panel(minutes: int = Query(60, ge=5, le=60)) -> dict:
+    """What this island is doing right now, minute by minute.
+
+    In-memory and per-process, which is the one thing to know before reading
+    it: with more than one uvicorn worker these are the numbers for whichever
+    worker answered, not the island total, so read shapes and ratios rather
+    than absolutes. It is still the only place that can answer half of these —
+    Caddy's log sees a request and a duration to the client, not our own work,
+    not the database pool, and not who was asking.
+
+    Everything resets on deploy. That is a feature for a panel meant to answer
+    "what is happening now"; the long view lives in the Transport tab, which
+    is written to disk by the hourly timer.
+    """
+    snap = metrics.snapshot(minutes=minutes)
+    pool = getattr(engine, "pool", None)
+    pool_info: dict = {"configured": None, "in_use": None, "overflow": None}
+    if pool is not None:
+        for key, attr in (("in_use", "checkedout"), ("overflow", "overflow"), ("configured", "size")):
+            fn = getattr(pool, attr, None)
+            if callable(fn):
+                try:
+                    pool_info[key] = fn()
+                except Exception:
+                    pass
+    snap["pool"] = pool_info
+    snap["workers_note"] = "per-process; multiple uvicorn workers each keep their own"
+    return snap
 
 
 @router.get("/stats", response_model=StatsOut)

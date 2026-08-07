@@ -1,4 +1,5 @@
 import asyncio
+import time
 import logging
 from contextlib import asynccontextmanager
 
@@ -7,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.core.db import init_db
+from app.core.db import engine, init_db
+from app.core import metrics
 from app.core.feature_gate import require_feature
 from app.core.redis import close_redis, get_redis
 from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
@@ -78,6 +80,43 @@ app.add_middleware(
 )
 
 _log = logging.getLogger("rcq")
+
+
+@app.middleware("http")
+async def record_metrics(request: Request, call_next):
+    """Time every request into the in-memory minute buckets.
+
+    The template, not the URL: `/groups/{group_id}` and not `/groups/21`, so a
+    thousand group ids stay one row and no id ends up in a counter key.
+
+    The uin comes from whatever the endpoint already resolved onto the request
+    state — this does not decode a token of its own. Sealed-sender endpoints
+    are unauthenticated by design and so are simply anonymous here, which is
+    the honest answer: we genuinely do not know who sent them.
+    """
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or "(unmatched)"
+        pool = getattr(engine, "pool", None)
+        in_use = None
+        if pool is not None and hasattr(pool, "checkedout"):
+            try:
+                in_use = pool.checkedout()
+            except Exception:
+                in_use = None
+        metrics.record_request(
+            path=path,
+            seconds=time.perf_counter() - started,
+            status_code=status_code,
+            uin=getattr(request.state, "uin", None),
+            pool_in_use=in_use,
+        )
 
 
 @app.exception_handler(Exception)
