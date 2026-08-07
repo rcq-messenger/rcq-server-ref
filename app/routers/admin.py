@@ -774,26 +774,10 @@ async def instrument_panel(minutes: int = Query(60, ge=5, le=60)) -> dict:
     is written to disk by the hourly timer.
     """
     snap = metrics.snapshot(minutes=minutes)
-    pool = getattr(engine, "pool", None)
-    # `size()` is the configured pool_size and `_max_overflow` the configured
-    # headroom above it, so their sum is the real ceiling a request can hit.
-    # ⚠ NOT `overflow()`: that is how far past pool_size we are RIGHT NOW, and
-    # it goes negative while the pool is idle — adding it to the size gave a
-    # "peak / ceiling" reading whose ceiling moved around under the peak.
-    pool_info: dict = {"configured": None, "in_use": None, "ceiling": None}
-    if pool is not None:
-        try:
-            if callable(getattr(pool, "size", None)):
-                pool_info["configured"] = pool.size()
-            if callable(getattr(pool, "checkedout", None)):
-                pool_info["in_use"] = pool.checkedout()
-            size = pool_info["configured"]
-            extra = getattr(pool, "_max_overflow", None)
-            if size is not None and isinstance(extra, int) and extra >= 0:
-                pool_info["ceiling"] = size + extra
-        except Exception:
-            pass
-    snap["pool"] = pool_info
+    from app.main import _pool_gauge  # local: app.main imports this router
+
+    in_use, ceiling = _pool_gauge()
+    snap["pool"] = {"in_use": in_use, "ceiling": ceiling}
     snap["workers_note"] = "per-process; multiple uvicorn workers each keep their own"
     return snap
 

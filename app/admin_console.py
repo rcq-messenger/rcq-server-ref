@@ -436,7 +436,8 @@ async function loadInstruments() {
     // always reads low, which looks like a sudden drop every refresh.
     const last = series.length > 1 ? series[series.length-2] : null;
     const peak = Math.max(0, ...series.map(s=>s.pool_peak_in_use||0));
-    const waits = series.reduce((a,s)=>a+(s.pool_waits||0),0);
+    const atCeiling = series.reduce((a,s)=>a+(s.pool_at_ceiling||0),0);
+    const errs = series.reduce((a,s)=>a+(s.errors||0),0);
     const churn = series.reduce((a,s)=>a+(s.sockets_opened||0),0);
     const busiest = Math.max(0, ...series.map(s=>s.busiest_account_chains||0));
     const ceiling = (m.pool && m.pool.ceiling) || 0;
@@ -444,7 +445,7 @@ async function loadInstruments() {
     const cells = [
       ['Requests / sec', last ? (last.requests/60).toFixed(1) : '—'],
       ['/groups typical', groups ? groups.mean_ms+' ms' : '—', groups && groups.mean_ms>1000],
-      ['DB pool peak', ceiling ? peak+' / '+ceiling : String(peak), waits>0 || (ceiling>0 && peak>=ceiling)],
+      ['DB pool peak', ceiling ? peak+' / '+ceiling : String(peak), atCeiling>0 && errs>0],
       ['Sockets opened / h', churn],
       // Value and label this way round on purpose: "9 boot chains/min" as the
       // big number wrapped onto three lines and stopped reading as a number.
@@ -807,7 +808,7 @@ function mock(method, path, body) {
       minutes:60,
       series:Array.from({length:60},(_,i)=>({minute:now-59+i, requests:Math.round(38+26*Math.sin(i/6)), errors:i%17===0?1:0,
         accounts:11+(i%5), boot_chains:13+(i%7), sockets_opened:8+(i%4), sockets_closed:8+(i%4),
-        pool_peak_in_use:2+(i%3), pool_waits:0, busiest_account_chains:i%11===0?9:2})),
+        pool_peak_in_use:2+(i%3), pool_at_ceiling:0, busiest_account_chains:i%11===0?9:2})),
       paths:[
         {path:'/messages/queue', calls:900, errors:0, mean_ms:44.2, worst_ms:820.1, per_min:15},
         {path:'/contacts', calls:340, errors:0, mean_ms:161.5, worst_ms:2470.9, per_min:5.7},
