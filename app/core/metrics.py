@@ -54,7 +54,12 @@ class Bucket:
     # Sampled once per request rather than averaged: pool saturation is a
     # high-water mark question ("did we run out"), not an average one.
     pool_peak_in_use: int = 0
-    pool_waits: int = 0
+    # Requests that found every connection already handed out. NOT a wait
+    # time: SQLAlchemy gives no hook between asking for a connection and
+    # getting one, so this is the honest measurable thing — how often we were
+    # AT the wall. A minute of these with no 5xx means the pool is fully used
+    # and nobody timed out; the same minute with 5xx is starvation.
+    pool_at_ceiling: int = 0
 
 
 _buckets: dict[int, Bucket] = {}
@@ -82,7 +87,7 @@ def record_request(
     status_code: int,
     uin: int | None,
     pool_in_use: int | None = None,
-    pool_waited: bool = False,
+    pool_ceiling: int | None = None,
 ) -> None:
     b = _bucket()
     b.calls[path] += 1
@@ -96,10 +101,11 @@ def record_request(
         if path == BOOT_CHAIN_PATH:
             b.boot_chains += 1
             b.boot_chains_by_uin[uin] += 1
-    if pool_in_use is not None and pool_in_use > b.pool_peak_in_use:
-        b.pool_peak_in_use = pool_in_use
-    if pool_waited:
-        b.pool_waits += 1
+    if pool_in_use is not None:
+        if pool_in_use > b.pool_peak_in_use:
+            b.pool_peak_in_use = pool_in_use
+        if pool_ceiling and pool_in_use >= pool_ceiling:
+            b.pool_at_ceiling += 1
 
 
 def record_socket(opened: bool) -> None:
@@ -122,7 +128,7 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
             series.append({
                 "minute": minute, "requests": 0, "errors": 0, "accounts": 0,
                 "boot_chains": 0, "sockets_opened": 0, "sockets_closed": 0,
-                "pool_peak_in_use": 0, "pool_waits": 0, "busiest_account_chains": 0,
+                "pool_peak_in_use": 0, "pool_at_ceiling": 0, "busiest_account_chains": 0,
             })
             continue
         series.append({
@@ -134,7 +140,7 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
             "sockets_opened": b.sockets_opened,
             "sockets_closed": b.sockets_closed,
             "pool_peak_in_use": b.pool_peak_in_use,
-            "pool_waits": b.pool_waits,
+            "pool_at_ceiling": b.pool_at_ceiling,
             # The single busiest account's chain count, unnamed. A healthy
             # minute has this in the low single digits; the storm had one
             # account at 160.

@@ -76,6 +76,26 @@ app.add_middleware(
 _log = logging.getLogger("rcq")
 
 
+def _pool_gauge() -> tuple[int | None, int | None]:
+    """(connections handed out, the wall) for the database pool.
+
+    The ceiling is `pool_size + max_overflow` — the configured maximum. NOT
+    `overflow()`, which is how far past the size we are right now and goes
+    negative while idle, so using it made the ceiling move under the reading.
+    """
+    pool = getattr(engine, "pool", None)
+    if pool is None:
+        return None, None
+    try:
+        in_use = pool.checkedout() if callable(getattr(pool, "checkedout", None)) else None
+        size = pool.size() if callable(getattr(pool, "size", None)) else None
+        extra = getattr(pool, "_max_overflow", None)
+        ceiling = size + extra if size is not None and isinstance(extra, int) and extra >= 0 else None
+        return in_use, ceiling
+    except Exception:
+        return None, None
+
+
 @app.middleware("http")
 async def record_metrics(request: Request, call_next):
     """Time every request into the in-memory minute buckets.
@@ -97,19 +117,14 @@ async def record_metrics(request: Request, call_next):
     finally:
         route = request.scope.get("route")
         path = getattr(route, "path", None) or "(unmatched)"
-        pool = getattr(engine, "pool", None)
-        in_use = None
-        if pool is not None and hasattr(pool, "checkedout"):
-            try:
-                in_use = pool.checkedout()
-            except Exception:
-                in_use = None
+        in_use, ceiling = _pool_gauge()
         metrics.record_request(
             path=path,
             seconds=time.perf_counter() - started,
             status_code=status_code,
             uin=getattr(request.state, "uin", None),
             pool_in_use=in_use,
+            pool_ceiling=ceiling,
         )
 
 
