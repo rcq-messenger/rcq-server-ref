@@ -202,12 +202,8 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
     for m, u in rows:
         # Live presence: only show as their saved status if they currently have
         # a live WebSocket; otherwise force offline. Fake demo users skip this
-        # gate so they appear with their seeded status. Invisible always reads
-        # as offline so it stays hidden from group-mates.
-        if u.is_fake:
-            raw_status = u.status
-        else:
-            raw_status = u.status if u.uin in online else "offline"
+        # Invisible always reads as offline so it stays hidden from group-mates.
+        raw_status = u.status if u.uin in online else "offline"
         visible = "offline" if raw_status == "invisible" else raw_status
         out.append(GroupMemberOut(
             uin=m.uin,

@@ -81,7 +81,6 @@ async def _perform_migration(
         kyber_prekey_public=None,
         kyber_prekey_signature=None,
         kyber_prekey_uploaded_at=None,
-        is_fake=False,
         first_name=user.first_name,
         last_name=user.last_name,
         age=user.age,

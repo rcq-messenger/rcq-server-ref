@@ -46,7 +46,6 @@ async def active_testers(
     stmt = (
         select(User.nickname)
         .where(
-            User.is_fake.is_(False),
             User.is_suspended.is_(False),
             User.last_seen >= active_since,
             User.last_seen >= User.created_at + RETURN_THRESHOLD,
@@ -102,7 +101,6 @@ async def hall_of_fame(
         .where(
             User.hof_approved.is_(True),
             User.hof_opt_in.is_(True),
-            User.is_fake.is_(False),
             User.is_suspended.is_(False),
         )
     )
@@ -162,7 +160,6 @@ async def hall_of_fame_avatar(
                 User.uin == uin,
                 User.hof_approved.is_(True),
                 User.hof_opt_in.is_(True),
-                User.is_fake.is_(False),
                 User.is_suspended.is_(False),
             )
         )
@@ -188,11 +185,11 @@ async def stats(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> StatsResponse:
-    """Public headline stats. `user_count` = real (non-fake) registered
+    """Public headline stats. `user_count` = registered
     accounts — surfaced in the iOS About sheet as a "X people on RCQ"
     badge. Cached 2 min; the number moves slowly enough."""
     count = await db.scalar(
-        select(func.count(User.uin)).where(User.is_fake.is_(False))
+        select(func.count(User.uin))
     )
     response.headers["Cache-Control"] = "public, max-age=120"
     return StatsResponse(user_count=int(count or 0))

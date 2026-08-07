@@ -641,7 +641,7 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
     rows = (
         await db.execute(
             select(User)
-            .where(User.hof_opt_in.is_(True), User.is_fake.is_(False))
+            .where(User.hof_opt_in.is_(True))
             .order_by(User.hof_approved.desc(), User.last_seen.desc())
         )
     ).scalars().all()
@@ -868,7 +868,7 @@ async def signups_timeseries(
             func.date(User.created_at).label("d"),
             func.count(User.uin).label("c"),
         )
-        .where(User.created_at >= start, User.is_fake == False)  # noqa: E712
+        .where(User.created_at >= start)
         .group_by("d")
         .order_by("d")
     )).all()
@@ -900,7 +900,7 @@ async def dau_timeseries(
             func.date(User.last_seen).label("d"),
             func.count(User.uin).label("c"),
         )
-        .where(User.last_seen >= start, User.is_fake == False)  # noqa: E712
+        .where(User.last_seen >= start)
         .group_by("d")
         .order_by("d")
     )).all()
