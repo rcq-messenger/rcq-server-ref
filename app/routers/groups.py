@@ -92,6 +92,12 @@ class GroupOut(BaseModel):
     # endpoint requires it before describing a CLOSED group to a stranger.
     share_token: str | None = None
     created_at: datetime
+    # How many people are in the group, always present.
+    #
+    # Exists so a caller can ask for the list WITHOUT the roster and still
+    # render "1869 members" — which is the only thing most screens do with a
+    # roster they paid a megabyte for.
+    member_count: int = 0
     members: list["GroupMemberOut"]
 
 
@@ -417,9 +423,12 @@ async def _broadcast_membership(
     await manager.fanout(uins, body)
 
 
-def _serialize(g: Group, members: list[GroupMemberOut]) -> GroupOut:
+def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None = None) -> GroupOut:
     """Single-source serializer so post_policy / entry_price land on
-    every payload (list / get / patch / add-member / etc.)."""
+    every payload (list / get / patch / add-member / etc.).
+
+    `member_count` is passed separately for the roster-less list, where the
+    count is known but the members deliberately are not."""
     return GroupOut(
         id=g.id,
         name=g.name,
@@ -436,6 +445,7 @@ def _serialize(g: Group, members: list[GroupMemberOut]) -> GroupOut:
         avatar_media_key=g.avatar_media_key,
         share_token=g.share_token,
         created_at=g.created_at,
+        member_count=member_count if member_count is not None else len(members),
         members=members,
     )
 
@@ -458,8 +468,18 @@ def _serialize(g: Group, members: list[GroupMemberOut]) -> GroupOut:
 )
 async def list_groups(
     uin: int = Depends(current_uin),
+    members: bool = True,
     db: AsyncSession = Depends(get_db),
 ) -> list[GroupOut]:
+    """The caller's groups.
+
+    `?members=0` returns them without the roster, which is what a chat list
+    actually needs: a name, a picture and a count. The roster is the expensive
+    part — every member with two base64 keys each — and a client that asks for
+    it on every poll pays it on every poll. The default stays ON so clients
+    already in the field are untouched; new ones opt out and fetch the roster
+    from `/groups/{id}` when a group is actually opened.
+    """
     rows = (
         await db.execute(
             select(Group)
@@ -468,10 +488,26 @@ async def list_groups(
             .order_by(Group.created_at.desc())
         )
     ).scalars().all()
+    if not members:
+        # One grouped count for every group at once rather than a roster query
+        # per group.
+        ids = [g.id for g in rows]
+        counts: dict[int, int] = {}
+        if ids:
+            counts = dict(
+                (
+                    await db.execute(
+                        select(GroupMember.group_id, func.count())
+                        .where(GroupMember.group_id.in_(ids))
+                        .group_by(GroupMember.group_id)
+                    )
+                ).all()
+            )
+        return [_serialize(g, [], member_count=counts.get(g.id, 0)) for g in rows]
     out: list[GroupOut] = []
     for g in rows:
-        members = await _members_with_users(db, g.id)
-        out.append(_serialize(g, members))
+        roster = await _members_with_users(db, g.id)
+        out.append(_serialize(g, roster))
     return out
 
 
