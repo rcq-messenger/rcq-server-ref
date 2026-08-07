@@ -63,10 +63,6 @@ class User(Base):
     kyber_prekey_uploaded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # Flagged on seeded demo users. Their stored `status` is reported as-is
-    # without consulting `manager.is_online`, so they can appear online/away/dnd
-    # even though no real WebSocket is connected for them.
-    is_fake: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     # Set true by an admin via /admin/users/{uin}/ban after a Reports-queue
     # review. Suspended UINs:
     #   - cannot send 1:1 / group messages (sealed-sender path checks before
@@ -274,8 +270,6 @@ def effective_status(user: "User") -> str:
     offline picks `invisible`, which `visible_status` reduces to
     `offline` for other viewers.
     """
-    if user.is_fake:
-        return user.status
     if user.presence_persistent:
         # TTL gate (when set): persistent presence expires after N
         # minutes past last_seen. NULL/0 = forever (legacy behaviour).

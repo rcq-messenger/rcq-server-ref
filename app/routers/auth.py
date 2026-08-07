@@ -208,7 +208,7 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     founder_uin = _founder_uin()
     if founder_uin and founder_uin != uin:
         founder = await db.scalar(
-            select(User).where(User.uin == founder_uin, User.is_fake == False)  # noqa: E712
+            select(User).where(User.uin == founder_uin)
         )
         if founder is not None:
             db.add(Contact(owner_uin=uin, contact_uin=founder_uin))

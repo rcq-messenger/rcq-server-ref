@@ -44,7 +44,6 @@ async def record_referral(db: AsyncSession, inviter_uin: int, invitee_uin: int) 
     inviter = await db.scalar(
         select(User).where(
             User.uin == inviter_uin,
-            User.is_fake.is_(False),
             User.is_suspended.is_(False),
         )
     )
