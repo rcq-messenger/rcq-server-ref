@@ -56,9 +56,13 @@ hosted-key tooling), keep an eye on releases.
 * **Account migration + UIN shop** — atomic re-key of every owned-by-uin
   row from old UIN to new. UIN shop uses a mock IAP receipt today; the
   real StoreKit hook lives at one function on the iOS side.
-* **Hood** — geohash-bucket chat + paid district-banner board. Optional
-  on a self-hosted instance; if you don't want it, every endpoint
-  cleanly no-ops when nobody calls it.
+* **Hood** — geohash-bucket chat: a thread per district, keyed off the
+  same geohash the Nearby surface uses. Optional on a self-hosted
+  instance; if you don't want it, every endpoint cleanly no-ops when
+  nobody calls it. (A paid district-banner board used to sit next to it
+  and was removed on 2026-08-07: in three months it took eight posts,
+  all tests, and it quoted dollar prices against a receipt check that
+  accepted any string.)
 * **Reports / moderation** — bug-bounty submissions, abuse reports
   with encrypted-media evidence, admin SPA at `admin.<your-domain>`.
 * **Built-in admin console (self-host)** — open
@@ -126,7 +130,7 @@ $EDITOR .env
 docker compose up -d --build
 # Caddy fetches a Let's Encrypt cert on first request to the new
 # hostname — takes a few seconds. Confirm with:
-curl https://rcq.example.com/health        # → {"ok":true,"app":"RCQ Backend"}
+curl https://rcq.example.com/health   # → {"ok":true,"app":"RCQ","version":"2026.08.07"}
 ```
 
 Once `/health` answers over HTTPS, point a client at the new backend
@@ -233,10 +237,11 @@ native-only (iOS/Android/desktop).
   That's a separate, RCQ-specific operational layer. A self-hosted
   instance doesn't need it: clients reach you over direct TLS to
   whatever domain you point at this server.
-* **Apple receipt validation** — `/uin/purchase` and
-  `/hood/banners` POSTs accept any non-empty `receipt` string today
-  (mock). Wire `App Store Server Notifications V2` + receipt-validation
-  at those two endpoints for real money.
+* **Apple receipt validation** — `/uin/purchase` accepts any non-empty
+  `receipt` string today (mock). Wire `App Store Server Notifications
+  V2` + receipt validation there before taking real money. Do not ship
+  a price to users until you have: a screen that charges nothing while
+  showing a figure is worse than a free feature.
 
 ## Protocol
 

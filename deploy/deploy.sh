@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Push the local backend/ tree to the droplet and restart uvicorn.
+# Push this repo's app/ tree to a droplet and restart uvicorn.
 # Usage:
 #   bash deploy/deploy.sh <droplet-ip-or-hostname> [ssh-user]
 #
@@ -9,7 +9,8 @@
 #                     user, pass it explicitly)
 #
 # What it does:
-#   1. rsync backend/ to /opt/rcq/app/backend/ (excludes the local SQLite db,
+#   1. rsync app/ and requirements.txt to /opt/rcq/app/ (excludes the local
+#      SQLite db,
 #      __pycache__, .venv, media uploads — those stay on the server)
 #   2. installs/updates Python dependencies inside the droplet venv
 #   3. installs the systemd unit + Caddyfile if not present yet
@@ -30,7 +31,7 @@ SSH="ssh ${USER}@${HOST}"
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO_ROOT"
 
-echo "==> rsync backend/"
+echo "==> rsync app/"
 rsync -az --delete \
     --exclude '__pycache__' \
     --exclude '.venv' \
@@ -41,7 +42,12 @@ rsync -az --delete \
     --exclude 'news_media/' \
     --exclude 'evidence/' \
     --exclude '.env' \
-    backend/ "${USER}@${HOST}:/opt/rcq/app/backend/"
+    app/ "${USER}@${HOST}:/opt/rcq/app/backend/app/"
+
+# requirements.txt lives at the repo root, not inside app/, and the pip step
+# below installs from the copy on the server — without this it installs
+# whatever was there from the last deploy.
+rsync -az requirements.txt "${USER}@${HOST}:/opt/rcq/app/backend/requirements.txt"
 
 echo "==> rsync deploy/ artifacts"
 rsync -az deploy/ "${USER}@${HOST}:/opt/rcq/app/deploy/"
@@ -78,4 +84,4 @@ $SSH "timeout 5 journalctl -u rcq-backend -n 30 --no-pager || true"
 
 echo ""
 echo "==> Smoke test:"
-echo "    curl -i https://api.rcq.app/health"
+echo "    curl -i https://${HOST}/health"
