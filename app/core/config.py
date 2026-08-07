@@ -39,11 +39,6 @@ class Settings(BaseSettings):
     UIN_MIN: int = 100_000
     UIN_MAX: int = 999_999_999
 
-    # Seed a catalogue of demo/fake users at first boot so an EMPTY directory
-    # doesn't look dead during early development. OFF by default: self-hosted
-    # islands must never silently grow phantom accounts their operators didn't
-    # create. Set SEED_FAKE_USERS=true in .env to opt a server in.
-    SEED_FAKE_USERS: bool = False
 
     # Surface flag advertised via /server/info → consumed by the iOS
     # client to decide whether to render the in-app UIN-shop tab. Off

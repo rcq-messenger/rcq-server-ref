@@ -213,7 +213,6 @@ class UserSummary(BaseModel):
     uin: int
     nickname: str
     is_suspended: bool
-    is_fake: bool
     status: str
     last_seen: datetime
     created_at: datetime
@@ -230,7 +229,6 @@ class BanIn(BaseModel):
 
 class StatsOut(BaseModel):
     total_users: int
-    fake_users: int
     suspended_users: int
     new_users_24h: int
     new_users_7d: int
@@ -578,7 +576,6 @@ async def _summarize(db: AsyncSession, user: User) -> UserSummary:
         uin=user.uin,
         nickname=user.nickname,
         is_suspended=user.is_suspended,
-        is_fake=user.is_fake,
         status=effective_status(user),
         last_seen=user.last_seen,
         created_at=user.created_at,
@@ -778,15 +775,24 @@ async def instrument_panel(minutes: int = Query(60, ge=5, le=60)) -> dict:
     """
     snap = metrics.snapshot(minutes=minutes)
     pool = getattr(engine, "pool", None)
-    pool_info: dict = {"configured": None, "in_use": None, "overflow": None}
+    # `size()` is the configured pool_size and `_max_overflow` the configured
+    # headroom above it, so their sum is the real ceiling a request can hit.
+    # ⚠ NOT `overflow()`: that is how far past pool_size we are RIGHT NOW, and
+    # it goes negative while the pool is idle — adding it to the size gave a
+    # "peak / ceiling" reading whose ceiling moved around under the peak.
+    pool_info: dict = {"configured": None, "in_use": None, "ceiling": None}
     if pool is not None:
-        for key, attr in (("in_use", "checkedout"), ("overflow", "overflow"), ("configured", "size")):
-            fn = getattr(pool, attr, None)
-            if callable(fn):
-                try:
-                    pool_info[key] = fn()
-                except Exception:
-                    pass
+        try:
+            if callable(getattr(pool, "size", None)):
+                pool_info["configured"] = pool.size()
+            if callable(getattr(pool, "checkedout", None)):
+                pool_info["in_use"] = pool.checkedout()
+            size = pool_info["configured"]
+            extra = getattr(pool, "_max_overflow", None)
+            if size is not None and isinstance(extra, int) and extra >= 0:
+                pool_info["ceiling"] = size + extra
+        except Exception:
+            pass
     snap["pool"] = pool_info
     snap["workers_note"] = "per-process; multiple uvicorn workers each keep their own"
     return snap
@@ -799,9 +805,6 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
     week_ago = now - timedelta(days=7)
 
     total_users = await db.scalar(select(func.count(User.uin))) or 0
-    fake_users = await db.scalar(
-        select(func.count(User.uin)).where(User.is_fake == True)  # noqa: E712
-    ) or 0
     suspended_users = await db.scalar(
         select(func.count(User.uin)).where(User.is_suspended == True)  # noqa: E712
     ) or 0
@@ -827,7 +830,6 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
 
     return StatsOut(
         total_users=int(total_users),
-        fake_users=int(fake_users),
         suspended_users=int(suspended_users),
         new_users_24h=int(new_users_24h),
         new_users_7d=int(new_users_7d),
@@ -994,7 +996,6 @@ class OnlineUser(BaseModel):
     nickname: str
     status: str
     last_seen: datetime
-    is_fake: bool
 
 
 async def _online_users(db: AsyncSession) -> list[OnlineUser]:
@@ -1042,7 +1043,6 @@ async def _online_users(db: AsyncSession) -> list[OnlineUser]:
             nickname=u.nickname,
             status=effective_status(u),
             last_seen=u.last_seen,
-            is_fake=bool(u.is_fake),
         )
         for u in rows
     ]
