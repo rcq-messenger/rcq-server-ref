@@ -1,7 +1,7 @@
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 from jose import JWTError, jwt
 
@@ -134,7 +134,10 @@ def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
     return payload.get("typ") == "recover" and payload.get("sk") == signing_key
 
 
-async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> int:
+async def current_uin(
+    request: Request,
+    creds: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> int:
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
     try:
@@ -158,6 +161,9 @@ async def current_uin(creds: HTTPAuthorizationCredentials = Depends(_bearer)) ->
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "stale token")
     if await is_suspended(uin):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+    # So the metrics middleware can count distinct accounts and boot chains
+    # without decoding a second token of its own. Nothing else reads this.
+    request.state.uin = uin
     return uin
 
 

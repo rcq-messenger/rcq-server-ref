@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, update
 
+from app.core import metrics
 from app.core.db import SessionLocal
 from app.core.security import decode_token, decode_device_id
 from app.models.contact import Contact
@@ -264,6 +265,10 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
             return
 
     await manager.connect(uin, ws, device_id)
+    # How fast sockets are being BORN, not how many are open. One client in a
+    # reconnect loop shows up here and nowhere else: the open count stays flat
+    # while it churns, which is exactly how the storm hid.
+    metrics.record_socket(opened=True)
     try:
         await _on_connect(uin)
         while True:
@@ -283,6 +288,7 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
             raise
         _log.info("ws uin=%s: socket closed under receive (superseded)", uin)
     finally:
+        metrics.record_socket(opened=False)
         await manager.disconnect(uin, ws)
         await _on_disconnect(uin)
 
