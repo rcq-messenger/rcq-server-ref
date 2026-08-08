@@ -110,6 +110,26 @@ def decode_device_id(token: str) -> str:
         return "primary"
 
 
+def carry_device_id(device_id: str) -> str | None:
+    """Carry an install's name onto a freshly minted token.
+
+    Every route that RE-mints a token (session, recover, reissue, migrate, a
+    number purchase) used to drop the `dev` claim, so `decode_device_id` then
+    answered "primary" for that session. That is not cosmetic: the websocket
+    registers under the name from the token while the push endpoint is
+    registered under the install's own id, so the two stop matching and
+    `skip_devices` can no longer tell that the device it is about to wake is
+    the one already holding the socket. The phone then gets a push for a
+    message it just received over that socket, and the same message sounds
+    twice — quietly from the app, loudly from the notification ("о-оу
+    несколько раз", tester report 2026-08-08).
+
+    "primary" is the ABSENCE of a name, so it is passed on as None rather than
+    pinned onto the new token.
+    """
+    return device_id if device_id != "primary" else None
+
+
 def issue_recover_challenge(signing_key: str) -> str:
     """Short-lived signed nonce bound to a claimed signing pubkey, for the
     account-recovery challenge-response. Stateless: the challenge IS the
