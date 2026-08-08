@@ -2,14 +2,20 @@
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.rate_limit import rate_limit
+from app.models.relay_inquiry import RelayInquiry
 from app.models.user import User
 from app.services.hof_stats import bug_report_stats, effort_score, podium_score
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/public", tags=["public"])
 
@@ -193,3 +199,56 @@ async def stats(
     )
     response.headers["Cache-Control"] = "public, max-age=120"
     return StatsResponse(user_count=int(count or 0))
+
+
+# ── private-relay inquiries (the /organizations form) ──────────────────────
+#
+# The page's submit button used to be a mock: it slept 700ms and said thank
+# you, storing nothing. Someone asking to pay us was answered by an animation.
+# This lands the request in a queue an operator actually reads (admin.rcq.app
+# → Inquiries), which is step one of `docs/private-relays-design.md` and the
+# step that does not need a payment rail to be worth anything.
+#
+# Unauthenticated on purpose: the audience is organisations that do not have
+# an account yet. That is spammable, so the route is rate limited per IP,
+# every field is capped by the schema, and the queue can dismiss in one click.
+
+
+class RelayInquiryIn(BaseModel):
+    tier: str = Field(default="team", max_length=32)
+    contact: str = Field(min_length=3, max_length=200)
+    about: str = Field(default="", max_length=4000)
+    lang: str = Field(default="", max_length=8)
+
+
+class RelayInquiryOut(BaseModel):
+    ok: bool
+
+
+@router.post(
+    "/relay-inquiry",
+    response_model=RelayInquiryOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit("relay_inquiry", 5, 3600))],
+)
+async def relay_inquiry(
+    body: RelayInquiryIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> RelayInquiryOut:
+    contact = body.contact.strip()
+    if len(contact) < 3:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "contact_required"})
+    row = RelayInquiry(
+        tier=body.tier.strip()[:32] or "team",
+        contact=contact,
+        about=body.about.strip(),
+        lang=body.lang.strip()[:8],
+        # Cloudflare gives us a country on the edge; it is a spam-triage hint,
+        # not a record of the person. No IP is stored.
+        country=(request.headers.get("cf-ipcountry") or "")[:8],
+    )
+    db.add(row)
+    await db.commit()
+    log.warning("[relay-inquiry] tier=%s country=%s", row.tier, row.country)
+    return RelayInquiryOut(ok=True)

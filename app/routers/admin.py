@@ -32,6 +32,7 @@ from app.core.db import engine, get_db
 from app.core.security import mark_suspended, require_admin
 from app.models.invite import Invite
 from app.models.owned_uin import OwnedUin
+from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
 from app.models.user import User, effective_status
 from app.services import server_settings
@@ -1193,3 +1194,86 @@ async def list_invites(
 async def revoke_invite(code: str, db: AsyncSession = Depends(get_db)) -> None:
     await db.execute(delete(Invite).where(Invite.code == code))
     await db.commit()
+
+
+# ── private-relay inquiries ────────────────────────────────────────────────
+#
+# The queue behind the `/organizations` form. Until this existed the form
+# stored nothing, so "довести заявку до админки" is the whole point: an
+# organisation asking to pay for private relays now reaches a human. Payment
+# is deliberately NOT here — the first customers are handled by hand (phase 0
+# in docs/private-relays-design.md), and a queue is what makes that possible.
+
+
+class RelayInquiryOut(BaseModel):
+    id: int
+    tier: str
+    contact: str
+    about: str
+    status: str
+    note: str
+    country: str
+    lang: str
+    created_at: datetime
+
+
+class RelayInquiriesListOut(BaseModel):
+    inquiries: list[RelayInquiryOut]
+    open_count: int
+
+
+@router.get("/relay-inquiries", response_model=RelayInquiriesListOut)
+async def list_relay_inquiries(
+    status_filter: str = Query("open", alias="status"),
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> RelayInquiriesListOut:
+    """`status` accepts: open | contacted | closed | all."""
+    query = select(RelayInquiry).order_by(desc(RelayInquiry.created_at)).limit(limit)
+    if status_filter != "all":
+        query = query.where(RelayInquiry.status == status_filter)
+    rows = (await db.execute(query)).scalars().all()
+    open_count = (
+        await db.execute(
+            select(func.count()).select_from(RelayInquiry).where(RelayInquiry.status == "open")
+        )
+    ).scalar_one()
+    return RelayInquiriesListOut(
+        inquiries=[
+            RelayInquiryOut(
+                id=r.id, tier=r.tier, contact=r.contact, about=r.about or "",
+                status=r.status, note=r.note or "", country=r.country or "",
+                lang=r.lang or "", created_at=r.created_at,
+            )
+            for r in rows
+        ],
+        open_count=int(open_count),
+    )
+
+
+class RelayInquiryPatch(BaseModel):
+    status: str | None = None
+    note: str | None = None
+
+
+@router.patch("/relay-inquiries/{inquiry_id}", response_model=RelayInquiryOut)
+async def update_relay_inquiry(
+    inquiry_id: int,
+    body: RelayInquiryPatch,
+    db: AsyncSession = Depends(get_db),
+) -> RelayInquiryOut:
+    row = await db.get(RelayInquiry, inquiry_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "inquiry not found")
+    if body.status is not None:
+        if body.status not in {"open", "contacted", "closed"}:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad status")
+        row.status = body.status
+    if body.note is not None:
+        row.note = body.note[:4000]
+    await db.commit()
+    return RelayInquiryOut(
+        id=row.id, tier=row.tier, contact=row.contact, about=row.about or "",
+        status=row.status, note=row.note or "", country=row.country or "",
+        lang=row.lang or "", created_at=row.created_at,
+    )
