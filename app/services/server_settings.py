@@ -69,10 +69,28 @@ _reg(SettingSpec("max_accounts_per_device", "int", lambda: 5, "limits",
                  min=1, max=50))
 
 # ── Branding
+#
+# ⚠ Both of these are served on /server/info and BOTH ARE CURRENTLY IGNORED BY
+# EVERY CLIENT. Checked 2026-08-08 across all three:
+#   iOS      — ServerInfoResponse decodes `name` and ServerInfoService.fetch()
+#              returns only ServerCapabilities, so the name is dropped on the
+#              floor; `welcome` is not in the struct at all.
+#   Android  — Session.kt reads `api.serverInfo().capabilities`; the data class
+#              has `name` and never reads it, and no `welcome` field.
+#   web-chat — neither field is referenced.
+#
+# The help text used to describe what these were meant to do, which is why an
+# operator setting them and seeing nothing change had no way to tell whether
+# they had mis-set something. Until a client actually renders them, the help
+# says so. Update these strings in the same commit that wires them up.
 _reg(SettingSpec("island_name", "str", lambda: _env.APP_NAME, "branding",
-                 "Island name", "Display name clients read from /server/info."))
+                 "Island name",
+                 "Served on /server/info. NOT SHOWN ANYWHERE YET — no client "
+                 "renders it, so changing this has no visible effect today."))
 _reg(SettingSpec("welcome_text", "str", lambda: "", "branding",
-                 "Welcome / rules", "Optional welcome or rules text shown in the app."))
+                 "Welcome / rules",
+                 "Served on /server/info. NOT SHOWN ANYWHERE YET — no client "
+                 "reads this field at all, so changing it has no effect today."))
 
 
 def _parse(spec: SettingSpec, raw: str) -> Any:
