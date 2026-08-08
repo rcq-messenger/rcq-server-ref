@@ -69,6 +69,29 @@ echo "==> pip install -r requirements.txt"
 $SSH "sudo -u rcq /opt/rcq/venv/bin/pip install --upgrade pip --quiet && \
       sudo -u rcq /opt/rcq/venv/bin/pip install -r /opt/rcq/app/backend/requirements.txt --quiet"
 
+echo "==> Caddyfile preflight: no vhost may disappear"
+# 2026-08-08: this script was run from the wrong tree and installed a Caddyfile
+# with fewer vhosts than the one serving. Five hosts vanished in a single
+# reload, push delivery among them, and nothing in the output looked wrong,
+# because installing a *valid* Caddyfile is a successful deploy as far as caddy
+# is concerned. Compare against what is actually serving and refuse to take a
+# vhost away by accident.
+INCOMING_HOSTS=$(grep -oE '^[a-z0-9.-]+\.[a-z]+ \{' deploy/Caddyfile | sed 's/ {$//' | sort -u)
+LIVE_HOSTS=$($SSH "grep -oE '^[a-z0-9.-]+\\.[a-z]+ \\{' /etc/caddy/Caddyfile 2>/dev/null | sed 's/ {\$//' | sort -u" || true)
+if [[ -n "$LIVE_HOSTS" ]]; then
+    VANISHING=$(comm -13 <(echo "$INCOMING_HOSTS") <(echo "$LIVE_HOSTS") || true)
+    if [[ -n "$VANISHING" ]]; then
+        echo ""
+        echo "REFUSING TO DEPLOY: these vhosts are serving now and are absent from"
+        echo "the Caddyfile this run would install:"
+        echo "$VANISHING" | sed 's/^/    /'
+        echo ""
+        echo "Check you are deploying from the intended tree. If removing them is"
+        echo "genuinely intended, re-run with RCQ_DEPLOY_ALLOW_VHOST_REMOVAL=1."
+        [[ "${RCQ_DEPLOY_ALLOW_VHOST_REMOVAL:-0}" == "1" ]] || exit 1
+    fi
+fi
+
 echo "==> install systemd unit + Caddyfile (if changed)"
 $SSH "install -m 644 /opt/rcq/app/deploy/rcq-backend.service /etc/systemd/system/rcq-backend.service && \
       install -m 644 /opt/rcq/app/deploy/Caddyfile /etc/caddy/Caddyfile && \
