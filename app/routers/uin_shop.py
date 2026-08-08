@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
-from app.core.security import current_uin, issue_token, uin_epoch
+from app.core.security import carry_device_id, current_device_id, current_uin, issue_token, uin_epoch
 from app.models.owned_uin import OwnedUin
 from app.models.user import User
 from app.routers.migrate import _perform_migration
@@ -291,6 +291,7 @@ class ActivateIn(BaseModel):
 async def activate(
     body: ActivateIn,
     me: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> PurchaseOut:
     """Answer as a number you already hold. Your current number goes into the
@@ -318,10 +319,12 @@ async def activate(
     # held would leave a row claiming the number the account now occupies.
     await db.delete(held)
     await db.flush()
-    return await _take(db, user, body.uin, switch=True)
+    return await _take(db, user, body.uin, switch=True, device_id=device_id)
 
 
-async def _take(db: AsyncSession, user: User, target: int, *, switch: bool) -> PurchaseOut:
+async def _take(
+    db: AsyncSession, user: User, target: int, *, switch: bool, device_id: str
+) -> PurchaseOut:
     """Give `target` to `user`, either as their new identity or as a held
     number. Shared by /purchase and /activate so the collection bookkeeping
     cannot drift between the two."""
@@ -340,7 +343,8 @@ async def _take(db: AsyncSession, user: User, target: int, *, switch: bool) -> P
     await db.commit()
     return PurchaseOut(
         new_uin=new_uin,
-        token=issue_token(new_uin, await uin_epoch(new_uin)),
+        # Keep naming this install on the new token (see carry_device_id).
+        token=issue_token(new_uin, await uin_epoch(new_uin), carry_device_id(device_id)),
         switched=True,
         owned=await _owned_uins(db, new_uin),
     )
@@ -350,6 +354,7 @@ async def _take(db: AsyncSession, user: User, target: int, *, switch: bool) -> P
 async def claim(
     body: ClaimIn,
     me: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> PurchaseOut:
     """BETA: claim any free 3-9 digit UIN and move this account onto it.
@@ -398,7 +403,7 @@ async def claim(
 
     # The freed number's tokens are retired inside _perform_migration, so the
     # old bearer cannot follow the number to whoever claims it next.
-    return await _take(db, user, body.uin, switch=body.switch)
+    return await _take(db, user, body.uin, switch=body.switch, device_id=device_id)
 
 
 # `/quote` and `/suggestions` are pricing helpers for a shop that only the

@@ -13,6 +13,7 @@ from app.core.rate_limit import rate_limit
 from app.core.security import (
     bump_uin_epoch,
     cache_uin_epoch,
+    carry_device_id,
     current_device_id,
     current_uin,
     issue_recover_challenge,
@@ -258,8 +259,14 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
 
 
 @router.post("/session", response_model=SessionOut)
-async def session(uin: int = Depends(current_uin)) -> SessionOut:
-    return SessionOut(token=issue_token(uin, await uin_epoch(uin)), ws_url=f"/ws/{uin}")
+async def session(
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+) -> SessionOut:
+    return SessionOut(
+        token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id)),
+        ws_url=f"/ws/{uin}",
+    )
 
 
 class ClaimDeviceIn(BaseModel):
@@ -326,6 +333,10 @@ class RecoverIn(BaseModel):
     challenge: str
     # base64 Ed25519 signature over the exact challenge string.
     signature: str
+    # The install doing the recovery, so the token it gets back names it (see
+    # carry_device_id). Optional: an older client simply gets the unnamed token it
+    # used to get, and claims the name on its next start.
+    device_id: str | None = Field(default=None, max_length=64)
 
 
 @router.post("/recover/challenge", response_model=RecoverChallengeOut)
@@ -361,7 +372,7 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     ).scalar_one_or_none()
     if uin is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
-    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin)))
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
 
 
 # ── identity key re-issue (in-place rotation) ───────────────────────────────
@@ -387,6 +398,7 @@ class ReissueIn(BaseModel):
 async def reissue(
     body: ReissueIn,
     uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> RegisterOut:
     ik = body.identity_key.strip()
@@ -399,7 +411,9 @@ async def reissue(
     user.identity_key = ik
     user.signing_key = sk
     await db.commit()
-    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin)))
+    return RegisterOut(
+        uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))
+    )
 
 
 @router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)

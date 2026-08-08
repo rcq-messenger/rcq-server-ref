@@ -25,7 +25,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.security import bump_uin_epoch, cache_uin_epoch, current_uin, issue_token, uin_epoch
+from app.core.security import (
+    bump_uin_epoch,
+    cache_uin_epoch,
+    carry_device_id,
+    current_device_id,
+    current_uin,
+    issue_token,
+    uin_epoch,
+)
 from app.models.device_token import DeviceToken
 from app.models.user import User
 from app.services.connection_manager import manager
@@ -161,6 +169,7 @@ async def _perform_migration(
 @router.post("/migrate", response_model=MigrateOut)
 async def migrate(
     uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> MigrateOut:
     user = await db.get(User, uin)
@@ -199,4 +208,10 @@ async def migrate(
             ex=MIGRATION_COOLDOWN_SECONDS,
         )
 
-    return MigrateOut(new_uin=new_uin, token=issue_token(new_uin, await uin_epoch(new_uin)))
+    # Carry the install's name onto the new token (see carry_device_id): a
+    # session that loses it stops matching its own push endpoint, and the phone
+    # gets woken about messages it already has.
+    return MigrateOut(
+        new_uin=new_uin,
+        token=issue_token(new_uin, await uin_epoch(new_uin), carry_device_id(device_id)),
+    )
