@@ -2,7 +2,7 @@ import base64
 import hashlib
 import hmac
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -517,6 +517,31 @@ async def register_push_token(
                 DeviceToken.device_id == device_id,
                 DeviceToken.platform == body.platform,
                 DeviceToken.token != body.token,
+            ))
+        )
+        # And the rows from BEFORE device ids existed, which nothing has ever
+        # cleaned. The rule above only matches rows carrying the same id, and
+        # `device_id == NULL` is never true in SQL, so every reinstall from that
+        # era left a row behind for good: 1378 of 1828 registrations had no
+        # device id, the heaviest testers held sixteen and seventeen endpoints
+        # each, and every single wake published to all of them.
+        #
+        # ⚠ Nothing else can find these. A UnifiedPush publish to a topic with
+        # no subscriber SUCCEEDS — ntfy has no idea anybody was meant to be
+        # listening — so the permanent-failure pruning in the sender never fires
+        # for them. They are only knowable by what they lack.
+        #
+        # Safe because a device that still runs re-registers on every launch,
+        # which upserts its row and backfills the id. So no id AND not seen in a
+        # week means a device that has neither reinstalled nor started since
+        # device ids shipped. The staleness window is what protects a genuine
+        # second device still running a pre-0.84 build.
+        await db.execute(
+            delete(DeviceToken).where(and_(
+                DeviceToken.uin == uin,
+                DeviceToken.platform == body.platform,
+                DeviceToken.device_id.is_(None),
+                DeviceToken.last_seen < now - timedelta(days=7),
             ))
         )
     await db.commit()
