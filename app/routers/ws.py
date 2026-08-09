@@ -9,6 +9,7 @@ from app.core import metrics
 from app.core.db import SessionLocal
 from app.core.security import decode_token, decode_device_id
 from app.models.contact import Contact
+from app.models.device_token import DeviceToken
 from app.models.user import User, presence_is_fresh, visible_status
 from app.routers import hood, random as random_chat
 from app.routers.presence import presence_watchers
@@ -610,6 +611,30 @@ async def _handle_client_message(
             # the receiver can ring with a full-screen incoming-call UI. No-op
             # when the callee has no Android endpoints.
             await up_call(target, payload=voip_payload)
+
+            # No socket AND no way to wake them: nothing is going to ring on
+            # the other side, at all. The caller was left listening to a
+            # ringback that meant nothing until it timed out, which reads as
+            # "they are ignoring me" rather than "they cannot be reached"
+            # (user request). Every wake channel we have lives in
+            # `device_tokens` — ios, ios-voip, android-up — so their absence
+            # is the whole answer.
+            #
+            # Sent to the CALLER only, and additive: a client that does not
+            # know this event ignores it and keeps the old behaviour.
+            async with SessionLocal() as db:
+                wakeable = await db.scalar(
+                    select(DeviceToken.id).where(DeviceToken.uin == target).limit(1)
+                )
+            if wakeable is None:
+                await manager.send(
+                    uin,
+                    {
+                        "type": "call_unreachable",
+                        "from_uin": target,
+                        "call_id": call_id,
+                    },
+                )
 
         # call_end fallback. If the recipient's WS wasn't connected
         # (their device just woke from the offer push but hasn't
