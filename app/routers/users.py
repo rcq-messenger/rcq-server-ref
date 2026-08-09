@@ -18,6 +18,7 @@ from app.core.security import current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.user import User, visible_status
+from app.services.connection_manager import manager
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -382,6 +383,31 @@ async def info(
     )
 
 
+async def _announce_rename(db: AsyncSession, uin: int, nickname: str) -> None:
+    """Tell everyone holding this user as a contact that the name changed.
+
+    A NEW packet type rather than a field bolted onto `presence`: presence has
+    a visibility rule behind it (an invisible user is broadcast as offline, and
+    only to `presence_watchers`), and a name has none — every contact already
+    reads it from the roster. Keeping them separate means neither one has to
+    borrow the other's audience.
+
+    Additive, like `call_unreachable` before it: a client that does not know
+    the type ignores it and keeps picking the name up on its next roster pull,
+    which is exactly today's behaviour. Best-effort, offline contacts likewise.
+    """
+    owners = (
+        await db.scalars(
+            select(Contact.owner_uin)
+            .where(Contact.contact_uin == uin)
+            .where(Contact.blocked == False)  # noqa: E712
+        )
+    ).all()
+    packet = {"type": "contact_renamed", "uin": uin, "nickname": nickname}
+    for owner_uin in set(owners):
+        await manager.send(owner_uin, packet)
+
+
 @router.put("/me", response_model=PublicUser)
 async def update_me(
     body: ProfileUpdate,
@@ -443,10 +469,21 @@ async def update_me(
         allowed = {0, 30, 60, 180, 480, 1440}
         if data["presence_ttl_minutes"] not in allowed:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid presence_ttl_minutes")
+    renamed = "nickname" in data and data["nickname"] != user.nickname
     for key, value in data.items():
         setattr(user, key, value)
     await db.commit()
     await db.refresh(user)
+    # Tell contacts the name changed. Nothing did, and nothing ever has: the
+    # only per-user packet on the socket is `presence`, which carries status
+    # and status message and not the name, so a rename reached the other side
+    # whenever their client next happened to re-read the whole roster. From
+    # the outside that is "he changed his nickname and it took a while, at
+    # what point is it supposed to update?" — reported, and the honest answer
+    # was "at no particular point". Best-effort: an offline contact reads the
+    # new name on their next roster pull exactly as before.
+    if renamed:
+        await _announce_rename(db, uin, user.nickname)
     # Owner-self path — `from_model_for_viewer` echoes the visibility
     # back so Settings can show the active choice.
     return PublicUser.from_model_for_viewer(

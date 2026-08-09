@@ -56,7 +56,7 @@ import json
 import logging
 import os
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -70,6 +70,12 @@ from app.models.device_token import DeviceToken
 log = logging.getLogger(__name__)
 
 _PLATFORM = "android-up"
+
+# How often a still-healthy endpoint re-stamps `push_last_ok`. Not per push
+# (that would be a write on every wake for every device) and not never (which
+# is what it was, and left the column permanently NULL for endpoints that had
+# simply always worked).
+_OK_STAMP_EVERY = timedelta(hours=1)
 
 # How long the push server may hold the wake for a device that is offline
 # (RFC 8030 `TTL`). A message wake is worth keeping for a while; a call wake
@@ -182,7 +188,9 @@ def _semaphore() -> asyncio.Semaphore:
     return _sem
 
 
-async def _endpoints_for(uin: int) -> list[tuple[int, str, str | None, str | None]]:
+async def _endpoints_for(
+    uin: int,
+) -> list[tuple[int, str, str | None, str | None, datetime | None]]:
     """Read this user's Android UnifiedPush endpoints in a SHORT session,
     then release the DB connection BEFORE any network I/O — same no-DB-across-
     network rule apns.py follows to avoid pinning a pool connection across a
@@ -197,10 +205,11 @@ async def _endpoints_for(uin: int) -> list[tuple[int, str, str | None, str | Non
                     DeviceToken.token,
                     DeviceToken.push_last_error,
                     DeviceToken.device_id,
+                    DeviceToken.push_last_ok,
                 ).where(DeviceToken.uin == uin, DeviceToken.platform == _PLATFORM)
             )
         ).all()
-    return [(r[0], r[1], r[2], r[3]) for r in rows]
+    return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
 async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
@@ -325,7 +334,7 @@ async def _fan_out(
         log.exception("[up] endpoint lookup failed uin=%s", uin)
         return
     if exclude_tokens:
-        skipped = [e for _, e, _, _ in endpoints if e in exclude_tokens]
+        skipped = [e for _, e, _, _, _ in endpoints if e in exclude_tokens]
         if skipped:
             endpoints = [row for row in endpoints if row[1] not in exclude_tokens]
             log.info("[up] %s uin=%s skipping %d sender-device endpoint(s)", what, uin, len(skipped))
@@ -346,23 +355,30 @@ async def _fan_out(
         return
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     results = await asyncio.gather(
-        *(_deliver(endpoint, body, ttl) for _, endpoint, _, _ in endpoints),
+        *(_deliver(endpoint, body, ttl) for _, endpoint, _, _, _ in endpoints),
         return_exceptions=True,
     )
     ok_ids: list[int] = []
     failed: list[tuple[int, str]] = []
     dead_ids: list[int] = []
     sent = 0
-    for (token_id, endpoint, prev_error, _device), result in zip(endpoints, results):
+    fresh_before = datetime.now(timezone.utc) - _OK_STAMP_EVERY
+    for (token_id, endpoint, prev_error, _device, prev_ok), result in zip(endpoints, results):
         if isinstance(result, BaseException):
             log.warning("[up] delivery task error for %s…: %r", endpoint[:48], result)
             continue
         outcome, detail = result
         if outcome == "ok":
             sent += 1
-            # Only write when the endpoint was previously unhealthy — a
-            # healthy endpoint costs zero DB writes per push.
-            if prev_error is not None:
+            # Write when the endpoint was previously unhealthy, or when the
+            # last success on record is old enough to be worth refreshing.
+            # ⚠ It used to be the first case ONLY, which meant an endpoint that
+            # had never once failed carried `push_last_ok = NULL` forever — and
+            # "never failed" and "never pushed to" were then the same row. That
+            # is the state every endpoint of the tester who reported push going
+            # quiet was in: nothing to look at, either way. One stamp an hour
+            # answers the question and still costs nothing per push.
+            if prev_error is not None or prev_ok is None or prev_ok < fresh_before:
                 ok_ids.append(token_id)
         elif outcome == "drop":
             dead_ids.append(token_id)
