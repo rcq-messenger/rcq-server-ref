@@ -2,14 +2,14 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.rate_limit import rate_limit
+from app.core.rate_limit import _client_ip, enforce_cost_budget, rate_limit
 from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
@@ -35,7 +35,43 @@ log = logging.getLogger(__name__)
 # NSE shows a real "screenshot" body for the shot and suppresses the toggle.
 _PUSHABLE_TYPES = {"message", "system", "secscreen"}
 
+# Ceiling on one group fan-out POST. The largest live group is ~1.9k members
+# (the founder beta group every registration is added to), so this leaves
+# generous headroom for the biggest legitimate send while bounding a request
+# body that had no limit anywhere: not on the model, not in Caddy.
+_MAX_GROUP_PAYLOADS = 4096
+
+# Recipients per minute per caller, shared across BOTH group endpoints (same
+# rule name, so a dual-send spends one budget). The unit is recipients, not
+# requests, because that is what actually costs us — one row in
+# `offline_group_messages` plus one APNs/UnifiedPush wake each.
+#
+# Sized off real traffic, not off the request caps: the flagship group is
+# ~1.9k members, so the authenticated budget is ~30 posts/min into the
+# biggest group we have and effectively unreachable in any normal one.
+#
+# The anonymous budget is separate and lower, but NOT tight, because the
+# identity there is an IP and most of our API traffic arrives collapsed
+# behind a handful of relay exits — a strict per-IP number would punish
+# everyone sharing an exit. It still cuts the single-source worst case by
+# an order of magnitude.
+_FANOUT_BUDGET_AUTHED = 60_000
+_FANOUT_BUDGET_ANON = 30_000
+_FANOUT_WINDOW_SECONDS = 60
+
 router = APIRouter(prefix="/messages", tags=["messages"])
+
+
+def _fanout_charge(request: Request, caller: int | None) -> tuple[str, int]:
+    """Budget identity + allowance for a group fan-out.
+
+    Authenticated callers are charged per UIN; sealed-sender posts (the
+    normal path for an 'all' group, where the server deliberately does not
+    learn the author) fall back to the client IP on a smaller allowance.
+    """
+    if caller is not None:
+        return f"uin:{caller}", _FANOUT_BUDGET_AUTHED
+    return f"ip:{_client_ip(request)}", _FANOUT_BUDGET_ANON
 
 
 async def _sender_device_tokens(db: AsyncSession, caller: int | None) -> frozenset[str]:
@@ -225,7 +261,7 @@ class GroupSealedSendIn(BaseModel):
     # themselves) using each member's identity_key. Server fans the right
     # ciphertext to the right recipient. The list shape replaces the old
     # single-payload schema — every iOS Stage-1 client sends this version.
-    payloads: list[GroupRecipientPayload]
+    payloads: list[GroupRecipientPayload] = Field(max_length=_MAX_GROUP_PAYLOADS)
 
 
 @router.post(
@@ -238,6 +274,7 @@ class GroupSealedSendIn(BaseModel):
     dependencies=[Depends(rate_limit("messages_group_send", 60, 60))],
 )
 async def send_group_sealed(
+    request: Request,
     body: GroupSealedSendIn,
     caller: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
@@ -300,6 +337,17 @@ async def send_group_sealed(
     # mistake guard — we don't error on it because the client is anonymous
     # (sealed sender) and we can't tell who they are.
     entries = [e for e in body.payloads if e.to_uin in members]
+    # Charge the fan-out BEFORE doing any of it. This endpoint does not (and
+    # must not) check that the SENDER is a member — sealed sender means the
+    # server cannot know who is posting — so without a budget anyone who knows
+    # a group id and some member UINs can aim the whole group's worth of queue
+    # rows and pushes at the database, repeatedly. Counting `entries` rather
+    # than `body.payloads` charges the real work: junk recipients were already
+    # dropped above and cost nothing.
+    identity, allowance = _fanout_charge(request, caller)
+    await enforce_cost_budget(
+        identity, "group_fanout", len(entries), allowance, _FANOUT_WINDOW_SECONDS
+    )
     # One pipelined publish for the whole group instead of a `manager.send()`
     # per member (two Redis round-trips each, awaited in series).
     online = await manager.fanout_each([
@@ -422,6 +470,7 @@ class GroupBroadcastIn(BaseModel):
     dependencies=[Depends(rate_limit("messages_broadcast", 120, 60))],
 )
 async def send_group_broadcast(
+    request: Request,
     body: GroupBroadcastIn,
     caller: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
@@ -443,6 +492,20 @@ async def send_group_broadcast(
     posts to it anonymously in owner_only groups, so an unauthenticated or
     non-owner `message` broadcast to a broadcast-mode group is rejected
     outright."""
+    # Authentication is REQUIRED here, unlike the legacy sealed path. This is
+    # the cheapest amplifier in the API: a single small POST fans one blob to
+    # every capable member, so the per-request cap alone priced an anonymous
+    # caller at the whole flagship group times 120 a minute. Requiring a token
+    # costs no privacy on this path — every shipped client (iOS, Android,
+    # web/desktop) already authenticates it, so the server learns the poster
+    # today regardless, and `kid` makes them pseudonymous to the server on the
+    # wire anyway. The legacy sealed endpoint stays anonymous; that is where
+    # sealed sender actually lives.
+    if caller is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "group-broadcast requires authentication",
+        )
     g = await db.get(Group, body.group_id)
     if g is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
@@ -470,6 +533,14 @@ async def send_group_broadcast(
         # at minimum the sender's own uin matches. Empty therefore means a
         # bogus group id / not-a-member race — nothing to deliver.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no broadcast-capable members")
+
+    # Same budget, same rule name as the sealed path: a dual-send (broadcast to
+    # capable members + per-member fan-out to the legacy ones) is one logical
+    # post and spends one allowance.
+    identity, allowance = _fanout_charge(request, caller)
+    await enforce_cost_budget(
+        identity, "group_fanout", len(recipients), allowance, _FANOUT_WINDOW_SECONDS
+    )
 
     now = datetime.now(timezone.utc)
     queueable = _queueable(recipient_rows)
