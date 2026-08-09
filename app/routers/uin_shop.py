@@ -283,6 +283,44 @@ async def my_uins(
     )
 
 
+@router.delete(
+    "/mine/{uin}",
+    response_model=MyUinsOut,
+    # Same budget as activating: a handful of deliberate taps, never a loop.
+    dependencies=[Depends(rate_limit("uin_release", 20, 3600))],
+)
+async def release(
+    uin: int,
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> MyUinsOut:
+    """Give a held number back. Collecting numbers you did not choose is a side
+    effect of the vault: activating one puts the previous one in the collection
+    whether you wanted it or not, and the long number the network handed you at
+    signup is usually the first thing you stop wanting (user request).
+
+    The number returns to the pool, so somebody else may end up with it. That is
+    the point, and it is why this is a separate deliberate call rather than a
+    swipe.
+
+    The active number is safe by construction: `activate` deletes the vault row
+    for the number it moves onto, so `me` is never in this table. The check is
+    here anyway — the invariant is three functions away, and the cost of it
+    being wrong is an account releasing the number it is answering as.
+
+    Not gated on UIN_SHOP_ENABLED, for the same reason `/mine` is not: an
+    operator closing the shop should stop sales, not trap people in a
+    collection."""
+    if uin == me:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "uin_in_use"})
+    held = await db.get(OwnedUin, uin)
+    if held is None or int(held.owner_uin) != me:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_owned"})
+    await db.delete(held)
+    await db.commit()
+    return await my_uins(me=me, db=db)
+
+
 class ActivateIn(BaseModel):
     uin: int = Field(gt=0)
 
