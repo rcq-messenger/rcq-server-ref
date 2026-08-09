@@ -138,6 +138,71 @@ async def enforce_rate_limit(
     )
 
 
+# Fixed-window COST counter, for endpoints whose damage scales with the
+# SIZE of the work a request asks for rather than the number of requests.
+# The group fan-out endpoints turn one POST into N queue rows and N pushes,
+# so a per-request cap prices them wrong: 120 requests/min against the
+# ~1.9k-member flagship group is a quarter of a million rows a minute from
+# a single caller, aimed at the layer that is already our bottleneck.
+#
+# Fixed window (INCRBY + EXPIRE) instead of the sliding set above because
+# the value here is a weight, not a timestamp — there is nothing to sweep.
+# A caller who goes over stays over until the window rolls, including the
+# rejected requests, which is the right shape for an abuse ceiling and
+# irrelevant to a real user who never approaches it.
+_COST_SCRIPT = """
+local key = KEYS[1]
+local cost = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local window = tonumber(ARGV[3])
+
+local used = tonumber(redis.call('INCRBY', key, cost))
+if used == cost then
+  redis.call('EXPIRE', key, window)
+end
+if used > limit then
+  local ttl = redis.call('TTL', key)
+  if ttl < 0 then ttl = window end
+  return {0, ttl}
+end
+return {1, 0}
+"""
+
+
+async def enforce_cost_budget(
+    identity: str, rule: str, cost: int, limit: int, window_seconds: int
+) -> None:
+    """Charge `cost` units against `identity`'s budget for `rule`.
+
+    Same fail-soft and same 429 shape as the request limiters. `cost` is
+    whatever unit the caller is measuring — for the group endpoints it is
+    the number of recipients the fan-out would actually touch, counted
+    AFTER membership filtering so a request padded with non-members is
+    charged for the real work and no more.
+    """
+    if cost <= 0:
+        return
+    key = f"rlc:{rule}:{identity}"
+    try:
+        redis = await get_redis()
+        result = await redis.eval(_COST_SCRIPT, 1, key, cost, limit, window_seconds)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[rate_limit] redis unavailable, allowing: %s", exc)
+        return
+    if int(result[0]) == 1:
+        return
+    retry_after = int(result[1]) if len(result) > 1 else window_seconds
+    log.warning(
+        "[rate_limit] fan-out budget exhausted rule=%s identity=%s cost=%d limit=%d",
+        rule, identity, cost, limit,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={"code": "fanout_budget_exhausted", "retry_after": retry_after},
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
     """Build a FastAPI dependency that enforces `limit` calls per
     `window_seconds` keyed by (rule, identity).

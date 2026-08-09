@@ -346,7 +346,18 @@ async def search(
     return [PublicUser.from_model(u) for u in rows]
 
 
-@router.get("/{uin}/info", response_model=PublicUser)
+@router.get(
+    "/{uin}/info",
+    response_model=PublicUser,
+    # `/search` was capped against scraping from day one and this was not, which
+    # left the whole directory walkable one UIN at a time by anyone holding a
+    # single account. Every client call site is user-driven — opening a profile,
+    # resolving one unknown sender, the `#911` exact lookup — and group fan-out
+    # reads keys from the roster, not from here, so no legitimate path loops
+    # over this endpoint. 180/min is far above human use and turns enumeration
+    # into something that needs many accounts, which registration limits price.
+    dependencies=[Depends(rate_limit("users_info", 180, 60))],
+)
 async def info(
     uin: int,
     me: int = Depends(current_uin),
