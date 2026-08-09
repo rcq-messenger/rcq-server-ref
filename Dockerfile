@@ -38,4 +38,8 @@ EXPOSE 8000
 
 # uvicorn worker count is small by default; tune via the docker
 # command override if you've got the CPU to spare.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# --timeout-graceful-shutdown for the same reason as the systemd unit: a
+# websocket never closes by itself, so without it the container ignores
+# SIGTERM until docker loses patience and kills it, and every restart is a
+# minute of downtime instead of a few seconds.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "10", "--workers", "2"]
