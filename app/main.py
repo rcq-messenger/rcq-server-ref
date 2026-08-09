@@ -1,6 +1,7 @@
 import asyncio
-import time
 import logging
+import re
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
@@ -19,8 +20,51 @@ from app.services.offline_queue_sweep import offline_queue_sweep_loop
 from app.services.story_sweep import story_sweep_loop
 
 
+class _RedactSecretsInLogs(logging.Filter):
+    """Strip session tokens out of anything we log.
+
+    A websocket cannot carry an Authorization header, so `/ws/{uin}` takes the
+    token in the query string, and uvicorn's access logger prints the request
+    line verbatim:
+
+        INFO: ('62.182.70.125', 0) - "WebSocket /ws/695744503?token=eyJhbGci…"
+
+    journald then puts that in /var/log/syslog, where the audit found 816
+    distinct tokens over 449 accounts, 815 of which would still have been
+    accepted. Our tokens have no working expiry, so a leaked one is good until
+    the number changes hands — a log file is effectively a file of passwords.
+
+    Caddy's access log was filtered back in August and stopped being a source;
+    this is the channel that was left, and it is the one closest to the leak,
+    so it covers whatever else ends up logging a URL later. The substring test
+    runs before the regex so the ordinary line costs one `in`.
+    """
+
+    _RE = re.compile(r"(?i)\b(token|access_token|invite)=[A-Za-z0-9._\-]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 — a broken record must not kill logging
+            return True
+        if "token=" in msg or "invite=" in msg:
+            record.msg = self._RE.sub(r"\1=<redacted>", msg)
+            record.args = ()
+        return True
+
+
+def _install_log_redaction() -> None:
+    # Attached to the loggers that see request lines AND to the root, because
+    # the point is to be the last thing between a secret and a disk, not to
+    # enumerate every logger that might one day print a URL.
+    f = _RedactSecretsInLogs()
+    for name in ("uvicorn.access", "uvicorn.error", "uvicorn", "rcq", ""):
+        logging.getLogger(name).addFilter(f)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _install_log_redaction()
     # Fail-closed on misconfigured JWT_SECRET. Issuing tokens signed with
     # the placeholder default would let anyone who reads the public repo
     # forge a JWT for any UIN on this server. Equally, an empty secret
