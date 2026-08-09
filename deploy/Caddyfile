@@ -99,6 +99,23 @@ api.rcq.app {
             roll_size  10mb
             roll_keep  5
         }
+        # A websocket cannot carry an Authorization header, so /ws/{uin} takes
+        # the session token in the query string — and without this filter Caddy
+        # writes it here in full. Our tokens have no working expiry, so the
+        # access log becomes a file of passwords that stays valid.
+        #
+        # The flagship found 990 of them across its own logs before this went
+        # in. The application redacts its OWN logs (see _RedactSecretsInLogs in
+        # app/main.py) and cannot reach Caddy's, which is why this belongs here
+        # as well and not only there.
+        format filter {
+            wrap json
+            fields {
+                request>uri query {
+                    replace token REDACTED
+                }
+            }
+        }
     }
 
     # Tighten the default header behaviour.

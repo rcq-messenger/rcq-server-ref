@@ -12,12 +12,23 @@ User=rcq
 Group=rcq
 WorkingDirectory=/opt/rcq/app/backend
 EnvironmentFile=/opt/rcq/.env
+# ⚠⚠ --timeout-graceful-shutdown is what makes a restart a blip instead of an
+# outage. Uvicorn's graceful stop waits for open connections to close, and a
+# WebSocket never closes on its own, so the worker holding live sockets hangs
+# on SIGTERM while the others exit in a second. Without a timeout here and
+# TimeoutStopSec below, systemd's default 90s is what finally ends it — the
+# flagship measured 201 responses of 502 across 95 seconds on every deploy,
+# and it reads from outside as the server being down.
 ExecStart=/opt/rcq/venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 \
     --port 8000 \
     --proxy-headers \
     --forwarded-allow-ips '*' \
+    --timeout-graceful-shutdown 10 \
     --workers 4
+# Backstop if uvicorn ignores its own timeout: 20s instead of 90. Never rely on
+# this alone — a SIGKILL at 20s is the same outage, only shorter.
+TimeoutStopSec=20
 # Multi-worker enabled. State that previously lived in a single
 # process is now Redis-backed:
 #   - WebSocket fanout via pub/sub (services/connection_manager.py)
