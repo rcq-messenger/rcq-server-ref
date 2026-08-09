@@ -79,6 +79,13 @@ class AudioRoomOut(BaseModel):
     # Number of UINs currently inside the live voice session. Driven
     # by the in-memory roster in ws.py; 0 if nobody is connected.
     active_count: int = 0
+    # How many fit. The cap has always been enforced (ws.py refuses the
+    # entry past it) but never stated, so a client could only show "the
+    # room is full" after the fact and had no way to say "4 of 8" while
+    # there was still room. Sent rather than hardcoded client-side so the
+    # number stays true if the mesh budget is ever revised — and so that a
+    # per-room cap, when it exists, needs no second client change.
+    capacity: int = MAX_ROOM_PARTICIPANTS
 
 
 class CreateRoomIn(BaseModel):
