@@ -154,14 +154,23 @@ def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
     return payload.get("typ") == "recover" and payload.get("sk") == signing_key
 
 
-async def current_uin(
-    request: Request,
-    creds: HTTPAuthorizationCredentials = Depends(_bearer),
-) -> int:
-    if creds is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
+async def authorize_session(token: str) -> int:
+    """Everything that makes a session token still valid, in one place.
+
+    Signature, then the two things a signature cannot express: whether this
+    linked device has been revoked, and whether the number has since changed
+    hands. Returns the uin or raises the usual 401/403.
+
+    ⚠ This exists because the WEBSOCKET did none of it. `/ws/{uin}` decoded the
+    token for its `sub` and checked suspension, and that was all — so revoking
+    a linked web session left it able to open a socket and keep receiving
+    everything, and a token minted for a previous holder of a number stayed
+    good on the one channel that actually carries messages. Revocation was
+    real on HTTP and cosmetic where it mattered. Any new entry point must call
+    THIS, not `decode_token`.
+    """
     try:
-        payload = _decode_session_payload(creds.credentials)
+        payload = _decode_session_payload(token)
         uin = int(payload["sub"])
     except (JWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
@@ -181,6 +190,16 @@ async def current_uin(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "stale token")
     if await is_suspended(uin):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+    return uin
+
+
+async def current_uin(
+    request: Request,
+    creds: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> int:
+    if creds is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
+    uin = await authorize_session(creds.credentials)
     # So the metrics middleware can count distinct accounts and boot chains
     # without decoding a second token of its own. Nothing else reads this.
     request.state.uin = uin
@@ -368,7 +387,12 @@ async def current_uin_optional(
     if creds is None:
         return None
     try:
-        return decode_token(creds.credentials)
+        # Same checks as the required path, not just the signature. This
+        # answers "who is this" for the owner-only gate on group posts among
+        # other things, and a revoked device passing as the owner there would
+        # be the revocation meaning nothing again. A token that fails simply
+        # reads as anonymous, which is what every caller already handles.
+        return await authorize_session(creds.credentials)
     except HTTPException:
         return None
 

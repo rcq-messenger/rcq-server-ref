@@ -2,12 +2,12 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select, update
 
 from app.core import metrics
 from app.core.db import SessionLocal
-from app.core.security import decode_token, decode_device_id
+from app.core.security import authorize_session, decode_device_id
 from app.models.contact import Contact
 from app.models.device_token import DeviceToken
 from app.models.user import User, presence_is_fresh, visible_status
@@ -239,8 +239,30 @@ async def _caller_allowed(caller_uin: int, callee_uin: int) -> bool:
 
 @router.websocket("/ws/{uin}")
 async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
+    # ⚠ This used to be `decode_token`, i.e. a signature check and nothing
+    # else. Revoking a linked web device and taking over a recycled number both
+    # went through Redis/the epoch table and were enforced on every HTTP route
+    # — and on none of the websocket, which is the channel that actually
+    # carries messages, presence and call signalling. A revoked browser could
+    # not call the API and could still sit on a socket receiving everything.
+    #
+    # `authorize_session` is the single place that answers "is this token still
+    # good", suspension included, so the 4408 branch below is gone with it.
     try:
-        token_uin = decode_token(token)
+        token_uin = await authorize_session(token)
+    except HTTPException as exc:
+        # ⚠ These codes do NOT reach the client and never have. Closing before
+        # `accept()` makes Starlette refuse the HANDSHAKE, so the peer sees an
+        # HTTP 403 and OkHttp reports it through onFailure, where no code is
+        # available — verified against prod. The numbers are kept because they
+        # are what the journal and any future accept-then-close would use, not
+        # because anything reads them today.
+        # ⏭ A suspended account therefore retries forever on the ordinary
+        # backoff instead of being told it is banned. Fixing that needs
+        # accept-then-close here AND a client that reads the code; today the
+        # only code any client acts on is 4000 (superseded).
+        await ws.close(code=4408 if exc.status_code == status.HTTP_403_FORBIDDEN else 4401)
+        return
     except Exception:
         await ws.close(code=4401)
         return
@@ -250,20 +272,6 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
     if token_uin != uin:
         await ws.close(code=4403)
         return
-
-    # Suspended users get a clean refusal at the WS gate. Sealed-
-    # sender means we can't block their /messages/sealed POSTs
-    # (server doesn't know who sent them), but without a live WS
-    # they can't receive replies, presence, group events, or any
-    # signalling — the app effectively becomes read-only-history
-    # until the admin un-bans. Custom 4408 close code surfaces a
-    # distinct reason in the iOS reconnect logic if we ever want
-    # to show "your account was suspended" UI there.
-    async with SessionLocal() as db:
-        user = await db.get(User, uin)
-        if user is not None and user.is_suspended:
-            await ws.close(code=4408)
-            return
 
     await manager.connect(uin, ws, device_id)
     # How fast sockets are being BORN, not how many are open. One client in a
