@@ -177,6 +177,13 @@ _NEARBY_CHECKIN_COLUMNS: list[tuple[str, str]] = [
 # primary device (phone); existing rows are all NULL so the primary OPK
 # paths (which now scope to `device_id IS NULL`) stay back-compatible. The
 # `devices` table itself is created fresh by create_all (new table, no ALTER).
+# Additive on `broker_relays` — paid tenancy. NULL means the public pool, which
+# is every row that existed before this, so the distribution behaviour of the
+# free fleet is unchanged by the column's arrival.
+_BROKER_RELAY_COLUMNS: list[tuple[str, str]] = [
+    ("tenant_id", "TEXT"),
+]
+
 _ONE_TIME_PREKEY_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "INTEGER"),
 ]
@@ -299,6 +306,7 @@ async def init_db() -> None:
         ("invites", _INVITE_COLUMNS),
         ("device_tokens", _DEVICE_TOKEN_COLUMNS),
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
+        ("broker_relays", _BROKER_RELAY_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:

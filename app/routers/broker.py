@@ -29,6 +29,7 @@ See `RCQ/docs/relay-broker-design.md`.
 import base64
 import binascii
 import hashlib
+import secrets
 import hmac
 import ipaddress
 import json
@@ -36,7 +37,7 @@ import re
 import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,7 +46,7 @@ from app.core.db import get_db
 from app.core.rate_limit import _client_ip, rate_limit
 from app.core.redis import get_redis
 from app.core.security import require_admin
-from app.models.broker import BrokerRelay
+from app.models.broker import BrokerRelay, RelayTenant
 from app.services.geoip import country_of
 
 router = APIRouter(prefix="/broker", tags=["broker"])
@@ -329,6 +330,53 @@ def _disclosure_cap(pool: int, requested: int) -> int:
     return max(1, min(requested, pool // 5))
 
 
+# ── paid tenancy ─────────────────────────────────────────────────────────
+#
+# A tenant proves itself with one bearer key and gets their own endpoints added
+# to the ordinary answer. Without a key nothing about this endpoint changes by
+# a single byte, which is the property that lets it ship before anyone has
+# bought anything.
+
+def _tenant_key(request: Request) -> str | None:
+    """The tenant key from `Authorization: Bearer …`.
+
+    ⚠ A header, deliberately, and this one because proxies redact it. The
+    obvious alternative was a query parameter, and a query parameter is exactly
+    how 990 session tokens ended up written to disk in this project — the
+    websocket has no choice but to use one, this does.
+    """
+    raw = request.headers.get("authorization") or ""
+    parts = raw.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    key = parts[1].strip()
+    # A logged-in client sends its own session JWT here on other endpoints, and
+    # some will send it to this one too. A JWT is three dot-separated parts; a
+    # tenant key is not. Cheap way to skip the pointless hash + query.
+    return None if (not key or key.count(".") == 2) else key
+
+
+async def _tenant_from_request(request: Request, db: AsyncSession, now: int):
+    """The active, paid-up tenant behind this request, or None.
+
+    Every failure is None rather than an error: presenting no key, a wrong key,
+    a revoked key and a lapsed subscription must all look identical from
+    outside, or this endpoint becomes an oracle for guessing keys.
+    """
+    key = _tenant_key(request)
+    if not key:
+        return None
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    tenant = (
+        await db.execute(select(RelayTenant).where(RelayTenant.key_hash == digest))
+    ).scalar_one_or_none()
+    if tenant is None or tenant.status != "active":
+        return None
+    if tenant.paid_until is not None and tenant.paid_until < now:
+        return None
+    return tenant
+
+
 @router.get(
     "/bridges",
     dependencies=[Depends(rate_limit("broker_bridges", 30, 60))],
@@ -353,6 +401,7 @@ async def get_bridges(
     now = int(time.time())
     client_ip = _client_ip(request)
     region = country_of(client_ip)
+    tenant = await _tenant_from_request(request, db, now)
     all_rows = (
         await db.execute(select(BrokerRelay).where(BrokerRelay.enabled.is_(True)))
     ).scalars().all()
@@ -387,6 +436,13 @@ async def get_bridges(
         pass  # Redis hiccup: fall back to the canary-only gate below.
 
     def _serve(r: BrokerRelay) -> bool:
+        # ⚠⚠ A tenant's endpoint is never in the public answer. Not ranked
+        # lower, not "only to trusted buckets" — never. What is sold is that
+        # the address is absent from the public list, so handing it out here
+        # once would sell the product and destroy it in the same request.
+        # These rows are added below, and only for the key that owns them.
+        if r.tenant_id:
+            return False
         # Trusted (admin-set, signed-config canary-monitored): always served.
         if r.tier == "trusted":
             return True
@@ -399,8 +455,16 @@ async def get_bridges(
         # the region quorum says it's blocked here.
         return region_ok or (canary_alive and not region_fail)
 
+    # Theirs, in full and unbucketed. Bucketing exists so no single requester
+    # learns the whole PUBLIC pool; a tenant is supposed to know their own
+    # endpoints, and there are three of them.
+    mine = [
+        r for r in all_rows
+        if tenant is not None and r.tenant_id == tenant.id
+    ] if tenant is not None else []
+
     rows = [r for r in all_rows if _serve(r)]
-    if not rows:
+    if not rows and not mine:
         return {"relays": [], "ts": now}
     bucket = f"{_ip_block(client_ip)}:{now // _BUCKET_PERIOD}"
     secret = _bucket_secret()
@@ -410,7 +474,11 @@ async def get_bridges(
 
     trusted = sorted((r for r in rows if r.tier == "trusted"), key=score)
     community = sorted((r for r in rows if r.tier != "trusted"), key=score)
-    chosen = (trusted + community)[:_disclosure_cap(len(rows), n)]
+    # A tenant gets their own endpoints IN ADDITION to the normal public set,
+    # never instead of it: private nodes are the thing that keeps working when
+    # the public pool is blocked, and the public pool is what keeps working
+    # when a private node is. Neither is a replacement for the other.
+    chosen = mine + (trusted + community)[:_disclosure_cap(len(rows), n)]
     out = []
     for r in chosen:
         try:
@@ -627,6 +695,113 @@ async def admin_set(body: AdminSet, db: AsyncSession = Depends(get_db)) -> dict:
         row.enabled = body.enabled
     await db.commit()
     return {"ok": True, "tag": row.tag, "tier": row.tier, "enabled": row.enabled}
+
+
+# ── tenants (founder) ────────────────────────────────────────────────────
+
+class TenantCreate(BaseModel):
+    name: str | None = None
+    # Days of access. Renewal is calling this again on an existing tenant,
+    # which extends rather than restarts — same rule as the console's crypto
+    # gateway, and for the same reason: paying early must not cost time.
+    days: int = Field(default=31, ge=1, le=3660)
+
+
+@router.post("/admin/tenants", dependencies=[Depends(require_admin)])
+async def admin_create_tenant(body: TenantCreate, db: AsyncSession = Depends(get_db)) -> dict:
+    """Mint a tenant and hand back their key ONCE.
+
+    Only the hash is stored, so this response is the only time the key exists
+    anywhere we control. Losing it means issuing a new one, not recovering the
+    old one — the same contract as the island owner token.
+    """
+    key = secrets.token_urlsafe(24)
+    now = int(time.time())
+    tenant = RelayTenant(
+        id="rt_" + secrets.token_hex(6),
+        key_hash=hashlib.sha256(key.encode("utf-8")).hexdigest(),
+        name=(body.name or None),
+        status="active",
+        paid_until=now + body.days * 86400,
+    )
+    db.add(tenant)
+    await db.commit()
+    return {"id": tenant.id, "key": key, "paid_until": tenant.paid_until, "name": tenant.name}
+
+
+class TenantSet(BaseModel):
+    id: str
+    status: str | None = None
+    # Extends from whichever is later, the current end or today: paying early
+    # adds to what is left, and paying after a lapse does not backdate a term
+    # into the past and expire on arrival.
+    add_days: int | None = Field(default=None, ge=1, le=3660)
+
+
+@router.post("/admin/tenants/set", dependencies=[Depends(require_admin)])
+async def admin_set_tenant(body: TenantSet, db: AsyncSession = Depends(get_db)) -> dict:
+    tenant = (
+        await db.execute(select(RelayTenant).where(RelayTenant.id == body.id))
+    ).scalar_one_or_none()
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such tenant")
+    if body.status is not None:
+        if body.status not in ("active", "disabled"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "status must be active or disabled")
+        tenant.status = body.status
+    if body.add_days is not None:
+        base = max(int(time.time()), tenant.paid_until or 0)
+        tenant.paid_until = base + body.add_days * 86400
+    await db.commit()
+    return {"id": tenant.id, "status": tenant.status, "paid_until": tenant.paid_until}
+
+
+@router.get("/admin/tenants", dependencies=[Depends(require_admin)])
+async def admin_list_tenants(db: AsyncSession = Depends(get_db)) -> dict:
+    rows = (await db.execute(select(RelayTenant))).scalars().all()
+    counts: dict[str, int] = {}
+    for r in (await db.execute(select(BrokerRelay).where(BrokerRelay.tenant_id.isnot(None)))).scalars().all():
+        counts[r.tenant_id] = counts.get(r.tenant_id, 0) + 1
+    return {"tenants": [
+        {
+            "id": t.id, "name": t.name, "status": t.status,
+            "paid_until": t.paid_until, "relays": counts.get(t.id, 0),
+            "created_at": int(t.created_at.timestamp()) if t.created_at else None,
+        }
+        for t in rows
+    ]}
+
+
+class TenantAssign(BaseModel):
+    tag: str
+    # None releases the endpoint back to the public pool.
+    tenant_id: str | None = None
+
+
+@router.post("/admin/tenants/assign", dependencies=[Depends(require_admin)])
+async def admin_assign_relay(body: TenantAssign, db: AsyncSession = Depends(get_db)) -> dict:
+    """Give an endpoint to a tenant, or hand it back to the public pool.
+
+    ⚠ Assigning REMOVES the endpoint from public distribution immediately. That
+    is the point, and it is also why an endpoint already published in the
+    signed config should not be assigned: its address is out there, and
+    charging for the privacy of an address that is already public would be
+    selling something we cannot deliver. Stand up a new node instead.
+    """
+    relay = (
+        await db.execute(select(BrokerRelay).where(BrokerRelay.tag == body.tag))
+    ).scalar_one_or_none()
+    if relay is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such relay")
+    if body.tenant_id is not None:
+        tenant = (
+            await db.execute(select(RelayTenant).where(RelayTenant.id == body.tenant_id))
+        ).scalar_one_or_none()
+        if tenant is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such tenant")
+    relay.tenant_id = body.tenant_id
+    await db.commit()
+    return {"tag": relay.tag, "tenant_id": relay.tenant_id}
 
 
 class LivenessResult(BaseModel):
