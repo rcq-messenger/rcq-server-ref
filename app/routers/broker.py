@@ -357,24 +357,39 @@ def _tenant_key(request: Request) -> str | None:
 
 
 async def _tenant_from_request(request: Request, db: AsyncSession, now: int):
-    """The active, paid-up tenant behind this request, or None.
+    """The active, paid-up tenant behind this request, plus WHY when there
+    isn't one: `(tenant | None, state)` where state is None (no key offered),
+    "ok", "unknown" or "expired".
 
-    Every failure is None rather than an error: presenting no key, a wrong key,
-    a revoked key and a lapsed subscription must all look identical from
-    outside, or this endpoint becomes an oracle for guessing keys.
+    ⚠ This used to answer None to everything, deliberately, so that no key, a
+    wrong key, a revoked key and a lapsed subscription were indistinguishable
+    and the endpoint could not be used as an oracle for guessing keys. That
+    property is given up here on purpose, and it is worth saying why.
+
+    It was never fully true: a real key adds the tenant's own endpoints to the
+    answer, so anybody guessing could already tell a hit from a miss by
+    counting relays. What the silence did cost was real, though. A client had
+    no way to distinguish "your key is good and quiet" from "you mistyped it",
+    so it reported every string the user pasted as accepted, including
+    nonsense. That was reported from the outside within a day of the first key
+    being issued.
+
+    What is actually protecting the keys is their size (32 characters of
+    base64url) against a 30-per-minute rate limit, and no amount of silence
+    here moves that needle.
     """
     key = _tenant_key(request)
     if not key:
-        return None
+        return None, None
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     tenant = (
         await db.execute(select(RelayTenant).where(RelayTenant.key_hash == digest))
     ).scalar_one_or_none()
     if tenant is None or tenant.status != "active":
-        return None
+        return None, "unknown"
     if tenant.paid_until is not None and tenant.paid_until < now:
-        return None
-    return tenant
+        return None, "expired"
+    return tenant, "ok"
 
 
 @router.get(
@@ -401,7 +416,7 @@ async def get_bridges(
     now = int(time.time())
     client_ip = _client_ip(request)
     region = country_of(client_ip)
-    tenant = await _tenant_from_request(request, db, now)
+    tenant, key_state = await _tenant_from_request(request, db, now)
     all_rows = (
         await db.execute(select(BrokerRelay).where(BrokerRelay.enabled.is_(True)))
     ).scalars().all()
@@ -465,7 +480,10 @@ async def get_bridges(
 
     rows = [r for r in all_rows if _serve(r)]
     if not rows and not mine:
-        return {"relays": [], "ts": now}
+        # The empty answer carries the verdict too, otherwise a good key on an
+        # island with nothing to hand out looks exactly like a bad one, which
+        # is the case this whole field exists for.
+        return {"relays": [], "ts": now, "key": key_state, "private_count": 0}
     bucket = f"{_ip_block(client_ip)}:{now // _BUCKET_PERIOD}"
     secret = _bucket_secret()
 
@@ -480,12 +498,20 @@ async def get_bridges(
     # when a private node is. Neither is a replacement for the other.
     chosen = mine + (trusted + community)[:_disclosure_cap(len(rows), n)]
     out = []
+    mine_tags = {r.tag for r in mine}
     for r in chosen:
         try:
             d = json.loads(r.descriptor)
         except ValueError:
             continue
         d["tier"] = r.tier
+        # Which of these are THEIRS. Without it the client cannot tell a node
+        # somebody paid for from one of the fourteen everybody has, so it threw
+        # both into one latency race and a paying customer spent most of their
+        # time on the public pool. The paid nodes are supposed to be the route;
+        # the public ones are supposed to be the parachute.
+        if r.tag in mine_tags:
+            d["private"] = True
         out.append(d)
     # Best-effort reach telemetry: bump a rolling ~24h served-count per relay so an
     # operator can confirm via /broker/status that their relay is actually being
@@ -501,7 +527,9 @@ async def get_bridges(
             await pipe.execute()
     except Exception:
         pass
-    return {"relays": out, "ts": now}
+    # `key` is null when none was offered, else ok | unknown | expired. See
+    # _tenant_from_request for why this is said out loud now.
+    return {"relays": out, "ts": now, "key": key_state, "private_count": len(mine)}
 
 
 @router.post(
