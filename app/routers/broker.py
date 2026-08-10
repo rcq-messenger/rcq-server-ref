@@ -693,6 +693,11 @@ async def admin_list(db: AsyncSession = Depends(get_db)) -> dict:
             "last_ok": r.last_ok,
             "fail_count": r.fail_count,
             "operator_key": (r.operator_key or "")[:12] + "…",
+            # Whose it is. A node assigned to a paying tenant is not part of
+            # the public pool at all and must not read as one in the admin: it
+            # is never handed to anybody but that customer, and "Promote to
+            # trusted" on it would be a category error rather than an action.
+            "tenant_id": r.tenant_id,
             # Server-side registration time, in unix seconds like last_ok. The
             # canary's prune step needs it to judge a row that has NEVER
             # answered, where last_ok gives it nothing to measure from.
