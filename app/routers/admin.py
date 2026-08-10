@@ -237,6 +237,10 @@ class StatsOut(BaseModel):
     # (additive default so older admin SPAs keep parsing).
     open_reports: int
     open_crashes: int = 0
+    # Organisations waiting for an answer on /organizations. The sidebar had a
+    # badge for reports and for crashes and none for the one queue where the
+    # person on the other end is trying to give us money.
+    open_inquiries: int = 0
     resolved_reports_7d: int
 
 
@@ -804,6 +808,10 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
             Report.status == "open", Report.reason.contains(CRASH_MARKER)
         )
     ) or 0
+    from app.models.relay_inquiry import RelayInquiry
+    open_inquiries = await db.scalar(
+        select(func.count()).select_from(RelayInquiry).where(RelayInquiry.status == "open")
+    ) or 0
     open_reports = (await db.scalar(
         select(func.count(Report.id)).where(Report.status == "open")
     ) or 0) - int(open_crashes)
@@ -820,6 +828,7 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
         new_users_7d=int(new_users_7d),
         open_reports=int(open_reports),
         open_crashes=int(open_crashes),
+        open_inquiries=int(open_inquiries),
         resolved_reports_7d=int(resolved_reports_7d),
     )
 
