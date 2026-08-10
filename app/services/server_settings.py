@@ -79,18 +79,20 @@ _reg(SettingSpec("max_accounts_per_device", "int", lambda: 5, "limits",
 #              has `name` and never reads it, and no `welcome` field.
 #   web-chat — neither field is referenced.
 #
-# The help text used to describe what these were meant to do, which is why an
-# operator setting them and seeing nothing change had no way to tell whether
-# they had mis-set something. Until a client actually renders them, the help
-# says so. Update these strings in the same commit that wires them up.
+# These carried a warning that nothing rendered them, which was true for as
+# long as it took somebody to ask why typing here changed nothing. Android
+# reads both as of 0.100; iOS and the web client do not yet, so the help says
+# where it shows and where it does not rather than going quiet about it.
 _reg(SettingSpec("island_name", "str", lambda: _env.APP_NAME, "branding",
                  "Island name",
-                 "Served on /server/info. NOT SHOWN ANYWHERE YET — no client "
-                 "renders it, so changing this has no visible effect today."))
+                 "Shown on Android: on the confirm before somebody joins this "
+                 "island, and beside the address in Settings → Network. iOS and "
+                 "the web client do not render it yet."))
 _reg(SettingSpec("welcome_text", "str", lambda: "", "branding",
                  "Welcome / rules",
-                 "Served on /server/info. NOT SHOWN ANYWHERE YET — no client "
-                 "reads this field at all, so changing it has no effect today."))
+                 "Shown on Android on the confirm before somebody joins this "
+                 "island, which is the one moment house rules get read. Leave "
+                 "empty for none. iOS and the web client do not render it yet."))
 
 
 def _parse(spec: SettingSpec, raw: str) -> Any:
