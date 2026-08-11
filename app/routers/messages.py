@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -726,8 +726,35 @@ async def fetch_queue(
     cursor has passed it; the TTL sweep backstops abandoned cursors.
     """
     cursor = await db.get(QueueCursor, (uin, device_id))
-    after_direct = cursor.last_direct_id if cursor else 0
-    after_group = cursor.last_group_id if cursor else 0
+    if cursor is not None:
+        after_direct = cursor.last_direct_id
+        after_group = cursor.last_group_id
+    else:
+        # ⚠ A device we have never seen starts where this account's furthest
+        # device already got to — NOT at zero.
+        #
+        # Reinstalling mints a new device id, so starting at zero replayed the
+        # entire queue: up to the 30-day TTL of history, including messages the
+        # person had deleted on the old install, whose local tombstones died
+        # with it. A tester hit this repeatedly ("ресетнула приложение ... но
+        # при входе продолжает подгружаться переписка, вместе с удалёнными"),
+        # and her account carries eight cursors — eight reinstalls, eight
+        # replays. It reads as the app hoarding history somewhere secret; it is
+        # the island's own queue, handed out again to something it considers a
+        # brand-new device.
+        #
+        # Anything genuinely undelivered sits ABOVE that mark and still arrives,
+        # which is what the queue is for. Anything below it was already
+        # delivered to this account once, and re-delivering it is the bug.
+        furthest = (
+            await db.execute(
+                select(
+                    func.coalesce(func.max(QueueCursor.last_direct_id), 0),
+                    func.coalesce(func.max(QueueCursor.last_group_id), 0),
+                ).where(QueueCursor.uin == uin)
+            )
+        ).one()
+        after_direct, after_group = int(furthest[0]), int(furthest[1])
 
     rows_1to1 = (
         await db.execute(
