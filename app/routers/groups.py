@@ -52,6 +52,13 @@ _REQUIRE_CLOSED_GROUP_TOKEN: bool = (
     in {"1", "true", "yes"}
 )
 
+# Above this member count the roster stops carrying live presence — see the
+# comment in `_members_with_users`. Env-tunable so a self-hoster running one
+# big trusted group can raise it.
+PRESENCE_ROSTER_LIMIT: int = int(
+    os.environ.get("RCQ_PRESENCE_ROSTER_LIMIT", "100")
+)
+
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -197,7 +204,21 @@ async def _members_with_users(db: AsyncSession, group_id: int) -> list[GroupMemb
     # a Redis round trip each, so serialising the 1800-member beta group cost
     # 1800 of them, on an endpoint every client polls. Prod was doing ~6900
     # SISMEMBER/s with twenty people online, which was most of the CPU.
-    online = await manager.online_subset(u.uin for _, u in rows)
+    #
+    # ⚠ Above PRESENCE_ROSTER_LIMIT members the roster reports everyone as
+    # offline instead (2026-08-11). The roster has to carry every member's UIN
+    # and keys — group ciphertext is sealed per recipient, so hiding the list
+    # would break encryption, not protect anybody. Live presence is different:
+    # it is the one field nothing else needs, and in a group the size of the
+    # beta one it hands any member who just registered a pollable online/offline
+    # feed for ~1900 accounts, which is enough to derive sleep patterns and time
+    # zones. Small groups keep the dots: there the roster is people you know,
+    # and knowing who is around is the point.
+    online = (
+        await manager.online_subset(u.uin for _, u in rows)
+        if len(rows) <= PRESENCE_ROSTER_LIMIT
+        else set()
+    )
     out: list[GroupMemberOut] = []
     for m, u in rows:
         # Live presence: only show as their saved status if they currently have

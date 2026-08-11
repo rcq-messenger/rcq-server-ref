@@ -16,6 +16,7 @@ from app.core.redis import close_redis, get_redis
 from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.evidence_sweep import evidence_sweep_loop
+from app.services.nearby_sweep import nearby_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
 from app.services.story_sweep import story_sweep_loop
 
@@ -91,6 +92,9 @@ async def lifespan(_: FastAPI):
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.
     evidence_sweep_task = asyncio.create_task(evidence_sweep_loop())
+    # Retention for expired People-Nearby check-ins (geohash buckets tied to a
+    # UIN were previously filtered on read but never deleted).
+    nearby_sweep_task = asyncio.create_task(nearby_sweep_loop())
     try:
         yield
     finally:
@@ -98,6 +102,7 @@ async def lifespan(_: FastAPI):
         story_sweep_task.cancel()
         offline_queue_sweep_task.cancel()
         evidence_sweep_task.cancel()
+        nearby_sweep_task.cancel()
         await close_redis()
 
 
