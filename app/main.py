@@ -12,7 +12,9 @@ from app.core.config import settings
 from app.core.db import engine, init_db
 from app.core import metrics
 from app.core.feature_gate import require_feature
+from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
+from app.core.transport import classify as transport_of
 from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.evidence_sweep import evidence_sweep_loop
@@ -174,6 +176,10 @@ async def record_metrics(request: Request, call_next):
             uin=getattr(request.state, "uin", None),
             pool_in_use=in_use,
             pool_ceiling=ceiling,
+            # Classified here, where the address is still whole, and counted
+            # rather than stored — Caddy's log masks it now, and the exact
+            # relay match this needs cannot survive that (see core/transport).
+            transport=transport_of(_client_ip(request)),
         )
 
 

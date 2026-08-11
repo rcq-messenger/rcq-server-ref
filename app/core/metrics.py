@@ -40,6 +40,10 @@ class Bucket:
     minute: int
     # path template -> (count, total seconds, errors)
     calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    # How each request reached us: direct / front / relay. Counted here rather
+    # than parsed out of Caddy's log because the log masks client addresses now
+    # (see core/transport.py) and an exact relay match needs the whole one.
+    transport: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
     errors: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     # Slowest single call per path this minute: an average hides the one
@@ -88,9 +92,12 @@ def record_request(
     uin: int | None,
     pool_in_use: int | None = None,
     pool_ceiling: int | None = None,
+    transport: str | None = None,
 ) -> None:
     b = _bucket()
     b.calls[path] += 1
+    if transport:
+        b.transport[transport] += 1
     b.seconds[path] += seconds
     if seconds > b.worst[path]:
         b.worst[path] = seconds
@@ -167,4 +174,18 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
         t.pop("seconds", None)
         t.pop("worst", None)
 
-    return {"minutes": minutes, "series": series, "paths": paths}
+    # Transport totals over the same window. Exact, unlike the log-derived
+    # figure, because the address was whole when it was classified.
+    transport: dict[str, int] = defaultdict(int)
+    for b in wanted:
+        if b is None:
+            continue
+        for kind, n in b.transport.items():
+            transport[kind] += n
+
+    return {
+        "minutes": minutes,
+        "series": series,
+        "paths": paths,
+        "transport": dict(transport),
+    }
