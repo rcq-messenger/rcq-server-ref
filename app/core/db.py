@@ -91,19 +91,25 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     ("kyber_prekey_public", "TEXT"),
     ("kyber_prekey_signature", "TEXT"),
     ("kyber_prekey_uploaded_at", "TIMESTAMP WITH TIME ZONE"),
-    # Last-seen visibility — additive. Default "everyone" matches the
-    # column default in the model; existing rows pick that up via the
-    # SQL `DEFAULT 'everyone'` clause. PG's DDL needs the literal in
-    # the ALTER syntax, SQLite is happy either way.
-    ("last_seen_visibility", "TEXT DEFAULT 'everyone'"),
+    # Privacy tri-states — additive. Each DEFAULT here must match the
+    # column default in models/user.py; existing rows pick it up via the
+    # SQL `DEFAULT` clause. PG's DDL needs the literal in the ALTER
+    # syntax, SQLite is happy either way.
+    #
+    # ⚠ These four moved from 'everyone' to 'contacts' on 2026-08-11.
+    # The clause only covers rows added AFTER the ALTER, so an existing
+    # deployment also needs the one-off backfill in
+    # `tools/backfill_privacy_defaults.py`. A fresh island gets private
+    # defaults straight from here.
+    ("last_seen_visibility", "TEXT DEFAULT 'contacts'"),
     ("gender_visibility", "TEXT DEFAULT 'nobody'"),
-    ("group_invite_policy", "TEXT DEFAULT 'everyone'"),
+    ("group_invite_policy", "TEXT DEFAULT 'contacts'"),
     ("trade_policy", "TEXT DEFAULT 'everyone'"),
-    ("call_policy", "TEXT DEFAULT 'everyone'"),
+    ("call_policy", "TEXT DEFAULT 'contacts'"),
     # Tri-state gate iOS uses to decide whether to send a
     # `.readReceipt` envelope. Enforced client-side only — server
     # mirrors the setting to the owner so Settings can show it.
-    ("read_receipts_visibility", "TEXT DEFAULT 'everyone'"),
+    ("read_receipts_visibility", "TEXT DEFAULT 'contacts'"),
     # Tri-state gate for profile-card fields (name/age/city/etc).
     # Mirrors the other *_visibility columns; default "everyone"
     # keeps existing accounts unchanged.

@@ -133,10 +133,17 @@ class User(Base):
     )
     # Last-seen visibility per ICQ tradition. "everyone" → /users/{uin}/info
     # always returns the timestamp; "contacts" → only callers who have a
-    # mutual contact row see it; "nobody" → never returned. Default
-    # "everyone" for parity with the existing behaviour where last_seen
-    # was always shipped (back when the column was unconditional).
-    last_seen_visibility: Mapped[str] = mapped_column(String(16), default="everyone")
+    # mutual contact row see it; "nobody" → never returned.
+    #
+    # ⚠ Default was "everyone" (parity with the era when last_seen was
+    # unconditional) until 2026-08-11. A prod snapshot then showed 2801 of
+    # 2923 accounts still sitting on it, i.e. the setting existed and nobody
+    # found it. An open last_seen plus an open group roster let any freshly
+    # registered account poll the whole base and derive sleep patterns and
+    # time zones without sending a single message, which is the one signal
+    # that leaks continuously and cannot be end-to-end encrypted because we
+    # are its source. Strangers now get nothing; contacts still see it.
+    last_seen_visibility: Mapped[str] = mapped_column(String(16), default="contacts")
     # Profile-card visibility. Same {"everyone","contacts","nobody"}
     # tri-state. Gates the optional profile fields (first_name,
     # last_name, age, city, country, about, interests, homepage,
@@ -154,11 +161,12 @@ class User(Base):
     # last-seen which has a long ICQ-era history of "default
     # public, can hide".
     gender_visibility: Mapped[str] = mapped_column(String(16), default="nobody")
-    # Group invite policy. Same tri-state. Default "everyone" so
-    # group-invite UX stays unchanged for users who never touch
-    # the setting; users worried about invite spam can flip it
-    # to "contacts" or "nobody".
-    group_invite_policy: Mapped[str] = mapped_column(String(16), default="everyone")
+    # Group invite policy. Same tri-state. Default "contacts" since
+    # 2026-08-11 (was "everyone"): being pulled into a group by a
+    # stranger both delivers unsolicited content and exposes the UIN
+    # to every other member of that group. Invite links still work for
+    # people who are not contacts yet, so the growth path is intact.
+    group_invite_policy: Mapped[str] = mapped_column(String(16), default="contacts")
     # Who can propose a trade to me. Same tri-state as the other
     # privacy controls. "everyone" — any user can send a trade
     # offer; "contacts" — only mutual contacts can; "nobody" —
@@ -167,13 +175,18 @@ class User(Base):
     # spam can dial it down. The setting is enforced server-side
     # in `propose_trade`.
     trade_policy: Mapped[str] = mapped_column(String(16), default="everyone")
-    # Who can call me (voice / video). Same tri-state. "everyone"
-    # / "contacts" both allow calls (the call-signalling path is
-    # gated on the contact graph anyway, so they're effectively
-    # equivalent for now); "nobody" hides every call-affordance
-    # in the caller's UI and refuses incoming WS call_offer
-    # events at the server. Default "everyone".
-    call_policy: Mapped[str] = mapped_column(String(16), default="everyone")
+    # Who can call me (voice / video). Same tri-state. "nobody" hides
+    # every call-affordance in the caller's UI and refuses incoming WS
+    # call_offer events at the server.
+    #
+    # ⚠ This comment used to claim "everyone" and "contacts" were
+    # equivalent because signalling was gated on the contact graph
+    # anyway. That is false: `_caller_allowed` in routers/ws.py returns
+    # True immediately on "everyone", so any stranger holding the number
+    # could ring. That matters more than spam — WebRTC hands the peer
+    # your ICE candidates, i.e. your real IP, and no amount of transport
+    # obfuscation covers it. Default is "contacts" since 2026-08-11.
+    call_policy: Mapped[str] = mapped_column(String(16), default="contacts")
     # Read-receipts visibility — gates whether iOS sends a
     # `.readReceipt` envelope when the user opens a chat. Same tri-
     # state as the other privacy controls. "everyone" → always sent
@@ -182,8 +195,11 @@ class User(Base):
     # the server doesn't see who would have received what (the
     # envelope is sealed-sender), so enforcement is client-side only.
     # The server still ferries the setting back to the owner so
-    # Settings can render the current state.
-    read_receipts_visibility: Mapped[str] = mapped_column(String(16), default="everyone")
+    # Settings can render the current state. Default "contacts" since
+    # 2026-08-11: a read receipt to a stranger confirms "this person is
+    # holding their phone right now", which is the same presence leak as
+    # last_seen, only finer-grained.
+    read_receipts_visibility: Mapped[str] = mapped_column(String(16), default="contacts")
     # (The pre-pivot social-reputation columns were removed here; the
     # 2026-05-27 pivot cut that feature. Existing deployments may still
     # carry unused `reputation`/`reputation_visibility` columns — the ORM
