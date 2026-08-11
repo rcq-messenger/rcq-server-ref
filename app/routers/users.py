@@ -324,7 +324,8 @@ async def search(
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> list[PublicUser]:
-    like = f"%{q.lower()}%"
+    raw = q.strip()
+    like = f"%{raw.lower()}%"
     text_clause = or_(
         User.nickname.ilike(like),
         User.first_name.ilike(like),
@@ -333,8 +334,17 @@ async def search(
         User.country.ilike(like),
         User.interests.ilike(like),
     )
-    if q.isdigit():
-        clause = or_(User.uin == int(q), text_clause)
+    # `#123` is how a UIN is written everywhere in this product — in a bubble
+    # header, in a profile, in a chat. Typing it into search therefore means
+    # THIS number, not "anything containing 123", and it used to mean neither:
+    # the `#` fell through to the text clause, which then matched `%#123%`
+    # against nicknames and cities and found nothing at all.
+    if raw.startswith("#") and raw[1:].isdigit():
+        clause = User.uin == int(raw[1:])
+    elif raw.isdigit():
+        # A bare number still searches both ways: somebody who types 1990 may
+        # want the number or may want it in a nickname, and we cannot tell.
+        clause = or_(User.uin == int(raw), text_clause)
     else:
         clause = text_clause
     # Never include the caller in their own search results — Add-to-contacts on
