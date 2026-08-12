@@ -36,6 +36,7 @@ trade for not blocking legit clients behind the same gateway.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Callable
 
@@ -247,6 +248,46 @@ def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
         )
 
     return _dep
+
+
+# ── websocket connect ceiling ────────────────────────────────────────────
+#
+# The concurrency cap in `connection_manager` handles ACCUMULATION: an account
+# that piles up live sockets loses the oldest. It does nothing about CHURN, and
+# churn is what the storm actually is — measured on prod 12.08, the three worst
+# accounts opened 1198, 641 and 632 sockets in an hour while never holding more
+# than 7-14 at once, because each socket died after about ten seconds and was
+# immediately redialled.
+#
+# The fixed backoff behind that was fixed in every client (Android 0.107, web,
+# desktop 0.3.6, iOS build 109), but a client that never updates keeps dialling
+# forever, and those are most of the traffic. So the island stops paying for
+# them: over the ceiling the handshake is refused before `accept()`, which
+# costs a socket setup instead of an authorised session, a queue drain, a
+# presence fan-out and a boot chain.
+#
+# The number is deliberately far above any real client. A phone on a bad
+# network with working backoff dials a handful of times a minute; three devices
+# reconnecting together stay under ten. Twelve leaves room for a genuinely
+# awful minute and still cuts a storming account by an order of magnitude.
+WS_CONNECTS_PER_MIN = int(os.getenv("RCQ_WS_CONNECTS_PER_MIN", "12"))
+
+
+async def allow_ws_connect(uin: int) -> bool:
+    """May this UIN open another websocket right now?
+
+    Fail-soft on purpose: a Redis hiccup must not lock every user out of the
+    one channel that carries messages, calls and presence. Returns True when
+    the ceiling is not reached, or when we cannot tell.
+    """
+    key = f"wsrate:{uin}"
+    try:
+        redis = await get_redis()
+        result = await redis.eval(_COST_SCRIPT, 1, key, 1, WS_CONNECTS_PER_MIN, 60)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[ws_rate] redis unavailable, allowing: %s", exc)
+        return True
+    return int(result[0]) == 1
 
 
 async def reset_buckets() -> None:
