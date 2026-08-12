@@ -219,6 +219,33 @@ return 1
 _CALL_REGISTRATION_STALE_S = 2 * 60 * 60
 
 
+# call_id -> (answerer_uin, monotonic time the answer was relayed). Per worker,
+# which is fine: both ends of one call are handled by whichever worker holds
+# each socket, and the only thing this gates is a sub-second delay.
+_answered_at: dict[str, tuple[int, float]] = {}
+
+# How long after the answer the answerer's candidates are held back. Long
+# enough for an old client to finish applying the answer, short enough to be
+# invisible: ICE gathering itself takes longer than this.
+_ANSWER_ICE_GRACE_S = 0.6
+
+
+async def _wait_out_answer_grace(call_id: str, sender_uin: int) -> None:
+    """Delay this candidate if it is the answerer's and the answer just went.
+
+    Only the ANSWERER is held. The caller's candidates are safe: the answering
+    side has had a remote description since it processed the offer, so nothing
+    it receives is ever dropped for want of one."""
+    rec = _answered_at.get(call_id)
+    if rec is None or rec[0] != sender_uin:
+        return
+    waited = time.monotonic() - rec[1]
+    if waited >= _ANSWER_ICE_GRACE_S:
+        _answered_at.pop(call_id, None)   # window is over; stop paying for lookups
+        return
+    await asyncio.sleep(_ANSWER_ICE_GRACE_S - waited)
+
+
 async def _register_call(call_id: str, a: int, b: int) -> bool:
     """Atomic check-and-set for `call_offer`. Returns True if both ends
     were free and we registered the pair, False if either side was busy
@@ -649,7 +676,34 @@ async def _handle_client_message(
         for key in ("call_id", "sdp", "candidate", "media", "reason"):
             if key in msg:
                 relay[key] = msg[key]
+
+        # ⚠⚠ Hold the answerer's ICE for a moment after their answer.
+        #
+        # Clients up to 0.107 throw away every remote candidate that reaches
+        # them before their peer connection has a remote description, and on
+        # the CALLER that description only exists once `call_answer` has been
+        # received AND applied — which happens asynchronously, a beat after the
+        # message lands. The answering side ships its candidates immediately
+        # after its answer, straight into that window, so the caller ends up
+        # with no remote candidates at all: it sends no connectivity checks,
+        # answers none, and the call dies with the screen saying "Connecting…".
+        #
+        # The relay log shows exactly this shape on real users — one side
+        # sending 200 packets, the other 6 — while a patched build on the same
+        # relay carries 74KB each way.
+        #
+        # 0.108 fixed the clients, but a fix nobody has installed is not a fix,
+        # so the island buys them the beat they need. Cheap, bounded, and
+        # harmless to a correct client: trickle ICE is allowed to be late.
+        if kind == "call_ice":
+            await _wait_out_answer_grace(call_id, uin)
+
         delivered = await manager.send(target, relay)
+
+        # Start the grace the moment an answer is on its way, not when the next
+        # candidate shows up — by then the race is already lost.
+        if kind == "call_answer":
+            _answered_at[call_id] = (uin, time.monotonic())
 
         # Bind the call to the device that answered. `call_offer` is delivered
         # to every device of the callee on purpose — all of them should ring —
@@ -675,6 +729,7 @@ async def _handle_client_message(
         # Done after the relay so the remote peer sees the end first; the
         # server-side bookkeeping then matches what both clients now think.
         if kind == "call_end":
+            _answered_at.pop(call_id, None)
             await _clear_call(call_id, uin, target)
 
         # If the recipient is offline AND this is the call_offer (the only
