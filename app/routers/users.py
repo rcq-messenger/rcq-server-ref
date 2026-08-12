@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.contact import Contact
+from app.models.group import GroupMember
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
@@ -132,6 +133,7 @@ class PublicUser(BaseModel):
         u: User,
         viewer_uin: int,
         is_contact: bool,
+        shares_group: bool = False,
     ) -> "PublicUser":
         last_seen = _last_seen_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
         gender = _gender_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
@@ -147,7 +149,14 @@ class PublicUser(BaseModel):
         # A picture is not part of the profile card gate: it follows the
         # relationship, not the "who may see my details" setting. Strangers get
         # nothing here regardless of how open the rest of the profile is.
-        avatar_ok = owner_self or is_contact
+        #
+        # Sharing a group IS such a relationship, and the server already acts on
+        # it: `GroupMemberOut` hands the picture to co-members. Leaving it out
+        # here made the two disagree about the same person — their avatar in the
+        # member list, a blank flower on their profile one tap away. Reported
+        # from the desktop, but it was never a client bug: every client asks
+        # this endpoint and every client showed the same hole.
+        avatar_ok = owner_self or is_contact or shares_group
         return cls(
             uin=u.uin,
             nickname=u.nickname,
@@ -380,6 +389,7 @@ async def info(
     is_contact: bool
     if me == user.uin:
         is_contact = False  # field not used in owner-self path
+        shares_group = False
     else:
         is_contact = (
             await db.scalar(
@@ -388,8 +398,20 @@ async def info(
                 )
             )
         ) is not None
+        shares_group = (
+            await db.scalar(
+                select(GroupMember.id)
+                .where(GroupMember.uin == user.uin)
+                .where(
+                    GroupMember.group_id.in_(
+                        select(GroupMember.group_id).where(GroupMember.uin == me)
+                    )
+                )
+                .limit(1)
+            )
+        ) is not None
     return PublicUser.from_model_for_viewer(
-        user, viewer_uin=me, is_contact=is_contact,
+        user, viewer_uin=me, is_contact=is_contact, shares_group=shares_group,
     )
 
 

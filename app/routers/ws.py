@@ -643,6 +643,23 @@ async def _handle_client_message(
                         "call_id": call_id,
                     },
                 )
+            else:
+                # They can be woken, but they are not there right now: the offer
+                # left as a push, and nothing is ringing on the other side until
+                # that push lands and raises a screen. The caller meanwhile hears
+                # a ringback, which is a promise the server has no basis for —
+                # "гудки идут, когда собеседник офлайн, которых быть не должно"
+                # (#463). So say what actually happened and let the caller's UI
+                # stop pretending. Additive like `call_unreachable`: a client
+                # that does not know this event keeps the old behaviour.
+                await manager.send(
+                    uin,
+                    {
+                        "type": "call_offline",
+                        "from_uin": target,
+                        "call_id": call_id,
+                    },
+                )
 
         # call_end fallback. If the recipient's WS wasn't connected
         # (their device just woke from the offer push but hasn't
