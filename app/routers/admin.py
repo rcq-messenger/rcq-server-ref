@@ -784,7 +784,54 @@ async def instrument_panel(minutes: int = Query(60, ge=5, le=60)) -> dict:
     in_use, ceiling = _pool_gauge()
     snap["pool"] = {"in_use": in_use, "ceiling": ceiling}
     snap["workers_note"] = "per-process; multiple uvicorn workers each keep their own"
+    # ⚠ Unlike everything above, calls are ISLAND-WIDE and survive a deploy:
+    # they live in Redis, not in this process. They are here because both
+    # numbers were invisible until 2026-08-12, when calls stopped working for
+    # everyone and it took a day to find out why — see the field notes on each.
+    snap["calls"] = await _call_health()
     return snap
+
+
+async def _call_health() -> dict:
+    """Two things that silently break calls, neither of which shows up
+    anywhere else.
+
+    `stuck` — active-call registrations older than a call could plausibly be.
+    Nothing expires that hash: it is cleared by call_end or by the socket-close
+    handler, so a worker that dies mid-call leaves its two participants marked
+    busy for ever, and every call they try afterwards is refused instantly with
+    "busy". Fifteen such entries were found on prod, two of them real accounts
+    stuck since June.
+
+    `relay_ports` — how much of the TURN media-port range is spoken for. Every
+    call here is relay-only by default, so it costs two allocations plus a
+    probe, and coturn holds each for ten minutes. The range had been
+    hand-narrowed to 49 ports, i.e. about a dozen concurrent calls for the whole
+    service; past that the client gathers no candidates at all and the call dies
+    on its connect timeout with nothing logged anywhere.
+    """
+    from app.routers.ws import _CALLS_KEY, _CALL_REGISTRATION_STALE_S, _get_redis
+
+    out: dict = {"active": 0, "stuck": 0, "stale_after_s": _CALL_REGISTRATION_STALE_S}
+    try:
+        redis = await _get_redis()
+        entries = await redis.hgetall(_CALLS_KEY)
+    except Exception:  # noqa: BLE001 — a panel must never be the thing that breaks
+        out["error"] = "redis unavailable"
+        return out
+    now = int(_time.time())
+    for raw in (entries or {}).values():
+        parts = str(raw).split("|")
+        started = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
+        # No timestamp means it predates the field, which means it predates the
+        # last deploy, which means it is not a live call.
+        if started is None or (now - started) > _CALL_REGISTRATION_STALE_S:
+            out["stuck"] += 1
+        else:
+            out["active"] += 1
+    # Registrations are per participant; a call holds two.
+    out["active_calls"] = out["active"] // 2
+    return out
 
 
 @router.get("/stats", response_model=StatsOut)

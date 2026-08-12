@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -102,15 +103,31 @@ async def evict_from_audio_room(room_id: int, uin: int) -> set[int]:
     return {int(m) for m in remaining if isinstance(m, str) and m.isdigit()}
 
 
+def _call_entry_is_live(entry_raw: str | None) -> bool:
+    """Is this `calls:active` value a call in progress, or a leak?
+
+    ⚠ Presence of the field is NOT the answer. Nothing expires this hash; it
+    is cleared by call_end or by the socket-close handler, and neither runs
+    when the worker holding the socket dies. Anyone left behind is busy for
+    ever. Anything past [_CALL_REGISTRATION_STALE_S], or written before the
+    timestamp field existed, is treated as gone."""
+    if not entry_raw:
+        return False
+    parts = str(entry_raw).split("|")
+    if len(parts) < 3 or not parts[2].isdigit():
+        return False
+    return (int(time.time()) - int(parts[2])) <= _CALL_REGISTRATION_STALE_S
+
+
 async def _is_busy(uin: int) -> bool:
     """True if the UIN is mid-call OR in an audio room — both block each
     other under the single-busy assumption."""
     redis = await _get_redis()
     pipe = redis.pipeline(transaction=False)
-    pipe.hexists(_CALLS_KEY, str(uin))
+    pipe.hget(_CALLS_KEY, str(uin))
     pipe.hexists(_ROOM_USER_PIN_KEY, str(uin))
-    in_call, in_room = await pipe.execute()
-    return bool(in_call) or bool(in_room)
+    call_entry, in_room = await pipe.execute()
+    return _call_entry_is_live(call_entry) or bool(in_room)
 
 
 async def _room_entry_busy_state(uin: int, target_room_id: int) -> tuple[bool, int | None]:
@@ -134,9 +151,10 @@ async def _room_entry_busy_state(uin: int, target_room_id: int) -> tuple[bool, i
     the prior state if needed."""
     redis = await _get_redis()
     pipe = redis.pipeline(transaction=False)
-    pipe.hexists(_CALLS_KEY, str(uin))
+    pipe.hget(_CALLS_KEY, str(uin))
     pipe.hget(_ROOM_USER_PIN_KEY, str(uin))
-    in_call, pinned_raw = await pipe.execute()
+    call_entry, pinned_raw = await pipe.execute()
+    in_call = _call_entry_is_live(call_entry)
     pinned_room: int | None = None
     if pinned_raw is not None and str(pinned_raw).isdigit():
         pinned_room = int(pinned_raw)
@@ -157,6 +175,32 @@ local a = ARGV[1]
 local b = ARGV[2]
 local payload_a = ARGV[3]
 local payload_b = ARGV[4]
+local now = tonumber(ARGV[5])
+local stale_after = tonumber(ARGV[6])
+
+-- An entry older than `stale_after` is not a call, it is a leak: the only
+-- thing that clears this hash is call_end or the socket-close handler, and
+-- neither runs if the worker holding that socket dies. Whoever it belonged
+-- to could then never place or receive a call again, for ever, with nothing
+-- in any log to say why. Found on prod 2026-08-12: fifteen entries, two of
+-- them real accounts stuck since June.
+local function free_if_stale(uin)
+    local entry = redis.call('HGET', calls, uin)
+    if entry == false then return end
+    -- ⚠ Anchor on the WHOLE shape, `call_id|peer|ts`. Matching just a trailing
+    -- number reads the PEER UIN of a two-field legacy entry as a timestamp,
+    -- and a uin-sized number is a date in the far future, so the entry looks
+    -- eternally fresh and never gets freed — the opposite of the point.
+    local ts = string.match(entry, '^[^|]*|%d+|(%d+)$')
+    -- No timestamp at all: written by a build from before this field existed,
+    -- so it is older than this deploy and cannot be a live call.
+    if ts == nil or (now - tonumber(ts)) > stale_after then
+        redis.call('HDEL', calls, uin)
+    end
+end
+
+free_if_stale(a)
+free_if_stale(b)
 
 if redis.call('HEXISTS', calls, a) == 1 then return 0 end
 if redis.call('HEXISTS', calls, b) == 1 then return 0 end
@@ -168,6 +212,12 @@ redis.call('HSET', calls, b, payload_b)
 return 1
 """
 
+# How long a call registration may sit before it is assumed leaked. Generous:
+# clearing it early costs only the single-busy guarantee for an unusually long
+# call (a third caller rings instead of being auto-declined), while clearing it
+# too late costs someone their calls entirely.
+_CALL_REGISTRATION_STALE_S = 2 * 60 * 60
+
 
 async def _register_call(call_id: str, a: int, b: int) -> bool:
     """Atomic check-and-set for `call_offer`. Returns True if both ends
@@ -175,11 +225,16 @@ async def _register_call(call_id: str, a: int, b: int) -> bool:
     on a 1:1 call OR in an audio room. Cluster-wide via the Lua script
     so two workers can't both succeed."""
     redis = await _get_redis()
-    payload_a = f"{call_id}|{b}"
-    payload_b = f"{call_id}|{a}"
+    now = int(time.time())
+    # `call_id|peer|started_at`. The timestamp is what lets a leaked entry be
+    # recognised as leaked; readers must tolerate its absence, since entries
+    # written by older workers during a rolling restart carry only two fields.
+    payload_a = f"{call_id}|{b}|{now}"
+    payload_b = f"{call_id}|{a}|{now}"
     result = await redis.eval(
         _REGISTER_CALL_LUA, 2, _CALLS_KEY, _ROOM_USER_PIN_KEY,
         str(a), str(b), payload_a, payload_b,
+        str(now), str(_CALL_REGISTRATION_STALE_S),
     )
     return bool(result)
 
@@ -443,9 +498,14 @@ async def _debounced_offline(uin: int) -> None:
             entry_raw = await redis.hget(_CALLS_KEY, str(uin))
             if entry_raw is not None:
                 try:
-                    call_id, peer_str = entry_raw.split("|", 1)
-                    peer = int(peer_str)
-                except (ValueError, AttributeError):
+                    # `call_id|peer` from an older worker, `call_id|peer|ts`
+                    # from this one. Splitting on a fixed count would make the
+                    # timestamp part of the peer and throw, and throwing here
+                    # means NOT clearing the registration — the exact leak the
+                    # timestamp was added to stop.
+                    parts = entry_raw.split("|")
+                    call_id, peer = parts[0], int(parts[1])
+                except (ValueError, AttributeError, IndexError):
                     call_id, peer = "", 0
                 if call_id:
                     await _clear_call(call_id, uin, peer)
