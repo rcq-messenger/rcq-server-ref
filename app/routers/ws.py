@@ -7,6 +7,7 @@ from sqlalchemy import select, update
 
 from app.core import metrics
 from app.core.db import SessionLocal
+from app.core.rate_limit import allow_ws_connect
 from app.core.security import authorize_session, decode_device_id
 from app.models.contact import Contact
 from app.models.device_token import DeviceToken
@@ -271,6 +272,25 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
     device_id = decode_device_id(token)
     if token_uin != uin:
         await ws.close(code=4403)
+        return
+
+    # Connect ceiling, checked BEFORE accept() so an account in a redial loop
+    # costs a refused handshake instead of a session: no queue drain, no
+    # presence fan-out, no boot chain behind it.
+    #
+    # ⚠ The concurrency cap in connection_manager does not cover this. Measured
+    # on prod 12.08: the worst account opened 1198 sockets in an hour while
+    # never holding more than 12 at once, because each died after ten seconds
+    # and was redialled immediately. Accumulation and churn are two different
+    # failures and need two different guards.
+    #
+    # Like the 4408/4401 codes above, this one does not reach the peer — the
+    # close happens pre-accept, so the client sees an HTTP error and its own
+    # backoff decides what happens next. That is the point: for a client too
+    # old to have the backoff fix, this at least makes its loop cheap for us.
+    if not await allow_ws_connect(uin):
+        metrics.record_socket_refused()
+        await ws.close(code=4429)
         return
 
     await manager.connect(uin, ws, device_id)

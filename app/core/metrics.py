@@ -55,6 +55,7 @@ class Bucket:
     boot_chains_by_uin: dict[int, int] = field(default_factory=lambda: defaultdict(int))
     sockets_opened: int = 0
     sockets_closed: int = 0
+    sockets_refused: int = 0
     # Sampled once per request rather than averaged: pool saturation is a
     # high-water mark question ("did we run out"), not an average one.
     pool_peak_in_use: int = 0
@@ -123,6 +124,14 @@ def record_socket(opened: bool) -> None:
         b.sockets_closed += 1
 
 
+def record_socket_refused() -> None:
+    """A dial turned away by the per-account connect ceiling. Counted apart
+    from opens and closes: a refusal is not a session that ended, it is one
+    that never started, and mixing them would hide whether the ceiling is
+    doing anything."""
+    _bucket().sockets_refused += 1
+
+
 def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
     """The last `minutes` of buckets, oldest first, plus a per-path roll-up."""
     m = _now_minute()
@@ -134,7 +143,7 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
         if b is None:
             series.append({
                 "minute": minute, "requests": 0, "errors": 0, "accounts": 0,
-                "boot_chains": 0, "sockets_opened": 0, "sockets_closed": 0,
+                "boot_chains": 0, "sockets_opened": 0, "sockets_closed": 0, "sockets_refused": 0,
                 "pool_peak_in_use": 0, "pool_at_ceiling": 0, "busiest_account_chains": 0,
             })
             continue
@@ -146,6 +155,7 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
             "boot_chains": b.boot_chains,
             "sockets_opened": b.sockets_opened,
             "sockets_closed": b.sockets_closed,
+            "sockets_refused": b.sockets_refused,
             "pool_peak_in_use": b.pool_peak_in_use,
             "pool_at_ceiling": b.pool_at_ceiling,
             # The single busiest account's chain count, unnamed. A healthy
