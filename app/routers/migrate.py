@@ -99,6 +99,14 @@ async def _perform_migration(
         interests=user.interests,
         homepage=user.homepage,
         status_message=user.status_message,
+        # The picture is part of the profile that "moves with you" — the shop
+        # says so in as many words ("Contacts, groups, profile and chat history
+        # come with you either way"). It was the one profile field the copy
+        # forgot, so moving onto a shorter number silently left the avatar
+        # behind: the blob and its key stay on the island, and the new row
+        # pointed at neither. Same media id, same key — nothing is re-uploaded.
+        avatar_media_id=user.avatar_media_id,
+        avatar_media_key=user.avatar_media_key,
         status="offline",
         # Suspension follows the PERSON. Without this, migrating minted a
         # clean account and a ban lasted exactly as long as it took the
@@ -111,6 +119,29 @@ async def _perform_migration(
         call_policy=user.call_policy,
         read_receipts_visibility=user.read_receipts_visibility,
         push_preferences=user.push_preferences,
+        # Everything below describes the PERSON, not the number they answered
+        # as, so it follows them across. Dropping it was never a decision:
+        #   * trade_policy — whether they accept UIN trade offers at all.
+        #   * presence_* — the "stay visible for N minutes" setting. Losing it
+        #     reset a privacy choice to the default without saying so.
+        #   * active_days / last_active_day — the activity streak the Hall of
+        #     Fame and the stats page read.
+        #   * hof_* — their standing on the wall, including the founder's own
+        #     approval. Without this a moved number quietly disappeared from
+        #     the Hall of Fame and had to be approved a second time.
+        # `last_seen` and `created_at` are deliberately NOT copied: they are
+        # facts about this row, and created_at is when this number began.
+        trade_policy=user.trade_policy,
+        presence_persistent=user.presence_persistent,
+        presence_ttl_minutes=user.presence_ttl_minutes,
+        active_days=user.active_days,
+        last_active_day=user.last_active_day,
+        hof_opt_in=user.hof_opt_in,
+        hof_approved=user.hof_approved,
+        hof_avatar=user.hof_avatar,
+        hof_tier=user.hof_tier,
+        hof_bonus_reports=user.hof_bonus_reports,
+        hof_bonus_confirmed=user.hof_bonus_confirmed,
     )
     db.add(new_user)
     try:

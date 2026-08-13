@@ -335,13 +335,30 @@ async def search(
 ) -> list[PublicUser]:
     raw = q.strip()
     like = f"%{raw.lower()}%"
+    # Search matches a NAME or a number, which is what the clients promise in
+    # the field's own label ("name, UIN or group"). It used to also match city,
+    # country and interests, and that was wrong twice over (#518):
+    #
+    #  * It broke the promise. Typing `av` returned somebody whose only `av` is
+    #    in "Moscow avenue", with nothing on the row to explain why they are in
+    #    the list.
+    #  * Worse, it matched fields the SAME request then refuses to return.
+    #    `PublicUser.from_model` blanks every optional field for a user whose
+    #    profile is not "everyone", so a hidden profile still answered questions
+    #    about itself through the result set: type a guess, see whether they
+    #    appear. "У него скрыта информация о себе? Если скрыта, то почему по ней
+    #    ищет и выдаёт?" — exactly right, and it applied to the real name too.
+    #
+    # So: nickname always (it is identity, never hidden, and it is the "name"
+    # people search by), first/last name only while the profile is public.
+    profile_public = or_(
+        User.profile_visibility.is_(None),
+        User.profile_visibility == "everyone",
+    )
     text_clause = or_(
         User.nickname.ilike(like),
-        User.first_name.ilike(like),
-        User.last_name.ilike(like),
-        User.city.ilike(like),
-        User.country.ilike(like),
-        User.interests.ilike(like),
+        and_(profile_public, User.first_name.ilike(like)),
+        and_(profile_public, User.last_name.ilike(like)),
     )
     # `#123` is how a UIN is written everywhere in this product — in a bubble
     # header, in a profile, in a chat. Typing it into search therefore means
@@ -358,9 +375,16 @@ async def search(
         clause = text_clause
     # Never include the caller in their own search results — Add-to-contacts on
     # self would 400, and "find people" silently shouldn't list me anyway.
+    # Suspended accounts stay out of the directory. models/user.py has claimed
+    # "their /users/search results are filtered out" since the flag was added;
+    # this is the line that makes the claim true.
     rows = (
         await db.execute(
-            select(User).where(clause).where(User.uin != me).limit(limit)
+            select(User)
+            .where(clause)
+            .where(User.uin != me)
+            .where(User.is_suspended.is_(False))
+            .limit(limit)
         )
     ).scalars().all()
     return [PublicUser.from_model(u) for u in rows]
