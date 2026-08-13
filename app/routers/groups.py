@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -40,7 +40,7 @@ from app.core.rate_limit import rate_limit
 from app.core.security import current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.contact import Contact
-from app.models.group import Group, GroupMember, GroupMessageView
+from app.models.group import Group, GroupMember, GroupMessageView, OfflineGroupMessage
 from app.models.user import User
 from app.services.connection_manager import manager
 
@@ -872,6 +872,27 @@ async def remove_member(
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not in group")
     await db.delete(target)
+    # And drop whatever of this group is still QUEUED for them (#529).
+    #
+    # Leaving a group used to leave its undelivered backlog in place, and the
+    # backlog is what the client turns into notifications when it drains. A
+    # fresh install gets a fresh device id, a fresh device has no cursor, and a
+    # cursorless device drains from the beginning — so the reporter left RCQ
+    # Beta, reinstalled clean, and was met by 460 queued messages replayed as
+    # notifications: "уже удалился из этой группы, переустановил приложение
+    # начисто — и всё равно они лезут и лезут".
+    #
+    # They cannot read these anyway once the senders rotate their chain, and a
+    # message addressed to a membership that no longer exists is not owed to
+    # anyone. The rows for members who STAY are untouched.
+    await db.execute(
+        delete(OfflineGroupMessage).where(
+            and_(
+                OfflineGroupMessage.group_id == group_id,
+                OfflineGroupMessage.to_uin == member_uin,
+            )
+        )
+    )
     await db.commit()
 
     # If the owner leaves and group still has members, hand the crown to the oldest one.
