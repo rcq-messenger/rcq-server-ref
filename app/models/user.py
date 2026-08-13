@@ -9,7 +9,16 @@ from app.core.db import Base
 class User(Base):
     __tablename__ = "users"
 
-    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # ⚠⚠ autoincrement=False is load-bearing, not tidiness. An integer primary
+    # key without it becomes a BIGSERIAL in `create_all`, and the flagship's
+    # `users.uin` really did: it carries DEFAULT nextval('users_uin_seq') to
+    # this day. Every code path supplies the uin itself, so the sequence sat
+    # untouched at 1 — until a hand-written INSERT omitted the column and
+    # Postgres helpfully handed out number 2. That account (nickname "x", a
+    # one-character identity key) is why UIN 2 is taken. The next such insert
+    # would mint 3, then 4: the scarcest numbers on the island, given away by
+    # a typo rather than chosen by anyone.
+    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     nickname: Mapped[str] = mapped_column(String(64), index=True)
     # Long-term X25519 public key for ECDH (32-byte raw, base64). Used as the
     # recipient half of every per-message ephemeral key agreement.

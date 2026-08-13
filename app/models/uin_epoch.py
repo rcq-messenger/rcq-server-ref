@@ -33,5 +33,7 @@ class UinEpoch(Base):
 
     __tablename__ = "uin_epochs"
 
-    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # See the note in models/user.py: an integer PK without this becomes a
+    # BIGSERIAL, and a forgotten column then mints a trophy number silently.
+    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -27,7 +27,9 @@ class HomeIslandRecord(Base):
     # Local handle on THIS island. Not a global identity (there is none); the
     # identity lives inside `doc` as `ik`. No FK to users.uin so a self-host
     # island can serve records without coupling to the user table's lifecycle.
-    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # See the note in models/user.py: an integer PK without this becomes a
+    # BIGSERIAL, and a forgotten column then mints a trophy number silently.
+    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     # The full §2.3 served object verbatim, as the client signed it. Stored as
     # text (not parsed JSON) so the canonical bytes the client signed are never
     # mutated by a JSON round-trip on the server.

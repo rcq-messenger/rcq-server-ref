@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 from datetime import datetime, timezone
@@ -66,6 +67,33 @@ def _founder_beta_group_id() -> int:
         return 0
 
 
+def _pubkey32(value: str, field: str) -> str:
+    """A public key must actually be one: base64 of exactly 32 bytes.
+
+    ⚠ This was unvalidated, and it showed. An account exists on the flagship
+    holding UIN 2 whose identity_key is the single character "x" — registered
+    by hand on 2026-06-15, never used since, and unusable by construction: no
+    sender can derive a key to it, so it can never receive a message. It is a
+    dead squat on the most valuable number on the island, and the only thing
+    that made it possible was that `identity_key: str` accepted anything.
+
+    Padded (44 chars) and unpadded (43) base64 both appear in the live table
+    and both decode to 32 bytes, so the test is the decoded LENGTH, not the
+    string length.
+    """
+    raw = value.strip()
+    try:
+        decoded = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True)
+    except Exception:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{field} is not base64")
+    if len(decoded) != 32:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{field} must be 32 bytes, got {len(decoded)}",
+        )
+    return raw
+
+
 class RegisterIn(BaseModel):
     nickname: str = Field(min_length=1, max_length=64)
     # Long-term X25519 ECDH public key (raw 32-byte, base64). Used by senders
@@ -106,9 +134,15 @@ class SessionOut(BaseModel):
     response_model=RegisterOut,
     status_code=status.HTTP_201_CREATED,
     # Registration is unauthenticated and mints an identity, so it is the one
-    # endpoint an attacker can call for free in a loop. This limiter is
-    # DEFENCE IN DEPTH only — the actual vanity-UIN hole is closed by the
-    # UIN_MIN/UIN_MAX clamp on `desired_uin` below, not here.
+    # endpoint an attacker can call for free in a loop.
+    #
+    # ⚠ This comment used to claim the vanity-UIN hole was "closed by the
+    # UIN_MIN/UIN_MAX clamp on `desired_uin` below". There is no UIN_MIN in
+    # that check and there deliberately never was — see the note beside it.
+    # `desired_uin` accepts ANY free number up to UIN_MAX, including the one
+    # and two digit ones the shop refuses to sell, and somebody took UIN 2 that
+    # way on 2026-06-15. This limiter is the only thing bounding how MANY, and
+    # it bounds nothing about WHICH.
     #
     # Deliberately loose (and keyed by IP, since there is no UIN yet): mobile
     # carriers across the CIS put many subscribers behind one CGNAT address,
@@ -119,6 +153,12 @@ class SessionOut(BaseModel):
     dependencies=[Depends(rate_limit("auth_register", 20, 3600))],
 )
 async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
+    # An account whose keys are not keys is not an account: nobody can seal to
+    # it and nothing it signs verifies. Checked before anything is minted, so a
+    # junk registration cannot claim a UIN on its way to failing.
+    identity_key = _pubkey32(body.identity_key, "identity_key")
+    signing_key = _pubkey32(body.signing_key, "signing_key")
+
     # Invite gate (default-open servers skip this entirely). Validate + consume
     # one use ATOMICALLY: a single UPDATE that only matches an unexpired,
     # not-exhausted code locks the row, so two simultaneous registrations can't
@@ -196,8 +236,8 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     user = User(
         uin=uin,
         nickname=body.nickname,
-        identity_key=body.identity_key,
-        signing_key=body.signing_key,
+        identity_key=identity_key,
+        signing_key=signing_key,
     )
     db.add(user)
     await db.commit()
