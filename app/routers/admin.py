@@ -237,6 +237,11 @@ class StatsOut(BaseModel):
     # (additive default so older admin SPAs keep parsing).
     open_reports: int
     open_crashes: int = 0
+    # The human queue split the way the console shows it: complaints about a
+    # person vs bugs filed about the island. Additive defaults so an older SPA
+    # (and the self-host console) keeps parsing this response.
+    open_abuse: int = 0
+    open_bugs: int = 0
     # Organisations waiting for an answer on /organizations. The sidebar had a
     # badge for reports and for crashes and none for the one queue where the
     # person on the other end is trying to give us money.
@@ -252,6 +257,15 @@ class StatsOut(BaseModel):
 # clutter human triage, so the admin UI splits them into their own tab.
 CRASH_MARKER = "[CRASH]"
 
+# What separates "a user told us about a bug" from "a user complained about
+# somebody". Every client sends context="bug_bounty" on the bug-report form;
+# an abuse report carries the surface it was filed from ("contact", "hood",
+# "group:<id>", …) or, for the oldest rows, nothing at all. A row with no
+# context is therefore NOT a bug report, and the negation spells that out
+# rather than letting SQL's NULL comparison drop it from both lists.
+_IS_BUG = Report.context == "bug_bounty"
+_IS_NOT_BUG = or_(Report.context.is_(None), Report.context != "bug_bounty")
+
 
 @router.get("/reports", response_model=ReportsListOut)
 async def list_reports(
@@ -261,14 +275,35 @@ async def list_reports(
     db: AsyncSession = Depends(get_db),
 ) -> ReportsListOut:
     """`status` accepts: open | resolved | dismissed | duplicate | all.
-    `kind` accepts: all | crash (auto crash reports) | user (everything else)."""
+
+    `kind` accepts:
+      all   — everything
+      crash — auto-submitted crash dumps ([CRASH] in `reason`)
+      bug   — bug reports a user filed about the island itself
+      abuse — a complaint ABOUT somebody: a user or one of their messages
+      user  — legacy: bug + abuse together (what the old SPA asks for)
+
+    bug and abuse are the same queue split by `context`, and they are three
+    different jobs: an abuse report is triaged by deciding what happens to the
+    reported account, a bug report by deciding whether it is a bug. Mixed in one
+    list they read as one queue with the wrong buttons on two thirds of it."""
     query = select(Report).order_by(desc(Report.created_at)).limit(limit)
     if status_filter != "all":
         query = query.where(Report.status == status_filter)
+    # Crash first: a crash row also carries context="bug_bounty", so the marker
+    # has to be tested before the context is.
     if kind == "crash":
         query = query.where(Report.reason.contains(CRASH_MARKER))
+    elif kind == "bug":
+        query = query.where(~Report.reason.contains(CRASH_MARKER), _IS_BUG)
+    elif kind == "abuse":
+        query = query.where(~Report.reason.contains(CRASH_MARKER), _IS_NOT_BUG)
     elif kind == "user":
         query = query.where(~Report.reason.contains(CRASH_MARKER))
+    elif kind != "all":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"unknown kind: {kind}"
+        )
     rows = (await db.execute(query)).scalars().all()
 
     uins: set[int] = set()
@@ -862,6 +897,20 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
     open_reports = (await db.scalar(
         select(func.count(Report.id)).where(Report.status == "open")
     ) or 0) - int(open_crashes)
+    open_bugs = await db.scalar(
+        select(func.count(Report.id)).where(
+            Report.status == "open",
+            ~Report.reason.contains(CRASH_MARKER),
+            _IS_BUG,
+        )
+    ) or 0
+    open_abuse = await db.scalar(
+        select(func.count(Report.id)).where(
+            Report.status == "open",
+            ~Report.reason.contains(CRASH_MARKER),
+            _IS_NOT_BUG,
+        )
+    ) or 0
     resolved_reports_7d = await db.scalar(
         select(func.count(Report.id)).where(
             Report.status != "open", Report.resolved_at >= week_ago
@@ -875,6 +924,8 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
         new_users_7d=int(new_users_7d),
         open_reports=int(open_reports),
         open_crashes=int(open_crashes),
+        open_abuse=int(open_abuse),
+        open_bugs=int(open_bugs),
         open_inquiries=int(open_inquiries),
         resolved_reports_7d=int(resolved_reports_7d),
     )

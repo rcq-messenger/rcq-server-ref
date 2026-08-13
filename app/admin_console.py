@@ -565,12 +565,25 @@ async function loadReports() {
     const r = await api('GET','/reports?status=open&kind=user');
     $('reports').innerHTML = (r.items||[]).map(rp=>`<tr>
       <td>${rp.id}</td>
-      <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+rp.target_nickname+')</span>':''}</td>
-      <td>${(rp.reason||'').slice(0,120)}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${rp.context||'—'}</span></td>
-      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> <button class="btn danger sm" onclick="resolve(${rp.id},true)">Ban</button></td>
+      <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+esc(rp.target_nickname)+')</span>':''}</td>
+      <td>${esc((rp.reason||'').slice(0,120))}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${esc(contextLabel(rp.context))}</span></td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> ${isAbuse(rp)?'<button class="btn danger sm" onclick="resolve('+rp.id+',true)">Ban</button>':''}</td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
 }
+/* Ban belongs to a complaint ABOUT somebody. On a bug report — which is what
+   nearly every row in this queue is — there is nobody to ban but the person who
+   took the trouble to tell you something was broken, and the button sat right
+   next to Dismiss. Crash dumps are worse still: the "target" there is whoever's
+   phone crashed. */
+function isAbuse(rp){ return (rp.context||'') !== 'bug_bounty' && !(rp.reason||'').includes('[CRASH]'); }
+/* The wire values are for the code, not for a person reading a queue at 3am.
+   ⚠ Object.create(null): with a plain literal, a report whose context is
+   'constructor' or 'toString' looks the label up on Object.prototype and the
+   queue renders a chunk of JS source. The context comes from a client, so it
+   is whatever a client sends. */
+const CONTEXT_LABELS = Object.assign(Object.create(null), {bug_bounty:'Bug report', contact:'From a chat', hood:'From the Hood', search:'From search', story:'From a story', message:'About a message', user:'About a user', premium_media:'Paid content'});
+function contextLabel(c){ if(!c) return '—'; return CONTEXT_LABELS[c] || (c.startsWith('group:') ? 'In a group' : c); }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
 /* Answer the reporter. The text is stored on the report and the reporter reads
    it back over their own authenticated session; the push we send is only a
