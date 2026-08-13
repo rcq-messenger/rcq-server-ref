@@ -637,6 +637,43 @@ class AckOut(BaseModel):
     deleted: int
 
 
+async def _acked_prefix(
+    db: AsyncSession, model: type, uin: int, base: int, acked: list[int] | None
+) -> int:
+    """How far the cursor may move given the ids a client actually persisted.
+
+    ⚠ This exists because taking `max(acked)` loses messages, permanently, and
+    it did (founder's second account, 2026-08-13).
+
+    The cursor is a single watermark and the drain asks for `id > cursor`, so
+    everything below it is unreachable for good. A client that acks a SUBSET —
+    say the sender-key distributions it could process, but not the group
+    messages interleaved between them — moved the watermark to the highest id
+    in that subset and buried every un-acked row underneath. One account lost
+    532 group messages over nine days that way: they were still on disk, still
+    addressed to it, and no request could ever return them again. It looked to
+    the user like the group simply stopped at a date.
+
+    So the cursor advances over the CONTIGUOUS acked prefix and stops at the
+    first hole. Anything past the hole stays queued and comes back on the next
+    drain, which is exactly what a queue is for.
+    """
+    if not acked:
+        return base
+    acked_set = set(acked)
+    ids = (
+        await db.execute(
+            select(model.id).where(model.to_uin == uin, model.id > base).order_by(model.id.asc())
+        )
+    ).scalars().all()
+    out = base
+    for i in ids:
+        if i not in acked_set:
+            break
+        out = i
+    return out
+
+
 async def _advance_cursor(
     db: AsyncSession, uin: int, device_id: str, max_direct: int, max_group: int
 ) -> int:
@@ -809,8 +846,11 @@ async def ack_queue(
     stale or out-of-order ACK list is harmless (idempotent). Returns rows
     actually reaped by the resulting min-cursor cleanup.
     """
-    max_direct = max(body.direct_ids) if body.direct_ids else 0
-    max_group = max(body.group_ids) if body.group_ids else 0
+    cursor = await db.get(QueueCursor, (uin, device_id))
+    base_direct = cursor.last_direct_id if cursor is not None else 0
+    base_group = cursor.last_group_id if cursor is not None else 0
+    max_direct = await _acked_prefix(db, OfflineMessage, uin, base_direct, body.direct_ids)
+    max_group = await _acked_prefix(db, OfflineGroupMessage, uin, base_group, body.group_ids)
     reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group)
     await db.commit()
     return AckOut(deleted=reaped)
