@@ -405,9 +405,31 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"})
     # Find the account bound to this signing key. Small scan at current scale;
     # add an index on users.signing_key when the table grows.
+    #
+    # ⚠⚠ Ordered by created_at, NOT by uin, and the difference is a hijack.
+    #
+    # A public signing key is public — /users/{uin}/info hands it out. Ordering
+    # by uin let anyone who learned a victim's key register a NEW account
+    # carrying it and simply ASK for a lower number (`desired_uin` has no
+    # floor), after which the victim's own seed phrase recovered the attacker's
+    # empty account instead of theirs, permanently. The attacker never reads a
+    # message — they hold no private key — but the owner loses their way back
+    # in, which for an account with no email and no phone is the whole of it.
+    #
+    # Seven signing keys on the flagship are already shared by more than one
+    # account (one by twelve), so this tie-break is not hypothetical: it decides
+    # real recoveries today. First to claim the key wins, and an attacker cannot
+    # claim it before the owner has published it.
+    #
+    # ⏭ This is a mitigation, not the fix. The fix is to stop accepting a
+    # signing key at registration without proof of the matching private key —
+    # /auth/recover/challenge already has the machinery.
     uin = (
         await db.execute(
-            select(User.uin).where(User.signing_key == sk).order_by(User.uin).limit(1)
+            select(User.uin)
+            .where(User.signing_key == sk)
+            .order_by(User.created_at.asc(), User.uin.asc())
+            .limit(1)
         )
     ).scalar_one_or_none()
     if uin is None:
