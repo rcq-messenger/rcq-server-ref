@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import String, and_, case, cast, delete, false, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -373,6 +373,30 @@ async def search(
         clause = or_(User.uin == int(raw), text_clause)
     else:
         clause = text_clause
+    # ORDER, and it is not a nicety (#524, #525). A single letter matches 123
+    # accounts on this island; `LIMIT 20` with no ORDER BY returns whichever
+    # twenty Postgres happens to reach first, so searching "L" did not find the
+    # user named "Li" while "Li" did — the row was never missing, it was
+    # twenty-first. Founder: "выдавать сначала отсортированных друзей, потом
+    # совпавший полностью номер, потом номера содержащие введённое число,
+    # затем блок по нику, потом блок по имени и фамилии".
+    #
+    # A subquery for "is this person already my contact" rather than a join:
+    # the ordering must not multiply rows, and a contact row that does not
+    # exist must not drop the person from the results.
+    my_contacts = select(Contact.contact_uin).where(Contact.owner_uin == me)
+    exact_uin = int(raw[1:]) if raw.startswith("#") and raw[1:].isdigit() else (
+        int(raw) if raw.isdigit() else None
+    )
+    rank = case(
+        (User.uin == exact_uin, 0) if exact_uin is not None else (false(), 0),
+        (User.uin.in_(my_contacts), 1),
+        (func.lower(User.nickname) == raw.lower(), 2),
+        (User.nickname.ilike(f"{raw.lower()}%"), 3),
+        (cast(User.uin, String).like(f"%{raw}%") if raw.isdigit() else false(), 4),
+        (User.nickname.ilike(like), 5),
+        else_=6,
+    )
     # Never include the caller in their own search results — Add-to-contacts on
     # self would 400, and "find people" silently shouldn't list me anyway.
     # Suspended accounts stay out of the directory. models/user.py has claimed
@@ -384,6 +408,7 @@ async def search(
             .where(clause)
             .where(User.uin != me)
             .where(User.is_suspended.is_(False))
+            .order_by(rank, func.lower(User.nickname), User.uin)
             .limit(limit)
         )
     ).scalars().all()
