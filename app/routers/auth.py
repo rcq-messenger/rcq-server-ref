@@ -37,6 +37,7 @@ from app.routers.groups import (
 )
 from app.routers.referrals import record_referral
 from app.services.connection_manager import manager
+from app.services.queue_drain import account_watermark
 from app.services.uin import allocate_uin
 from app.services.uin_rows import purge_uin_rows
 
@@ -339,11 +340,18 @@ async def claim_device(
     existing = await db.get(QueueCursor, (uin, body.device_id))
     if existing is None:
         old = await db.get(QueueCursor, (uin, old_device_id))
+        if old is not None:
+            floor_direct, floor_group = old.last_direct_id, old.last_group_id
+        else:
+            # No "primary" cursor to inherit: start where this account's
+            # furthest device got to, never at zero, or the upgrade itself would
+            # replay the queue it was written to avoid replaying.
+            floor_direct, floor_group = await account_watermark(db, uin)
         db.add(QueueCursor(
             uin=uin,
             device_id=body.device_id,
-            last_direct_id=old.last_direct_id if old else 0,
-            last_group_id=old.last_group_id if old else 0,
+            last_direct_id=floor_direct,
+            last_group_id=floor_group,
             updated_at=datetime.now(timezone.utc),
         ))
         await db.commit()
