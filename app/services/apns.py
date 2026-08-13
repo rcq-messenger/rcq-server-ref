@@ -21,8 +21,9 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, Sequence
 
 import httpx
 from jose import jwt
@@ -35,6 +36,10 @@ from app.models.device_token import DeviceToken
 from app.models.user import User
 
 log = logging.getLogger(__name__)
+
+# UnifiedPush rows live in the same table under this platform tag. Named here
+# (rather than imported) to keep the two push services free of each other.
+_UP_PLATFORM = "android-up"
 
 
 # Default push-preference values. Applied when a user's
@@ -125,11 +130,23 @@ async def is_group_muted(recipient_uin: int, group_id: int) -> bool:
     return int(group_id) in {int(g) for g in muted}
 
 
+class PushEndpoints(NamedTuple):
+    """One recipient's push endpoints, already read and split by transport.
+
+    Each list is in the shape the owning sender wants, so neither of them has
+    to go back to the database for it.
+    """
+
+    ios: list[tuple[int, str, str | None]]  # (token id, token, device id)
+    android: list[tuple[int, str, str | None, str | None, datetime | None]]
+
+
 async def group_push_targets(
     db: AsyncSession, uins: list[int], group_id: int
-) -> list[int]:
-    """The subset of `uins` worth waking about a post in `group_id`: they have
-    at least one registered push endpoint AND have not silenced this group.
+) -> dict[int, PushEndpoints]:
+    """The members of `uins` worth waking about a post in `group_id` — they
+    have at least one registered push endpoint AND have not silenced this
+    group — mapped to those endpoints, in the caller's order.
 
     Two queries for the whole fan-out, on the CALLER's session. The
     per-recipient path this replaces (`is_group_muted` + the token reads
@@ -139,21 +156,41 @@ async def group_push_targets(
     (PgBouncer, transaction mode). Reading tokens first also means we never
     spawn a delivery task for the majority of members, who have no push
     endpoint registered at all.
+
+    ⚠ The endpoints come back WITH the targets for the same reason. Each
+    delivery task used to open its own short session to read the very rows this
+    query already touched — two more per recipient, on top of the fan-out, all
+    starting at once. Handing them over costs one extra column set here and
+    removes ~2 connections per woken member from the pool's peak.
     """
     if not uins:
-        return []
-    with_tokens = set(
-        (
-            await db.execute(
-                select(DeviceToken.uin).where(DeviceToken.uin.in_(uins)).distinct()
-            )
-        ).scalars().all()
-    )
-    if not with_tokens:
-        return []
+        return {}
+    token_rows = (
+        await db.execute(
+            select(
+                DeviceToken.uin,
+                DeviceToken.id,
+                DeviceToken.token,
+                DeviceToken.platform,
+                DeviceToken.device_id,
+                DeviceToken.push_last_error,
+                DeviceToken.push_last_ok,
+            ).where(DeviceToken.uin.in_(uins))
+        )
+    ).all()
+    if not token_rows:
+        return {}
+    by_uin: dict[int, PushEndpoints] = {}
+    for uin, tid, token, platform, device_id, last_error, last_ok in token_rows:
+        slot = by_uin.setdefault(uin, PushEndpoints(ios=[], android=[]))
+        if platform == "ios":
+            slot.ios.append((tid, token, device_id))
+        elif platform == _UP_PLATFORM:
+            slot.android.append((tid, token, last_error, device_id, last_ok))
+        # Any other platform (e.g. "ios-voip") has its own code path.
     rows = (
         await db.execute(
-            select(User.uin, User.push_preferences).where(User.uin.in_(list(with_tokens)))
+            select(User.uin, User.push_preferences).where(User.uin.in_(list(by_uin)))
         )
     ).all()
     gid = int(group_id)
@@ -164,7 +201,11 @@ async def group_push_targets(
     }
     # Preserve the caller's ordering; a user row missing entirely is treated
     # as unmuted only if it exists (a token without a user is a dead row).
-    return [uin for uin in uins if uin in unmuted]
+    return {
+        uin: by_uin[uin]
+        for uin in uins
+        if uin in unmuted and (by_uin[uin].ios or by_uin[uin].android)
+    }
 
 # JWT cache. Apple's docs say tokens may be reused for up to 1 hour, but they
 # rate-limit if you re-sign too often. Refresh comfortably under the limit.
@@ -363,6 +404,7 @@ async def send_to_user(
     group_name: str | None = None,
     exclude_tokens: frozenset[str] = frozenset(),
     skip_devices: frozenset[str] = frozenset(),
+    tokens: Sequence[tuple[int, str, str | None]] | None = None,
 ) -> int:
     """Regular APNs push to every iOS device of `uin`. Skips VoIP tokens —
     those have a separate code path (`send_voip_to_user`) with a different
@@ -398,19 +440,25 @@ async def send_to_user(
     if not _is_configured():
         log.warning("[apns] send_to_user uin=%s skipped: APNs not configured", uin)
         return 0
-    # Read tokens in a SHORT session, then release the DB connection
+    # `tokens` given: a fan-out already read them for the whole batch (see
+    # `group_push_targets`), and opening a session per recipient here is the
+    # cost that batching exists to remove.
+    #
+    # Otherwise read them in a SHORT session, then release the DB connection
     # BEFORE any APNs network I/O. Holding the connection across the
     # HTTP/2 send is what leaked the pool: a stalled push left the
     # connection `idle in transaction` until the pool starved (→ 500s).
     # Select plain columns so the values survive the closed session.
-    async with SessionLocal() as db:  # type: AsyncSession
-        tokens = (
-            await db.execute(
-                select(DeviceToken.id, DeviceToken.token, DeviceToken.device_id).where(
-                    DeviceToken.uin == uin, DeviceToken.platform == "ios"
+    if tokens is None:
+        async with SessionLocal() as db:  # type: AsyncSession
+            tokens = (
+                await db.execute(
+                    select(DeviceToken.id, DeviceToken.token, DeviceToken.device_id).where(
+                        DeviceToken.uin == uin, DeviceToken.platform == "ios"
+                    )
                 )
-            )
-        ).all()
+            ).all()
+    tokens = list(tokens)
     if exclude_tokens:
         before = len(tokens)
         tokens = [row for row in tokens if row[1] not in exclude_tokens]
