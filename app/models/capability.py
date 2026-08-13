@@ -26,7 +26,9 @@ class UserCapability(Base):
 
     __tablename__ = "user_capabilities"
 
-    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # See the note in models/user.py: an integer PK without this becomes a
+    # BIGSERIAL, and a forgotten column then mints a trophy number silently.
+    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     sender_keys: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
