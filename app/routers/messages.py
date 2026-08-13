@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, insert, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -21,6 +22,7 @@ from app.services.apns import group_push_targets, send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
 from app.services.connection_manager import manager
 from app.services.offline_queue_sweep import dormant_cutoff
+from app.services.queue_drain import account_watermark, drain_floor
 
 log = logging.getLogger(__name__)
 
@@ -675,13 +677,25 @@ async def _acked_prefix(
 
 
 async def _advance_cursor(
-    db: AsyncSession, uin: int, device_id: str, max_direct: int, max_group: int
+    db: AsyncSession, uin: int, device_id: str, max_direct: int, max_group: int,
+    cursor: QueueCursor | None = None,
 ) -> int:
     """Move THIS device's drain cursor forward (never backward), then reap any
-    queued rows now below EVERY device's cursor. Returns rows reaped."""
-    cursor = await db.get(QueueCursor, (uin, device_id))
+    queued rows now below EVERY device's cursor. Returns rows reaped.
+
+    ⚠ A cursor created here starts at this account's watermark, NOT at zero: an
+    axis left at zero would hand this device the whole queue on its next drain
+    (and pin the account's reap floor at zero forever). The caller has already
+    read above that watermark, so seeding it loses nothing.
+    """
     if cursor is None:
-        cursor = QueueCursor(uin=uin, device_id=device_id, last_direct_id=0, last_group_id=0)
+        cursor = await db.get(QueueCursor, (uin, device_id))
+    if cursor is None:
+        floor_direct, floor_group = await account_watermark(db, uin)
+        cursor = QueueCursor(
+            uin=uin, device_id=device_id,
+            last_direct_id=floor_direct, last_group_id=floor_group,
+        )
         db.add(cursor)
     if max_direct > cursor.last_direct_id:
         cursor.last_direct_id = max_direct
@@ -698,6 +712,14 @@ async def _advance_cursor(
 STALE_CURSOR_DAYS = 30
 
 
+def _as_utc(ts: datetime | None) -> datetime | None:
+    """Read a timestamp back as aware UTC. Postgres hands these back aware, but
+    SQLite (the local test harness) drops the zone, and comparing the two raises."""
+    if ts is None or ts.tzinfo is not None:
+        return ts
+    return ts.replace(tzinfo=timezone.utc)
+
+
 async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     """Delete queued rows every one of the user's devices has already drained
     (id <= the minimum cursor across the user's LIVE devices). The TTL sweep is
@@ -712,7 +734,7 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     # ever be cleared by the TTL sweep. A stamp-less row predates the column and
     # is left alone until it next acks (which stamps it).
     cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_CURSOR_DAYS)
-    stale = [c for c in cursors if c.updated_at is not None and c.updated_at < cutoff]
+    stale = [c for c in cursors if _as_utc(c.updated_at) is not None and _as_utc(c.updated_at) < cutoff]
     if stale:
         for c in stale:
             await db.delete(c)
@@ -762,36 +784,40 @@ async def fetch_queue(
     robbed the user's other devices). A row is reaped only once every device's
     cursor has passed it; the TTL sweep backstops abandoned cursors.
     """
-    cursor = await db.get(QueueCursor, (uin, device_id))
-    if cursor is not None:
-        after_direct = cursor.last_direct_id
-        after_group = cursor.last_group_id
-    else:
-        # ⚠ A device we have never seen starts where this account's furthest
-        # device already got to — NOT at zero.
-        #
-        # Reinstalling mints a new device id, so starting at zero replayed the
-        # entire queue: up to the 30-day TTL of history, including messages the
-        # person had deleted on the old install, whose local tombstones died
-        # with it. A tester hit this repeatedly ("ресетнула приложение ... но
-        # при входе продолжает подгружаться переписка, вместе с удалёнными"),
-        # and her account carries eight cursors — eight reinstalls, eight
-        # replays. It reads as the app hoarding history somewhere secret; it is
-        # the island's own queue, handed out again to something it considers a
-        # brand-new device.
-        #
-        # Anything genuinely undelivered sits ABOVE that mark and still arrives,
-        # which is what the queue is for. Anything below it was already
-        # delivered to this account once, and re-delivering it is the bug.
-        furthest = (
-            await db.execute(
-                select(
-                    func.coalesce(func.max(QueueCursor.last_direct_id), 0),
-                    func.coalesce(func.max(QueueCursor.last_group_id), 0),
-                ).where(QueueCursor.uin == uin)
-            )
-        ).one()
-        after_direct, after_group = int(furthest[0]), int(furthest[1])
+    # ⚠ A device we have never seen starts where this account's furthest device
+    # already got to — NOT at zero. See app/services/queue_drain.py.
+    #
+    # Reinstalling mints a new device id, so starting at zero replayed the
+    # entire queue: up to the 30-day TTL of history, including messages the
+    # person had deleted on the old install, whose local tombstones died with
+    # it. A tester hit this repeatedly ("ресетнула приложение ... но при входе
+    # продолжает подгружаться переписка, вместе с удалёнными"), and her account
+    # carries eight cursors — eight reinstalls, eight replays. It reads as the
+    # app hoarding history somewhere secret; it is the island's own queue,
+    # handed out again to something it considers a brand-new device.
+    #
+    # Anything genuinely undelivered sits ABOVE that mark and still arrives,
+    # which is what the queue is for. Anything below it was already delivered to
+    # this account once, and re-delivering it is the bug.
+    after_direct, after_group, cursor = await drain_floor(db, uin, device_id)
+    if cursor is None:
+        # Pin that floor as this device's cursor NOW, before handing rows out.
+        # Leaving it unwritten until the ack lets a sibling device's ack raise
+        # the account watermark in between, and this device would then be
+        # rebased onto the higher mark — burying the very rows it is holding.
+        cursor = QueueCursor(
+            uin=uin, device_id=device_id,
+            last_direct_id=after_direct, last_group_id=after_group,
+            updated_at=datetime.now(timezone.utc),
+        )
+        db.add(cursor)
+        try:
+            await db.commit()
+        except IntegrityError:  # concurrent first drain from the same device
+            await db.rollback()
+            cursor = await db.get(QueueCursor, (uin, device_id))
+            if cursor is not None:
+                after_direct, after_group = cursor.last_direct_id, cursor.last_group_id
 
     rows_1to1 = (
         await db.execute(
@@ -826,7 +852,7 @@ async def fetch_queue(
         # advance this device's cursor past all returned rows.
         max_direct = max((r.id for r in rows_1to1), default=after_direct)
         max_group = max((r.id for r in rows_group), default=after_group)
-        await _advance_cursor(db, uin, device_id, max_direct, max_group)
+        await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
         await db.commit()
     return out
 
@@ -845,12 +871,17 @@ async def ack_queue(
     every device's cursor has passed it. The cursor only moves FORWARD, so a
     stale or out-of-order ACK list is harmless (idempotent). Returns rows
     actually reaped by the resulting min-cursor cleanup.
+
+    ⚠ A device with no cursor bases off the account watermark, NOT zero. Basing
+    at zero was the second half of the replay bug: the fetch above already hands
+    a brand-new device only the rows above that watermark, so the ids it acks
+    never form a contiguous prefix from zero — `_acked_prefix` therefore stopped
+    at the very first row and wrote a cursor of 0, and the device's next drain
+    was the entire queue, as notifications.
     """
-    cursor = await db.get(QueueCursor, (uin, device_id))
-    base_direct = cursor.last_direct_id if cursor is not None else 0
-    base_group = cursor.last_group_id if cursor is not None else 0
+    base_direct, base_group, cursor = await drain_floor(db, uin, device_id)
     max_direct = await _acked_prefix(db, OfflineMessage, uin, base_direct, body.direct_ids)
     max_group = await _acked_prefix(db, OfflineGroupMessage, uin, base_group, body.group_ids)
-    reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group)
+    reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
     await db.commit()
     return AckOut(deleted=reaped)
