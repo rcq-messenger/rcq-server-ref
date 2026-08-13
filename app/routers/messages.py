@@ -18,7 +18,7 @@ from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
-from app.services.apns import group_push_targets, send_to_user as apns_send
+from app.services.apns import PushEndpoints, group_push_targets, send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
 from app.services.connection_manager import manager
 from app.services.offline_queue_sweep import dormant_cutoff
@@ -414,7 +414,7 @@ async def send_group_sealed(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
 
-        async def _push(target_uin: int) -> None:
+        async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
                 target_uin,
                 alert_title=gname,
@@ -425,6 +425,7 @@ async def send_group_sealed(
                 group_id=group_id,
                 group_name=gname,
                 exclude_tokens=sender_tokens,
+                tokens=ends.ios,
             )
             await up_send(
                 target_uin,
@@ -436,10 +437,11 @@ async def send_group_sealed(
                 group_id=group_id,
                 group_name=gname,
                 exclude_tokens=sender_tokens,
+                endpoints=ends.android,
             )
 
-        for uin in wake:
-            asyncio.create_task(_push(uin))
+        for uin, ends in wake.items():
+            asyncio.create_task(_push(uin, ends))
     log.warning(
         "[group-sealed] gid=%s type=%s payloads=%d queued=%d delivered_any=%s offline=%d",
         body.group_id, body.envelope_type, len(body.payloads), len(rows),
@@ -592,7 +594,7 @@ async def send_group_broadcast(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
 
-        async def _push(target_uin: int) -> None:
+        async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
                 target_uin,
                 alert_title=gname,
@@ -603,6 +605,7 @@ async def send_group_broadcast(
                 group_id=group_id,
                 group_name=gname,
                 exclude_tokens=sender_tokens,
+                tokens=ends.ios,
             )
             await up_send(
                 target_uin,
@@ -614,10 +617,11 @@ async def send_group_broadcast(
                 group_id=group_id,
                 group_name=gname,
                 exclude_tokens=sender_tokens,
+                endpoints=ends.android,
             )
 
-        for uin in wake:
-            asyncio.create_task(_push(uin))
+        for uin, ends in wake.items():
+            asyncio.create_task(_push(uin, ends))
     log.warning(
         "[group-broadcast] gid=%s type=%s recipients=%d queued=%d delivered_any=%s offline=%d",
         body.group_id, body.envelope_type, len(recipients), len(rows),

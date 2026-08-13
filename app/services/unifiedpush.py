@@ -57,7 +57,7 @@ import logging
 import os
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlparse
 
 import httpx
@@ -188,9 +188,11 @@ def _semaphore() -> asyncio.Semaphore:
     return _sem
 
 
-async def _endpoints_for(
-    uin: int,
-) -> list[tuple[int, str, str | None, str | None, datetime | None]]:
+# (token id, endpoint url, last error, device id, last success)
+EndpointRow = tuple[int, str, str | None, str | None, datetime | None]
+
+
+async def _endpoints_for(uin: int) -> list[EndpointRow]:
     """Read this user's Android UnifiedPush endpoints in a SHORT session,
     then release the DB connection BEFORE any network I/O — same no-DB-across-
     network rule apns.py follows to avoid pinning a pool connection across a
@@ -304,6 +306,46 @@ async def _record_health(
         log.exception("[up] failed to record push health")
 
 
+# Bookkeeping from one fan-out is one write, not one write per recipient. Each
+# delivery task finishes on its own and used to open its own session for the
+# stamp, so a post to the beta group asked the pool for a connection per woken
+# member the moment the hourly freshness stamp came due — the same pile-up the
+# batched endpoint read removes on the way in. Collect for a beat, write once.
+_HEALTH_FLUSH_DELAY = 2.0
+_pending_ok: set[int] = set()
+_pending_failed: list[tuple[int, str]] = []
+_pending_dead: set[int] = set()
+_health_flush: asyncio.Task | None = None
+
+
+def _queue_health(
+    ok_ids: list[int], failed: list[tuple[int, str]], dead_ids: list[int]
+) -> None:
+    """Fold one task's outcome into the pending batch and make sure a flush is
+    on its way. Never awaited by the sender."""
+    global _health_flush
+    if not ok_ids and not failed and not dead_ids:
+        return
+    _pending_ok.update(ok_ids)
+    _pending_failed.extend(failed)
+    _pending_dead.update(dead_ids)
+    if _health_flush is None or _health_flush.done():
+        _health_flush = asyncio.create_task(_flush_health())
+        _tasks.add(_health_flush)
+        _health_flush.add_done_callback(_tasks.discard)
+
+
+async def _flush_health() -> None:
+    await asyncio.sleep(_HEALTH_FLUSH_DELAY)
+    # Drain under no await, so a task finishing mid-flush lands in the NEXT
+    # batch rather than being written twice or dropped.
+    ok, failed, dead = list(_pending_ok), list(_pending_failed), list(_pending_dead)
+    _pending_ok.clear()
+    _pending_failed.clear()
+    _pending_dead.clear()
+    await _record_health(ok, failed, dead)
+
+
 async def _fan_out(
     uin: int,
     payload: dict[str, Any],
@@ -311,6 +353,7 @@ async def _fan_out(
     what: str,
     exclude_tokens: frozenset[str] = frozenset(),
     skip_devices: frozenset[str] = frozenset(),
+    endpoints: Sequence[EndpointRow] | None = None,
 ) -> None:
     """Deliver `payload` to every UnifiedPush endpoint of `uin`. Runs as a
     background task; nothing awaits the result but the log line and the
@@ -327,12 +370,19 @@ async def _fan_out(
     registration carry no device id and are skipped in that case, because they
     might belong to the connected device — same conservative answer the old
     account-wide check gave. When nothing is connected this is empty and every
-    endpoint is woken as before."""
-    try:
-        endpoints = await _endpoints_for(uin)
-    except Exception:  # noqa: BLE001 — a pool timeout must not kill the task loudly
-        log.exception("[up] endpoint lookup failed uin=%s", uin)
-        return
+    endpoint is woken as before.
+
+    `endpoints` given: a group fan-out already read every recipient's rows in
+    one query, so this task must not open a session of its own to re-read what
+    it was handed — that per-recipient session is exactly what starves the
+    pool on a large group."""
+    if endpoints is None:
+        try:
+            endpoints = await _endpoints_for(uin)
+        except Exception:  # noqa: BLE001 — a pool timeout must not kill the task loudly
+            log.exception("[up] endpoint lookup failed uin=%s", uin)
+            return
+    endpoints = list(endpoints)
     if exclude_tokens:
         skipped = [e for _, e, _, _, _ in endpoints if e in exclude_tokens]
         if skipped:
@@ -387,7 +437,7 @@ async def _fan_out(
             if prev_error != detail:
                 failed.append((token_id, detail))
     log.warning("[up] %s uin=%s endpoints=%d sent=%d", what, uin, len(endpoints), sent)
-    await _record_health(ok_ids, failed, dead_ids)
+    _queue_health(ok_ids, failed, dead_ids)
 
 
 def _schedule(
@@ -397,11 +447,14 @@ def _schedule(
     what: str,
     exclude_tokens: frozenset[str] = frozenset(),
     skip_devices: frozenset[str] = frozenset(),
+    endpoints: Sequence[EndpointRow] | None = None,
 ) -> None:
     """Fire the fan-out as a background task. Deliberately NOT awaited by the
     caller: retries span ~30s and the sender's HTTP request (or the WS call
     relay) must not wait on a third-party push server."""
-    task = asyncio.create_task(_fan_out(uin, payload, ttl, what, exclude_tokens, skip_devices))
+    task = asyncio.create_task(
+        _fan_out(uin, payload, ttl, what, exclude_tokens, skip_devices, endpoints)
+    )
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
@@ -419,6 +472,7 @@ async def send_to_user(
     group_name: str | None = None,
     exclude_tokens: frozenset[str] = frozenset(),
     skip_devices: frozenset[str] = frozenset(),
+    endpoints: Sequence[EndpointRow] | None = None,
 ) -> int:
     """Wake every Android UnifiedPush device of `uin`. No-op when the user has
     no Android endpoints (the common case for an iOS-only account). Same
@@ -454,7 +508,7 @@ async def send_to_user(
         payload["group_id"] = group_id
     if group_name:
         payload["group_name"] = group_name
-    _schedule(uin, payload, _TTL_MESSAGE, "msg", exclude_tokens, skip_devices)
+    _schedule(uin, payload, _TTL_MESSAGE, "msg", exclude_tokens, skip_devices, endpoints)
     return 1
 
 
