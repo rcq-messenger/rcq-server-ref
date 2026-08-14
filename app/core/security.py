@@ -130,13 +130,15 @@ def carry_device_id(device_id: str) -> str | None:
     return device_id if device_id != "primary" else None
 
 
-def issue_recover_challenge(signing_key: str) -> str:
-    """Short-lived signed nonce bound to a claimed signing pubkey, for the
-    account-recovery challenge-response. Stateless: the challenge IS the
-    server's commitment; the client proves key ownership by signing it back.
-    Reveals nothing about whether the account actually exists."""
+def issue_key_challenge(signing_key: str, typ: str = "recover") -> str:
+    """Short-lived signed nonce bound to a claimed signing pubkey.
+
+    `typ` keeps the two uses apart: a challenge minted for REGISTRATION must not
+    be replayable at /auth/recover and the other way round, even though both
+    prove the same thing about the same key.
+    """
     payload = {
-        "typ": "recover",
+        "typ": typ,
         "sk": signing_key,
         "nonce": secrets.token_urlsafe(16),
         "exp": datetime.now(timezone.utc) + timedelta(seconds=120),
@@ -144,14 +146,26 @@ def issue_recover_challenge(signing_key: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
-def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
-    """True if `challenge` is a non-expired recover challenge bound to
+def verify_key_challenge(challenge: str, signing_key: str, typ: str = "recover") -> bool:
+    """True if `challenge` is a non-expired challenge of `typ` bound to
     `signing_key` (jwt.decode enforces the signature + expiry)."""
     try:
         payload = jwt.decode(challenge, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
     except JWTError:
         return False
-    return payload.get("typ") == "recover" and payload.get("sk") == signing_key
+    return payload.get("typ") == typ and payload.get("sk") == signing_key
+
+
+def issue_recover_challenge(signing_key: str) -> str:
+    """The recovery flavour of [issue_key_challenge]. Stateless: the challenge
+    IS the server's commitment; the client proves key ownership by signing it
+    back. Reveals nothing about whether the account actually exists."""
+    return issue_key_challenge(signing_key, "recover")
+
+
+def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
+    """True if `challenge` is a non-expired RECOVER challenge for this key."""
+    return verify_key_challenge(challenge, signing_key, "recover")
 
 
 async def authorize_session(token: str) -> int:

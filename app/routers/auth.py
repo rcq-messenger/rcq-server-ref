@@ -11,15 +11,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from base64 import b64decode
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from app.core.security import (
     bump_uin_epoch,
     cache_uin_epoch,
     carry_device_id,
     current_device_id,
     current_uin,
+    issue_key_challenge,
     issue_recover_challenge,
     issue_token,
     uin_epoch,
+    verify_key_challenge,
     verify_recover_challenge,
 )
 from app.services import server_settings
@@ -118,6 +125,12 @@ class RegisterIn(BaseModel):
     # clients that predate it get "primary" and the old shared behaviour.
     # See `issue_token` for what it buys.
     device_id: str | None = Field(default=None, max_length=64)
+    # Proof that the caller holds the PRIVATE half of `signing_key`: a challenge
+    # from POST /auth/register/challenge and an Ed25519 signature over it.
+    # Optional on the wire so clients that predate it still register, REQUIRED
+    # by the checks below for the two cases where its absence is exploitable.
+    challenge: str | None = None
+    signature: str | None = None
 
 
 class RegisterOut(BaseModel):
@@ -128,6 +141,29 @@ class RegisterOut(BaseModel):
 class SessionOut(BaseModel):
     token: str
     ws_url: str
+
+
+class RegisterChallengeIn(BaseModel):
+    signing_key: str
+
+
+class RegisterChallengeOut(BaseModel):
+    challenge: str
+
+
+@router.post(
+    "/register/challenge",
+    response_model=RegisterChallengeOut,
+    dependencies=[Depends(rate_limit("auth_register_challenge", 60, 3600))],
+)
+async def register_challenge(body: RegisterChallengeIn) -> RegisterChallengeOut:
+    """A short-lived nonce to sign at registration, proving the caller holds the
+    private half of the signing key they are about to claim.
+
+    Stateless and free of information: it says nothing about whether the key or
+    any account exists, so it cannot be used to probe for either.
+    """
+    return RegisterChallengeOut(challenge=issue_key_challenge(body.signing_key.strip(), "register"))
 
 
 @router.post(
@@ -159,6 +195,48 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # junk registration cannot claim a UIN on its way to failing.
     identity_key = _pubkey32(body.identity_key, "identity_key")
     signing_key = _pubkey32(body.signing_key, "signing_key")
+
+    # ⚠⚠ Registration used to take a signing key on the caller's word.
+    #
+    # A public signing key IS public — /users/{uin}/info hands it out — so
+    # anyone could mint a NEW account carrying somebody else's key, ask for a
+    # lower number (`desired_uin` has no floor) and thereby own where that
+    # person's own seed phrase lands. They never read a message, they hold no
+    # private key; the owner simply loses the way back into an account with no
+    # email and no phone attached. `/auth/recover` picking the OLDEST claim
+    # (2026-08-13) made that race unwinnable, but it left the claim itself free
+    # to make: seven signing keys on the flagship are already shared by more
+    # than one account, one of them by twelve.
+    #
+    # So the key must now be PROVEN, exactly the way recovery proves it. The
+    # proof is not demanded of everyone yet, because clients that predate it are
+    # in people's hands and a hard requirement would lock out every one of them.
+    # It IS demanded for the two cases where its absence is what the attack
+    # needs:
+    #   * the key is already claimed by an existing account — the impersonation
+    #     case, and the only way to legitimately re-use a key here is to hold it;
+    #   * a specific number is being asked for — multihoming, which a real
+    #     client does with its own keys and a squatter cannot.
+    # ⏭ Make it unconditional once the fleet has turned over.
+    proven = False
+    if body.challenge and body.signature:
+        if not verify_key_challenge(body.challenge, signing_key, "register"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_challenge"})
+        try:
+            Ed25519PublicKey.from_public_bytes(b64decode(signing_key)).verify(
+                b64decode(body.signature), body.challenge.encode()
+            )
+        except (InvalidSignature, ValueError, TypeError):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"})
+        proven = True
+    if not proven:
+        key_taken = await db.scalar(
+            select(User.uin).where(User.signing_key == signing_key).limit(1)
+        )
+        if key_taken is not None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail={"code": "key_proof_required"}
+            )
 
     # Invite gate (default-open servers skip this entirely). Validate + consume
     # one use ATOMICALLY: a single UPDATE that only matches an unexpired,
@@ -225,8 +303,18 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # island-record (`GET /federation/island-record/{uin}`) already binds a UIN
     # to its holder's keys, so a multihoming client can present one and a
     # squatter cannot.
+    #
+    # ⚠ Honoured only under `proven`. Refusing the whole registration instead
+    # would have been the tidier rule and the wrong one: every client in
+    # people's hands today sends `desired_uin` for multihoming (Android
+    # Multihome.kt, iOS Multihome.swift, web multihome.ts), so a 403 here would
+    # break adding a backup island for everyone who has not updated. Ignoring
+    # the request degrades them to a fresh number on the backup island — what
+    # they got before multihoming existed — while a squatter, who cannot sign
+    # for the key, cannot pick a number at all.
     if (
         uin is None
+        and proven
         and body.desired_uin is not None
         and 0 < body.desired_uin <= settings.UIN_MAX
         and await db.scalar(select(User.uin).where(User.uin == body.desired_uin)) is None
