@@ -125,6 +125,21 @@ _UPDATE_TTL = 6 * 3600.0
 _update_cache: tuple[float, dict] | None = None
 
 
+def _version_tuple(v: str) -> tuple[int, ...] | None:
+    """`2026.08.13.5` → (2026, 8, 13, 5). None when it is not dotted numbers."""
+    parts = v.strip().split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def _is_newer(latest: str, current: str) -> bool:
+    a, b = _version_tuple(latest), _version_tuple(current)
+    if a is None or b is None:
+        return latest != current
+    return a > b
+
+
 @router.get("/update-check", include_in_schema=False)
 async def update_check() -> dict:
     current = settings.SERVER_VERSION
@@ -146,9 +161,15 @@ async def update_check() -> dict:
     result = {
         **base,
         "latest": latest,
-        # Any difference means "behind": a self-hoster tracking main is never
-        # ahead of it. A blank/unknown latest → no nag.
-        "update_available": bool(latest) and latest != current,
+        # ⚠ NEWER than published is not "behind". This used to be `latest !=
+        # current`, on the theory that a self-hoster tracking main is never
+        # ahead of it — which is false for anyone who builds before the tag
+        # lands, us included: the flagship ran 2026.08.13.5 while the repo said
+        # .4 and its own console nagged the author to update TO AN OLDER
+        # BUILD. Compare as version numbers and nag only when the published one
+        # is genuinely higher; fall back to plain inequality for anything that
+        # does not parse as dotted numbers.
+        "update_available": bool(latest) and _is_newer(latest, current),
     }
     _update_cache = (now + _UPDATE_TTL, result)
     return result
