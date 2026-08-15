@@ -18,7 +18,7 @@ from app.models.device_token import DeviceToken
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
-from app.models.user import User
+from app.models.user import User, _as_aware
 from app.services.apns import (
     PushEndpoints,
     group_push_targets,
@@ -364,9 +364,15 @@ def _queueable(member_rows: list[tuple[int, datetime | None]]) -> set[int]:
     cutoff = dormant_cutoff()
     if cutoff is None:
         return {uin for uin, _ in member_rows}
+    # `_as_aware` rather than a bare compare: SQLite hands back naive
+    # datetimes, and `naive >= aware` raises. On Postgres this is a no-op, so
+    # the only thing it changes is a self-hosted island, where without it EVERY
+    # group message answered 500 "internal_error" and the group simply did not
+    # work. Same coercion the presence path already does (`models/user.py`);
+    # this call site was written later and missed it.
     return {
         uin for uin, last_seen in member_rows
-        if last_seen is not None and last_seen >= cutoff
+        if last_seen is not None and _as_aware(last_seen) >= cutoff
     }
 
 
