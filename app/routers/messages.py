@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -41,6 +42,13 @@ log = logging.getLogger(__name__)
 # recipient's WS is down/stale doesn't sit unseen until they reopen the app; the
 # NSE shows a real "screenshot" body for the shot and suppresses the toggle.
 _PUSHABLE_TYPES = {"message", "system", "secscreen"}
+
+# Sender-key chain distribution + recovery (rcq-spec 6.5). These are never
+# pushed — they raise no banner — but they are the ONE class of group envelope
+# that must never be dropped from the offline queue: without the chain key a
+# member cannot read a single later broadcast, and the client has no way to
+# tell "no messages" from "cannot decrypt". See `_keep_for`.
+_SENDER_KEY_CONTROL = {"skdm", "sknack"}
 
 # ⚠ "call" is deliberately NOT in the set above. A cross-island call deposit
 # (§5d) needs a RINGING wake, not a message banner, and it must not get both:
@@ -362,6 +370,41 @@ def _queueable(member_rows: list[tuple[int, datetime | None]]) -> set[int]:
     }
 
 
+def _keep_for(
+    recipients: Iterable[int],
+    queueable: set[int],
+    envelope_type: str,
+    wake: Iterable[int],
+) -> set[int]:
+    """Who this group envelope is actually stored for.
+
+    `_queueable` alone was the answer, and it was the wrong one twice.
+
+    1. **It skipped SENDER-KEY DISTRIBUTION.** An `skdm` is not backlog, it is
+       the chain key without which every later `gmsg` in the group decrypts to
+       nothing. Dropping one costs the member the whole group, silently: the
+       client gets the broadcast, `deriveInbound` returns null, the payload is
+       discarded, and there is no bubble, no unread and NO SOUND — report #544,
+       "человек, которого я добавил, не получил звук ни на моё сообщение, ни на
+       твоё". The dormant rule exists to stop us hoarding *content* nobody will
+       read; key material is a few hundred bytes and it is the difference
+       between a working member and a broken one. So [_SENDER_KEY_CONTROL] is
+       kept for every recipient, dormant or not.
+
+    2. **It disagreed with the push.** The wake fan-out below never consulted
+       it, so a member absent longer than OFFLINE_GROUP_DORMANT_DAYS got a
+       "New group message" banner for a message that was never written down.
+       They open the group and it is empty — report #547, "приходит
+       уведомление, что есть сообщение в группе, захожу, а его там нет". If we
+       are willing to wake somebody, we are willing to keep their copy: a
+       registered push endpoint is also the best evidence we have that this
+       member still comes back.
+    """
+    if envelope_type in _SENDER_KEY_CONTROL:
+        return set(recipients)
+    return set(queueable) | set(wake)
+
+
 class GroupRecipientPayload(BaseModel):
     to_uin: int
     payload: str
@@ -475,24 +518,6 @@ async def send_group_sealed(
         )
         for e in entries
     ])
-    # Queue regardless of the live send: being online at publish time is
-    # optimistic (bytes in an OS buffer != client ingested them), so the
-    # recipient drains anything they missed on their next /messages/queue
-    # fetch and dedupes by UUID.
-    rows = [
-        {
-            "to_uin": e.to_uin,
-            "group_id": body.group_id,
-            "envelope_type": body.envelope_type,
-            "payload": e.payload,
-            "received_at": now,
-        }
-        for e in entries
-        if e.to_uin in queueable
-    ]
-    if rows:
-        await db.execute(insert(OfflineGroupMessage), rows)
-    await db.commit()
     delivered_any = bool(online)
     offline_recipients = [e.to_uin for e in entries if e.to_uin not in online]
     # Group fan-out: same per-recipient encrypted-envelope pattern as
@@ -507,6 +532,10 @@ async def send_group_sealed(
     # "sending" clock icon while recipients had already received the
     # message via WS. Each task opens its own short DB session inside
     # apns_send / up_send, so detaching is safe.
+    #
+    # ⚠ Resolved BEFORE the queue rows are written, because who we wake now
+    # decides who we keep the message for — see `_keep_for` below.
+    wake: dict[int, PushEndpoints] = {}
     if body.envelope_type in _PUSHABLE_TYPES:
         payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
         envelope_type = body.envelope_type
@@ -524,6 +553,28 @@ async def send_group_sealed(
         wake = await group_push_targets(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
+    # Queue regardless of the live send: being online at publish time is
+    # optimistic (bytes in an OS buffer != client ingested them), so the
+    # recipient drains anything they missed on their next /messages/queue
+    # fetch and dedupes by UUID.
+    keep = _keep_for(
+        (e.to_uin for e in entries), queueable, body.envelope_type, wake
+    )
+    rows = [
+        {
+            "to_uin": e.to_uin,
+            "group_id": body.group_id,
+            "envelope_type": body.envelope_type,
+            "payload": e.payload,
+            "received_at": now,
+        }
+        for e in entries
+        if e.to_uin in keep
+    ]
+    if rows:
+        await db.execute(insert(OfflineGroupMessage), rows)
+    await db.commit()
+    if wake:
 
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
@@ -669,26 +720,17 @@ async def send_group_broadcast(
         "server_time": now.isoformat(),
     }
     online = await manager.fanout(recipients, pkt)
-    rows = [
-        {
-            "to_uin": uin,
-            "group_id": body.group_id,
-            "envelope_type": "gmsg",
-            "payload": body.payload,
-            "received_at": now,
-        }
-        for uin in recipients
-        if uin in queueable
-    ]
-    if rows:
-        await db.execute(insert(OfflineGroupMessage), rows)
-    await db.commit()
     delivered_any = bool(online)
     offline_recipients = [uin for uin in recipients if uin not in online]
     # Push offline members for real posts only (mirrors _PUSHABLE_TYPES
     # gating on the declared inner type). Everyone gets the SAME envelope —
     # that's the whole point. The iOS NSE shows a generic group banner for
     # gmsg (it never advances ratchet state out-of-process).
+    #
+    # ⚠ Resolved BEFORE the queue rows are written: waking a member we did not
+    # keep the message for is a notification for a message that will never
+    # arrive (#547). See `_keep_for`.
+    wake: dict[int, PushEndpoints] = {}
     if body.envelope_type in _PUSHABLE_TYPES:
         group_id = body.group_id
         payload = body.payload
@@ -704,6 +746,22 @@ async def send_group_broadcast(
         wake = await group_push_targets(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
+    keep = _keep_for(recipients, queueable, body.envelope_type, wake)
+    rows = [
+        {
+            "to_uin": uin,
+            "group_id": body.group_id,
+            "envelope_type": "gmsg",
+            "payload": body.payload,
+            "received_at": now,
+        }
+        for uin in recipients
+        if uin in keep
+    ]
+    if rows:
+        await db.execute(insert(OfflineGroupMessage), rows)
+    await db.commit()
+    if wake:
 
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
