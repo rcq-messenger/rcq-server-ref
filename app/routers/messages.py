@@ -18,8 +18,13 @@ from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
-from app.services.apns import PushEndpoints, group_push_targets, send_to_user as apns_send
-from app.services.unifiedpush import send_to_user as up_send
+from app.services.apns import (
+    PushEndpoints,
+    group_push_targets,
+    send_to_user as apns_send,
+    send_voip_to_user,
+)
+from app.services.unifiedpush import send_call_to_user as up_call, send_to_user as up_send
 from app.services.connection_manager import manager
 from app.services.offline_queue_sweep import dormant_cutoff
 from app.services.queue_drain import account_watermark, drain_floor
@@ -36,6 +41,77 @@ log = logging.getLogger(__name__)
 # recipient's WS is down/stale doesn't sit unseen until they reopen the app; the
 # NSE shows a real "screenshot" body for the shot and suppresses the toggle.
 _PUSHABLE_TYPES = {"message", "system", "secscreen"}
+
+# ⚠ "call" is deliberately NOT in the set above. A cross-island call deposit
+# (§5d) needs a RINGING wake, not a message banner, and it must not get both:
+# an ordinary alert next to a CallKit screen is a duplicate notification for a
+# call that is already on screen. It takes the `_wake_for_sealed_call` branch
+# instead, which is the same VoIP/UnifiedPush pair a same-island `call_offer`
+# uses from app/routers/ws.py.
+_CALL_TYPE = "call"
+
+# Ceiling on the sealed envelope we are willing to carry INSIDE a wake payload.
+# APNs caps a VoIP push at 5KB total and ntfy (the common UnifiedPush
+# distributor) caps a message at 4KB, and an offer envelope carries a whole SDP,
+# so a large one would be rejected by the push provider and the device would
+# never ring at all. Above the ceiling we send the wake WITHOUT the envelope:
+# the app still comes up, connects its socket, and drains the deposit from the
+# queue — a beat slower, but it rings.
+_CALL_WAKE_ENV_MAX = 3500
+
+
+async def _wake_for_sealed_call(to_uin: int, payload: str) -> int:
+    """Ring the recipient's devices for a cross-island call deposit (§5d).
+
+    ⚠ WHAT THIS DISCLOSES TO THE RECIPIENT'S ISLAND — this is the whole
+    tradeoff, decided by the founder on 2026-08-15 and worth stating plainly:
+
+      The island now learns that A CALL IS ARRIVING FOR THIS USER, at this
+      instant. Before this change the deposit was indistinguishable from a
+      text message. It is not indistinguishable any more, because the caller
+      asked for `envelope_type: "call"` and we act on it.
+
+      What it still does NOT learn: WHO is calling, on which island they live,
+      the call id, whether it is audio or video, or the SDP. All of that lives
+      inside the sealed envelope, which the island cannot open — so this
+      function must never invent any of it. In particular there is NO caller
+      nickname here: the same-island VoIP payload carries one because that
+      island knows the caller, and this one genuinely does not. The client
+      renders "Incoming call" until it decrypts the envelope itself.
+
+      Accepted because a censor watching the wire can already infer a call
+      from packet timing and size, and a call that does not ring is not a
+      call.
+
+    The wake fires only when the account has NO live socket, exactly like the
+    same-island `call_offer` fallback in ws.py. Neither `send_voip_to_user` nor
+    `send_call_to_user` can skip an individual connected device, and the client
+    cannot dedupe a ring against the socket copy (it has no call id until it
+    decrypts), so waking while a socket is up would ring twice.
+    """
+    wake: dict = {
+        # Discriminator: this is a SEALED call wake, not the flat call payload
+        # a same-island offer sends. A client that does not know it has no
+        # call_id/sdp to act on and falls back to its malformed-payload path,
+        # which is a report-then-end on iOS and a drop on Android — i.e. the
+        # pre-change behaviour of not ringing, never a crash.
+        "kind": "sealed",
+        # Recipient in plain, same reason the message push carries it: a
+        # multi-account device has one token and needs to know which local
+        # account to swap in before it can decrypt anything.
+        "to_uin": to_uin,
+        "envType": _CALL_TYPE,
+    }
+    if len(payload) <= _CALL_WAKE_ENV_MAX:
+        # Verbatim, byte for byte, the ciphertext we were handed. Same field
+        # name (`env`) the message push uses, so the client's existing decrypt
+        # helper takes it unchanged.
+        wake["env"] = payload
+    sent = await send_voip_to_user(to_uin, payload=wake)
+    # Android has no PushKit — the UnifiedPush call payload raises the
+    # full-screen incoming-call UI. No-op when there are no Android endpoints.
+    sent += await up_call(to_uin, payload=wake)
+    return sent
 
 # Ceiling on one group fan-out POST. The largest live group is ~1.9k members
 # (the founder beta group every registration is added to), so this leaves
@@ -94,9 +170,12 @@ async def _sender_device_tokens(db: AsyncSession, caller: int | None) -> frozens
 
 class SealedSendIn(BaseModel):
     to_uin: int
-    # message | nudge | delete | system | read | reaction | bounce | visit.
-    # The server is type-agnostic — it just routes the opaque payload — so the
-    # list is informational. New envelope kinds don't need a server change.
+    # message | call | nudge | delete | system | read | reaction | bounce | visit.
+    # The server is type-agnostic for ROUTING — it just forwards the opaque
+    # payload — so the list is informational and new envelope kinds don't need a
+    # server change. The one type that changes server behaviour is "call"
+    # (§5d cross-island call signalling): it rings instead of notifying. See
+    # `_wake_for_sealed_call` for exactly what that tells this island.
     envelope_type: str = Field(default="message")
     payload: str  # base64 LibSignal sealed-sender ciphertext (sender lives inside)
     # F3 deposit-auth: an OPTIONAL anonymous blinded token {epoch_id, prepared, sig}
@@ -166,7 +245,29 @@ async def send_sealed(
 
     now = datetime.now(timezone.utc)
     pkt = {
-        "type": body.envelope_type,
+        # ⚠⚠ THE SOCKET FRAME FOR A CALL DEPOSIT IS LABELLED "message", NOT
+        # "call". The deposit type is an instruction to THIS ISLAND (ring the
+        # recipient's devices instead of posting a message banner); the frame
+        # type is how the RECIPIENT'S CLIENT routes it, and every client in the
+        # field — including the three updated on 2026-08-15 — accepts sealed
+        # envelopes from an explicit list of frame types. `iOS
+        # WebSocketService` ends that list with `default: break` and Android's
+        # is the `SEALED_WS_TYPES` set, so a frame typed "call" was DROPPED IN
+        # SILENCE by a running app. That is the worst case, not the harmless
+        # one: the wake below only fires when nothing is connected, so calling
+        # somebody whose app was OPEN rang nothing at all and the caller timed
+        # out — a total regression against the "message" deposits this replaced.
+        #
+        # The envelope is a sealed blob either way and every client routes it
+        # by its INNER kind (`kind:"call"` → the call state machine), so the
+        # label costs the client nothing and buys compatibility with every
+        # build ever shipped. Same reasoning Android's `TYPED_CONTROL_SENDS =
+        # false` records for reactions/edits/deletes: keep labelling the wire
+        # "message" until the typed form is understood everywhere.
+        #
+        # The QUEUE row keeps the real `envelope_type` (below) — nothing
+        # dispatches on it there, and it is what makes the deposit auditable.
+        "type": "message" if body.envelope_type == _CALL_TYPE else body.envelope_type,
         "payload": body.payload,
         "server_time": now.isoformat(),
     }
@@ -200,7 +301,17 @@ async def send_sealed(
     # Endpoints that predate device-aware registration carry no device id; when
     # something IS connected they are skipped, exactly as before, since they
     # might belong to that connected device.
-    if body.envelope_type in _PUSHABLE_TYPES:
+    if body.envelope_type == _CALL_TYPE:
+        # §5d cross-island call. The live-socket send above already happened and
+        # is byte-identical to a "message" deposit, so a call to somebody whose
+        # app is in the foreground is completely unchanged by this branch. What
+        # is new is that a CLOSED app now rings: previously this deposit went out
+        # as an ordinary message push and nothing on the device knew a call was
+        # arriving. The row is queued either way (above), so the offline drain
+        # still delivers the envelope if the wake is late or lost.
+        if not delivered:
+            pushed = await _wake_for_sealed_call(body.to_uin, body.payload)
+    elif body.envelope_type in _PUSHABLE_TYPES:
         online_devices = frozenset(await manager.online_devices(body.to_uin))
         if not delivered or online_devices:
             pushed = await apns_send(

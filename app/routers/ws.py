@@ -927,7 +927,6 @@ async def _handle_client_message(
             from app.routers.audio_rooms import (
                 MAX_ROOM_PARTICIPANTS,
                 is_room_member,
-                lookup_user_nickname,
             )
             from app.models.audio_room import AudioRoom
 
@@ -946,7 +945,12 @@ async def _handle_client_message(
                     "reason": "not_member",
                 })
                 return
-            entrant_nick = await lookup_user_nickname(db, uin) or str(uin)
+            # The whole row, not just the nickname: `room_member_entered`
+            # carries the avatar too, and this lookup was already a row read.
+            entrant = await db.get(User, uin)
+            entrant_nick = (entrant.nickname if entrant else None) or str(uin)
+            entrant_avatar_id = entrant.avatar_media_id if entrant else None
+            entrant_avatar_key = entrant.avatar_media_key if entrant else None
 
         # Reserve the slot via Redis — capacity check + insert is
         # atomic via a Lua script so two simultaneous entrants on
@@ -1005,11 +1009,17 @@ async def _handle_client_message(
             owner_only = bool(
                 await db.scalar(_sel(_AR.owner_only_speaking).where(_AR.id == room_id))
             )
+        # Avatars ride along on the roster, gated by room membership —
+        # the same relationship group rosters already treat as enough
+        # (`GroupMemberOut`). Nothing extra is fetched: these columns
+        # came with the User rows above.
         roster = [
             {
                 "uin": u.uin,
                 "nickname": u.nickname,
                 "muted_by_owner": u.uin in muted,
+                "avatar_media_id": u.avatar_media_id,
+                "avatar_media_key": u.avatar_media_key,
             }
             for u in users
         ]
@@ -1046,6 +1056,8 @@ async def _handle_client_message(
                     "uin": uin,
                     "nickname": entrant_nick,
                     "muted_by_owner": entrant_muted,
+                    "avatar_media_id": entrant_avatar_id,
+                    "avatar_media_key": entrant_avatar_key,
                 },
             })
         return

@@ -34,7 +34,6 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.audio_room import AudioRoom, AudioRoomMembership, AudioRoomMute
-from app.models.user import User
 
 router = APIRouter(prefix="/audio_rooms", tags=["audio_rooms"])
 
@@ -683,8 +682,3 @@ async def is_room_member(db: AsyncSession, room_id: int, uin: int) -> bool:
         )
     )
     return membership is not None
-
-
-async def lookup_user_nickname(db: AsyncSession, uin: int) -> str | None:
-    user = await db.get(User, uin)
-    return user.nickname if user else None

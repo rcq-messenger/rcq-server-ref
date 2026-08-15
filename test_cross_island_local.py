@@ -167,6 +167,61 @@ async def main() -> int:
                         "the island must not touch the ciphertext",
                     )
 
+            # 2b. The same call signal deposited with the OUTER envelope_type
+            #     set to "call" (2026-08-15). That is the wake path: the island
+            #     rings the recipient's devices instead of sending an ordinary
+            #     message alert, so a closed app can raise CallKit / the
+            #     full-screen incoming-call UI. Everything else must be
+            #     identical to a "message" deposit — accepted, byte-preserved,
+            #     on the live socket, and queued — because a foreground call
+            #     rides the socket exactly as before.
+            payload = envelope("call", sig="call_offer", cid=str(uuid.uuid4()), data={"sdp": "v=0"})
+            r = await c.post(
+                f"{ISLAND_B}/messages/sealed",
+                json={"to_uin": uin_b, "envelope_type": "call", "payload": payload},
+            )
+            check("envelope_type=call accepted by B's island", r.status_code == 200, r.text[:160])
+            frame = await recv_until(ws_b, "message")
+            check("envelope_type=call reached B's live socket", frame is not None)
+            if frame is not None:
+                check(
+                    "envelope_type=call payload survived byte for byte",
+                    frame.get("payload") == payload,
+                    "the island must not touch the ciphertext",
+                )
+                # ⚠ The frame is labelled "message" ON PURPOSE. Every client
+                # accepts sealed envelopes from a fixed list of frame types
+                # (iOS ends its list with `default: break`, Android's is
+                # `SEALED_WS_TYPES`), and none of them listed "call" — so a
+                # frame typed "call" was dropped in silence by a RUNNING app,
+                # which is precisely when the wake does not fire. Calling
+                # somebody with the app open rang nothing. The deposit type is
+                # an instruction to the island; the frame type is how the
+                # client routes, and the client routes on the INNER kind.
+                check(
+                    "the socket frame is typed 'message' so every client ingests it",
+                    frame.get("type") == "message",
+                    str(frame.get("type")),
+                )
+            # The wake is a push, which this harness cannot observe — but the
+            # queue row is the thing that makes the wake safe to lose, so assert
+            # it exists. A device woken by a ring that arrives without its
+            # envelope (too large for the 5KB VoIP cap) drains it from here.
+            r = await c.get(
+                f"{ISLAND_B}/messages/queue",
+                headers={"Authorization": f"Bearer {b['token']}"},
+            )
+            check("queue readable after a call deposit", r.status_code == 200, r.text[:160])
+            rows = r.json() if r.status_code == 200 else []
+            row = next((x for x in rows if x.get("payload") == payload), None)
+            check("the call deposit is queued for the offline drain", row is not None)
+            if row is not None:
+                check(
+                    "the queued row keeps envelope_type=call",
+                    row.get("envelope_type") == "call",
+                    str(row.get("envelope_type")),
+                )
+
             # 3. A deposit to a uin that does not exist on this island. Clients
             #    rely on 404 here to tell "wrong island" from "delivered".
             r = await c.post(
