@@ -96,13 +96,27 @@ SWEEP_INTERVAL_SECONDS = int(os.environ.get("OFFLINE_QUEUE_SWEEP_INTERVAL_SECOND
 # One batch of group rows addressed to someone who has not connected since
 # `cutoff` (or whose account is gone). Written as SQL because the ORM's
 # `delete().where(...)` cannot express a LIMIT, and the LIMIT is the point.
+#
+# ⚠ `skdm` is EXEMPT, and the exemption is the whole point of the write-side
+# rule it mirrors (`app.routers.messages._keep_for`). A sender-key
+# distribution is not backlog: it is the chain key, and a member who loses it
+# cannot read a single later broadcast — no bubble, no unread, no sound, and
+# no way for their client to tell "no messages" from "cannot decrypt" (#544).
+# Keeping it at write time and reaping it six hours later would make that fix
+# last exactly one sweep interval. A few hundred bytes per (sender, chain) is
+# not what filled this table; content addressed to people who never return is,
+# and that is still swept. The 30-day TTL above still bounds these rows.
+#
+# `sknack` is deliberately NOT exempt — it is a QUESTION, worthless once
+# stale, and it has its own much shorter TTL below.
 _DORMANT_SQL = text(
     """
     DELETE FROM offline_group_messages
     WHERE id IN (
         SELECT o.id FROM offline_group_messages o
         LEFT JOIN users u ON u.uin = o.to_uin
-        WHERE u.uin IS NULL OR u.last_seen < :cutoff
+        WHERE (u.uin IS NULL OR u.last_seen < :cutoff)
+          AND o.envelope_type <> 'skdm'
         LIMIT :batch
     )
     """
