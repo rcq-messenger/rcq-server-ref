@@ -268,6 +268,23 @@ class StatsOut(BaseModel):
     # person on the other end is trying to give us money.
     open_inquiries: int = 0
     resolved_reports_7d: int
+    # ⚠⚠ The number of relays a BLOCKED stranger can actually be handed.
+    #
+    # `/broker/bridges` is the last path left when a user's whole bundled pool
+    # is unreachable: the signed config is the same addresses they already
+    # cannot reach, and onion rides those same addresses too. It is therefore
+    # the one figure that says whether someone who has just been cut off has
+    # anywhere to go.
+    #
+    # It read ZERO for an unknown length of time and nothing said so, because
+    # this panel never showed it. Every relay registered with the broker was
+    # bound to a tenant, and a tenant's endpoint is deliberately never in the
+    # public answer (broker.py) — so the pool was empty by construction while
+    # the admin page looked healthy. Surfaced here so it cannot happen quietly
+    # again: if this is 0, the bypass has no fallback at all.
+    broker_public_relays: int = 0
+    # Of those, how many the liveness gate would actually serve right now.
+    broker_public_live: int = 0
 
 
 # ── Reports ─────────────────────────────────────────────────────────
@@ -938,7 +955,32 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
         )
     ) or 0
 
+    # The public bridge pool, counted the way `/broker/bridges` itself filters:
+    # enabled, and NOT bound to a tenant (a tenant's node is never disclosed
+    # publicly). `live` additionally applies the canary liveness window, which
+    # is what actually gates a community relay from being served.
+    from app.models.broker import BrokerRelay
+    from app.routers.broker import _LIVENESS_WINDOW
+
+    public_rows = (
+        await db.execute(
+            select(BrokerRelay).where(
+                BrokerRelay.enabled.is_(True),
+                BrokerRelay.tenant_id.is_(None),
+            )
+        )
+    ).scalars().all()
+    now_epoch = int(now.timestamp())
+    broker_public_live = sum(
+        1
+        for r in public_rows
+        if r.tier == "trusted"
+        or (r.last_ok is not None and now_epoch - r.last_ok <= _LIVENESS_WINDOW)
+    )
+
     return StatsOut(
+        broker_public_relays=len(public_rows),
+        broker_public_live=int(broker_public_live),
         total_users=int(total_users),
         suspended_users=int(suspended_users),
         new_users_24h=int(new_users_24h),
