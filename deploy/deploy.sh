@@ -35,9 +35,9 @@ echo "==> rsync app/"
 rsync -az --delete \
     --exclude '__pycache__' \
     --exclude '.venv' \
-    --exclude 'rcq.db' \
-    --exclude 'rcq.db-shm' \
-    --exclude 'rcq.db-wal' \
+    --exclude '*.db' \
+    --exclude '*.db-shm' \
+    --exclude '*.db-wal' \
     --exclude 'media/' \
     --exclude 'news_media/' \
     --exclude 'evidence/' \
