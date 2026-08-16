@@ -533,6 +533,71 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
 
 
+# ── session token re-issue (no stored token) ────────────────────────────────
+# Same proof as /auth/recover, but the caller says WHICH uin it wants, and gets
+# it only if that account really carries the key. It exists so a client does
+# not have to keep a 30-day token on disk beside the keys that can mint one:
+# the web client now holds no token at all between sessions (see
+# docs/web-storage-inventory.md), and asks for one at start-up.
+#
+# ⚠ /auth/recover cannot do this job. It resolves a key to the OLDEST account
+# claiming it, which is the right rule for "I lost everything, take me home"
+# and the wrong one here: seven signing keys on the flagship are shared by more
+# than one account, and for those a start-up recover would silently hand the
+# session to somebody else's uin. Naming the uin removes the ambiguity, and
+# gives away nothing — the proof is still possession of the private key, which
+# an impersonator who registered a copy of the public one does not have.
+class RefreshIn(BaseModel):
+    uin: int
+    signing_key: str
+    challenge: str
+    # base64 Ed25519 signature over the exact challenge string.
+    signature: str
+    device_id: str | None = Field(default=None, max_length=64)
+
+
+@router.post(
+    "/refresh",
+    response_model=RegisterOut,
+    # Once per start-up per install, plus the odd 401 retry. Keyed by IP (there
+    # is no session yet), and loose for the same CGNAT reason as /auth/register.
+    dependencies=[Depends(rate_limit("auth_refresh", 60, 3600))],
+)
+async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
+    sk = body.signing_key.strip()
+    if not verify_recover_challenge(body.challenge, sk):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_challenge"})
+    try:
+        Ed25519PublicKey.from_public_bytes(b64decode(sk)).verify(
+            b64decode(body.signature), body.challenge.encode()
+        )
+    except (InvalidSignature, ValueError, TypeError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"})
+    owned = (
+        await db.execute(
+            select(User.uin).where(User.uin == body.uin, User.signing_key == sk).limit(1)
+        )
+    ).scalar_one_or_none()
+    if owned is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
+    # Same queue-cursor floor as /auth/device. A named install that has no
+    # cursor yet (its row was dropped when the session was revoked, or the
+    # install id is new) would otherwise be handed the ENTIRE queue on its next
+    # drain and notify for all of it.
+    if body.device_id:
+        if await db.get(QueueCursor, (owned, body.device_id)) is None:
+            floor_direct, floor_group = await account_watermark(db, owned)
+            db.add(QueueCursor(
+                uin=owned,
+                device_id=body.device_id,
+                last_direct_id=floor_direct,
+                last_group_id=floor_group,
+                updated_at=datetime.now(timezone.utc),
+            ))
+            await db.commit()
+    return RegisterOut(uin=owned, token=issue_token(owned, await uin_epoch(owned), body.device_id))
+
+
 # ── identity key re-issue (in-place rotation) ───────────────────────────────
 # Re-key an EXISTING account without changing the UIN. The caller is already
 # authenticated (the bearer token proves they own the UIN), so this simply
