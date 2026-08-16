@@ -97,12 +97,27 @@ git merge --ff-only "origin/$BRANCH" || die "cannot fast-forward — update by h
 docker compose up -d --build app || die "rebuild failed — the old container may still be running"
 
 # ── prove it came back ───────────────────────────────────────────────────────
-DOMAIN=$(grep -E '^RCQ_DOMAIN=' .env 2>/dev/null | cut -d= -f2- || true)
+#
+# ⚠ Asked from INSIDE the container first, and that order is the point. From
+# the host, port 8000 is not published (only Caddy is), and the public name
+# depends on DNS and a certificate — so a perfectly healthy island would look
+# dead. Python rather than curl: the image is slim and has no curl.
+#
+# ⚠ `RCQ_DOMAIN` can list SEVERAL names, comma-separated, because Caddy accepts
+# that ("is2.rcq.app, is2.165-22-95-218.sslip.io" on a real island). Feeding the
+# whole string to curl produces "malformed URL" and a false alarm — which is
+# exactly what the first live run reported, on an island that had updated fine.
+DOMAIN=$(grep -E '^RCQ_DOMAIN=' .env 2>/dev/null | cut -d= -f2- | cut -d, -f1 | tr -d ' ' || true)
 HEALTH_OK=false
 for _ in $(seq 1 24); do
     sleep 5
-    if curl -fsS -m 5 "http://127.0.0.1:8000/health" >/dev/null 2>&1 ||
-       { [ -n "$DOMAIN" ] && curl -fsS -m 5 "https://$DOMAIN/health" >/dev/null 2>&1; }; then
+    if docker compose exec -T app python -c \
+         'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5).status == 200 else 1)' \
+         >/dev/null 2>&1; then
+        HEALTH_OK=true
+        break
+    fi
+    if [ -n "$DOMAIN" ] && curl -fsS -m 5 "https://$DOMAIN/health" >/dev/null 2>&1; then
         HEALTH_OK=true
         break
     fi
