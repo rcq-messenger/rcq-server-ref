@@ -211,7 +211,8 @@ for _ in $(seq 1 12); do
         echo "Operations:"
         echo "  Tail logs:    cd $INSTALL_DIR && docker compose logs -f app"
         echo "  Restart:      cd $INSTALL_DIR && docker compose restart app"
-        echo "  Update:       cd $INSTALL_DIR && git pull && docker compose up -d --build"
+        echo "  Update now:   $INSTALL_DIR/deploy/rcq-update.sh"
+        echo "  Update daily: see $INSTALL_DIR/docs/updating.md (off by default)"
         echo "  APNs setup:   $INSTALL_DIR/docs/apns.md"
         exit 0
     fi
