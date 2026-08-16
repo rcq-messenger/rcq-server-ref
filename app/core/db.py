@@ -1,3 +1,4 @@
+import logging
 import secrets
 
 from sqlalchemy import text
@@ -5,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import settings
+
+log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -380,6 +383,55 @@ async def init_db() -> None:
                 )
         except Exception:
             pass
+
+    # ── Columns the model no longer has, still NOT NULL in an old database ──
+    #
+    # ⚠⚠ This is the same failure as the DEFAULT self-heal above, and it bit
+    # twice. A column REMOVED from the model keeps living in a database that
+    # predates the removal. The ORM stops filling it, so if it is NOT NULL
+    # with no default, EVERY insert into that table dies — and the error comes
+    # out as a 500 on /auth/register, i.e. "nobody can create an account here
+    # any more", with nothing on the client saying why.
+    #
+    # First time: `reputation`, fixed by re-asserting defaults (above), which
+    # only works for columns still in the add-list. Second time, 2026-08-16:
+    # `is_fake` on is2 — dropped from the model with the demo accounts on
+    # 07.08, left NOT NULL in the database, and registration there had been
+    # 500ing for who knows how long. Reported by a user, not by us.
+    #
+    # So: stop listing them. Ask the database which NOT NULL columns have no
+    # default and are unknown to the model, and drop the constraint. Anything
+    # the model DOES know keeps its constraint — this only ever touches
+    # columns nothing can fill.
+    if dialect == "postgresql":
+        for table_name, table in Base.metadata.tables.items():
+            known = {c.name for c in table.columns}
+            async with engine.begin() as conn:
+                try:
+                    rows = (await conn.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = :t AND is_nullable = 'NO' "
+                            "AND column_default IS NULL"
+                        ),
+                        {"t": table_name},
+                    )).fetchall()
+                except Exception:
+                    continue
+            for (col,) in rows:
+                if col in known:
+                    continue
+                async with engine.begin() as conn:
+                    try:
+                        await conn.execute(text(
+                            f'ALTER TABLE {table_name} ALTER COLUMN "{col}" DROP NOT NULL'
+                        ))
+                        log.warning(
+                            "[db] %s.%s is NOT NULL but no longer in the model — "
+                            "dropped the constraint so inserts work", table_name, col
+                        )
+                    except Exception:
+                        pass
 
     # Account-recovery lookup: /auth/recover finds the UIN by signing_key.
     # Without an index that's a seq scan holding one of the (deliberately tiny)
