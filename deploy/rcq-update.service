@@ -1,0 +1,18 @@
+# One update run. Driven by rcq-update.timer; safe to start by hand:
+#   systemctl start rcq-update.service && journalctl -u rcq-update -n 50
+#
+# Type=oneshot with no restart on failure: a failed update has already written
+# what went wrong to state/update.log and left the old container running. A
+# retry loop against a repository that is unreachable — which on a censored
+# network is the normal case — would just hammer it.
+
+[Unit]
+Description=Update the RCQ island to the latest release
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=INSTALL_DIR=/opt/rcq-server
+ExecStart=/opt/rcq-server/deploy/rcq-update.sh
+TimeoutStartSec=900

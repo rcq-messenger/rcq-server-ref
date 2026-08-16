@@ -1,0 +1,24 @@
+# Check for a new RCQ island release once a day, at a time nobody picked.
+#
+# Install (as root, on the machine running the island):
+#   cp /opt/rcq-server/deploy/rcq-update.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now rcq-update.timer
+#
+# Off by default and never installed behind the operator's back: an island that
+# pulls code by itself is a trust decision, and it is theirs to make.
+#
+# `RandomizedDelaySec` matters more than it looks. Without it every island on
+# earth would fetch the same repository in the same second after a release, and
+# the ones behind a censored network — the ones this project exists for — would
+# be the ones that time out.
+
+[Unit]
+Description=Check for and apply RCQ island updates
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
