@@ -40,8 +40,14 @@ mkdir -p "$STATE_DIR"
 cd "$INSTALL_DIR"
 
 # ── refuse to touch a checkout somebody is working in ────────────────────────
-if [ -n "$(git status --porcelain 2>/dev/null | grep -v '^?? state/' || true)" ]; then
-    die "local changes in $INSTALL_DIR — update by hand, nothing was touched"
+#
+# ⚠ TRACKED files only (`--untracked-files=no`). Every island has untracked
+# files by definition — `.env` is one, and so is anything the operator left
+# lying around — so counting those would mean this script refused to run on
+# literally every install. Caught on the first live run against is2, which has
+# `.env` plus a handful of old `.bak` files.
+if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+    die "tracked files were modified in $INSTALL_DIR — update by hand, nothing was touched"
 fi
 
 git fetch --quiet origin "$BRANCH" || die "cannot reach the repository"
