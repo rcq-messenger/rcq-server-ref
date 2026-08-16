@@ -34,6 +34,7 @@ from app.models.invite import Invite
 from app.models.owned_uin import OwnedUin
 from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
+from app.models.report_message import ReportMessage
 from app.models.user import User, effective_status
 from app.services import server_settings
 from app.services.apns import send_to_user as apns_send
@@ -185,6 +186,14 @@ class ReportAttachmentOut(BaseModel):
     size: int = 0
 
 
+class ReportTurnOut(BaseModel):
+    id: int
+    from_admin: bool
+    author_uin: int
+    body: str
+    created_at: datetime
+
+
 class ReportOut(BaseModel):
     id: int
     reporter_uin: int
@@ -209,6 +218,11 @@ class ReportOut(BaseModel):
     # response (and so every view of it is logged individually).
     has_evidence: bool = False
     evidence_mime: str | None = None
+    # The exchange so far, oldest first. The operator needs the reporter's
+    # follow-ups in the queue itself — that is the whole point of letting them
+    # write back, and an answer written without reading "it still happens after
+    # the update" is worse than no answer.
+    thread: list[ReportTurnOut] = []
 
 
 class ReportsListOut(BaseModel):
@@ -362,6 +376,19 @@ async def list_reports(
         select(func.count(Report.id)).where(Report.status == "open")
     ) or 0) - int(open_crash_count)
 
+    # One query for every turn on the page, not one per report.
+    turns: dict[int, list[ReportTurnOut]] = {}
+    if rows:
+        for m in (await db.execute(
+            select(ReportMessage)
+            .where(ReportMessage.report_id.in_([r.id for r in rows]))
+            .order_by(ReportMessage.created_at.asc())
+        )).scalars().all():
+            turns.setdefault(m.report_id, []).append(ReportTurnOut(
+                id=m.id, from_admin=m.from_admin, author_uin=m.author_uin,
+                body=m.body, created_at=m.created_at,
+            ))
+
     items = [
         ReportOut(
             id=r.id,
@@ -381,6 +408,7 @@ async def list_reports(
             attachments=_coerce_attachments(r.attachments),
             has_evidence=bool(r.evidence_path),
             evidence_mime=r.evidence_mime,
+            thread=turns.get(r.id, []),
         )
         for r in rows
     ]
@@ -512,6 +540,14 @@ async def reply_to_report(
 
     report.reply_text = body.text.strip()
     report.replied_at = datetime.now(timezone.utc)
+    # The same text also becomes a turn in the report's conversation. Both,
+    # not one or the other: `reply_text` is what every already-installed client
+    # reads, and the thread is what a client with a ticket screen renders. When
+    # the fleet has turned over, `reply_text` becomes a mirror of the last
+    # operator turn and nothing more.
+    db.add(ReportMessage(
+        report_id=report.id, from_admin=True, author_uin=0, body=report.reply_text
+    ))
     await db.commit()
     await db.refresh(report)
 

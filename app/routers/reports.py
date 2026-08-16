@@ -33,6 +33,7 @@ from app.core.db import get_db
 from app.core.rate_limit import enforce_rate_limit, rate_limit
 from app.core.security import current_uin
 from app.models.report import Report
+from app.models.report_message import ReportMessage
 from app.services import server_settings
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -313,6 +314,13 @@ async def create_report_with_evidence(
     return CreateReportOut(id=report.id, created_at=report.created_at)
 
 
+class ReportTurnOut(BaseModel):
+    id: int
+    from_admin: bool
+    body: str
+    created_at: datetime
+
+
 class MyReportOut(BaseModel):
     id: int
     reason: str
@@ -320,8 +328,40 @@ class MyReportOut(BaseModel):
     created_at: datetime
     # The operator's answer, empty until one is written. This is the whole
     # point of the endpoint: before it existed a report was a one-way box.
+    #
+    # ⚠ Kept for clients that predate the thread below. It mirrors the LAST
+    # operator turn, so an old build shows the newest answer instead of
+    # silently showing nothing.
     reply: str
     replied_at: datetime | None
+    # The whole exchange, oldest first — what a client with a ticket screen
+    # renders. Empty on a report nobody has answered and nobody has added to.
+    thread: list[ReportTurnOut] = []
+
+
+async def _thread_of(db: AsyncSession, report_ids: list[int]) -> dict[int, list[ReportTurnOut]]:
+    """Every turn for these reports, grouped. One query, because the list
+    screen asks for fifty reports at once and a query per report is how a
+    screen that used to be instant becomes a spinner."""
+    if not report_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(ReportMessage)
+            .where(ReportMessage.report_id.in_(report_ids))
+            .order_by(ReportMessage.created_at.asc())
+        )
+    ).scalars().all()
+    out: dict[int, list[ReportTurnOut]] = {}
+    for m in rows:
+        out.setdefault(m.report_id, []).append(
+            ReportTurnOut(id=m.id, from_admin=m.from_admin, body=m.body, created_at=m.created_at)
+        )
+    return out
+
+
+class AddTurnIn(BaseModel):
+    body: str = Field(..., min_length=1, max_length=4000)
 
 
 @router.get("/mine", response_model=list[MyReportOut])
@@ -352,6 +392,7 @@ async def my_reports(
             .limit(50)
         )
     ).scalars().all()
+    threads = await _thread_of(db, [r.id for r in rows])
     return [
         MyReportOut(
             id=r.id,
@@ -360,9 +401,55 @@ async def my_reports(
             created_at=r.created_at,
             reply=r.reply_text or "",
             replied_at=r.replied_at,
+            thread=threads.get(r.id, []),
         )
         for r in rows
     ]
+
+
+@router.post(
+    "/mine/{report_id}/messages",
+    response_model=ReportTurnOut,
+    status_code=status.HTTP_201_CREATED,
+    # A conversation, not a firehose: enough to answer a question and add the
+    # log line you forgot, not enough to turn the queue into a chat room.
+    dependencies=[Depends(rate_limit("report_reply", 20, 3600))],
+)
+async def add_to_my_report(
+    report_id: int,
+    body: AddTurnIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> ReportTurnOut:
+    """Write back on your own report.
+
+    This is the half that was missing. An operator could answer, but the person
+    who filed it could not say "still happens" or hand over the diagnostic line
+    they were asked for — so they filed a second report instead, and the queue
+    filled with the same issue three times over.
+
+    ⚠ Deliberately NOT gated on the island's "reports open" switch, same as
+    reading: intake can be closed while a conversation that is already open
+    must still be finishable.
+
+    Only your own report, and only while it is open — a closed one that starts
+    receiving text again is a ticket nobody is watching.
+    """
+    report = await db.get(Report, report_id)
+    if report is None or report.reporter_uin != uin:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such report")
+    if report.status != "open":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "closed", "message": "this report is closed"},
+        )
+    turn = ReportMessage(report_id=report.id, from_admin=False, author_uin=uin, body=body.body.strip())
+    db.add(turn)
+    await db.commit()
+    await db.refresh(turn)
+    return ReportTurnOut(
+        id=turn.id, from_admin=turn.from_admin, body=turn.body, created_at=turn.created_at
+    )
 
 
 @router.delete("/mine/{report_id}", status_code=status.HTTP_204_NO_CONTENT)

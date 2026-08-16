@@ -6,8 +6,10 @@ from .device_token import DeviceToken
 from .audio_room import AudioRoom, AudioRoomMembership
 from .story import Story, StoryView
 from .owned_uin import OwnedUin
+from .report_message import ReportMessage
 
 __all__ = [
+    "ReportMessage",
     "User",
     "Contact",
     "ContactRequest",
