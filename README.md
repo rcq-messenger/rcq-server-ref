@@ -64,7 +64,12 @@ hosted-key tooling), keep an eye on releases.
   all tests, and it quoted dollar prices against a receipt check that
   accepted any string.)
 * **Reports / moderation** — bug-bounty submissions, abuse reports
-  with encrypted-media evidence, admin SPA at `admin.<your-domain>`.
+  with encrypted-media evidence, admin SPA at `admin.<your-domain>`. A report
+  is a CONVERSATION since 2026-08-16: the reporter writes back on their own
+  report (`POST /reports/mine/{id}/messages`, 20/hour) and both sides see the
+  whole thread. Deliberately server-side plaintext and never dressed up as a
+  chat message — this island holds no keys, so a channel where the server puts
+  text in front of a person has to look like what it is.
 * **Built-in admin console (self-host)** — open
   `https://<your-server>/admin/console` and log in with the
   `ADMIN_USERNAME` / `ADMIN_PASSWORD` you set in `.env`. One self-contained
@@ -242,6 +247,20 @@ native-only (iOS/Android/desktop).
   V2` + receipt validation there before taking real money. Do not ship
   a price to users until you have: a screen that charges nothing while
   showing a figure is worse than a free feature.
+
+## Keeping it up to date
+
+`deploy/rcq-update.sh` pulls, rebuilds and health-checks in one pass, and
+refuses to run when a tracked file has local edits. It dumps the database
+first and keeps the last five dumps. Install the timer and it runs daily with
+a random delay of up to four hours, so every island does not restart at the
+same minute:
+
+```bash
+sudo bash deploy/rcq-update.sh --install-timer
+```
+
+Details, the manual path, and how to roll back: [`docs/updating.md`](docs/updating.md).
 
 ## Protocol
 
