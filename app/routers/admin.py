@@ -442,6 +442,46 @@ def _coerce_attachments(raw) -> list[ReportAttachmentOut]:
     return out
 
 
+async def _report_out(db: AsyncSession, report: Report) -> ReportOut:
+    """One place that turns a Report row into the queue's shape. Three handlers
+    used to build it inline, which is how `thread` ended up on some responses
+    and not others."""
+    target_user = await db.get(User, report.target_uin)
+    reporter_user = await db.get(User, report.reporter_uin)
+    return ReportOut(
+        id=report.id,
+        reporter_uin=report.reporter_uin,
+        reporter_nickname=reporter_user.nickname if reporter_user else None,
+        target_uin=report.target_uin,
+        target_nickname=target_user.nickname if target_user else None,
+        reason=report.reason,
+        context=report.context,
+        status=report.status,
+        resolution_action=report.resolution_action,
+        resolution_notes=report.resolution_notes,
+        reply_text=report.reply_text or "",
+        replied_at=report.replied_at,
+        created_at=report.created_at,
+        resolved_at=report.resolved_at,
+        attachments=_coerce_attachments(report.attachments),
+        has_evidence=bool(report.evidence_path),
+        evidence_mime=report.evidence_mime,
+        # The thread rides along, so a queue that just replied or reopened
+        # repaints from the response instead of refetching the list.
+        thread=[
+            ReportTurnOut(
+                id=m.id, from_admin=m.from_admin, author_uin=m.author_uin,
+                body=m.body, created_at=m.created_at,
+            )
+            for m in (await db.execute(
+                select(ReportMessage)
+                .where(ReportMessage.report_id == report.id)
+                .order_by(ReportMessage.created_at.asc())
+            )).scalars().all()
+        ],
+    )
+
+
 @router.post("/reports/{report_id}/resolve", response_model=ReportOut)
 async def resolve_report(
     report_id: int,
@@ -458,6 +498,19 @@ async def resolve_report(
     # the report as `resolved` and inflated the resolved-reports stat with
     # reports nobody acted on.
     action = body.action.strip().lower()
+    # Reopening is a verdict like any other, and the queue needs it: a ticket
+    # closed by mistake, or one the reporter answered after it was closed, has
+    # to come back to the open list. Without it the only way back was a manual
+    # UPDATE on the database, which is not a workflow.
+    if action in {"reopen", "open", "reopened"}:
+        report.status = "open"
+        report.resolution_action = ""
+        report.resolution_notes = body.notes.strip()
+        report.resolved_at = None
+        await db.commit()
+        await db.refresh(report)
+        return await _report_out(db, report)
+
     if action == "duplicate":
         new_status = "duplicate"
     elif action in {"no_action", "rejected", "dismissed"}:
@@ -560,27 +613,57 @@ async def reply_to_report(
     await apns_send(report.reporter_uin, **push_args)
     await up_send(report.reporter_uin, **push_args)
 
-    target_user = await db.get(User, report.target_uin)
-    reporter_user = await db.get(User, report.reporter_uin)
-    return ReportOut(
-        id=report.id,
-        reporter_uin=report.reporter_uin,
-        reporter_nickname=reporter_user.nickname if reporter_user else None,
-        target_uin=report.target_uin,
-        target_nickname=target_user.nickname if target_user else None,
-        reason=report.reason,
-        context=report.context,
-        status=report.status,
-        resolution_action=report.resolution_action,
-        resolution_notes=report.resolution_notes,
-        reply_text=report.reply_text or "",
-        replied_at=report.replied_at,
-        created_at=report.created_at,
-        resolved_at=report.resolved_at,
-        attachments=_coerce_attachments(report.attachments),
-        has_evidence=bool(report.evidence_path),
-        evidence_mime=report.evidence_mime,
-    )
+    return await _report_out(db, report)
+
+
+class EditTurnIn(BaseModel):
+    body: str = Field(..., min_length=1, max_length=4000)
+
+
+@router.patch("/reports/{report_id}/messages/{message_id}", response_model=ReportOut)
+async def edit_admin_turn(
+    report_id: int,
+    message_id: int,
+    body: EditTurnIn,
+    db: AsyncSession = Depends(get_db),
+) -> ReportOut:
+    """Fix an operator's own turn in a ticket.
+
+    Answers get typed under time pressure and sometimes carry the wrong version
+    number or the wrong link. Before this the only options were to send a second
+    turn correcting the first, or to leave it. Only OUR side is editable: the
+    reporter's words are theirs, and an operator quietly rewriting them would
+    make the whole thread worthless as a record.
+
+    `reply_text` mirrors the LAST operator turn for clients that predate the
+    thread, so editing that turn updates it too — otherwise an old build would
+    keep showing the sentence we just corrected.
+    """
+    report = await db.get(Report, report_id)
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such report")
+    turn = await db.get(ReportMessage, message_id)
+    if turn is None or turn.report_id != report_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such message")
+    if not turn.from_admin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={"code": "not_ours", "message": "only operator turns can be edited"},
+        )
+    turn.body = body.body.strip()
+    last_admin = (
+        await db.execute(
+            select(ReportMessage)
+            .where(ReportMessage.report_id == report_id, ReportMessage.from_admin.is_(True))
+            .order_by(ReportMessage.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if last_admin is not None and last_admin.id == turn.id:
+        report.reply_text = turn.body
+    await db.commit()
+    await db.refresh(report)
+    return await _report_out(db, report)
 
 
 # ── Report evidence (decrypted media) ───────────────────────────────
