@@ -539,7 +539,9 @@ async def send_to_user(
     return sent
 
 
-async def send_voip_to_user(uin: int, *, payload: dict[str, Any]) -> int:
+async def send_voip_to_user(
+    uin: int, *, payload: dict[str, Any], except_device: str | None = None
+) -> int:
     """VoIP-push fan-out for incoming-call wake-from-killed. Routes to
     `<bundle>.voip` topic with `apns-push-type: voip` so iOS treats this
     as a CallKit-bound delivery and wakes the app even from a fully
@@ -549,6 +551,12 @@ async def send_voip_to_user(uin: int, *, payload: dict[str, Any]) -> int:
     The `payload` should be a flat dict with the call info the iOS
     handler needs (call_id, from_uin, nickname, media, sdp). VoIP push
     payloads max out at 5KB — full SDPs are ~1.5KB so we fit comfortably.
+
+    `except_device` skips one install — the device that ANSWERED, when this
+    push is the answered-elsewhere un-ring. ⚠ A token row with no device_id
+    is skipped too in that case: it cannot be proven not to be the answering
+    install, and a `kind=end` landing on the device that is IN the call
+    would tear its own call down.
     """
     if not _is_configured():
         log.info("[apns] send_voip_to_user uin=%s skipped: APNs not configured", uin)
@@ -556,13 +564,15 @@ async def send_voip_to_user(uin: int, *, payload: dict[str, Any]) -> int:
     # Same no-DB-across-network rule as send_to_user: read tokens, release
     # the connection, then send.
     async with SessionLocal() as db:  # type: AsyncSession
-        tokens = (
-            await db.execute(
-                select(DeviceToken.id, DeviceToken.token).where(
-                    DeviceToken.uin == uin, DeviceToken.platform == "ios-voip"
-                )
+        query = select(DeviceToken.id, DeviceToken.token).where(
+            DeviceToken.uin == uin, DeviceToken.platform == "ios-voip"
+        )
+        if except_device is not None:
+            query = query.where(
+                DeviceToken.device_id.is_not(None),
+                DeviceToken.device_id != except_device,
             )
-        ).all()
+        tokens = (await db.execute(query)).all()
     log.warning("[apns] send_voip_to_user uin=%s tokens=%d", uin, len(tokens))
     if not tokens:
         return 0
