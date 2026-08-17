@@ -212,11 +212,15 @@ redis.call('HSET', calls, b, payload_b)
 return 1
 """
 
-# How long a call registration may sit before it is assumed leaked. Generous:
-# clearing it early costs only the single-busy guarantee for an unusually long
-# call (a third caller rings instead of being auto-declined), while clearing it
-# too late costs someone their calls entirely.
-_CALL_REGISTRATION_STALE_S = 2 * 60 * 60
+# How long a call registration may sit before it is assumed leaked. The cost
+# asymmetry decides this: clearing early costs only the single-busy guarantee
+# for an unusually long call (a third caller rings instead of being
+# auto-declined — and the callee's own client still answers busy while it has
+# a call open), while clearing too late costs someone their calls ENTIRELY.
+# This used to be two hours, and a `call_end` that died on a bad socket left
+# both parties refused with "busy" for the whole window; ten minutes turns the
+# same leak into a nuisance that heals itself before anyone writes a report.
+_CALL_REGISTRATION_STALE_S = 10 * 60
 
 
 # call_id -> (answerer_uin, monotonic time the answer was relayed). Per worker,
@@ -295,6 +299,40 @@ async def _clear_call(call_id: str, *uins: int) -> None:
     redis = await _get_redis()
     args = [call_id] + [str(u) for u in uins]
     await redis.eval(_CLEAR_CALL_LUA, 1, _CALLS_KEY, *args)
+
+
+# Which device of the callee actually took the call — cluster-wide, unlike the
+# per-worker `_answered_at` above (that one only feeds the ICE grace, and both
+# ends of a call may be held by different workers than the callee's OTHER
+# devices, which is exactly where the frame this mark gates arrives).
+_ANSWERED_KEY_PREFIX = "call:answered:"
+
+
+async def _set_answered_mark(call_id: str, uin: int, device_id: str) -> None:
+    redis = await _get_redis()
+    await redis.set(
+        f"{_ANSWERED_KEY_PREFIX}{call_id}",
+        f"{uin}|{device_id}",
+        ex=_CALL_REGISTRATION_STALE_S,
+    )
+
+
+async def _answered_mark(call_id: str) -> tuple[int, str] | None:
+    redis = await _get_redis()
+    raw = await redis.get(f"{_ANSWERED_KEY_PREFIX}{call_id}")
+    if raw is None:
+        return None
+    text = raw.decode() if isinstance(raw, bytes) else str(raw)
+    head, _, dev = text.partition("|")
+    try:
+        return int(head), dev
+    except ValueError:
+        return None
+
+
+async def _clear_answered_mark(call_id: str) -> None:
+    redis = await _get_redis()
+    await redis.delete(f"{_ANSWERED_KEY_PREFIX}{call_id}")
 
 
 async def _caller_allowed(caller_uin: int, callee_uin: int) -> bool:
@@ -777,12 +815,28 @@ async def _handle_client_message(
         if kind == "call_ice":
             await _wait_out_answer_grace(call_id, uin)
 
+        # A ringing device that never had the call must not be able to end it.
+        # `call_offer` fans out to EVERY device of the callee on purpose; the
+        # un-ring below tells the others to stop once one answers, but a device
+        # the un-ring cannot single out (two installs whose tokens both key
+        # "primary") keeps ringing to its own timeout and then ships
+        # `no_answer` — or a human taps decline on it — carrying the LIVE
+        # call's id. Relaying that tore down a call both real parties were
+        # happily on, ~70 seconds in. The answered mark says who took the call
+        # and on which device; an ending that is really "the ring stopped on a
+        # device that never held the call" is dropped, not relayed.
+        if kind == "call_end" and str(msg.get("reason", "")) in {"no_answer", "declined"}:
+            mark = await _answered_mark(call_id)
+            if mark is not None and mark[0] == uin and mark[1] != device_id:
+                return
+
         delivered = await manager.send(target, relay)
 
         # Start the grace the moment an answer is on its way, not when the next
         # candidate shows up — by then the race is already lost.
         if kind == "call_answer":
             _answered_at[call_id] = (uin, time.monotonic())
+            await _set_answered_mark(call_id, uin, device_id)
 
         # Bind the call to the device that answered. `call_offer` is delivered
         # to every device of the callee on purpose — all of them should ring —
@@ -809,6 +863,7 @@ async def _handle_client_message(
         # server-side bookkeeping then matches what both clients now think.
         if kind == "call_end":
             _answered_at.pop(call_id, None)
+            await _clear_answered_mark(call_id)
             await _clear_call(call_id, uin, target)
 
         # If the recipient is offline AND this is the call_offer (the only
