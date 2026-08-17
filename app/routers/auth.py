@@ -22,6 +22,7 @@ from app.core.security import (
     carry_device_id,
     current_device_id,
     current_uin,
+    device_is_revoked,
     issue_key_challenge,
     issue_recover_challenge,
     issue_token,
@@ -387,6 +388,26 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
 
 
+async def _refuse_revoked_device(uin: int, device_id: str | None) -> None:
+    """Guard for every endpoint below that MINTS a session token.
+
+    ⚠ Checking a token on the way IN is not the same as refusing to make a new
+    one, and until report #607 this file only ever did the first. The web keeps
+    no token on disk: it proves the signing key and mints one at start-up
+    (`/auth/refresh`). So disconnecting a browser from the phone denylisted the
+    token it was holding and then handed it a fresh one on the next request —
+    the session did not even blink, and a reload restored it outright.
+
+    The denylist is the same set `authorize_session` consults, so a revoke now
+    means one thing in both directions: this install gets no session, neither
+    the one it has nor a new one.
+    """
+    if await device_is_revoked(uin, device_id):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, detail={"code": "device_revoked"}
+        )
+
+
 @router.post("/session", response_model=SessionOut)
 async def session(
     uin: int = Depends(current_uin),
@@ -424,7 +445,21 @@ async def claim_device(
     would look brand new and be handed the whole queue again (harmless —
     clients dedupe by envelope id — but a pointless re-download of everything
     still on the server).
+
+    ⚠ A LINKED session may not rename itself. `current_uin` already refuses a
+    revoked device's bearer, but the id in the registry is the one the phone's
+    "disconnect" button acts on: a linked browser that swapped it for a name of
+    its own choosing would still be listed as connected and would no longer be
+    reachable by the revoke. Nothing does that today (every client claims an
+    install id only when its token has none) — this is here so that stays true.
     """
+    from app.routers.devices import is_linked_device  # local import: avoid cycle
+
+    await _refuse_revoked_device(uin, body.device_id)
+    if body.device_id != old_device_id and await is_linked_device(uin, old_device_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "linked_device_cannot_rename"}
+        )
     existing = await db.get(QueueCursor, (uin, body.device_id))
     if existing is None:
         old = await db.get(QueueCursor, (uin, old_device_id))
@@ -530,6 +565,11 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     ).scalar_one_or_none()
     if uin is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
+    # Recovery is the other door into the same room: it mints a session from the
+    # signing key alone, so a disconnected install must not be able to walk
+    # through it either. A genuine re-install carries a device id the account has
+    # never revoked (or none at all) and is unaffected.
+    await _refuse_revoked_device(uin, body.device_id)
     return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
 
 
@@ -580,6 +620,10 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Regist
     ).scalar_one_or_none()
     if owned is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
+    # ★ The whole point of report #607. Proving the signing key says WHO is
+    # asking, never WHERE from, so this is the only thing standing between a
+    # disconnected browser and a brand-new session for the same account.
+    await _refuse_revoked_device(owned, body.device_id)
     # Same queue-cursor floor as /auth/device. A named install that has no
     # cursor yet (its row was dropped when the session was revoked, or the
     # install id is new) would otherwise be handed the ENTIRE queue on its next

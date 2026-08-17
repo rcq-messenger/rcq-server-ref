@@ -44,17 +44,26 @@ def issue_token(uin: int, epoch: int = 0, device_id: str | None = None) -> str:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
-def issue_device_token(uin: int, device_id: str) -> str:
+def issue_device_token(uin: int, device_id: str, epoch: int = 0) -> str:
     """A session token for a LINKED web device — same `sub` (uin) as the phone,
     plus a `dev` claim so the session can be revoked independently (current_uin
     checks the per-account `dev_revoked` denylist for tokens carrying a `dev`).
-    Lives ~90 days, matching the device-registry TTL in routers/devices.py."""
+    Lives ~90 days, matching the device-registry TTL in routers/devices.py.
+
+    ⚠ `epoch` is not optional in practice, only in the signature. This was the
+    one token-minting function that never carried the claim, so on any number
+    that has changed hands (262 of them on the flagship) `authorize_session`
+    rejected a freshly linked browser's token as "stale" the moment it was
+    handed over. It went unnoticed because the browser answers a 401 by minting
+    its own token — which is the very behaviour report #607 is about."""
     payload = {
         "sub": str(uin),
         "dev": device_id,
         "iat": datetime.now(timezone.utc),
         "exp": datetime.now(timezone.utc) + timedelta(seconds=90 * 24 * 3600),
     }
+    if epoch:
+        payload["ep"] = epoch
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
@@ -168,6 +177,31 @@ def verify_recover_challenge(challenge: str, signing_key: str) -> bool:
     return verify_key_challenge(challenge, signing_key, "recover")
 
 
+async def device_is_revoked(uin: int, device_id: str | None) -> bool:
+    """Has this account disconnected the install named `device_id`?
+
+    ⚠ Every place that hands out a session token for an account MUST ask this,
+    not just the places that CHECK one. `authorize_session` refused a revoked
+    device's bearer from the first day, and that looked like enough — but the
+    web keeps no token on disk any more: it MINTS one at start-up from the
+    signing key (`POST /auth/refresh`). A mint endpoint that never consulted
+    the denylist simply issued the revoked browser a brand-new valid token, so
+    "отключить связь с браузером" survived exactly until the next request and
+    did not survive a reload at all (report #607).
+
+    Fails CLOSED — a Redis blip makes this raise, and the callers let it: a
+    mint is a rare, retryable operation, and answering "not revoked" because
+    the denylist was unreachable is the one answer that cannot be taken back.
+    (`authorize_session` has always had the same shape.)
+    """
+    if not device_id:
+        return False
+    from app.core.redis import get_redis  # local import avoids an import cycle
+
+    redis = await get_redis()
+    return bool(await redis.sismember(f"dev_revoked:{uin}", device_id))
+
+
 async def authorize_session(token: str) -> int:
     """Everything that makes a session token still valid, in one place.
 
@@ -192,11 +226,8 @@ async def authorize_session(token: str) -> int:
     # revocable. Only THESE pay the Redis denylist lookup — a plain phone token
     # (no `dev`) skips it, so the hot path is untouched.
     dev = payload.get("dev")
-    if dev:
-        from app.core.redis import get_redis  # local import avoids an import cycle
-        redis = await get_redis()
-        if await redis.sismember(f"dev_revoked:{uin}", dev):
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "device revoked")
+    if dev and await device_is_revoked(uin, dev):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "device revoked")
     # Reject a token minted for a PREVIOUS holder of this number. Absent claim
     # and absent row both read as epoch 0, so sessions predating this check are
     # unaffected — only a number that actually changed hands invalidates.

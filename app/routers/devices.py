@@ -9,7 +9,15 @@ first). Removing the last device auto-restores v=2 (the hash disappears).
 
 Redis-backed — these are ephemeral session state, not durable account data:
   devices:{uin}      hash  device_id -> JSON{label, created_at}
-  dev_revoked:{uin}  set   revoked device_ids (the JWT denylist current_uin checks)
+  dev_revoked:{uin}  set   revoked device_ids (the denylist `device_is_revoked`
+                           answers from — consulted both when a token is
+                           PRESENTED and when one is MINTED, see auth.py)
+
+⚠ A revoke can only ever be as good as the id it names. The linked session must
+keep refreshing under the `device_id` minted here, because that is the only
+handle the phone's "disconnect" button has on it: a client that re-mints under
+an id of its own choosing is invisible to this registry, and the disconnect
+becomes a button that changes nothing (report #607).
 """
 
 from __future__ import annotations
@@ -26,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.redis import get_redis
-from app.core.security import current_device_id, current_uin, issue_device_token
+from app.core.security import current_device_id, current_uin, issue_device_token, uin_epoch
 from app.models.queue_cursor import QueueCursor
 from app.services.connection_manager import manager
 
@@ -51,6 +59,17 @@ async def has_linked_devices(uin: int) -> bool:
     """True if the account has >=1 linked web session (→ serve v=1, not v=2)."""
     redis = await get_redis()
     return bool(await redis.exists(_devices_key(uin)))
+
+
+async def is_linked_device(uin: int, device_id: str | None) -> bool:
+    """True if `device_id` is one of this account's LINKED sessions, as opposed
+    to one of its own installs. Membership in the registry hash is the exact
+    test — a phone's token carries a `dev` claim too, and the two are told apart
+    nowhere else."""
+    if not device_id or device_id == "primary":
+        return False
+    redis = await get_redis()
+    return bool(await redis.hexists(_devices_key(uin), device_id))
 
 
 class LinkIn(BaseModel):
@@ -79,7 +98,10 @@ async def link_device(body: LinkIn, uin: int = Depends(current_uin)) -> LinkOut:
     await redis.hset(_devices_key(uin), device_id, entry)
     await redis.expire(_devices_key(uin), DEVICE_TTL_SECONDS)
     await _announce(uin, "device_linked", device_id, body.label)
-    return LinkOut(device_id=device_id, token=issue_device_token(uin, device_id))
+    return LinkOut(
+        device_id=device_id,
+        token=issue_device_token(uin, device_id, await uin_epoch(uin)),
+    )
 
 
 class DeviceOut(BaseModel):
@@ -189,4 +211,18 @@ async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
     )
     await db.commit()
     await _announce(uin, "device_revoked", device_id)
+    # Closing the socket is not decoration: the denylist is consulted at the
+    # HANDSHAKE, so a session that simply never reconnects went on receiving
+    # messages, presence and call signalling on the socket it already had —
+    # for as long as an idle tab stays open.
+    #
+    # ⚠ The announcement above races this and may not reach the device being
+    # disconnected (it travels through Redis; the close is immediate on this
+    # worker). It is the account's OTHER devices that need it, to refresh the
+    # linked-devices list. Nothing may depend on the revoked session hearing
+    # its own goodbye — being cut off is the message.
+    try:
+        await manager.kick_device(uin, device_id)
+    except Exception:  # noqa: BLE001 — the registry write is the source of truth
+        log.exception("[devices] failed to kick sockets uin=%s dev=%s", uin, device_id)
     return {"ok": True}
