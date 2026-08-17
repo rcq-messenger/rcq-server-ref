@@ -819,15 +819,21 @@ async def _handle_client_message(
         # `call_offer` fans out to EVERY device of the callee on purpose; the
         # un-ring below tells the others to stop once one answers, but a device
         # the un-ring cannot single out (two installs whose tokens both key
-        # "primary") keeps ringing to its own timeout and then ships
-        # `no_answer` — or a human taps decline on it — carrying the LIVE
-        # call's id. Relaying that tore down a call both real parties were
-        # happily on, ~70 seconds in. The answered mark says who took the call
-        # and on which device; an ending that is really "the ring stopped on a
-        # device that never held the call" is dropped, not relayed.
-        if kind == "call_end" and str(msg.get("reason", "")) in {"no_answer", "declined"}:
+        # "primary"), or one it simply never reached (woken by push, socket not
+        # up yet), keeps ringing to its own timeout and then ships `no_answer` /
+        # `expired` — or a human taps decline on it — carrying the LIVE call's
+        # id. Relaying that tore down a call both real parties were happily on,
+        # ~70 seconds in.
+        #
+        # The gate is the REASON plus the answered mark, deliberately not a
+        # device comparison: an answered callee has no path that legitimately
+        # ships any of these three reasons (the answering device's ring stopped
+        # at the answer; hanging up is `ended`; a failed setup is `failed`), and
+        # comparing device ids let the two-"primary" pair — the very case that
+        # produced the incident — sail through as "same device".
+        if kind == "call_end" and str(msg.get("reason", "")) in {"no_answer", "declined", "expired"}:
             mark = await _answered_mark(call_id)
-            if mark is not None and mark[0] == uin and mark[1] != device_id:
+            if mark is not None and mark[0] == uin:
                 return
 
         delivered = await manager.send(target, relay)
