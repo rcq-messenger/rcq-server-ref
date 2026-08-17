@@ -863,6 +863,24 @@ async def _handle_client_message(
                 },
                 except_device=device_id,
             )
+            # The live frame above only reaches devices that HOLD a socket —
+            # and the device most likely to still be ringing is one without:
+            # it was woken by the offer's push and is ringing full-screen
+            # while its socket is still dialling. Mirror the offer's push
+            # road with an end push so its ring stops now, not at its 60s
+            # watchdog. Both clients already treat `kind=end` as "dismiss
+            # the ring, file nothing". The ANSWERING device is excluded on
+            # both roads — an end push landing on the device that is in the
+            # call would tear its own call down — and so are device-id-less
+            # token rows, which cannot be proven not to be it.
+            unring_payload = {
+                "call_id": call_id,
+                "from_uin": target,
+                "kind": "end",
+                "reason": "answered_elsewhere",
+            }
+            await send_voip_to_user(uin, payload=unring_payload, except_device=device_id)
+            await up_call(uin, payload=unring_payload, skip_devices=frozenset({device_id}))
 
         # Clear the active-call registration on call_end from either side.
         # Done after the relay so the remote peer sees the end first; the
