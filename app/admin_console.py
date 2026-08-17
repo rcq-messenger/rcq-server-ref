@@ -154,7 +154,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<div id="updbar" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:#b45309;color:#fff;padding:10px 16px;font-size:14px;line-height:1.45;text-align:center;box-shadow:0 1px 6px rgba(0,0,0,.25)"></div>
+<div id="updbar" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:#b45309;color:#fff;padding:10px 16px;font-size:14px;line-height:1.5;text-align:center;white-space:normal;overflow-wrap:anywhere;box-shadow:0 1px 6px rgba(0,0,0,.25)"></div>
 <div class="layout">
   <aside id="side">
     <div class="brand">
@@ -566,7 +566,7 @@ async function loadReports() {
     $('reports').innerHTML = (r.items||[]).map(rp=>`<tr>
       <td>${rp.id}</td>
       <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+esc(rp.target_nickname)+')</span>':''}</td>
-      <td>${esc((rp.reason||'').slice(0,120))}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${esc(contextLabel(rp.context))}</span></td>
+      <td style="white-space:normal;overflow-wrap:anywhere">${esc(rp.reason||'')}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${esc(contextLabel(rp.context))}</span></td>
       <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> ${isAbuse(rp)?'<button class="btn danger sm" onclick="resolve('+rp.id+',true)">Ban</button>':''}</td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
@@ -906,10 +906,15 @@ async function checkUpdate() {
     const u = await api('GET','/update-check');
     if (!u || !u.update_available) return;
     const bar = $('updbar');
+    // ⚠ One line that WRAPS, and a command that exists. The bar used to run off
+    // the right edge on anything narrower than a desktop (founder, with a
+    // screenshot), and it told operators to `git pull` by hand — the updater
+    // that dumps the database first, rebuilds and health-checks has been there
+    // since 2026-08-16.
     bar.innerHTML = '🔔 Доступно обновление RCQ-сервера: <b>'+u.latest+'</b> (у вас '+u.current+'). '
-      + 'Обновите: <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px">git pull</code> и перезапустите сервис &middot; '
-      + '<a href="'+u.repo_url+'" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">что изменилось</a>'
-      + ' &nbsp;|&nbsp; Update available — pull &amp; restart.';
+      + 'Обновить: <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px">sudo bash deploy/rcq-update.sh</code> '
+      + '(снимет дамп базы, соберёт и проверит здоровье). '
+      + '<a href="'+u.repo_url+'" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">Что изменилось</a>';
     bar.style.display='block';
     document.body.style.paddingTop='46px';
   } catch(e) {}
