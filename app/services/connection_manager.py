@@ -443,6 +443,34 @@ class ConnectionManager:
 
     # ── Public API ──────────────────────────────────────────────────
 
+    async def kick_device(self, uin: int, device_id: str) -> None:
+        """Drop every socket this cluster holds for one (uin, device), now.
+
+        ⚠ Revoking a linked session used to be enforced only on the way IN:
+        `authorize_session` refuses the next handshake, and the socket already
+        open was left alone. A browser that never reconnects therefore went on
+        receiving messages, presence and call signalling for as long as its
+        socket lived — which for an idle tab is hours. The revoke has to reach
+        the connection that exists, not only the one that would be made.
+
+        Reuses the `supersede` envelope (same meaning: close stale sockets for
+        this uin+device, leave the account's other devices alone). `pid` is
+        omitted so the origin worker acts on it too — a supersede skips its own
+        publisher because that worker just accepted the new socket, and here
+        there is no new socket to spare.
+        """
+        await self._ensure_pubsub()
+        await self._close_local_sockets_for_device(uin, device_id)
+        try:
+            redis = await get_redis()
+            await redis.srem(_online_devs_key(uin), device_id)
+            await redis.publish(
+                _FANOUT_CHANNEL,
+                self._envelope(target="supersede", uin=uin, device_id=device_id),
+            )
+        except Exception:  # noqa: BLE001 — the local close already happened
+            log.warning("could not fan out device kick uin=%s dev=%s", uin, device_id)
+
     async def connect(self, uin: int, ws: WebSocket, device_id: str = "primary") -> None:
         await ws.accept()
         # Supersede only the SAME device's stale sockets — a reconnect of
