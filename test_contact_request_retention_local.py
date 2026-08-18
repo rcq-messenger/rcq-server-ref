@@ -18,6 +18,7 @@ Run: cd backend && PYTHONPATH=. .venv/bin/python test_contact_request_retention_
 import asyncio
 import base64
 import os
+from datetime import datetime, timedelta, timezone
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_contact_req.db"
 os.environ["ENV"] = "dev"
@@ -29,7 +30,7 @@ for f in ("test_contact_req.db",):
         pass
 
 import httpx  # noqa: E402
-from sqlalchemy import func, select  # noqa: E402
+from sqlalchemy import func, select, update  # noqa: E402
 
 from app.core.db import SessionLocal, init_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -81,16 +82,25 @@ async def main() -> None:
         D = {"Authorization": f"Bearer {dt}"}
         E = {"Authorization": f"Bearer {et}"}
 
-        # ── 1. accept leaves no request row, but does leave contacts ────────
+        # ── 1. accept marks the row and stamps it; the sweep takes it later ──
         r = await c.post("/contacts/request", json={"to_uin": bob}, headers=A)
         rid = r.json()["id"]
         r = await c.post("/contacts/respond", json={"request_id": rid, "accept": True}, headers=B)
         check("accept answers 'accepted'", r.json().get("state") == "accepted", r.text[:120])
         left = await rows_between(alice, bob)
-        check("accepted request row is gone", len(left) == 0, f"{[x.state for x in left]}")
+        check("row is marked accepted and stamped",
+              len(left) == 1 and left[0].state == "accepted" and left[0].resolved_at is not None,
+              f"{[(x.state, x.resolved_at) for x in left]}")
         lst = (await c.get("/contacts", headers=A)).json()
         uins = {x["uin"] for x in (lst if isinstance(lst, list) else lst.get("contacts", []))}
-        check("they are contacts nonetheless", bob in uins, str(uins))
+        check("they are contacts", bob in uins, str(uins))
+
+        # A second tap on Accept — slow network, impatient finger — must not
+        # 404 on a request that succeeded. This is why the row is not deleted
+        # inline; the web client turns any exception into an error banner.
+        r2 = await c.post("/contacts/respond", json={"request_id": rid, "accept": True}, headers=B)
+        check("a repeated Accept stays calm", r2.status_code == 200 and r2.json().get("state") == "accepted",
+              f"{r2.status_code} {r2.text[:120]}")
 
         # ── 2. decline KEEPS the row: it is how the sender finds out ────────
         r = await c.post("/contacts/request", json={"to_uin": dave}, headers=C)
@@ -121,14 +131,38 @@ async def main() -> None:
         check("mutual add auto-accepts", body.get("state") == "accepted" and body.get("auto") is True,
               str(body)[:140])
         left = await rows_between(alice, erin)
-        check("auto-accepted row is gone too", len(left) == 0, f"{[x.state for x in left]}")
+        check("auto-accepted row is marked, not left pending",
+              len(left) == 1 and left[0].state == "accepted", f"{[x.state for x in left]}")
+
+        # ── 5. the sweep is what actually removes them ──────────────────────
+        # Fresh acceptances are inside the grace and must survive it...
+        from app.services.contact_request_sweep import sweep_once
+
+        n = await sweep_once()
+        async with SessionLocal() as db:
+            fresh = int(await db.scalar(
+                select(func.count(ContactRequest.id)).where(ContactRequest.state == "accepted")
+            ) or 0)
+        check("the sweep spares acceptances inside the grace", n == 0 and fresh > 0,
+              f"swept {n}, {fresh} accepted left")
+
+        # ...and go once the grace has passed. Backdated rather than slept.
+        async with SessionLocal() as db:
+            await db.execute(
+                update(ContactRequest)
+                .where(ContactRequest.state == "accepted")
+                .values(resolved_at=datetime.now(timezone.utc) - timedelta(hours=3))
+            )
+            await db.commit()
+        n = await sweep_once()
+        check("the sweep takes them after the grace", n == fresh, f"swept {n}, expected {fresh}")
 
         # What is left island-wide: the one declined row, and the fresh pending
-        # re-request from step 3. Nothing in state 'accepted' anywhere — four
-        # acceptances happened above and not one left a trace.
+        # re-request from step 3. Nothing accepted survives.
         async with SessionLocal() as db:
             states = sorted(s for (s,) in (await db.execute(select(ContactRequest.state))).all())
-        check("no accepted row survives anywhere", states == ["declined", "pending"], str(states))
+        check("no accepted row survives the sweep", states == ["declined", "pending"], str(states))
+        check("the declined row is still there afterwards", "declined" in states, str(states))
 
     print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} pass")
     if FAIL:

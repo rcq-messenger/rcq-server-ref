@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -178,20 +178,20 @@ async def send_request(
         )
     )
     if reverse is not None:
-        # The accepted request is DELETED, not kept as history: once the two
-        # Contact rows exist they are the relationship, and nothing reads an
-        # accepted request afterwards (both list endpoints exclude the state,
-        # no client compares against it). Keeping it left a permanent "A asked
-        # B on date D" on the island for no reader — 515 such rows going back
-        # to April, before this. A later re-request simply inserts a fresh
-        # pending row; the reopen path below existed only to dodge the unique
-        # index this deletion clears.
+        # Accepted requests are not kept as history: once the two Contact rows
+        # exist they are the relationship, and nothing reads an accepted
+        # request afterwards (both list endpoints exclude the state, no client
+        # compares against it). Keeping them left a permanent "A asked B on
+        # date D" on the island for no reader — 515 such rows going back to
+        # April, before this. The row is marked here and swept an hour later;
+        # see the note in respond() for why not inline.
         reverse_id, reverse_from = reverse.id, reverse.from_uin
+        reverse.state = "accepted"
+        reverse.resolved_at = datetime.now(timezone.utc)
         db.add_all([
             Contact(owner_uin=reverse.from_uin, contact_uin=reverse.to_uin),
             Contact(owner_uin=reverse.to_uin, contact_uin=reverse.from_uin),
         ])
-        await db.delete(reverse)
         await db.commit()
         delivered = await manager.send(
             reverse_from,
@@ -382,16 +382,22 @@ async def respond(
         return {"state": req.state}
     req_id, req_from = req.id, req.from_uin
     if body.accept:
-        # Mutual contact rows so both sides see each other in their list...
+        # Mutual contact rows so both sides see each other in their list. Those
+        # two rows ARE the relationship; the request row is spent the moment
+        # they exist and is swept shortly after (services/contact_request_sweep).
+        #
+        # ⚠ Marked, not deleted here. Deleting inline makes a second tap on
+        # Accept — a slow network and an impatient finger — answer 404 for a
+        # request that in fact succeeded, and the web client raises an error
+        # banner on any exception. The sweep's short delay costs an hour of
+        # retention and keeps the endpoint idempotent, which is the better
+        # trade for a row that used to live forever.
         db.add_all([
             Contact(owner_uin=req.from_uin, contact_uin=req.to_uin),
             Contact(owner_uin=req.to_uin, contact_uin=req.from_uin),
         ])
-        # ...and the request itself goes. Those two rows ARE the relationship;
-        # an accepted request has no reader anywhere (see the delete in the
-        # auto-accept path above), so keeping it only left the island a
-        # permanent record of who asked whom and when.
-        await db.delete(req)
+        req.state = "accepted"
+        req.resolved_at = datetime.now(timezone.utc)
         state = "accepted"
     else:
         # ⚠⚠ A DECLINED row is NOT history and must not be swept away with the
