@@ -894,6 +894,17 @@ async def _advance_cursor(
 # a reinstalled device does not pin an account's queue for a season.
 STALE_CURSOR_DAYS = 30
 
+# ...but a cursor that another device of the SAME account has long overtaken is
+# a different animal, and the 30-day rule is far too generous for it. A phone
+# switched off for a fortnight is indistinguishable from a dead install only
+# while it is the account's ONLY device; the moment a sibling cursor keeps
+# moving, the still one belongs to an install that is gone — reinstalled,
+# uninstalled, wiped — and holding everybody's sealed envelopes for it is a
+# fortnight of stored metadata bought for nobody. Measured on prod 18.08: two
+# accounts alone were pinning 3926 envelopes behind cursors last touched two
+# weeks earlier, while their live devices sat at zero pending.
+SUPERSEDED_CURSOR_DAYS = 7
+
 
 def _as_utc(ts: datetime | None) -> datetime | None:
     """Read a timestamp back as aware UTC. Postgres hands these back aware, but
@@ -916,8 +927,28 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     # and hold every later row above the reap floor — the queue would then only
     # ever be cleared by the TTL sweep. A stamp-less row predates the column and
     # is left alone until it next acks (which stamps it).
-    cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_CURSOR_DAYS)
-    stale = [c for c in cursors if _as_utc(c.updated_at) is not None and _as_utc(c.updated_at) < cutoff]
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=STALE_CURSOR_DAYS)
+    # The freshest cursor is the proof that somebody is still reading this
+    # account somewhere; it is never itself a candidate, whatever its age.
+    stamps = [_as_utc(c.updated_at) for c in cursors if _as_utc(c.updated_at) is not None]
+    newest = max(stamps) if stamps else None
+    superseded_cutoff = now - timedelta(days=SUPERSEDED_CURSOR_DAYS)
+    fresh_sibling = newest is not None and newest >= superseded_cutoff
+
+    def _drop(c: QueueCursor) -> bool:
+        ts = _as_utc(c.updated_at)
+        if ts is None:  # predates the column; left alone until it next acks
+            return False
+        if ts < cutoff:
+            return True
+        # Overtaken by a device that is still reading: a much shorter leash.
+        # A cursor older than this cutoff cannot be the freshest one, since
+        # `fresh_sibling` says the freshest is newer than the same cutoff — so
+        # this can never drop the only cursor an account has.
+        return fresh_sibling and ts < superseded_cutoff
+
+    stale = [c for c in cursors if _drop(c)]
     if stale:
         for c in stale:
             await db.delete(c)
