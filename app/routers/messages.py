@@ -19,6 +19,7 @@ from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User, _as_aware
+from app.services.activity_rollup import bump_bg as activity_bump
 from app.services.apns import (
     PushEndpoints,
     group_push_targets,
@@ -342,6 +343,7 @@ async def send_sealed(
         "[sealed] to=%s type=%s ws_delivered=%s queued=%s pushed=%s",
         body.to_uin, body.envelope_type, delivered, queued, pushed,
     )
+    activity_bump("msg")
     return SendOut(delivered=delivered, queued=queued, server_time=now)
 
 
@@ -615,6 +617,7 @@ async def send_group_sealed(
         body.group_id, body.envelope_type, len(body.payloads), len(rows),
         delivered_any, len(offline_recipients),
     )
+    activity_bump("gmsg")
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
 
 
@@ -802,6 +805,7 @@ async def send_group_broadcast(
         body.group_id, body.envelope_type, len(recipients), len(rows),
         delivered_any, len(offline_recipients),
     )
+    activity_bump("gmsg")
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
 
 

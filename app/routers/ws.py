@@ -778,6 +778,10 @@ async def _handle_client_message(
                 })
                 return
             registered = await _register_call(call_id, uin, target)
+            if registered:
+                from app.services.activity_rollup import bump_bg as activity_bump
+
+                activity_bump("call")
             if not registered:
                 # Caller (or callee) is busy on another call. Tell the
                 # caller's client to short-circuit straight to .ended.

@@ -383,6 +383,9 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
                 else {"type": "group_membership_changed", "group_id": beta_group_id},
             )
 
+    from app.services.activity_rollup import bump_bg as activity_bump
+
+    activity_bump("reg")
     # Mint under the number's CURRENT epoch: a recycled UIN starts above 0,
     # which is what stops a previous holder's saved bearer from working.
     return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
