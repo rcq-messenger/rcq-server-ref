@@ -540,6 +540,9 @@ class ConnectionManager:
         # sockets for this UIN — that's the cross-worker half of the
         # deduplication above.
         try:
+            from app.services.activity_rollup import bump_bg as activity_bump
+
+            activity_bump("ws")
             redis = await get_redis()
             await redis.sadd(_ONLINE_KEY, uin)
             await redis.sadd(_online_devs_key(uin), device_id)

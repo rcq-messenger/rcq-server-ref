@@ -1189,6 +1189,37 @@ async def dau_timeseries(
     return result
 
 
+class HourPoint(BaseModel):
+    hour: str
+    msg: int
+    gmsg: int
+    reg: int
+    ws: int
+    call: int
+    online_max: int
+
+
+class ActivityHourlyOut(BaseModel):
+    points: list[HourPoint]
+    # When the counters first existed — hours before this are "no data yet",
+    # not "the island was silent", and the panel draws them differently.
+    since: str | None
+
+
+@router.get("/activity-hourly", response_model=ActivityHourlyOut)
+async def activity_hourly(hours: int = Query(168, ge=24, le=720)) -> ActivityHourlyOut:
+    """Island-wide hourly activity with the sampled online peak.
+
+    This is the long-memory counterpart to /admin/metrics: island-wide (the
+    ring is per worker) and deploy-proof (the ring resets). Counted in Redis
+    at the hot paths; see services/activity_rollup.py.
+    """
+    from app.services.activity_rollup import read_hours
+
+    points, since = await read_hours(hours)
+    return ActivityHourlyOut(points=[HourPoint(**p) for p in points], since=since)
+
+
 # ── Activity feed (recent admin actions) ────────────────────────────
 
 

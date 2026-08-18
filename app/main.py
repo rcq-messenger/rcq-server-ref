@@ -97,6 +97,12 @@ async def lifespan(_: FastAPI):
     # Retention for expired People-Nearby check-ins (geohash buckets tied to a
     # UIN were previously filtered on read but never deleted).
     nearby_sweep_task = asyncio.create_task(nearby_sweep_loop())
+    # Five-minute online samples for the hourly activity history. Every worker
+    # runs one; the write is a max() into a shared Redis hash, so the extras
+    # cost a SCARD each and change nothing.
+    from app.services.activity_rollup import activity_sampler_loop
+
+    activity_sampler_task = asyncio.create_task(activity_sampler_loop())
     try:
         yield
     finally:
@@ -105,6 +111,7 @@ async def lifespan(_: FastAPI):
         offline_queue_sweep_task.cancel()
         evidence_sweep_task.cancel()
         nearby_sweep_task.cancel()
+        activity_sampler_task.cancel()
         await close_redis()
 
 
