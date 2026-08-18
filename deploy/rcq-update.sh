@@ -126,10 +126,15 @@ for _ in $(seq 1 24); do
         HEALTH_OK=true
         break
     fi
-    # 2. Through the island's own front door on loopback. ⚠ -L on purpose:
-    #    Caddy answers plain HTTP with a 308 to https, which `curl -f` counts
-    #    as a failure — an island that redirects correctly would look broken.
-    if WHY=$(curl -fsSL -m 5 http://127.0.0.1/health 2>&1); then
+    # 2. Through the island's own front door, over loopback.
+    #    ⚠ Not plain `http://127.0.0.1/health`: Caddy answers that with a 308
+    #    to https, which `curl -f` counts as a failure — an island that
+    #    redirects correctly looked broken. And not `-L` either, because the
+    #    redirect lands on https://127.0.0.1, where the certificate is for the
+    #    DOMAIN and TLS fails. `--resolve` asks the real vhost by name while
+    #    pinning it to loopback: valid certificate, no dependency on public DNS.
+    if [ -n "$DOMAIN" ] && WHY=$(curl -fsS -m 5 --resolve "$DOMAIN:443:127.0.0.1" \
+         "https://$DOMAIN/health" 2>&1); then
         HEALTH_OK=true
         break
     fi
