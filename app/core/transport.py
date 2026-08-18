@@ -69,6 +69,32 @@ def _relay_addresses() -> frozenset[str]:
     return frozenset(out)
 
 
+@lru_cache(maxsize=1)
+def fleet_endpoints() -> frozenset[str]:
+    """`server:port` for every signed-config relay endpoint.
+
+    Same file and the same best-effort contract as [_relay_addresses], but the
+    port matters here: this set is what lets the broker ACCEPT in-region
+    reachability reports for the fleet. Several endpoints share a machine
+    (hysteria2 + vless on :443), so the set is smaller than the relay count.
+    """
+    try:
+        import yaml  # noqa: PLC0415 — optional dependency, only needed here
+
+        with open(RELAYS_YAML) as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        return frozenset()
+    out = set()
+    for r in data.get("relays") or []:
+        if not isinstance(r, dict):
+            continue
+        server, port = r.get("server"), r.get("port")
+        if server and isinstance(port, int) and not isinstance(port, bool):
+            out.add(f"{server}:{port}")
+    return frozenset(out)
+
+
 def classify(ip: str | None) -> str:
     """`direct` | `front` | `relay` for one client address.
 
