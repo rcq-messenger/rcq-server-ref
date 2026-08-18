@@ -46,6 +46,7 @@ from app.core.db import get_db
 from app.core.rate_limit import _client_ip, rate_limit
 from app.core.redis import get_redis
 from app.core.security import require_admin
+from app.core.transport import fleet_endpoints
 from app.models.broker import BrokerRelay, RelayTenant
 from app.services.geoip import country_of
 
@@ -576,6 +577,14 @@ async def report_reachability(
             continue
         if d.get("server") and d.get("port") is not None:
             known.add(f"{d['server']}:{d['port']}")
+    # ...and for the SIGNED-CONFIG fleet, which the clients have been probing
+    # and reporting all along — the reports were silently dropped here because
+    # those relays are not broker rows. That left the seven machines carrying
+    # most of the bypass with no in-region signal at all, while their share of
+    # traffic fell from 68% to 20% and nobody could see whether they were
+    # blocked or merely unused (18.08). The canary probes from Frankfurt and
+    # cannot answer that question by construction.
+    known |= fleet_endpoints()
 
     accepted = 0
     try:
@@ -705,6 +714,84 @@ async def admin_list(db: AsyncSession = Depends(get_db)) -> dict:
             "descriptor": desc,
         })
     return {"relays": out}
+
+
+@router.get("/admin/reachability", dependencies=[Depends(require_admin)])
+async def admin_reachability(db: AsyncSession = Depends(get_db)) -> dict:
+    """Who can actually reach each relay, by region, as reported by clients.
+
+    The one question the canary cannot answer: it probes from Frankfurt, where
+    nothing is blocked, so "all relays alive" and "our users in RU cannot reach
+    any of them" are both true at once. This reads the votes the clients have
+    been casting — one entry per (relay, country), with the number of distinct
+    reporter networks on each side — for the broker pool AND for the
+    signed-config fleet.
+
+    ⚠ Absence of a row is not failure. It means nobody in that region has
+    reported lately: a relay nobody tries is indistinguishable here from one
+    nobody can reach, and only the traffic mix can tell those apart.
+    """
+    now = int(time.time())
+    min_score = now - _REACH_WINDOW
+
+    endpoints: dict[str, str] = {}          # server:port -> source label
+    for sp in sorted(fleet_endpoints()):
+        endpoints[sp] = "fleet"
+    for r in (await db.execute(select(BrokerRelay))).scalars().all():
+        try:
+            d = json.loads(r.descriptor)
+        except ValueError:
+            continue
+        if d.get("server") and d.get("port") is not None:
+            endpoints[f"{d['server']}:{d['port']}"] = f"broker:{r.tier}"
+
+    out: list[dict] = []
+    try:
+        redis = await get_redis()
+        # SCAN rather than a key per (relay × every country on earth): the
+        # regions that reported are exactly the keys that exist.
+        found: dict[str, dict[str, dict[str, int]]] = {}
+        for state in ("ok", "fail"):
+            cursor = 0
+            while True:
+                cursor, keys = await redis.scan(cursor, match=f"broker:reach:{state}:*", count=500)
+                for raw in keys:
+                    key = raw.decode() if isinstance(raw, bytes) else raw
+                    # broker:reach:<state>:<server>:<port>:<region>
+                    rest = key.split(":", 3)[3]
+                    server, port, region = rest.rsplit(":", 2)[0], *rest.rsplit(":", 2)[1:]
+                    sp = f"{server}:{port}"
+                    if sp not in endpoints:
+                        continue
+                    n = int(await redis.zcount(key, min_score, "+inf") or 0)
+                    if n:
+                        found.setdefault(sp, {}).setdefault(region, {"ok": 0, "fail": 0})[state] = n
+                if cursor == 0:
+                    break
+        for sp, regions in found.items():
+            for region, counts in regions.items():
+                out.append({
+                    "endpoint": sp,
+                    "source": endpoints[sp],
+                    "region": region,
+                    "ok_networks": counts["ok"],
+                    "fail_networks": counts["fail"],
+                    "reachable": counts["ok"] >= _REACH_QUORUM and counts["ok"] > counts["fail"],
+                })
+    except Exception:
+        pass  # best-effort, like every other reader of this data
+
+    out.sort(key=lambda e: (e["region"], e["endpoint"]))
+    silent = sorted(sp for sp in endpoints if not any(e["endpoint"] == sp for e in out))
+    return {
+        "window_s": _REACH_WINDOW,
+        "quorum": _REACH_QUORUM,
+        "reports": out,
+        # Endpoints nobody has voted on in the window. On the fleet this is the
+        # number to watch: it was 100% of them before clients' reports for the
+        # signed config were accepted at all.
+        "silent": silent,
+    }
 
 
 class AdminSet(BaseModel):
