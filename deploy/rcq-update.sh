@@ -109,15 +109,33 @@ docker compose up -d --build app || die "rebuild failed — the old container ma
 # exactly what the first live run reported, on an island that had updated fine.
 DOMAIN=$(grep -E '^RCQ_DOMAIN=' .env 2>/dev/null | cut -d= -f2- | cut -d, -f1 | tr -d ' ' || true)
 HEALTH_OK=false
+# Why the last attempt failed, so a timeout can be acted on instead of merely
+# announced. 19.08 this loop declared an island dead for two minutes while it
+# had in fact been serving users since twelve seconds after the restart, and
+# the message said only "check the logs" — the logs were clean, because
+# nothing was wrong with the island. A probe that cannot say what it saw is
+# not a health check, it is a rumour.
+WHY=""
 for _ in $(seq 1 24); do
     sleep 5
-    if docker compose exec -T app python -c \
+    # 1. From inside the container: the most direct answer, and the only one
+    #    that works before Caddy has a certificate.
+    if WHY=$(docker compose exec -T app python -c \
          'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5).status == 200 else 1)' \
-         >/dev/null 2>&1; then
+         2>&1); then
         HEALTH_OK=true
         break
     fi
-    if [ -n "$DOMAIN" ] && curl -fsS -m 5 "https://$DOMAIN/health" >/dev/null 2>&1; then
+    # 2. Through the island's own front door on loopback. ⚠ -L on purpose:
+    #    Caddy answers plain HTTP with a 308 to https, which `curl -f` counts
+    #    as a failure — an island that redirects correctly would look broken.
+    if WHY=$(curl -fsSL -m 5 http://127.0.0.1/health 2>&1); then
+        HEALTH_OK=true
+        break
+    fi
+    # 3. The public name, last: it depends on DNS and a certificate, so it is
+    #    the slowest to become true and the least specific when it is false.
+    if [ -n "$DOMAIN" ] && WHY=$(curl -fsS -m 5 "https://$DOMAIN/health" 2>&1); then
         HEALTH_OK=true
         break
     fi
@@ -134,5 +152,5 @@ else
     # Deliberately NOT an automatic rollback. Rolling the code back does not
     # roll the database back, and doing that unattended is how a bad minute
     # becomes lost data. The operator gets a loud line and a dump to work from.
-    die "updated to $NEW_VERSION but /health did not answer in two minutes — check: cd $INSTALL_DIR && docker compose logs app"
+    die "updated to $NEW_VERSION but /health did not answer in two minutes (last probe said: ${WHY:-nothing}) — check: cd $INSTALL_DIR && docker compose logs app"
 fi
