@@ -178,18 +178,27 @@ async def send_request(
         )
     )
     if reverse is not None:
-        reverse.state = "accepted"
+        # The accepted request is DELETED, not kept as history: once the two
+        # Contact rows exist they are the relationship, and nothing reads an
+        # accepted request afterwards (both list endpoints exclude the state,
+        # no client compares against it). Keeping it left a permanent "A asked
+        # B on date D" on the island for no reader — 515 such rows going back
+        # to April, before this. A later re-request simply inserts a fresh
+        # pending row; the reopen path below existed only to dodge the unique
+        # index this deletion clears.
+        reverse_id, reverse_from = reverse.id, reverse.from_uin
         db.add_all([
             Contact(owner_uin=reverse.from_uin, contact_uin=reverse.to_uin),
             Contact(owner_uin=reverse.to_uin, contact_uin=reverse.from_uin),
         ])
+        await db.delete(reverse)
         await db.commit()
         delivered = await manager.send(
-            reverse.from_uin,
-            {"type": "contact_response", "request_id": reverse.id, "accepted": True, "to_uin": uin},
+            reverse_from,
+            {"type": "contact_response", "request_id": reverse_id, "accepted": True, "to_uin": uin},
         )
         if not delivered and await should_push_for(
-            reverse.from_uin,
+            reverse_from,
             kind="contact_response_accepted",
             sender_uin=uin,
         ):
@@ -204,11 +213,14 @@ async def send_request(
                 thread_id=f"peer-{uin}",
                 notif_kind="contact_response_accepted",
             )
-            await apns_send(reverse.from_uin, **push_args)
+            await apns_send(reverse_from, **push_args)
             # Android rides UnifiedPush, not APNs — without this an Android
             # user simply never heard about a contact request or an accept.
-            await up_send(reverse.from_uin, **push_args)
-        return {"id": reverse.id, "state": "accepted", "auto": True}
+            await up_send(reverse_from, **push_args)
+        # ⚠ Every field below the delete comes from the locals captured above:
+        # the row is gone from the session, and touching the instance here
+        # would raise on a refresh rather than answer.
+        return {"id": reverse_id, "state": "accepted", "auto": True}
 
     existing = await db.scalar(
         select(ContactRequest).where(
@@ -368,24 +380,39 @@ async def respond(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such request")
     if req.state != "pending":
         return {"state": req.state}
-    req.state = "accepted" if body.accept else "declined"
+    req_id, req_from = req.id, req.from_uin
     if body.accept:
-        # Mutual contact rows so both sides see each other in their list.
+        # Mutual contact rows so both sides see each other in their list...
         db.add_all([
             Contact(owner_uin=req.from_uin, contact_uin=req.to_uin),
             Contact(owner_uin=req.to_uin, contact_uin=req.from_uin),
         ])
+        # ...and the request itself goes. Those two rows ARE the relationship;
+        # an accepted request has no reader anywhere (see the delete in the
+        # auto-accept path above), so keeping it only left the island a
+        # permanent record of who asked whom and when.
+        await db.delete(req)
+        state = "accepted"
+    else:
+        # ⚠⚠ A DECLINED row is NOT history and must not be swept away with the
+        # accepted ones: it is the only way the sender ever learns they were
+        # declined. GET /contacts/outgoing serves exactly pending+declined, no
+        # push is sent for a decline on purpose, and all three clients render
+        # that state ("Declined", with a Dismiss that DELETEs the row). Drop it
+        # and the request silently reverts to looking like it was never sent.
+        req.state = "declined"
+        state = "declined"
     await db.commit()
     delivered = await manager.send(
-        req.from_uin,
-        {"type": "contact_response", "request_id": req.id, "accepted": body.accept, "to_uin": uin},
+        req_from,
+        {"type": "contact_response", "request_id": req_id, "accepted": body.accept, "to_uin": uin},
     )
     # Only push for ACCEPTED responses; declined responses are
     # silent (the requester probably doesn't want a banner saying
     # "X declined your friend request"). Tap routes to the freshly-
     # opened chat with the accepter.
     if not delivered and body.accept and await should_push_for(
-        req.from_uin, kind="contact_response_accepted", sender_uin=uin,
+        req_from, kind="contact_response_accepted", sender_uin=uin,
     ):
         accepter = await db.get(User, uin)
         push_args = dict(
@@ -394,9 +421,9 @@ async def respond(
             thread_id=f"peer-{uin}",
             notif_kind="contact_response_accepted",
         )
-        await apns_send(req.from_uin, **push_args)
-        await up_send(req.from_uin, **push_args)
-    return {"state": req.state}
+        await apns_send(req_from, **push_args)
+        await up_send(req_from, **push_args)
+    return {"state": state}
 
 
 @router.delete("/{contact_uin}", status_code=status.HTTP_204_NO_CONTENT)
