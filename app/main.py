@@ -103,6 +103,11 @@ async def lifespan(_: FastAPI):
     from app.services.activity_rollup import activity_sampler_loop
 
     activity_sampler_task = asyncio.create_task(activity_sampler_loop())
+    # Retention for accepted contact requests — the relationship lives in
+    # `contacts`, the request row does not need to outlive it.
+    from app.services.contact_request_sweep import contact_request_sweep_loop
+
+    contact_request_sweep_task = asyncio.create_task(contact_request_sweep_loop())
     try:
         yield
     finally:
@@ -112,6 +117,7 @@ async def lifespan(_: FastAPI):
         evidence_sweep_task.cancel()
         nearby_sweep_task.cancel()
         activity_sampler_task.cancel()
+        contact_request_sweep_task.cancel()
         await close_redis()
 
 

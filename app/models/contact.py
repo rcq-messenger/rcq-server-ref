@@ -30,3 +30,12 @@ class ContactRequest(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # When the request left `pending`. NOT the same clock as created_at, which
+    # is why the retention sweep needs its own column: a request raised a week
+    # ago and accepted a minute ago must be measured from the acceptance, or
+    # the sweep would delete it out from under a client still retrying.
+    # Nullable: every row that predates the column is still pending or was
+    # resolved before any of this existed.
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )

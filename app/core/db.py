@@ -197,6 +197,14 @@ _ONE_TIME_PREKEY_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "INTEGER"),
 ]
 
+# Additive on `contact_requests`. When the row left `pending`, which the
+# retention sweep measures its grace from — created_at is a different clock
+# (a week-old request accepted a minute ago must not be swept at once).
+# Nullable: existing rows are pending, or were resolved before this existed.
+_CONTACT_REQUEST_COLUMNS: list[tuple[str, str]] = [
+    ("resolved_at", "TIMESTAMP WITH TIME ZONE"),
+]
+
 # Additive on `groups`. Pre-existing rows default to free + everyone-
 # can-post, matching pre-feature behaviour. Avatar columns nullable —
 # legacy groups keep rendering the generic placeholder.
@@ -316,6 +324,7 @@ async def init_db() -> None:
         ("device_tokens", _DEVICE_TOKEN_COLUMNS),
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
         ("broker_relays", _BROKER_RELAY_COLUMNS),
+        ("contact_requests", _CONTACT_REQUEST_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:
