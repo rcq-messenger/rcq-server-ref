@@ -68,6 +68,19 @@ _REACH_WINDOW = 7200           # a region report stays fresh this long (client r
 _REACH_QUORUM = 2              # distinct reporter /24s in a region needed to flip its in-region liveness
 _MAX_REACH_REPORTS = 25        # per request body
 
+# What a client can say about the route it ended up on. Deliberately a closed
+# set: it is a counter key, and an open string would let a client mint Redis
+# keys. `tunnel_ok` is the only good outcome; the other three are the shapes of
+# failure we cannot currently tell apart from the traffic mix alone.
+_TRANSPORT_OUTCOMES = frozenset({
+    "tunnel_ok",       # engaged and the route carried traffic
+    "tunnel_dead",     # engaged, carried nothing, no fallback taken
+    "fell_to_direct",  # tunnel carried nothing, direct worked
+    "fell_to_front",   # tunnel AND direct dead, went out through the CF front
+    "direct_ok",       # never needed the tunnel
+})
+_TRANSPORT_RETENTION = 45 * 86400
+
 # Per-proto descriptor schema: required + optional keys, each with a charset.
 _RE = {
     "server": re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,255}$"),
@@ -608,6 +621,34 @@ async def report_reachability(
             await pipe.execute()
     except Exception:
         pass
+
+    # ── did the tunnel actually CARRY anything ──────────────────────────────
+    #
+    # The per-relay votes above are a TCP connect: they answer "does the port
+    # answer", which is not the same question as "does the tunnel work". DPI
+    # commonly lets the TCP handshake through and kills the connection at the
+    # TLS/Reality stage — so a fleet can read 100% reachable while nobody can
+    # actually use it. That gap is what left us unable to explain the relay
+    # share falling from 68% to 20% while every probe said the machines were
+    # fine (18.08).
+    #
+    # The client already computes the answer for its own routing (`routeOk`,
+    # and the fallbacks that follow it). This just lets the island hear it:
+    # one counted outcome per report, per region, per hour. No identifiers —
+    # a counter per (region, outcome), nothing per account.
+    outcome = body.get("transport")
+    if isinstance(outcome, str) and outcome in _TRANSPORT_OUTCOMES:
+        try:
+            redis = await get_redis()
+            hour = time.strftime("%Y%m%d%H", time.gmtime(now))
+            key = f"transport:outcome:{hour}:{region}"
+            pipe = redis.pipeline(transaction=False)
+            pipe.hincrby(key, outcome, 1)
+            pipe.expire(key, _TRANSPORT_RETENTION)
+            await pipe.execute()
+        except Exception:
+            pass
+
     return {"ok": True, "accepted": accepted, "region": region, "ts": now}
 
 
@@ -781,12 +822,42 @@ async def admin_reachability(db: AsyncSession = Depends(get_db)) -> dict:
     except Exception:
         pass  # best-effort, like every other reader of this data
 
+    # How the route actually ended up, per region, over the last 24h. This is
+    # the half a per-relay probe cannot answer: a port that answers is not a
+    # tunnel that carries traffic.
+    transport: dict[str, dict[str, int]] = {}
+    try:
+        redis = await get_redis()
+        hours = [time.strftime("%Y%m%d%H", time.gmtime(now - h * 3600)) for h in range(24)]
+        cursor = 0
+        keys: list[str] = []
+        while True:
+            cursor, batch = await redis.scan(cursor, match="transport:outcome:*", count=500)
+            keys.extend(k.decode() if isinstance(k, bytes) else k for k in batch)
+            if cursor == 0:
+                break
+        for key in keys:
+            _, _, hour, region_key = key.split(":", 3)
+            if hour not in hours:
+                continue
+            row = await redis.hgetall(key)
+            bucket = transport.setdefault(region_key, {})
+            for f, v in (row or {}).items():
+                f = f.decode() if isinstance(f, bytes) else f
+                bucket[f] = bucket.get(f, 0) + int(v)
+    except Exception:
+        pass
+
     out.sort(key=lambda e: (e["region"], e["endpoint"]))
     silent = sorted(sp for sp in endpoints if not any(e["endpoint"] == sp for e in out))
     return {
         "window_s": _REACH_WINDOW,
         "quorum": _REACH_QUORUM,
         "reports": out,
+        # {region: {outcome: count}} over 24h. `tunnel_ok` against
+        # `fell_to_front` is the ratio that says whether the fleet is carrying
+        # the people it is reachable by.
+        "transport": transport,
         # Endpoints nobody has voted on in the window. On the fleet this is the
         # number to watch: it was 100% of them before clients' reports for the
         # signed config were accepted at all.
