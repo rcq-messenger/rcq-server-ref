@@ -243,9 +243,26 @@ async def fetch_bundle(
     # devices, so v=2 to a multi-homed account silently desyncs on whichever
     # device didn't decrypt first. The 404 is the same "fall back to v=1" signal
     # senders already handle. Auto-restores once the last device is removed.
+    # ⚠ This withholding is for the LEGACY caller only — the one that asked for
+    # "the bundle of this account" and can therefore reach exactly one device.
+    # A device-aware sender goes through GET /keys/{uin}/devices/{id}/bundle,
+    # which calls `_primary_bundle` below directly and is NOT gated: it encrypts
+    # a separate copy per device, which is the real fix this guard stands in for.
     from app.routers.devices import has_linked_devices  # local import: avoid cycle
     if await has_linked_devices(uin):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "multi-device: v=1 only")
+    return await _primary_bundle(uin, db)
+
+
+async def _primary_bundle(uin: int, db: AsyncSession) -> BundleOut:
+    """The primary device's (device 1) bundle, with no multi-device gate.
+
+    Split out of `fetch_bundle` so the per-device path can reach device 1 while
+    the legacy path keeps falling back to v=1 for a multi-homed account.
+    """
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     if (
         user.signal_identity_key is None
         or user.signed_prekey_id is None
@@ -436,7 +453,7 @@ async def fetch_device_bundle(
     legacy path); >= 2 = a secondary device. Consumes one OPK from THAT
     device's pool."""
     if device_id == PRIMARY_DEVICE_ID:
-        return await fetch_bundle(uin, _me, db)
+        return await _primary_bundle(uin, db)
 
     device = (
         await db.execute(
