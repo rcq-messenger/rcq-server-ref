@@ -277,6 +277,13 @@ _QUEUE_CURSOR_COLUMNS: list[tuple[str, str]] = [
     ("updated_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
+# Fan-out addressing: which of the recipient's libsignal devices a queued
+# ciphertext is for. NULL on every row written before fan-out existed, which is
+# exactly the "any device may read it" meaning the drain gives it.
+_OFFLINE_MESSAGE_COLUMNS: list[tuple[str, str]] = [
+    ("to_device_id", "INTEGER"),
+]
+
 _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "VARCHAR(64)"),
     # Push health (UnifiedPush sender). NULL error = healthy / never tried.
@@ -320,6 +327,7 @@ async def init_db() -> None:
         ("audio_rooms", _AUDIO_ROOM_COLUMNS),
         ("reports", _REPORT_COLUMNS),
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
+        ("offline_messages", _OFFLINE_MESSAGE_COLUMNS),
         ("invites", _INVITE_COLUMNS),
         ("device_tokens", _DEVICE_TOKEN_COLUMNS),
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
