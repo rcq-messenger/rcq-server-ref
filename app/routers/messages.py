@@ -348,6 +348,7 @@ async def send_sealed(
                 alert_body="New message",
                 envelope_b64=body.payload,
                 envelope_type=body.envelope_type,
+                to_device_id=body.to_device_id,
                 skip_devices=online_devices,
             )
             # Android has no APNs — fire the parallel UnifiedPush wake (no-op when
@@ -357,6 +358,7 @@ async def send_sealed(
                 alert_body="New message",
                 envelope_b64=body.payload,
                 envelope_type=body.envelope_type,
+                to_device_id=body.to_device_id,
                 skip_devices=online_devices,
             )
     log.warning(
@@ -843,7 +845,8 @@ class AckOut(BaseModel):
 
 
 async def _acked_prefix(
-    db: AsyncSession, model: type, uin: int, base: int, acked: list[int] | None
+    db: AsyncSession, model: type, uin: int, base: int, acked: list[int] | None,
+    dev: int | None = None,
 ) -> int:
     """How far the cursor may move given the ids a client actually persisted.
 
@@ -866,9 +869,18 @@ async def _acked_prefix(
     if not acked:
         return base
     acked_set = set(acked)
+    where = [model.to_uin == uin, model.id > base]
+    # Count only the rows this device is ever handed. A fan-out copy for a
+    # SIBLING device is withheld by the drain, so it can never be acked — and as
+    # an un-acked row it would be the "first hole" the prefix stops at, forever.
+    # The queue would then grow without bound and nothing below it would reap:
+    # the same permanent-burial failure this function exists to prevent, entered
+    # from the other side.
+    if dev is not None and hasattr(model, "to_device_id"):
+        where.append(or_(model.to_device_id.is_(None), model.to_device_id == dev))
     ids = (
         await db.execute(
-            select(model.id).where(model.to_uin == uin, model.id > base).order_by(model.id.asc())
+            select(model.id).where(*where).order_by(model.id.asc())
         )
     ).scalars().all()
     out = base
@@ -1107,6 +1119,7 @@ async def fetch_queue(
 @router.post("/queue/ack", response_model=AckOut)
 async def ack_queue(
     body: AckIn,
+    dev: int = 1,
     uin: int = Depends(current_uin),
     device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
@@ -1127,7 +1140,7 @@ async def ack_queue(
     was the entire queue, as notifications.
     """
     base_direct, base_group, cursor = await drain_floor(db, uin, device_id)
-    max_direct = await _acked_prefix(db, OfflineMessage, uin, base_direct, body.direct_ids)
+    max_direct = await _acked_prefix(db, OfflineMessage, uin, base_direct, body.direct_ids, dev)
     max_group = await _acked_prefix(db, OfflineGroupMessage, uin, base_group, body.group_ids)
     reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
     await db.commit()
