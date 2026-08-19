@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -192,6 +192,14 @@ class SealedSendIn(BaseModel):
     # + consumed (single-use), letting the island rate-limit deposits without
     # de-anonymizing the sender. Absent = the legacy per-IP path (back compatible).
     deposit_token: dict | None = None
+    # Which of the recipient's libsignal devices this ciphertext is for.
+    #
+    # A device-aware sender encrypts the message once PER recipient device (each
+    # device is its own ratchet) and posts each copy with the matching id here.
+    # The queue then hands each device only its own copy. Absent = the legacy
+    # "every device drains it" behaviour, which is still correct while only one
+    # of the recipient's devices holds keys.
+    to_device_id: int | None = None
 
 
 class SendOut(BaseModel):
@@ -206,6 +214,11 @@ class HistoryRow(BaseModel):
     payload: str
     received_at: datetime
     group_id: int | None = None
+    # The libsignal device this copy was encrypted for, when the sender fanned
+    # out. Echoed so a client can tell "this one is not mine" apart from "this
+    # one is mine and broken" — the first is ACKed and dropped, the second is
+    # left queued for a retry.
+    to_device_id: int | None = None
 
 
 @router.post(
@@ -279,6 +292,12 @@ async def send_sealed(
         "type": "message" if body.envelope_type == _CALL_TYPE else body.envelope_type,
         "payload": body.payload,
         "server_time": now.isoformat(),
+        # Present only for a fan-out copy. Every socket of the account still
+        # gets every copy (filtering live delivery would mean teaching the
+        # connection manager which libsignal device is behind each socket, for
+        # no gain), so the addressee is stated and the other devices drop it
+        # without trying to decrypt. Absent = "for whoever can read it".
+        **({"to_device_id": body.to_device_id} if body.to_device_id is not None else {}),
     }
     # Always queue alongside WS delivery. `manager.send()` returning
     # True only means the bytes hit the OS write buffer — the recipient
@@ -294,6 +313,7 @@ async def send_sealed(
         envelope_type=body.envelope_type,
         payload=body.payload,
         received_at=now,
+        to_device_id=body.to_device_id,
     )
     db.add(msg)
     await db.commit()
@@ -979,6 +999,7 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
 @router.get("/queue", response_model=list[HistoryRow])
 async def fetch_queue(
     ack: bool = False,
+    dev: int = 1,
     uin: int = Depends(current_uin),
     device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
@@ -1033,10 +1054,22 @@ async def fetch_queue(
             if cursor is not None:
                 after_direct, after_group = cursor.last_direct_id, cursor.last_group_id
 
+    # `dev` is the caller's LIBSIGNAL device id (1 = primary), not the install
+    # id the cursor is keyed by. A fan-out copy addressed to another device is
+    # not this device's business: it cannot decrypt it, and handing it over
+    # would only park an undecryptable row in front of its cursor. Rows with no
+    # addressee predate fan-out and belong to everyone, as before.
     rows_1to1 = (
         await db.execute(
             select(OfflineMessage)
-            .where(OfflineMessage.to_uin == uin, OfflineMessage.id > after_direct)
+            .where(
+                OfflineMessage.to_uin == uin,
+                OfflineMessage.id > after_direct,
+                or_(
+                    OfflineMessage.to_device_id.is_(None),
+                    OfflineMessage.to_device_id == dev,
+                ),
+            )
             .order_by(OfflineMessage.received_at.asc())
         )
     ).scalars().all()
@@ -1052,7 +1085,7 @@ async def fetch_queue(
     for r in rows_1to1:
         out.append(HistoryRow(
             id=r.id, envelope_type=r.envelope_type, payload=r.payload,
-            received_at=r.received_at, group_id=None,
+            received_at=r.received_at, group_id=None, to_device_id=r.to_device_id,
         ))
     for r in rows_group:
         out.append(HistoryRow(

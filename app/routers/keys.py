@@ -141,6 +141,18 @@ class StatusOut(BaseModel):
     one_time_prekey_count: int
     target_count: int
     signed_prekey_age_seconds: int | None  # None when no signed prekey yet
+    # The identity key currently published as this account's PRIMARY device.
+    #
+    # A client compares it with its own: same means "I am device 1"; different
+    # means another install owns the primary slot and this one must register as
+    # a secondary device instead of overwriting it. Overwriting is what broke
+    # 1:1 delivery for anyone running a phone and a desktop at once — both
+    # published here, so peers built sessions against whichever wrote last and
+    # the other device's messages became undecryptable.
+    #
+    # Public key of the caller's own account: it leaks nothing they can't fetch
+    # from their own bundle.
+    signal_identity_key: str | None = None
 
 
 @router.post("/bundle", status_code=status.HTTP_204_NO_CONTENT)
@@ -299,6 +311,7 @@ async def my_status(
         one_time_prekey_count=int(count),
         target_count=TARGET_PREKEY_COUNT,
         signed_prekey_age_seconds=age,
+        signal_identity_key=user.signal_identity_key,
     )
 
 
