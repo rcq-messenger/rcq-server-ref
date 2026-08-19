@@ -398,6 +398,7 @@ async def send_to_user(
     alert_body: str = "New message",
     envelope_b64: str | None = None,
     envelope_type: str | None = None,
+    to_device_id: int | None = None,
     thread_id: str | None = None,
     notif_kind: str | None = None,
     group_id: int | None = None,
@@ -505,6 +506,13 @@ async def send_to_user(
         # it locally (private keys live in the shared Keychain group).
         payload["env"] = envelope_b64
         payload["envType"] = envelope_type or "message"
+        if to_device_id is not None:
+            # Which of the account's libsignal devices this copy is for. A
+            # fan-out message wakes every install, and only one of them holds
+            # the ratchet that opens it — without this the others try, fail,
+            # and raise the generic "New message" banner reserved for a real
+            # decryption problem. They read it and stay quiet instead.
+            payload["toDev"] = to_device_id
     if notif_kind:
         # NSE swaps the body literal we sent for a localized
         # version keyed off this field. `alert_body` stays as
