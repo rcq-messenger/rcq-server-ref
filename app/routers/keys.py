@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -10,6 +11,11 @@ from app.core.security import current_uin
 from app.models.device import Device
 from app.models.prekey import OneTimePreKey
 from app.models.user import User, _as_aware
+from app.services.apns import send_to_user as apns_send
+from app.services.connection_manager import manager
+from app.services.unifiedpush import send_to_user as up_send
+
+log = logging.getLogger(__name__)
 
 # Primary device = the phone, libsignal deviceId 1, bundle on the User row.
 PRIMARY_DEVICE_ID = 1
@@ -155,6 +161,44 @@ class StatusOut(BaseModel):
     signal_identity_key: str | None = None
 
 
+async def _announce_device_event(
+    uin: int,
+    kind: str,
+    device_id: int,
+    label: str | None,
+    push_body: str,
+) -> None:
+    """A key-slot event every session of the account should hear about (#643):
+    a phrase-restored install was invisible — it appeared in no device list
+    and announced nothing, so whoever held the phrase could quietly read as a
+    full device. The slot claim is the one thing such an install cannot avoid
+    if it wants to read or send v=2, so this is where the account learns.
+
+    Live sessions get a registry-style WS event (same channel the QR-link
+    screen already listens to); every device gets a push wake. ⚠ The push
+    body carries NO label and NO uin: it travels through APNs and the push
+    host in the clear. Best-effort — a failed announcement must never fail
+    the registration that caused it."""
+    try:
+        payload: dict[str, object] = {"type": kind, "device_id": device_id}
+        if label:
+            payload["label"] = label
+        await manager.send(uin, payload)
+    except Exception:  # noqa: BLE001 — bookkeeping must not break the claim
+        log.exception("[keys] failed to announce %s uin=%s", kind, uin)
+    push_args = dict(
+        alert_title="RCQ",
+        alert_body=push_body,
+        thread_id="devices",
+        notif_kind=kind,
+    )
+    try:
+        await apns_send(uin, **push_args)
+        await up_send(uin, **push_args)
+    except Exception:  # noqa: BLE001
+        log.exception("[keys] failed to push %s uin=%s", kind, uin)
+
+
 @router.post("/bundle", status_code=status.HTTP_204_NO_CONTENT)
 async def upload_bundle(
     body: BundleIn,
@@ -167,6 +211,12 @@ async def upload_bundle(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    # A DIFFERENT identity under the primary slot means the install that held
+    # it is gone — a reinstalled phone, a phrase restore, or someone else's
+    # machine claiming the slot. The account's other devices deserve to hear
+    # that (#643); a first-time bootstrap (no prior key) is silent, and so is
+    # a re-upload of the same identity (signed-prekey rotation).
+    prev_ik = user.signal_identity_key
     user.signal_identity_key = body.signal_identity_key
     user.signal_registration_id = body.registration_id
     user.signed_prekey_id = body.signed_prekey.id
@@ -190,6 +240,14 @@ async def upload_bundle(
     for pk in body.one_time_prekeys:
         db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=None))
     await db.commit()
+    if prev_ik is not None and prev_ik != body.signal_identity_key:
+        await _announce_device_event(
+            uin,
+            "device_rekeyed",
+            PRIMARY_DEVICE_ID,
+            None,
+            "This account's primary device was re-keyed",
+        )
 
 
 @router.post("/prekeys", status_code=status.HTTP_204_NO_CONTENT)
@@ -411,6 +469,13 @@ async def register_device(
     for pk in body.one_time_prekeys:
         db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=next_id))
     await db.commit()
+    await _announce_device_event(
+        uin,
+        "device_registered",
+        next_id,
+        body.label,
+        "New device connected to this account",
+    )
     return DeviceRegisterOut(device_id=next_id)
 
 
