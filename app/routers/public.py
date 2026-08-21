@@ -131,13 +131,16 @@ async def hall_of_fame(
     # Podium: the three highest-scoring GOLD members who have had at least one
     # bug confirmed. Gold is a prerequisite rather than a tiebreak — the flower
     # is the founder's call, and the score only ranks people he already vouched
-    # for. Ruby counts too: it sits above gold, and a promotion must never
-    # cost somebody their podium place. Ties fall back to confirmed count,
+    # for. Ruby counts too, and it comes FIRST: the fourth grade sits above
+    # gold everywhere, the podium included — a ruby holder standing under a
+    # gold one was the first thing the founder saw after grading one
+    # (21.08). Within a tier the score still decides, so the places keep
+    # meaning "best confirmed-bug record". Ties fall back to confirmed count,
     # then nickname, so the order is stable between requests instead of
     # wobbling with dict order.
     contenders = sorted(
         (m for m in members if m.tier in ("gold", "ruby") and m.confirmed > 0),
-        key=lambda m: (-podium_score(m.reports, m.confirmed), -m.confirmed, m.nickname.lower()),
+        key=lambda m: (_TIER_RANK.get(m.tier, 0), -podium_score(m.reports, m.confirmed), -m.confirmed, m.nickname.lower()),
     )
     for place, m in enumerate(contenders[:3], start=1):
         m.rank = place
