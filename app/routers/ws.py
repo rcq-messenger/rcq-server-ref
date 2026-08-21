@@ -414,6 +414,12 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
         return
 
     await manager.connect(uin, ws, device_id)
+    # The token's first live use ends the link row's PENDING state (the ghost
+    # web-session fix — see devices.mark_device_seen). Local import: devices
+    # pulls the connection manager, so a module-level import here would close
+    # a cycle the same way auth.py notes it would.
+    from app.routers.devices import mark_device_seen
+    await mark_device_seen(uin, device_id)
     # How fast sockets are being BORN, not how many are open. One client in a
     # reconnect loop shows up here and nowhere else: the open count stays flat
     # while it churns, which is exactly how the storm hid.

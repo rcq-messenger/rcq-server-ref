@@ -1031,6 +1031,13 @@ async def fetch_queue(
     robbed the user's other devices). A row is reaped only once every device's
     cursor has passed it; the TTL sweep backstops abandoned cursors.
     """
+    # The token's first live use ends the link row's PENDING state (the ghost
+    # web-session fix): a fresh web session drains within seconds of adopting
+    # the blob, so this covers builds that predate the flag too. Local import
+    # for the same cycle reason auth.py notes.
+    from app.routers.devices import mark_device_seen
+    await mark_device_seen(uin, device_id)
+
     # ⚠ A device we have never seen starts where this account's furthest device
     # already got to — NOT at zero. See app/services/queue_drain.py.
     #
