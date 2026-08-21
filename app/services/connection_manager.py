@@ -513,13 +513,22 @@ class ConnectionManager:
                     existing.discard(extra)
                     self._device_of.pop(extra, None)
                     self._opened_at.pop(extra, None)
-                # print() and not log.warning(): the logger's output does not
-                # reach the journal under the current uvicorn config, so a
-                # warning here would be written and never read — which is the
-                # same class of mistake as the mechanism that is never checked.
+                # ⚠ The uin rides RCQ_LOG_IDENTITIES, like the busy-account
+                # hint four lines below. 2026.08.22.2 gated four socket lines
+                # and missed this one, which is the same fact (an account's
+                # presence, written down) about exactly the accounts that
+                # generate the most of it: the cap is 8 and the hint is 4, so
+                # every breach printed a name here and a `-` a moment later.
+                #
+                # Still print() and not log.warning(), to stay the same shape
+                # as the hint below and greppable as a pair. Not because a
+                # warning would be unread: `log.exception` in `_pubsub_loop`
+                # above reaches journald like any other WARNING-or-worse
+                # record, which is what an earlier version of this comment got
+                # wrong.
                 print(
-                    f"[ws] uin={uin}: {len(existing) + len(surplus)} sockets over "
-                    f"the cap of {_MAX_SOCKETS_PER_UIN} — closing {len(surplus)} oldest",
+                    f"[ws] uin={log_identity(uin)}: {len(existing) + len(surplus)} sockets "
+                    f"over the cap of {_MAX_SOCKETS_PER_UIN}, closing {len(surplus)} oldest",
                     flush=True,
                 )
             self._conns[uin] = existing
