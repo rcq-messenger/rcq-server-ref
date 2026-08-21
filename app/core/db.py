@@ -227,6 +227,11 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     # Unguessable half of a share link (see the model comment). Backfilled
     # for existing rows by `_backfill_group_share_tokens` below.
     ("share_token", "VARCHAR(32)"),
+    # Owner-set content policy (clients honor; see model comment) + the
+    # server-enforced slowmode. Defaults preserve existing behaviour.
+    ("links_allowed", "BOOLEAN DEFAULT TRUE"),
+    ("files_allowed", "BOOLEAN DEFAULT TRUE"),
+    ("slowmode_sec", "INTEGER DEFAULT 0"),
 ]
 
 # Additive on `group_members` — granular moderator capabilities the owner

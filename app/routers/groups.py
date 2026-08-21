@@ -31,7 +31,7 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,6 +81,13 @@ class GroupOut(BaseModel):
     # When true, iOS hides the member roster in Group Info from
     # everyone but the owner. Display-only — `members` still ships.
     members_hidden: bool = False
+    # Owner-set content policy: links clickable / files sendable in this
+    # group. Client-honored (sealed envelopes are opaque to the server).
+    links_allowed: bool = True
+    files_allowed: bool = True
+    # Slowmode step in seconds (0 = off). Server-enforced for
+    # authenticated senders; moderators and the owner are exempt.
+    slowmode_sec: int = 0
     # Pinned plaintext announcement, owner/admin-editable. NULL when
     # unset. Rendered as a sticky banner above the message list so a
     # brand-new joiner (who can't see encrypted history) at least sees
@@ -152,6 +159,10 @@ class AddMemberIn(BaseModel):
     uin: int
 
 
+# The slowmode picker every client shows: off, 5s, 10s, 30s, 1min.
+_SLOWMODE_STEPS = {0, 5, 10, 30, 60}
+
+
 class GroupPatchIn(BaseModel):
     """All-optional partial update. The PATCH endpoint applies only
     the fields the caller actually populated, leaving everything
@@ -163,6 +174,20 @@ class GroupPatchIn(BaseModel):
     post_policy: str | None = Field(default=None, pattern="^(all|owner_only)$")
     is_closed: bool | None = None
     members_hidden: bool | None = None
+    # Owner-only content policy toggles (clients honor them; the server
+    # can't see inside sealed envelopes).
+    links_allowed: bool | None = None
+    files_allowed: bool | None = None
+    # Slowmode step, seconds. Fixed menu of steps rather than a free
+    # integer so every client renders the same picker.
+    slowmode_sec: int | None = None
+
+    @field_validator("slowmode_sec")
+    @classmethod
+    def _slowmode_step(cls, v: int | None) -> int | None:
+        if v is not None and v not in _SLOWMODE_STEPS:
+            raise ValueError(f"slowmode_sec must be one of {sorted(_SLOWMODE_STEPS)}")
+        return v
     # Pinned announcement. Empty string clears the pin; None = leave
     # untouched. Plaintext, owner/admin-editable. See model docstring.
     pinned_text: str | None = Field(default=None, max_length=500)
@@ -455,6 +480,9 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
         post_policy=g.post_policy,
         is_closed=g.is_closed,
         members_hidden=g.members_hidden,
+        links_allowed=g.links_allowed,
+        files_allowed=g.files_allowed,
+        slowmode_sec=g.slowmode_sec,
         pinned_text=g.pinned_text,
         pinned_at=g.pinned_at,
         pinned_by=g.pinned_by,
@@ -965,6 +993,20 @@ async def patch_group(
         if g.owner_uin != uin:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
         g.members_hidden = body.members_hidden
+    # Content policy + slowmode: owner-only, like post_policy — they set
+    # the rules of the room, not its decoration.
+    if body.links_allowed is not None:
+        if g.owner_uin != uin:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
+        g.links_allowed = body.links_allowed
+    if body.files_allowed is not None:
+        if g.owner_uin != uin:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
+        g.files_allowed = body.files_allowed
+    if body.slowmode_sec is not None:
+        if g.owner_uin != uin:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
+        g.slowmode_sec = body.slowmode_sec
     if body.pinned_text is not None:
         # Owner OR admin can pin / change / clear the announcement.
         # Empty / whitespace-only string clears the pin entirely so
