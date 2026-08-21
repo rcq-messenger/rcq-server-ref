@@ -44,6 +44,7 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from app.core.config import log_identity
 from app.core.redis import get_redis
 
 log = logging.getLogger(__name__)
@@ -469,7 +470,9 @@ class ConnectionManager:
                 self._envelope(target="supersede", uin=uin, device_id=device_id),
             )
         except Exception:  # noqa: BLE001 — the local close already happened
-            log.warning("could not fan out device kick uin=%s dev=%s", uin, device_id)
+            log.warning(
+                "could not fan out device kick uin=%s dev=%s", log_identity(uin), device_id
+            )
 
     async def connect(self, uin: int, ws: WebSocket, device_id: str = "primary") -> None:
         await ws.accept()
@@ -526,7 +529,11 @@ class ConnectionManager:
         if held >= _BUSY_ACCOUNT_HINT:
             # One line per dial once an account is holding an unusual number,
             # so "is it accumulating or is it redialing?" stops being a guess.
-            print(f"[ws] uin={uin} dev={device_id}: now holding {held} sockets on this worker", flush=True)
+            print(
+                f"[ws] uin={log_identity(uin)} dev={device_id}: "
+                f"now holding {held} sockets on this worker",
+                flush=True,
+            )
         for old in old_sockets:
             # Not awaited: a ghost takes the full close_timeout to answer, and
             # this runs before the new socket is marked online — waiting here
@@ -555,7 +562,7 @@ class ConnectionManager:
             )
             await redis.publish(_FANOUT_CHANNEL, envelope)
         except Exception:  # noqa: BLE001
-            log.warning("Could not mark uin=%d online in redis", uin)
+            log.warning("Could not mark uin=%s online in redis", log_identity(uin))
 
     async def disconnect(self, uin: int, ws: WebSocket) -> None:
         async with self._lock:

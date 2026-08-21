@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconn
 from sqlalchemy import select, update
 
 from app.core import metrics
+from app.core.config import log_identity
 from app.core.db import SessionLocal
 from app.core.rate_limit import allow_ws_connect
 from app.core.security import authorize_session, decode_device_id
@@ -441,7 +442,13 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
         # error in the log. Count it as a disconnect; anything else re-raises.
         if "not connected" not in str(exc):
             raise
-        _log.info("ws uin=%s: socket closed under receive (superseded)", uin)
+        # ⚠ `uvicorn.error` is one of the few loggers uvicorn configures at
+        # INFO, so unlike our own modules this line really does reach journald,
+        # and at ~18k a day it was the loudest remaining source of account
+        # names there after the delivery lines were cleaned up. A reconnect
+        # history is not the delivery graph, but it is still an account's
+        # presence written down. Behind the same flag.
+        _log.info("ws uin=%s: socket closed under receive (superseded)", log_identity(uin))
     finally:
         metrics.record_socket(opened=False)
         await manager.disconnect(uin, ws)
@@ -515,7 +522,7 @@ async def _presence_expired(uin: int, delay: float) -> None:
     except asyncio.CancelledError:
         raise
     except Exception:
-        _log.exception("presence expiry fan-out failed for %s", uin)
+        _log.exception("presence expiry fan-out failed for %s", log_identity(uin))
     finally:
         _pending_expiry_tasks.pop(uin, None)
 
