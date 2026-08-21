@@ -814,7 +814,7 @@ class HofListOut(BaseModel):
 
 
 # Valid founder ratings. Anything else on POST is a 400.
-_HOF_TIERS = {"bronze", "silver", "gold"}
+_HOF_TIERS = {"bronze", "silver", "gold", "ruby"}
 
 
 class HofApproveIn(BaseModel):
