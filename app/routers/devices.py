@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 from datetime import datetime, timezone
 
@@ -45,6 +46,12 @@ router = APIRouter(prefix="/devices", tags=["devices"])
 _MAX_DEVICES = 5
 # A linked web session lives ~90 days; the device token's exp matches.
 DEVICE_TTL_SECONDS = 90 * 24 * 3600
+
+# The 100200300 rule (he retracted auto-blocking new sessions — with a lost
+# phone there is nobody left to confirm one — and asked for a COOLDOWN long
+# enough for the owner to notice a new session and act). How long a freshly
+# LINKED session must live before it may revoke something older than itself.
+REVOKE_COOLDOWN_SECONDS = int(os.environ.get("RCQ_REVOKE_COOLDOWN_SECONDS", str(24 * 3600)))
 
 
 def _devices_key(uin: int) -> str:
@@ -143,6 +150,57 @@ async def mark_device_seen(uin: int, device_id: str | None) -> None:
         return
 
 
+async def _linked_created_at(uin: int, device_id: str | None) -> datetime | None:
+    """When this LINKED session was born, or None for anything not in the
+    registry (native installs, "primary", absent ids)."""
+    if not device_id or device_id == "primary":
+        return None
+    redis = await get_redis()
+    raw = await redis.hget(_devices_key(uin), device_id)
+    if not raw:
+        return None
+    raw = raw.decode() if isinstance(raw, bytes) else raw
+    try:
+        return datetime.fromisoformat(json.loads(raw).get("created_at", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+async def revoker_gate(uin: int, revoker_device_id: str | None, target_created_at: datetime | None) -> None:
+    """May THIS session revoke THAT one? The stolen-link threat model: a
+    freshly-linked session must not be able to throw the owner out.
+
+    - A NATIVE install (registered/recovered — not in the linked registry)
+      revokes freely: whoever holds the account keys IS the account, and no
+      denylist changes that (#607's root).
+    - A linked session revokes anything YOUNGER than itself freely (the owner
+      kicking the thief must never wait).
+    - A linked session revokes something OLDER only once it has survived the
+      cooldown — long enough for the owner to notice it in the device list
+      and act first. Until then: 403 revoke_cooldown with the wait.
+    """
+    revoker_born = await _linked_created_at(uin, revoker_device_id)
+    if revoker_born is None:
+        return
+    now = datetime.now(timezone.utc)
+    if revoker_born.tzinfo is None:
+        revoker_born = revoker_born.replace(tzinfo=timezone.utc)
+    age = (now - revoker_born).total_seconds()
+    if age >= REVOKE_COOLDOWN_SECONDS:
+        return
+    if target_created_at is not None:
+        target_born = target_created_at if target_created_at.tzinfo else target_created_at.replace(tzinfo=timezone.utc)
+        if revoker_born <= target_born:
+            return
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "revoke_cooldown",
+            "wait_seconds": int(REVOKE_COOLDOWN_SECONDS - age),
+        },
+    )
+
+
 class DeviceOut(BaseModel):
     device_id: str
     label: str
@@ -221,12 +279,18 @@ async def revoke_own_device(
 async def revoke_device(
     device_id: str,
     uin: int = Depends(current_uin),
+    caller_device: str | None = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Disconnect a web session: drop it from the registry AND denylist its
     token. When the last device is removed the hash disappears, so the account
     is single-device again and `GET /keys/{uin}/bundle` resumes serving v=2.
-    Returns 200 {ok:true} (any 2xx satisfies the clients)."""
+    Returns 200 {ok:true} (any 2xx satisfies the clients).
+
+    Gated by [revoker_gate]: a freshly-linked session cannot kick sessions
+    older than itself until the cooldown passes (self-disconnect stays on
+    `DELETE /devices/me`, ungated)."""
+    await revoker_gate(uin, caller_device, await _linked_created_at(uin, device_id))
     return await _revoke(uin, device_id, db)
 
 
