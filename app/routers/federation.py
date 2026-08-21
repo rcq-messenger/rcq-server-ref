@@ -19,6 +19,7 @@ import json
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -128,9 +129,24 @@ async def put_island_record(
             raise HTTPException(status.HTTP_409_CONFLICT, "stale ts")
         existing.doc = raw
         existing.ts = ts
-    else:
-        db.add(HomeIslandRecord(uin=uin, doc=raw, ts=ts))
-    await db.commit()
+        await db.commit()
+        return {"ok": True, "ts": ts}
+    db.add(HomeIslandRecord(uin=uin, doc=raw, ts=ts))
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Two first boots of a fresh account can both pass the SELECT above and
+        # both INSERT; the loser used to surface as a 500. Take the update path
+        # against the row the winner just wrote, same anti-rollback rule.
+        await db.rollback()
+        existing = (
+            await db.execute(select(HomeIslandRecord).where(HomeIslandRecord.uin == uin))
+        ).scalar_one()
+        if ts < existing.ts:
+            raise HTTPException(status.HTTP_409_CONFLICT, "stale ts")
+        existing.doc = raw
+        existing.ts = ts
+        await db.commit()
     return {"ok": True, "ts": ts}
 
 
