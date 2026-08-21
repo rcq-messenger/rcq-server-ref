@@ -8,7 +8,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import engine, get_db
-from app.core.security import current_uin
+from app.core.security import current_device_id, current_uin
 from app.models.device import Device
 from app.models.prekey import OneTimePreKey
 from app.models.user import User, _as_aware
@@ -610,6 +610,57 @@ async def fetch_device_bundle(
             signature=device.kyber_prekey_signature,
         ),
         one_time_prekey=opk_out,
+    )
+
+
+@router.post("/devices/{device_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_device_slot(
+    device_id: int,
+    uin: int = Depends(current_uin),
+    caller_device: str | None = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Retire a key slot (founder batch 21.08, item 13): senders stop fanning
+    out to it on their next roster fetch, and its one-time prekeys are gone so
+    no NEW session can be established against it. The install that held the
+    slot keeps whatever it already decrypted — a revoke is "stop talking to
+    it", not remote erasure — and its AUTH session, if it is a linked one, is
+    disconnected separately on the phone's linked-devices screen.
+
+    Slot 1 is refused: that is the account's primary bundle on the User row,
+    the thing every legacy sender encrypts to. Removing it is a key rotation
+    (`/auth/reissue`), not a slot operation.
+
+    Gated by the same [revoker_gate] cooldown as session revocation: a
+    freshly-linked session cannot strip the owner's slots until it has either
+    outlived the cooldown or is older than what it touches."""
+    if device_id == PRIMARY_DEVICE_ID:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "primary_slot"})
+    device = (
+        await db.execute(
+            select(Device).where(
+                Device.uin == uin,
+                Device.device_id == device_id,
+                Device.revoked_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if device is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+    from app.routers.devices import revoker_gate
+
+    await revoker_gate(uin, caller_device, device.created_at)
+    device.revoked_at = datetime.now(timezone.utc)
+    await db.execute(
+        delete(OneTimePreKey).where(OneTimePreKey.uin == uin, OneTimePreKey.device_id == device_id)
+    )
+    await db.commit()
+    _announce_device_event(
+        uin,
+        "device_slot_revoked",
+        device_id,
+        device.label,
+        "A device slot was removed from this account",
     )
 
 
