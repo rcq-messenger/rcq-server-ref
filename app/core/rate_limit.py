@@ -4,14 +4,15 @@ Migrated from an in-process dict so the limit is shared across all
 uvicorn workers — without this, a 60/min cap on a 4-worker box would
 let a single client do 240/min, one quarter per worker.
 
-The bucket is a Redis sorted set keyed `rl:<rule>:<identity>` where
+The bucket is a Redis sorted set keyed `rl:<rule>:<bucket>` where
 each member is a request timestamp (epoch seconds, also used as the
 score). The check-and-set Lua script runs atomically inside Redis so
 two concurrent workers can't both see "below limit" and both accept.
 
   • Keyed by `(rule_name, identity)` where identity is the UIN for
     authenticated routes and the client IP for anonymous ones
-    (sealed-sender messages, /reports without bearer token).
+    (sealed-sender messages, /reports without bearer token). The
+    identity never reaches Redis in the clear. See [bucket_name].
   • Sliding window: ZREMRANGEBYSCORE drops timestamps older than
     `window_seconds`, ZCARD counts the rest, ZADD records this one.
   • Self-pruning: each bucket gets `EXPIRE` equal to the window so
@@ -35,6 +36,8 @@ trade for not blocking legit clients behind the same gateway.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -43,10 +46,79 @@ from typing import Callable
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .config import settings
 from .redis import get_redis
 from .security import decode_token
 
 log = logging.getLogger(__name__)
+
+
+def _bucket_secret() -> bytes:
+    """HMAC key for the bucket names below.
+
+    Same derivation shape as the broker's own `_bucket_secret`
+    (`routers/broker.py`): SHA-256 over a domain label and the app's JWT
+    secret. That secret is read from the one `/opt/rcq/.env` all four uvicorn
+    workers share and it survives a restart, which are the two properties this
+    needs and the two a per-process random value would not have had. A random
+    per-process salt here would give every worker its own private set of
+    buckets and quietly turn every limit in the product into four times itself
+    which is the exact bug the move to Redis was made to fix.
+
+    No new environment variable: a fresh self-hosted island already has a JWT
+    secret and needs no extra configuration for this to work.
+    """
+    return hashlib.sha256(b"rcq-rate-limit-bucket-v1:" + settings.JWT_SECRET.encode()).digest()
+
+
+def bucket_name(identity: str) -> str:
+    """The opaque Redis bucket name for one limiter identity.
+
+    `identity` is what it always was: "uin:123", "ip:1.2.3.4", and for group
+    slowmode a (group, member) pair. What changed on 2026-08-22 is that it is
+    no longer what lands in Redis.
+
+    WHY. `POST /messages/sealed` takes no auth on purpose: the island must not
+    learn who sent an envelope, and that is the headline privacy property of
+    the product. The limiter decoded the bearer token the client sends anyway
+    and wrote `rl:messages_send:uin:<sender>` with a timestamp per send. So the
+    sender identity we refuse to keep in Postgres was written to Redis on every
+    single send, with timing, by infrastructure nobody thinks of as part of the
+    message path. Group slowmode did the same for (group, member), and the IP
+    branch below wrote the FULL client address that Caddy masks to /24 before
+    it is allowed to touch disk (`core/transport.py`).
+
+    What the HMAC buys, precisely, and what it does not:
+
+      • A Redis dump, an RDB snapshot that rides along in a backup, a stray
+        `KEYS *`, or anyone who reaches port 6379 and nothing else, stops
+        reading as a plaintext who-talked-when list. That is the whole win and
+        it is a real one.
+      • It is NOT protection against seizure of the host. The secret is in
+        `/opt/rcq/.env` on the same disk. Anyone holding both can hash every
+        candidate uin (there are a few thousand) or every plausible IPv4
+        address and match them straight back. This is not designed to survive
+        that and does not.
+      • It is a stable pseudonym, not an anonymiser. Within one secret's life
+        the same sender always lands in the same bucket, so a dump still
+        supports counting and correlation. It just cannot name anyone without
+        the secret.
+      • On an island still running the default JWT secret the label is public
+        and this buys nothing. That island has forgeable tokens too, which is
+        the larger problem and not this function's to solve.
+
+    Rotating JWT_SECRET rotates every bucket with it, which empties the live
+    limiter state. Harmless: the windows here are seconds to an hour.
+
+    Deliberately not memoised. An `lru_cache` keyed on `identity` would be a
+    live in-process table of exactly the plaintext identities this exists to
+    stop writing down, and the HMAC costs a microsecond.
+
+    64 bits of output. With a few thousand active identities the odds of two
+    sharing a bucket are around 10^-12, and the consequence of one would be two
+    callers sharing a limit rather than any loss of enforcement.
+    """
+    return hmac.new(_bucket_secret(), identity.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
 
 
 # Reuse the optional bearer token reader so a route that's NOT
@@ -108,6 +180,9 @@ def _identity(request: Request, creds: HTTPAuthorizationCredentials | None) -> s
             # 401 separately; for anonymous routes (sealed-sender),
             # an invalid token shouldn't be a free pass.
             pass
+    # Whole address, because a /24 is too coarse to price abuse with. It goes
+    # through [bucket_name] like every other identity, so the thing Caddy masks
+    # before it reaches disk is not written to Redis in the clear either.
     return f"ip:{_client_ip(request)}"
 
 
@@ -121,7 +196,7 @@ async def enforce_rate_limit(
     `identity` is the already-built identity string, usually `f"uin:{uin}"`.
     Same fail-soft, same 429 shape as the dependency below.
     """
-    key = f"rl:{rule}:{identity}"
+    key = f"rl:{rule}:{bucket_name(identity)}"
     now = time.time()
     try:
         redis = await get_redis()
@@ -183,7 +258,8 @@ async def enforce_cost_budget(
     """
     if cost <= 0:
         return
-    key = f"rlc:{rule}:{identity}"
+    bucket = bucket_name(identity)
+    key = f"rlc:{rule}:{bucket}"
     try:
         redis = await get_redis()
         result = await redis.eval(_COST_SCRIPT, 1, key, cost, limit, window_seconds)
@@ -193,9 +269,14 @@ async def enforce_cost_budget(
     if int(result[0]) == 1:
         return
     retry_after = int(result[1]) if len(result) > 1 else window_seconds
+    # The bucket, not the identity: this line runs at WARNING and so reaches
+    # journald, and `identity=uin:<sender>` here named the author of a group
+    # post the endpoint above is built not to learn. The bucket still tells an
+    # operator whether one caller is hitting the ceiling repeatedly or many
+    # different ones are hitting it once, which is what the line is read for.
     log.warning(
-        "[rate_limit] fan-out budget exhausted rule=%s identity=%s cost=%d limit=%d",
-        rule, identity, cost, limit,
+        "[rate_limit] fan-out budget exhausted rule=%s bucket=%s cost=%d limit=%d",
+        rule, bucket, cost, limit,
     )
     raise HTTPException(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -223,7 +304,7 @@ def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     ) -> None:
-        key = f"rl:{rule}:{_identity(request, creds)}"
+        key = f"rl:{rule}:{bucket_name(_identity(request, creds))}"
         now = time.time()
         try:
             redis = await get_redis()
@@ -280,7 +361,11 @@ async def allow_ws_connect(uin: int) -> bool:
     one channel that carries messages, calls and presence. Returns True when
     the ceiling is not reached, or when we cannot tell.
     """
-    key = f"wsrate:{uin}"
+    # Bucketed like every other limiter key. This one was never a sealed-sender
+    # problem (the socket is authenticated, so the island knows who is dialling
+    # anyway) but `wsrate:<uin>` in Redis is still a list of who was connecting
+    # in the last minute, readable by anyone who reaches Redis alone.
+    key = f"wsrate:{bucket_name(f'uin:{uin}')}"
     try:
         redis = await get_redis()
         result = await redis.eval(_COST_SCRIPT, 1, key, 1, WS_CONNECTS_PER_MIN, 60)
@@ -294,10 +379,15 @@ async def reset_buckets() -> None:
     """Wipe all rate-limit state. Used by tests; never called in
     production. Buckets self-prune via the cutoff sweep + key
     `EXPIRE` so memory growth is bounded by `unique_identities *
-    unique_rules` and naturally fades after idle windows."""
+    unique_rules` and naturally fades after idle windows.
+
+    All three prefixes, not just the sliding-window one: a test that resets
+    only `rl:*` and then asserts against a cost budget or a socket ceiling is
+    reading state the previous test left behind."""
     try:
         redis = await get_redis()
-        async for key in redis.scan_iter(match="rl:*"):
-            await redis.delete(key)
+        for pattern in ("rl:*", "rlc:*", "wsrate:*"):
+            async for key in redis.scan_iter(match=pattern):
+                await redis.delete(key)
     except Exception:  # noqa: BLE001
         pass

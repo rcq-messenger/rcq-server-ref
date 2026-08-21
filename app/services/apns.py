@@ -30,7 +30,7 @@ from jose import jwt
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.config import log_identity, settings
 from app.core.db import SessionLocal
 from app.models.device_token import DeviceToken
 from app.models.user import User
@@ -439,7 +439,7 @@ async def send_to_user(
       - "trades"     → trades list
     """
     if not _is_configured():
-        log.warning("[apns] send_to_user uin=%s skipped: APNs not configured", uin)
+        log.warning("[apns] send_to_user uin=%s skipped: APNs not configured", log_identity(uin))
         return 0
     # `tokens` given: a fan-out already read them for the whole batch (see
     # `group_push_targets`), and opening a session per recipient here is the
@@ -465,7 +465,8 @@ async def send_to_user(
         tokens = [row for row in tokens if row[1] not in exclude_tokens]
         if len(tokens) != before:
             log.info(
-                "[apns] uin=%s skipping %d sender-device token(s)", uin, before - len(tokens)
+                "[apns] uin=%s skipping %d sender-device token(s)",
+                log_identity(uin), before - len(tokens),
             )
     if skip_devices:
         before = len(tokens)
@@ -475,9 +476,16 @@ async def send_to_user(
         tokens = [row for row in tokens if row[2] and row[2] not in skip_devices]
         if len(tokens) != before:
             log.info(
-                "[apns] uin=%s skipping %d connected device(s)", uin, before - len(tokens)
+                "[apns] uin=%s skipping %d connected device(s)",
+                log_identity(uin), before - len(tokens),
             )
-    log.warning("[apns] send_to_user uin=%s tokens=%d", uin, len(tokens))
+    # ⚠ `uin=` here is the RECIPIENT of a message, written at WARNING on every
+    # push. It is the same delivery graph as the [sealed] line in routers/messages.py
+    # and logged one layer down, so removing it there and leaving it here would
+    # have moved the leak rather than closed it. The token count is what the
+    # line is read for ("did this account have anywhere to push to"); the
+    # account is behind RCQ_LOG_IDENTITIES.
+    log.warning("[apns] send_to_user uin=%s tokens=%d", log_identity(uin), len(tokens))
     if not tokens:
         return 0
     aps: dict[str, Any] = {
@@ -567,7 +575,7 @@ async def send_voip_to_user(
     would tear its own call down.
     """
     if not _is_configured():
-        log.info("[apns] send_voip_to_user uin=%s skipped: APNs not configured", uin)
+        log.info("[apns] send_voip_to_user uin=%s skipped: APNs not configured", log_identity(uin))
         return 0
     # Same no-DB-across-network rule as send_to_user: read tokens, release
     # the connection, then send.
@@ -581,7 +589,7 @@ async def send_voip_to_user(
                 DeviceToken.device_id != except_device,
             )
         tokens = (await db.execute(query)).all()
-    log.warning("[apns] send_voip_to_user uin=%s tokens=%d", uin, len(tokens))
+    log.warning("[apns] send_voip_to_user uin=%s tokens=%d", log_identity(uin), len(tokens))
     if not tokens:
         return 0
     sent = 0

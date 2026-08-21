@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -6,10 +7,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import log_identity
 from app.core.db import get_db
 from app.core.security import current_uin
 from app.models.nearby import NearbyCheckin
 from app.models.user import User
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/nearby", tags=["nearby"])
 
@@ -116,7 +120,17 @@ async def checkin(
     # Surface inbound checkins in journalctl so cross-device tests
     # can correlate "uin A is in bucket X" with "uin B is in bucket
     # Y" without us having to ssh in and SELECT * every time.
-    print(f"[Nearby] checkin uin={uin} bucket={body.bucket_id} ttl={body.ttl_seconds}s")
+    #
+    # ⚠ That correlation is the whole point of the line, and it is also exactly
+    # why it cannot run by default: (uin, geohash tile, time) written into
+    # journald is a location history of named people, on the one feature whose
+    # docstring above promises the server never sees where anyone is. Both
+    # halves ride RCQ_LOG_IDENTITIES; the TTL stays, so an operator can still
+    # see checkins arriving and how long they claim to last.
+    log.warning(
+        "[nearby] checkin uin=%s bucket=%s ttl=%ss",
+        log_identity(uin), log_identity(body.bucket_id), body.ttl_seconds,
+    )
     return CheckinOut(expires_at=expires_at)
 
 
@@ -190,9 +204,16 @@ async def list_nearby(
     # Visibility-debug log so the operator can trace why two
     # devices that "should" see each other don't. Compare the
     # caller's bucket list against any concurrent checkins.
-    print(
-        f"[Nearby] list uin={me} buckets={bucket_list} "
-        f"hits={len(rows)} ({[u.uin for _, u in rows]})"
+    #
+    # ⚠ This one printed the caller, the tiles they were asking about AND the
+    # uin of everyone standing in them: a co-location record for a set of named
+    # people, at WARNING visibility, on every roster refresh. The hit count is
+    # the half that answers "is the query finding anything at all" and it is
+    # the half that stays.
+    log.warning(
+        "[nearby] list uin=%s buckets=%s hits=%d (%s)",
+        log_identity(me), log_identity(bucket_list), len(rows),
+        log_identity([u.uin for _, u in rows]),
     )
     return [
         NearbyUser(

@@ -15,13 +15,50 @@ operator panel that quietly turned into a per-user request log would be a
 worse thing to run than the problem it solves; the one place a uin matters
 (one client in a loop drowning the island) is served by the top-talker count
 without naming anyone.
+
+⚠ Until 2026-08-22 the paragraph above described the OUTPUT accurately and the
+storage not at all: two lines below it the bucket kept `set[int]` of uins and a
+`dict[uin -> chains]`, for sixty rolling minutes, and the metadata audit found
+it (§1.8). It now keeps [_pseudonym] values instead. Every number this module
+publishes is bit-for-bit what it was (both consumers want cardinality, one
+`len()` and one `max()`), and there is no uin left in the process to read.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+# Per-process, per-boot salt for [_pseudonym]. Never written down, never sent
+# anywhere, gone when the worker restarts.
+_PSEUDONYM_SALT = os.urandom(16)
+
+
+def _pseudonym(uin: int) -> int:
+    """A stand-in number for one account, stable within this worker process.
+
+    The two structures that hold these need CARDINALITY and nothing else: "how
+    many distinct accounts this minute" and "how many boot chains did the
+    busiest of them start". Neither ever prints a uin, so neither ever needed
+    one, and a hash preserves both answers exactly.
+
+    Random per-process salt on purpose, and note that this is the OPPOSITE
+    choice from `core/rate_limit.bucket_name`, which derives its secret from
+    the JWT secret so all four workers agree. The reasoning is the same
+    reasoning reaching a different answer: the limiter's buckets HAVE to be
+    shared across workers or every limit multiplies by four, while these
+    buckets are per-process, in-memory and served to the panel by whichever
+    worker answered, so there is nothing to gain from a value that survives a
+    restart, and something to lose from one an attacker could recompute.
+    """
+    return int.from_bytes(
+        hashlib.blake2b(_PSEUDONYM_SALT + str(uin).encode("ascii"), digest_size=8).digest(),
+        "big",
+    )
+
 
 # One hour at a minute each. Long enough to see a spike and what preceded it,
 # small enough that the whole structure is a few hundred kilobytes.
@@ -50,9 +87,12 @@ class Bucket:
     # request that took four seconds behind ninety that took thirty
     # milliseconds, and the slow one is the one a person felt.
     worst: dict[str, float] = field(default_factory=lambda: defaultdict(float))
-    accounts: set[int] = field(default_factory=set)
+    # [_pseudonym] values, NOT uins. The names say so because the previous
+    # names (`accounts`, `boot_chains_by_uin`) are what made it easy to read
+    # the header's promise and the field list as agreeing with each other.
+    account_ids: set[int] = field(default_factory=set)
     boot_chains: int = 0
-    boot_chains_by_uin: dict[int, int] = field(default_factory=lambda: defaultdict(int))
+    boot_chains_by_account: dict[int, int] = field(default_factory=lambda: defaultdict(int))
     sockets_opened: int = 0
     sockets_closed: int = 0
     sockets_refused: int = 0
@@ -105,10 +145,12 @@ def record_request(
     if status_code >= 500:
         b.errors[path] += 1
     if uin is not None:
-        b.accounts.add(uin)
+        # Hashed on the way IN, so the uin never lands in the ring at all.
+        account = _pseudonym(uin)
+        b.account_ids.add(account)
         if path == BOOT_CHAIN_PATH:
             b.boot_chains += 1
-            b.boot_chains_by_uin[uin] += 1
+            b.boot_chains_by_account[account] += 1
     if pool_in_use is not None:
         if pool_in_use > b.pool_peak_in_use:
             b.pool_peak_in_use = pool_in_use
@@ -151,7 +193,7 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
             "minute": minute,
             "requests": sum(b.calls.values()),
             "errors": sum(b.errors.values()),
-            "accounts": len(b.accounts),
+            "accounts": len(b.account_ids),
             "boot_chains": b.boot_chains,
             "sockets_opened": b.sockets_opened,
             "sockets_closed": b.sockets_closed,
@@ -161,7 +203,7 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
             # The single busiest account's chain count, unnamed. A healthy
             # minute has this in the low single digits; the storm had one
             # account at 160.
-            "busiest_account_chains": max(b.boot_chains_by_uin.values(), default=0),
+            "busiest_account_chains": max(b.boot_chains_by_account.values(), default=0),
         })
 
     totals: dict[str, dict] = {}

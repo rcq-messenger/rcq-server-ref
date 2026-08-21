@@ -64,7 +64,9 @@ import httpx
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import log_identity
 from app.core.db import SessionLocal
+from app.core.rate_limit import bucket_name
 from app.models.device_token import DeviceToken
 
 log = logging.getLogger(__name__)
@@ -117,6 +119,31 @@ _RELAY_KEY = os.getenv("PUSH_RELAY_KEY", "").strip()
 _RELAY_HOSTS = frozenset(
     h.strip().lower() for h in os.getenv("PUSH_RELAY_HOSTS", "ntfy.sh").split(",") if h.strip()
 )
+
+
+def _endpoint_label(endpoint: str) -> str:
+    """A safe name for one push endpoint in a log line.
+
+    ⚠⚠ This replaces `endpoint[:48]`, which was a CREDENTIAL in the journal and
+    the worst single line in the 2026-08-22 metadata audit. A UnifiedPush
+    endpoint is `https://<host>/<topic>` and the topic IS the whole secret:
+    `https://push.rcq.app/` is twenty-one characters, so forty-eight of them
+    carried twenty-seven characters of topic, and an ntfy.sh endpoint fitted
+    with room to spare. Anyone reading the log could then subscribe to a
+    device's wakes and post fake ones at it. There is no level at which that is
+    acceptable, so this is not behind RCQ_LOG_IDENTITIES: it is simply gone.
+
+    The HOST survives, because that is the debuggable part: which distributor,
+    is this the relayed one, is it our own push server. The topic becomes an
+    HMAC under the same server secret the limiter buckets use, which is enough
+    to tell two endpoints apart across lines (the retry line and the giving-up
+    line are about the same device) and worth nothing to a reader.
+    """
+    try:
+        host = (urlparse(endpoint).hostname or "?").lower()
+    except ValueError:
+        host = "?"
+    return f"{host}/#{bucket_name('up-endpoint:' + endpoint)}"
 
 
 def _needs_relay(endpoint: str) -> bool:
@@ -271,7 +298,7 @@ async def _deliver(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
         if outcome != "retry":
             return outcome, detail
         if attempt < len(_RETRY_DELAYS):
-            log.info("[up] %s for %s… — retry %d", detail, endpoint[:48], attempt + 1)
+            log.info("[up] %s for %s, retry %d", detail, _endpoint_label(endpoint), attempt + 1)
     return outcome, detail
 
 
@@ -380,14 +407,17 @@ async def _fan_out(
         try:
             endpoints = await _endpoints_for(uin)
         except Exception:  # noqa: BLE001 — a pool timeout must not kill the task loudly
-            log.exception("[up] endpoint lookup failed uin=%s", uin)
+            log.exception("[up] endpoint lookup failed uin=%s", log_identity(uin))
             return
     endpoints = list(endpoints)
     if exclude_tokens:
         skipped = [e for _, e, _, _, _ in endpoints if e in exclude_tokens]
         if skipped:
             endpoints = [row for row in endpoints if row[1] not in exclude_tokens]
-            log.info("[up] %s uin=%s skipping %d sender-device endpoint(s)", what, uin, len(skipped))
+            log.info(
+                "[up] %s uin=%s skipping %d sender-device endpoint(s)",
+                what, log_identity(uin), len(skipped),
+            )
     if skip_devices:
         before = len(endpoints)
         # Keep ONLY endpoints we can positively place on a device that is not
@@ -399,7 +429,7 @@ async def _fan_out(
         if len(endpoints) != before:
             log.info(
                 "[up] %s uin=%s skipping %d connected/unattributed endpoint(s)",
-                what, uin, before - len(endpoints),
+                what, log_identity(uin), before - len(endpoints),
             )
     if not endpoints:
         return
@@ -415,7 +445,7 @@ async def _fan_out(
     fresh_before = datetime.now(timezone.utc) - _OK_STAMP_EVERY
     for (token_id, endpoint, prev_error, _device, prev_ok), result in zip(endpoints, results):
         if isinstance(result, BaseException):
-            log.warning("[up] delivery task error for %s…: %r", endpoint[:48], result)
+            log.warning("[up] delivery task error for %s: %r", _endpoint_label(endpoint), result)
             continue
         outcome, detail = result
         if outcome == "ok":
@@ -433,10 +463,15 @@ async def _fan_out(
         elif outcome == "drop":
             dead_ids.append(token_id)
         else:
-            log.warning("[up] %s giving up on %s… (%s)", detail, endpoint[:48], what)
+            log.warning("[up] %s giving up on %s (%s)", detail, _endpoint_label(endpoint), what)
             if prev_error != detail:
                 failed.append((token_id, detail))
-    log.warning("[up] %s uin=%s endpoints=%d sent=%d", what, uin, len(endpoints), sent)
+    # `uin=` is the message RECIPIENT, the same delivery graph as the APNs line
+    # and the [sealed] line above it, behind the same flag. The counts are the
+    # operational half and they stay.
+    log.warning(
+        "[up] %s uin=%s endpoints=%d sent=%d", what, log_identity(uin), len(endpoints), sent
+    )
     _queue_health(ok_ids, failed, dead_ids)
 
 
