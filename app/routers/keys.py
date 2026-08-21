@@ -449,6 +449,20 @@ class DeviceRegisterOut(BaseModel):
 class DeviceInfo(BaseModel):
     device_id: int
     label: str | None = None
+    # The libsignal identity this device currently publishes.
+    #
+    # ⚠ Here so that a sender can ask "is the install I share a ratchet with
+    # still the one behind this device?" WITHOUT reading a bundle. Reading a
+    # bundle CONSUMES one of the account's one-time prekeys (see _claim_opk),
+    # and a silence probe that re-reads a bundle every half hour to answer a
+    # question that is almost always "yes, unchanged" drains a pool that only
+    # refills while its owner's client is online. An emptied pool means every
+    # later X3DH with that account loses its one-time contributory secret —
+    # the probe would erode the exact property it exists to protect.
+    #
+    # Additive and public: this key is in every bundle the same caller can
+    # already fetch. Old clients ignore the field.
+    signal_identity_key: str | None = None
 
 
 class DevicesOut(BaseModel):
@@ -526,7 +540,11 @@ async def list_devices(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     devices: list[DeviceInfo] = []
     if user.signal_identity_key is not None:
-        devices.append(DeviceInfo(device_id=PRIMARY_DEVICE_ID, label="primary"))
+        devices.append(DeviceInfo(
+            device_id=PRIMARY_DEVICE_ID,
+            label="primary",
+            signal_identity_key=user.signal_identity_key,
+        ))
     rows = (
         await db.execute(
             select(Device)
@@ -535,7 +553,11 @@ async def list_devices(
         )
     ).scalars().all()
     for d in rows:
-        devices.append(DeviceInfo(device_id=d.device_id, label=d.label))
+        devices.append(DeviceInfo(
+            device_id=d.device_id,
+            label=d.label,
+            signal_identity_key=d.signal_identity_key,
+        ))
     return DevicesOut(uin=uin, devices=devices)
 
 
