@@ -112,6 +112,18 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = ""
     ADMIN_PASSWORD: str = ""
 
+    # Hosts that are ROADS to an island, not islands: CDN/domain fronts that
+    # proxy every request through to a real island (the flagship's
+    # cdn.rcq.app). A home-island record naming one of these as a "home" is
+    # fiction — the mailbox behind the front IS the fronted island — and old
+    # clients that stamped the road instead of the island produced exactly such
+    # records. Both record PUTs reject them; without this, one polluted record
+    # keeps re-publishing forever via the clients' read-before-publish
+    # carry-over. Comma-separated bare hosts. The default stays correct for
+    # every operator: cdn.rcq.app is the project's CDN front and is never
+    # anyone's island.
+    FRONT_ALIAS_HOSTS: str = "cdn.rcq.app"
+
     # Server-join gate. "open" (default) = anyone can /auth/register on this
     # server (the current behaviour). "invite" = registration requires a valid
     # invite token (see app/models/invite.py); orgs/islands that want only
