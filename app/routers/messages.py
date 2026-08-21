@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -435,6 +436,60 @@ def _keep_for(
     return set(queueable) | set(wake)
 
 
+# How long the second half of a dual-send may follow the first before it has
+# to buy its own slowmode slot. A dual-send (one broadcast to the capable
+# members + one legacy sealed tail) is one logical post issued back-to-back;
+# 30s covers a slow uplink without opening a real second-message window.
+_SLOWMODE_PAIR_GRACE_SEC = 30
+
+
+async def _enforce_group_slowmode(
+    db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str, path: str
+) -> None:
+    """Group slowmode: one *message* per `g.slowmode_sec` window per
+    identified non-moderator member (same phase-1 trust shape as owner_only —
+    an anonymous poster stays on the client-side gate, because sealed sender
+    hides who they are). The owner, an admin, and any member holding a
+    granted cap are exempt, matching what every client's composer shows.
+
+    `path` is 'sealed' or 'broadcast'. A mixed group's post is a DUAL-SEND —
+    the same message POSTed to both endpoints — and a naive per-path check
+    would 429 the legacy tail and cut the non-capable members out of the
+    conversation. So only the half that actually consumed the slot arms a
+    short-lived free pass for the OTHER path; the freed half arms nothing,
+    which keeps two same-path posts from ever sharing one slot."""
+    if envelope_type != "message" or g is None or (g.slowmode_sec or 0) <= 0:
+        return
+    if caller is None or caller == g.owner_uin:
+        return
+    row = (
+        await db.execute(
+            select(GroupMember.role, GroupMember.permissions).where(
+                GroupMember.group_id == g.id, GroupMember.uin == caller
+            )
+        )
+    ).first()
+    if row is None:
+        return  # not a member — the fan-out budget is the gate for those
+    role, perms = row
+    if role == "admin" or bool((perms or "").strip()):
+        return
+    redis = None
+    try:
+        from app.core.redis import get_redis
+
+        redis = await get_redis()
+        if await redis.getdel(f"gslowfree:{path}:{g.id}:{caller}"):
+            return
+    except Exception:  # noqa: BLE001 — fail-soft, like the limiter itself
+        redis = None
+    await enforce_rate_limit(f"uin:{caller}", f"group_slowmode:{g.id}", 1, g.slowmode_sec)
+    if redis is not None:
+        other = "sealed" if path == "broadcast" else "broadcast"
+        with contextlib.suppress(Exception):
+            await redis.set(f"gslowfree:{other}:{g.id}:{caller}", "1", ex=_SLOWMODE_PAIR_GRACE_SEC)
+
+
 class GroupRecipientPayload(BaseModel):
     to_uin: int
     payload: str
@@ -508,35 +563,17 @@ async def send_group_sealed(
     # a member depends on how long they have been away (see `_queueable`).
     member_rows = (
         await db.execute(
-            select(GroupMember.uin, User.last_seen, GroupMember.role, GroupMember.permissions)
+            select(GroupMember.uin, User.last_seen)
             .outerjoin(User, User.uin == GroupMember.uin)
             .where(GroupMember.group_id == body.group_id)
         )
     ).all()
     if not member_rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "group has no members")
-    members = {uin for uin, _, _, _ in member_rows}
-    queueable = _queueable([(uin, last_seen) for uin, last_seen, _, _ in member_rows])
+    members = {uin for uin, _ in member_rows}
+    queueable = _queueable(member_rows)
 
-    # Slowmode (same phase-1 trust shape as owner_only above): enforced for
-    # IDENTIFIED members only — an anonymous poster stays on the client-side
-    # gate, because sealed sender hides who they are. The owner and
-    # moderators (admin role or any granted cap) are exempt, matching what
-    # every client's composer shows them.
-    if (
-        body.envelope_type == "message"
-        and g is not None
-        and (g.slowmode_sec or 0) > 0
-        and caller is not None
-        and caller != g.owner_uin
-        and caller in members
-    ):
-        role, perms = next(((r, p) for u, _, r, p in member_rows if u == caller), (None, None))
-        moderator = role == "admin" or bool((perms or "").strip())
-        if not moderator:
-            await enforce_rate_limit(
-                f"uin:{caller}", f"group_slowmode:{body.group_id}", 1, g.slowmode_sec
-            )
+    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="sealed")
 
     now = datetime.now(timezone.utc)
     # Drop entries that don't correspond to real group members. Cheap client
@@ -732,6 +769,8 @@ async def send_group_broadcast(
         and caller != g.owner_uin
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
+
+    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="broadcast")
 
     recipient_rows = (
         await db.execute(
