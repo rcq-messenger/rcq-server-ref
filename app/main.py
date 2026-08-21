@@ -108,6 +108,11 @@ async def lifespan(_: FastAPI):
     from app.services.contact_request_sweep import contact_request_sweep_loop
 
     contact_request_sweep_task = asyncio.create_task(contact_request_sweep_loop())
+    # Retention for the encrypted media store — see media_sweep's docstring
+    # (30-day age sweep that spares avatars, stories and report evidence).
+    from app.services.media_sweep import media_sweep_loop
+
+    media_sweep_task = asyncio.create_task(media_sweep_loop())
     try:
         yield
     finally:
@@ -118,6 +123,7 @@ async def lifespan(_: FastAPI):
         nearby_sweep_task.cancel()
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
+        media_sweep_task.cancel()
         await close_redis()
 
 
