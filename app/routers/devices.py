@@ -86,7 +86,14 @@ async def link_device(body: LinkIn, uin: int = Depends(current_uin)) -> LinkOut:
     """Register a new web session for the caller and mint its own session token
     (a `dev`-claim JWT). The phone calls this in its connect-to-web flow and
     puts the returned token (NOT its own) in the LinkBlob, so the web session is
-    independently revocable."""
+    independently revocable.
+
+    The row starts PENDING: this endpoint runs when the QR is shown / the blob
+    is minted, which is BEFORE any browser picked it up — so an abandoned link
+    used to leave a ghost "Web" device in the list until the registry TTL
+    (open item "призрачная веб-сессия"). The flag clears on the token's first
+    real use (`mark_device_seen` from the WS connect and the queue drain), and
+    a row still pending after `_PENDING_TTL` is swept by the list."""
     redis = await get_redis()
     if await redis.hlen(_devices_key(uin)) >= _MAX_DEVICES:
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "too_many_devices"})
@@ -94,6 +101,7 @@ async def link_device(body: LinkIn, uin: int = Depends(current_uin)) -> LinkOut:
     entry = json.dumps({
         "label": body.label,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "pending": True,
     })
     await redis.hset(_devices_key(uin), device_id, entry)
     await redis.expire(_devices_key(uin), DEVICE_TTL_SECONDS)
@@ -104,16 +112,51 @@ async def link_device(body: LinkIn, uin: int = Depends(current_uin)) -> LinkOut:
     )
 
 
+# How long a pending (never-used) link row may sit in the list. Long enough to
+# cover a slow QR handoff, short enough that an abandoned scan does not haunt
+# the devices screen. After this the list sweeps the row lazily.
+_PENDING_TTL_SECONDS = 15 * 60
+
+
+async def mark_device_seen(uin: int, device_id: str | None) -> None:
+    """First real use of a linked device's token — clear its PENDING flag.
+
+    Called from the WS connect and the offline-queue drain: every live session
+    does one of those within seconds of adopting the link blob, including the
+    web builds that predate the flag (nothing to ship client-side). Best-effort
+    and cheap (one HGET, an HSET only on the first call that finds the flag)."""
+    if not device_id or device_id == "primary":
+        return
+    try:
+        redis = await get_redis()
+        raw = await redis.hget(_devices_key(uin), device_id)
+        if not raw:
+            return
+        raw = raw.decode() if isinstance(raw, bytes) else raw
+        entry = json.loads(raw)
+        if not entry.get("pending"):
+            return
+        entry.pop("pending", None)
+        await redis.hset(_devices_key(uin), device_id, json.dumps(entry))
+    except Exception:
+        # A lost clear only means the row stays "pending" until its next use.
+        return
+
+
 class DeviceOut(BaseModel):
     device_id: str
     label: str
     created_at: str
+    # A link whose token was never used yet (QR shown, no browser picked it
+    # up). Old clients ignore the extra field; new ones may label the row.
+    pending: bool = False
 
 
 @router.get("", response_model=list[DeviceOut])
 async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
     redis = await get_redis()
     raw = await redis.hgetall(_devices_key(uin))
+    now = datetime.now(timezone.utc)
     out: list[DeviceOut] = []
     for did, entry in raw.items():
         did = did.decode() if isinstance(did, bytes) else did
@@ -122,10 +165,23 @@ async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
             d = json.loads(entry)
         except (ValueError, TypeError):
             d = {}
+        if d.get("pending"):
+            # An abandoned handoff: the QR was shown, nobody ever used the
+            # token. Sweep it here rather than in a background job — the list
+            # is the only place the ghost was ever visible.
+            try:
+                born = datetime.fromisoformat(d.get("created_at", ""))
+                stale = (now - born).total_seconds() > _PENDING_TTL_SECONDS
+            except ValueError:
+                stale = True
+            if stale:
+                await redis.hdel(_devices_key(uin), did)
+                continue
         out.append(DeviceOut(
             device_id=did,
             label=d.get("label", "Web"),
             created_at=d.get("created_at", ""),
+            pending=bool(d.get("pending")),
         ))
     return out
 
