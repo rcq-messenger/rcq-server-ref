@@ -152,7 +152,7 @@ async def put_island_record(
 
 @router.get(
     "/island-record/{uin}",
-    dependencies=[Depends(rate_limit("federation_island_record_get", 120, 60))],
+    dependencies=[Depends(rate_limit("federation_island_record_get", 900, 60))],
 )
 async def get_island_record(
     uin: int,
@@ -169,14 +169,25 @@ async def get_island_record(
     cross-island linkage map (1925 records on the flagship): who is reachable
     on which island, which is a social graph across borders, not a key card.
 
-    120/min because that is what the neighbour uses and because the traffic
-    says it is far above any real client. Measured on the flagship's own access
-    log, 02.08 to 21.08: 5998 reads, and the busiest single minute from one
-    entire /24 was 28, and a /24 aggregates a relay's whole user base, since
-    a relayed request arrives wearing the relay's address. A client resolves a
-    given peer's record at most once per ten minutes (`PEER_CACHE_TTL_MS`, the
-    same constant in web and Android) plus one for itself at boot, so one
-    device's steady state is a handful per minute at worst.
+    ⚠⚠ 900/min, and the number has already been wrong once. It shipped at
+    120/min on a measurement that undercounted, and it started refusing real
+    users within thirteen minutes: `429` to a web client at 23:33 on 21.08.
+    Three things the first estimate missed, all of them recorded here so the
+    next person does not repeat it.
+
+    First, NONE of the clients send a bearer on this endpoint, so every caller
+    falls back to an IP bucket, and a relayed request wears the relay's
+    address: one bucket for a relay's entire user base. Relay 165.22.90.214
+    alone runs 22 to 33 of these a minute. Second, the real top of the
+    per-address distribution over the retained journal is 90, 75, 46, 40 per
+    minute, not the 28 the first pass measured. Third, relay share is at 20%
+    against a normal 68%, so a recovery multiplies the busiest bucket by about
+    3.4 on its own.
+
+    The ceiling has to clear a relay carrying a large share of the fleet
+    during a bad hour, and enumeration is still bounded: 1925 records at
+    900/min is a fifteen-minute crawl from one address rather than a free one,
+    and the same crawl was unlimited before this dependency existed.
     """
     row = (
         await db.execute(select(HomeIslandRecord).where(HomeIslandRecord.uin == uin))
@@ -248,7 +259,7 @@ async def put_gossip_record(
 
 @router.get(
     "/gossip-record",
-    dependencies=[Depends(rate_limit("federation_gossip_get", 120, 60))],
+    dependencies=[Depends(rate_limit("federation_gossip_get", 900, 60))],
 )
 async def get_gossip_record(
     sk: str = Query(..., min_length=1, max_length=128),
