@@ -49,6 +49,27 @@ async def active_testers(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> ActiveTestersResponse:
+    """The wall of people who are around, for the landing page.
+
+    ⚠ This used to be `ORDER BY last_seen DESC`, which made an unauthenticated,
+    uncredentialed endpoint into a presence oracle: poll it every sixty seconds
+    and the top of the list is whoever just opened the app. `last_seen_visibility`
+    gates `/users/{uin}/info` and never gated this, so the leak ran straight
+    past the setting, including for the DEFAULT value ("contacts"), to
+    strangers, from a URL with no auth on it at all.
+
+    Randomised order rather than "drop the accounts that set it to nobody",
+    which was the other candidate. The leak is the ORDER, not the membership:
+    excluding one setting would have gone on publishing "these fifty were the
+    most recently online" for everybody else, which is the same oracle with a
+    slightly smaller cast, and it would have quietly made the strictest privacy
+    setting the only one that worked. What is left after the shuffle is a
+    sample of accounts seen in a fourteen-day window, which is a much coarser
+    fact than "thirty seconds ago" and is the fact the wall was ever entitled
+    to show. A rotating sample also suits the surface better: a wall of testers
+    that changes when you reload looks like a community, and a fixed top-fifty
+    looked like a leaderboard nobody meant to publish.
+    """
     now = datetime.now(timezone.utc)
     active_since = now - ACTIVE_WINDOW
     stmt = (
@@ -58,7 +79,10 @@ async def active_testers(
             User.last_seen >= active_since,
             User.last_seen >= User.created_at + RETURN_THRESHOLD,
         )
-        .order_by(User.last_seen.desc())
+        # `random()` on both Postgres and SQLite, so the self-host reference
+        # runs the same query. The WHERE clause has already cut the table to
+        # the recently-active few hundred, so the sort is on a small set.
+        .order_by(func.random())
         .limit(TESTER_LIMIT)
     )
     rows = (await db.execute(stmt)).scalars().all()

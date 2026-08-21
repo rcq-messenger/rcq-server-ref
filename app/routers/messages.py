@@ -10,9 +10,15 @@ from sqlalchemy import delete, func, insert, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.config import log_identity, settings
 from app.core.db import get_db
-from app.core.rate_limit import _client_ip, enforce_cost_budget, enforce_rate_limit, rate_limit
+from app.core.rate_limit import (
+    _client_ip,
+    bucket_name,
+    enforce_cost_budget,
+    enforce_rate_limit,
+    rate_limit,
+)
 from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
@@ -362,9 +368,17 @@ async def send_sealed(
                 to_device_id=body.to_device_id,
                 skip_devices=online_devices,
             )
+    # ⚠ No recipient on the default line. This ran at WARNING for every single
+    # 1:1 delivery, so journald held the recipient uin, the envelope kind and
+    # the minute for every message the island carried. That is the delivery graph the
+    # database refuses to store, rebuilt in plain text next to it, and for the
+    # sealed-sender endpoint above all. What the line is actually read for is
+    # the four flags: did the socket take it, did the queue, did a push go out.
+    # Those stay. `to=` is available behind RCQ_LOG_IDENTITIES for an operator
+    # debugging their own island.
     log.warning(
         "[sealed] to=%s type=%s ws_delivered=%s queued=%s pushed=%s",
-        body.to_uin, body.envelope_type, delivered, queued, pushed,
+        log_identity(body.to_uin), body.envelope_type, delivered, queued, pushed,
     )
     activity_bump("msg")
     return SendOut(delivered=delivered, queued=queued, server_time=now)
@@ -443,6 +457,42 @@ def _keep_for(
 _SLOWMODE_PAIR_GRACE_SEC = 30
 
 
+def _slowmode_identity(group_id: int, caller: int) -> str:
+    """Limiter identity for one (group, member) slowmode slot.
+
+    ⚠ The group id rides INSIDE the identity now, where it gets hashed, rather
+    than in the rule name where it used to sit. `rl:group_slowmode:<gid>:uin:
+    <caller>` spelled out in plain text in Redis that account X posted in group
+    Y at time T. A room rule meant to slow down flooding was quietly trading away
+    the sender anonymity of every group that turns it on. Only the rule name
+    survives into the key unhashed, so anything that is a social fact has to be
+    on this side of the line.
+
+    The bucket is still exactly one per (group, member): same slot, same
+    window, same 429. Two different groups cannot share a slot and two members
+    of one group cannot either, which is all the old key shape guaranteed.
+    """
+    return f"g{group_id}:uin:{caller}"
+
+
+def _slowmode_free_key(path: str, group_id: int, caller: int) -> str:
+    """Redis key for the one-shot pass that lets a dual-send's OTHER half
+    through.
+
+    Hashed for the same reason as [_slowmode_identity]: `gslowfree:<path>:
+    <gid>:<caller>` was the same social fact with a thirty-second life. The
+    mechanism is untouched: one key per (path, group, member), armed by the
+    half that consumed the slot, consumed by a GETDEL on the other half.
+
+    ⚠ The key SHAPE changed, so markers armed by the previous build are
+    unreadable by this one. They expire in 30s on their own; the only cost is
+    that a dual-send whose two halves straddle the restart pays for two slots
+    and the tail may 429. Restart is a blip and slowmode is on in very few
+    rooms, so this is the cheapest available answer to a plaintext key.
+    """
+    return f"gslowfree:{bucket_name(f'{path}:g{group_id}:uin:{caller}')}"
+
+
 async def _enforce_group_slowmode(
     db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str, path: str
 ) -> None:
@@ -479,15 +529,15 @@ async def _enforce_group_slowmode(
         from app.core.redis import get_redis
 
         redis = await get_redis()
-        if await redis.getdel(f"gslowfree:{path}:{g.id}:{caller}"):
+        if await redis.getdel(_slowmode_free_key(path, g.id, caller)):
             return
     except Exception:  # noqa: BLE001 — fail-soft, like the limiter itself
         redis = None
-    await enforce_rate_limit(f"uin:{caller}", f"group_slowmode:{g.id}", 1, g.slowmode_sec)
+    await enforce_rate_limit(_slowmode_identity(g.id, caller), "group_slowmode", 1, g.slowmode_sec)
     if redis is not None:
         other = "sealed" if path == "broadcast" else "broadcast"
         with contextlib.suppress(Exception):
-            await redis.set(f"gslowfree:{other}:{g.id}:{caller}", "1", ex=_SLOWMODE_PAIR_GRACE_SEC)
+            await redis.set(_slowmode_free_key(other, g.id, caller), "1", ex=_SLOWMODE_PAIR_GRACE_SEC)
 
 
 class GroupRecipientPayload(BaseModel):
@@ -691,9 +741,15 @@ async def send_group_sealed(
 
         for uin, ends in wake.items():
             asyncio.create_task(_push(uin, ends))
+    # Same treatment as the 1:1 line above, and the group id goes with the uins.
+    # A gid is not a person on its own, but the membership table turns it into
+    # one: `gid=41 at 22:44` plus a SELECT is the same delivery graph, for
+    # everyone in the room at once. The counts answer the operational question
+    # (is the fan-out working, how big was it, how much of it went to the queue)
+    # without naming the room.
     log.warning(
         "[group-sealed] gid=%s type=%s payloads=%d queued=%d delivered_any=%s offline=%d",
-        body.group_id, body.envelope_type, len(body.payloads), len(rows),
+        log_identity(body.group_id), body.envelope_type, len(body.payloads), len(rows),
         delivered_any, len(offline_recipients),
     )
     activity_bump("gmsg")
@@ -881,9 +937,10 @@ async def send_group_broadcast(
 
         for uin, ends in wake.items():
             asyncio.create_task(_push(uin, ends))
+    # Identity-free by default, same reasoning as [group-sealed] above.
     log.warning(
         "[group-broadcast] gid=%s type=%s recipients=%d queued=%d delivered_any=%s offline=%d",
-        body.group_id, body.envelope_type, len(recipients), len(rows),
+        log_identity(body.group_id), body.envelope_type, len(recipients), len(rows),
         delivered_any, len(offline_recipients),
     )
     activity_bump("gmsg")

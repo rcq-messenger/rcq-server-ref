@@ -150,7 +150,10 @@ async def put_island_record(
     return {"ok": True, "ts": ts}
 
 
-@router.get("/island-record/{uin}")
+@router.get(
+    "/island-record/{uin}",
+    dependencies=[Depends(rate_limit("federation_island_record_get", 120, 60))],
+)
 async def get_island_record(
     uin: int,
     db: AsyncSession = Depends(get_db),
@@ -159,6 +162,21 @@ async def get_island_record(
 
     Open by design: the record is public, signed routing data that reveals only
     where an identity is reachable. The client verifies its signature.
+
+    IP rate-limited to bound UIN enumeration, the same reason and the same
+    shape as `/federation/keys/{uin}` below. Open and unlimited, this was the
+    cheaper of the two oracles: one GET per uin walks out the whole
+    cross-island linkage map (1925 records on the flagship): who is reachable
+    on which island, which is a social graph across borders, not a key card.
+
+    120/min because that is what the neighbour uses and because the traffic
+    says it is far above any real client. Measured on the flagship's own access
+    log, 02.08 to 21.08: 5998 reads, and the busiest single minute from one
+    entire /24 was 28, and a /24 aggregates a relay's whole user base, since
+    a relayed request arrives wearing the relay's address. A client resolves a
+    given peer's record at most once per ten minutes (`PEER_CACHE_TTL_MS`, the
+    same constant in web and Android) plus one for itself at boot, so one
+    device's steady state is a handful per minute at worst.
     """
     row = (
         await db.execute(select(HomeIslandRecord).where(HomeIslandRecord.uin == uin))
@@ -228,7 +246,10 @@ async def put_gossip_record(
     return {"ok": True, "ts": ts}
 
 
-@router.get("/gossip-record")
+@router.get(
+    "/gossip-record",
+    dependencies=[Depends(rate_limit("federation_gossip_get", 120, 60))],
+)
 async def get_gossip_record(
     sk: str = Query(..., min_length=1, max_length=128),
     db: AsyncSession = Depends(get_db),
@@ -238,6 +259,14 @@ async def get_gossip_record(
     Open: the record is public signed routing data. `sk` is a base64 query
     param (path-unsafe `+`/`/`). The client re-verifies the signature and
     anchors `sk`/`ik` to the peer it already knows before trusting the homes.
+
+    Rate-limited for the same reason as the by-uin read above and the key card
+    below: bounding enumeration. A 32-byte key is not guessable the way a uin
+    is, so what this bounds is bulk HARVESTING: walking a list of keys you
+    already hold and turning it into the same cross-island map. The PUT beside
+    it has been limited since it shipped; the GET was simply missed. Same
+    120/min, and this endpoint is measured in single digits per WEEK on the
+    flagship (10 reads, 02.08 to 21.08).
     """
     row = (
         await db.execute(select(GossipRecord).where(GossipRecord.sk == sk.strip()))

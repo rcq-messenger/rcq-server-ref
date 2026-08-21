@@ -31,6 +31,23 @@ class Settings(BaseSettings):
     # just see user reports. The maintainer's flagship sets RCQ_ADMIN_SHOW_CRASHES=true.
     RCQ_ADMIN_SHOW_CRASHES: bool = False
     ENV: str = "dev"
+
+    # Identity-bearing debug logging. OFF, and it has to stay off anywhere real
+    # people are: with it on, the delivery lines in routers/messages.py, the two
+    # push senders and routers/nearby.py name the RECIPIENT of every message and
+    # the geographic bucket of every checkin. Journald is capped at 1G, so that
+    # is a few days of the who-talks-to-whom graph the database is deliberately
+    # built not to keep, written in plain text one file away from the code
+    # that promises we do not keep it (metadata-map-2026-08-22 §1.3).
+    #
+    # It is a flag on the CONTENT of a WARNING rather than a log level on
+    # purpose: uvicorn leaves the root logger at WARNING, so `log.debug` and
+    # even `log.info` from our own modules are invisible in production and a
+    # level-based switch would be a switch that does nothing. Turn this on for a
+    # dev box, or for a short deliberate window on an island whose operator owns
+    # every account on it, and turn it off again.
+    RCQ_LOG_IDENTITIES: bool = False
+
     DATABASE_URL: str = "sqlite+aiosqlite:///./rcq.db"
     REDIS_URL: str = "redis://localhost:6379/0"
     JWT_SECRET: str = "change-me-in-prod"
@@ -147,3 +164,17 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def log_identity(value: object) -> str:
+    """One field of a log line: `value` when RCQ_LOG_IDENTITIES is on, `-` when
+    it is not.
+
+    A placeholder rather than a dropped field, so the line keeps ONE format
+    string and an operator reading `to=-` in the journal can see that there is
+    a field there and that it is switched off, instead of wondering whether
+    this build ever had one. Every caller is a line that used to name a person:
+    the delivery lines in routers/messages.py, the two push senders, the Nearby
+    debug prints.
+    """
+    return str(value) if settings.RCQ_LOG_IDENTITIES else "-"
