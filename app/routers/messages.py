@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.rate_limit import _client_ip, enforce_cost_budget, rate_limit
+from app.core.rate_limit import _client_ip, enforce_cost_budget, enforce_rate_limit, rate_limit
 from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
@@ -508,15 +508,35 @@ async def send_group_sealed(
     # a member depends on how long they have been away (see `_queueable`).
     member_rows = (
         await db.execute(
-            select(GroupMember.uin, User.last_seen)
+            select(GroupMember.uin, User.last_seen, GroupMember.role, GroupMember.permissions)
             .outerjoin(User, User.uin == GroupMember.uin)
             .where(GroupMember.group_id == body.group_id)
         )
     ).all()
     if not member_rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "group has no members")
-    members = {uin for uin, _ in member_rows}
-    queueable = _queueable(member_rows)
+    members = {uin for uin, _, _, _ in member_rows}
+    queueable = _queueable([(uin, last_seen) for uin, last_seen, _, _ in member_rows])
+
+    # Slowmode (same phase-1 trust shape as owner_only above): enforced for
+    # IDENTIFIED members only — an anonymous poster stays on the client-side
+    # gate, because sealed sender hides who they are. The owner and
+    # moderators (admin role or any granted cap) are exempt, matching what
+    # every client's composer shows them.
+    if (
+        body.envelope_type == "message"
+        and g is not None
+        and (g.slowmode_sec or 0) > 0
+        and caller is not None
+        and caller != g.owner_uin
+        and caller in members
+    ):
+        role, perms = next(((r, p) for u, _, r, p in member_rows if u == caller), (None, None))
+        moderator = role == "admin" or bool((perms or "").strip())
+        if not moderator:
+            await enforce_rate_limit(
+                f"uin:{caller}", f"group_slowmode:{body.group_id}", 1, g.slowmode_sec
+            )
 
     now = datetime.now(timezone.utc)
     # Drop entries that don't correspond to real group members. Cheap client

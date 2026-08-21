@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -46,6 +46,18 @@ class Group(Base):
     # group messages — so this is a display-only gate enforced by the
     # iOS client. Default False keeps existing groups' rosters open.
     members_hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Owner-set content policy: whether links in messages are treated as
+    # clickable and whether file attachments may be sent/opened. The server
+    # cannot inspect sealed envelopes, so both are honored by CLIENTS (the
+    # same receiver-side trust model as moderator deletes); storing them
+    # here just makes the choice reach every member. Defaults keep existing
+    # groups exactly as they were.
+    links_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    files_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Slowmode: minimum seconds between messages per non-moderator member
+    # (0 = off). Unlike the two flags above this one IS server-enforced for
+    # authenticated senders on /messages/group-sealed — see messages.py.
+    slowmode_sec: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Pinned plaintext announcement, owner/admin-editable. Surfaced as
     # a sticky header above the message list in ChatView so new joiners
     # who can't see the encrypted history at least see the rules /
