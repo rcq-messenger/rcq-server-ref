@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
@@ -32,6 +33,25 @@ router = APIRouter(prefix="/federation", tags=["federation"])
 # The signed document is small: a key, a short list of (host, uin) homes, a
 # timestamp, a signature. Anything larger is malformed or abusive.
 _MAX_DOC_BYTES = 8 * 1024
+
+
+def _front_alias_in_homes(homes: list) -> str | None:
+    """The first `homes` host that is a configured CDN/domain FRONT, or None.
+
+    A front is a road to an island, not an island: a record listing one as a
+    home describes a mailbox that does not exist ("backup" copies land on the
+    fronted island itself, so the redundancy is fiction). Old clients that
+    stamped the road instead of the island published exactly such records, and
+    the clients' read-before-publish carry-over then re-publishes the phantom
+    home forever — the store is where the loop is broken."""
+    aliases = {h.strip().lower() for h in settings.FRONT_ALIAS_HOSTS.split(",") if h.strip()}
+    if not aliases:
+        return None
+    for h in homes:
+        host = h.get("host") if isinstance(h, dict) else None
+        if isinstance(host, str) and host.strip().lower() in aliases:
+            return host
+    return None
 
 
 def _record_signed_bytes(doc: dict) -> bytes:
@@ -94,6 +114,9 @@ async def put_island_record(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing homes")
     if not isinstance(doc.get("ik"), str) or not isinstance(doc.get("sig"), str):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing ik or sig")
+    front = _front_alias_in_homes(homes)
+    if front is not None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"front is not an island: {front}")
 
     existing = (
         await db.execute(select(HomeIslandRecord).where(HomeIslandRecord.uin == uin))
@@ -167,6 +190,9 @@ async def put_gossip_record(
     sk = doc.get("sk")
     if not isinstance(sk, str) or not isinstance(doc.get("ik"), str) or not isinstance(doc.get("sig"), str):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing ik/sk/sig")
+    front = _front_alias_in_homes(homes)
+    if front is not None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"front is not an island: {front}")
     # The whole point of an open write: prove the record is genuinely signed by
     # the key it claims, so a stranger cannot poison `sk`'s slot.
     if not _verify_record_sig(doc):
