@@ -22,7 +22,9 @@ router = APIRouter(prefix="/public", tags=["public"])
 # Wall ordering — gold flowers first, then silver, then bronze, alphabetical
 # within a tier. A curated wall, not a leaderboard, so the only signal in the
 # order is the founder's rating; report counts never reorder anyone.
-_TIER_RANK = {"gold": 0, "silver": 1, "bronze": 2}
+# Ruby sits ABOVE gold (founder, 21.08): the fourth, rarest grade, for a
+# contribution the wall's other three don't reach.
+_TIER_RANK = {"ruby": -1, "gold": 0, "silver": 1, "bronze": 2}
 
 
 class ActiveTesterOut(BaseModel):
@@ -129,10 +131,12 @@ async def hall_of_fame(
     # Podium: the three highest-scoring GOLD members who have had at least one
     # bug confirmed. Gold is a prerequisite rather than a tiebreak — the flower
     # is the founder's call, and the score only ranks people he already vouched
-    # for. Ties fall back to confirmed count, then nickname, so the order is
-    # stable between requests instead of wobbling with dict order.
+    # for. Ruby counts too: it sits above gold, and a promotion must never
+    # cost somebody their podium place. Ties fall back to confirmed count,
+    # then nickname, so the order is stable between requests instead of
+    # wobbling with dict order.
     contenders = sorted(
-        (m for m in members if m.tier == "gold" and m.confirmed > 0),
+        (m for m in members if m.tier in ("gold", "ruby") and m.confirmed > 0),
         key=lambda m: (-podium_score(m.reports, m.confirmed), -m.confirmed, m.nickname.lower()),
     )
     for place, m in enumerate(contenders[:3], start=1):
