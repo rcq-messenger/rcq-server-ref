@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -161,7 +162,7 @@ class StatusOut(BaseModel):
     signal_identity_key: str | None = None
 
 
-async def _announce_device_event(
+async def _announce_device_event_now(
     uin: int,
     kind: str,
     device_id: int,
@@ -175,10 +176,12 @@ async def _announce_device_event(
     if it wants to read or send v=2, so this is where the account learns.
 
     Live sessions get a registry-style WS event (same channel the QR-link
-    screen already listens to); every device gets a push wake. ⚠ The push
-    body carries NO label and NO uin: it travels through APNs and the push
-    host in the clear. Best-effort — a failed announcement must never fail
-    the registration that caused it."""
+    screen already listens to); every device gets a push wake. ⚠ The alert
+    BODY carries no label and no device detail: it travels through APNs and
+    the push host in the clear. (The recipient uin rides every push of every
+    kind as routing metadata — see apns.send_to_user — so the marginal thing
+    those hosts learn here is the notif_kind.) Best-effort — a failed
+    announcement must never fail the registration that caused it."""
     try:
         payload: dict[str, object] = {"type": kind, "device_id": device_id}
         if label:
@@ -192,11 +195,41 @@ async def _announce_device_event(
         thread_id="devices",
         notif_kind=kind,
     )
-    try:
-        await apns_send(uin, **push_args)
-        await up_send(uin, **push_args)
-    except Exception:  # noqa: BLE001
-        log.exception("[keys] failed to push %s uin=%s", kind, uin)
+    # One try EACH: a raise out of the APNs path (a corrupt .p8 makes
+    # _get_jwt throw before its own network try) would otherwise swallow the
+    # UnifiedPush wake with it — and Android is where most of this account's
+    # devices are. A security announce must not be all-or-nothing across
+    # transports.
+    for send in (apns_send, up_send):
+        try:
+            await send(uin, **push_args)
+        except Exception:  # noqa: BLE001
+            log.exception("[keys] failed to push %s uin=%s via %s", kind, uin, send.__module__)
+
+
+# Strong refs to in-flight announces: asyncio holds only a weak one, and a
+# task collected mid-await is an announcement that silently never happened.
+_announce_tasks: set[asyncio.Task] = set()
+
+
+def _announce_device_event(
+    uin: int,
+    kind: str,
+    device_id: int,
+    label: str | None,
+    push_body: str,
+) -> None:
+    """Schedule the announce and return immediately.
+
+    ⚠ Deliberately NOT awaited by the endpoints. apns_send walks the account's
+    tokens with a 15s ceiling EACH, so awaiting it inline put an APNs stall
+    directly in front of the 201 — and a client that gives up and retries a
+    device registration burns a second slot of the 127 for the same install.
+    The registration is the source of truth; telling the account about it is
+    bookkeeping that must never hold the door."""
+    task = asyncio.create_task(_announce_device_event_now(uin, kind, device_id, label, push_body))
+    _announce_tasks.add(task)
+    task.add_done_callback(_announce_tasks.discard)
 
 
 @router.post("/bundle", status_code=status.HTTP_204_NO_CONTENT)
@@ -241,7 +274,7 @@ async def upload_bundle(
         db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=None))
     await db.commit()
     if prev_ik is not None and prev_ik != body.signal_identity_key:
-        await _announce_device_event(
+        _announce_device_event(
             uin,
             "device_rekeyed",
             PRIMARY_DEVICE_ID,
@@ -469,7 +502,7 @@ async def register_device(
     for pk in body.one_time_prekeys:
         db.add(OneTimePreKey(uin=uin, prekey_id=pk.id, public_key=pk.public, device_id=next_id))
     await db.commit()
-    await _announce_device_event(
+    _announce_device_event(
         uin,
         "device_registered",
         next_id,
