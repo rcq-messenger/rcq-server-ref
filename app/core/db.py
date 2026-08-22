@@ -547,11 +547,26 @@ async def init_db() -> None:
                         {"new": hashlib.sha256(raw.strip().encode()).hexdigest(), "old": raw},
                     )
                     converted += 1
-                await conn.execute(
-                    text(
+                # ⚠ Every uvicorn worker runs init_db, and they all read the
+                # marker as absent before any of them has written it. The
+                # UPDATEs are safe to race (the second worker's `WHERE code =
+                # :old` finds nothing once the first has committed), but a plain
+                # INSERT of the marker is not: on is2 (2 workers) the loser hit
+                # the primary key and printed a full traceback on the first
+                # boot after the upgrade. Ignore the duplicate instead; the
+                # winner's value is the one that counts.
+                if engine.dialect.name == "postgresql":
+                    marker_sql = (
                         "INSERT INTO server_settings (key, value, updated_at) "
+                        "VALUES (:k, :v, :t) ON CONFLICT (key) DO NOTHING"
+                    )
+                else:
+                    marker_sql = (
+                        "INSERT OR IGNORE INTO server_settings (key, value, updated_at) "
                         "VALUES (:k, :v, :t)"
-                    ),
+                    )
+                await conn.execute(
+                    text(marker_sql),
                     {
                         "k": _INVITE_HASH_MARKER,
                         "v": str(converted),
