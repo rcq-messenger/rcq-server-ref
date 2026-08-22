@@ -46,8 +46,6 @@ def _reg(spec: SettingSpec) -> SettingSpec:
 
 
 # ── Consumer features (off => router gated + hidden in the client via /server/info)
-_reg(SettingSpec("nearby_enabled", "bool", lambda: True, "features", "Nearby",
-                 "Geo 'people near you' discovery."))
 _reg(SettingSpec("random_enabled", "bool", lambda: True, "features", "Random Chat",
                  "Anonymous roulette-style 1:1 chat."))
 # `hood_enabled` and `stories_enabled` were removed from the registry on

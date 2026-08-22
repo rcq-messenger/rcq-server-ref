@@ -831,7 +831,6 @@ async function setFeature(key, value){
 }
 
 let MOCK_SETTINGS = [
-  {key:'nearby_enabled',type:'bool',group:'features',label:'Nearby',help:'Geo people-near-you discovery.',value:true,default:true,overridden:false,min:null,max:null,choices:null},
   {key:'random_enabled',type:'bool',group:'features',label:'Random Chat',help:'Anonymous roulette-style chat.',value:true,default:true,overridden:false,min:null,max:null,choices:null},
   {key:'registration_policy',type:'str',group:'limits',label:'Registration',help:'Who may create an account on this island.',value:'open',default:'open',overridden:false,min:null,max:null,choices:['open','invite']},
   {key:'max_accounts_per_device',type:'int',group:'limits',label:'Max accounts / device',help:'How many accounts one device may hold.',value:5,default:5,overridden:false,min:1,max:50,choices:null},

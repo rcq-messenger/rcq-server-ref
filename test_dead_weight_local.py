@@ -311,7 +311,7 @@ async def main() -> None:
     check("an operator override for a deleted feature is refused", rejected)
     caps = ServerCapabilities(
         uin_shop=False, hall_of_fame=False, registration_policy="open",
-        nearby=True, random_chat=True, reports=True, max_accounts_per_device=5,
+        random_chat=True, reports=True, max_accounts_per_device=5,
     )
     check("/server/info advertises Hood and Stories as off",
           caps.hood is False and caps.stories is False)

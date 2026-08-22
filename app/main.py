@@ -15,10 +15,9 @@ from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, nearby, news, polls, presence, public, reports, server, uin_shop, users, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.evidence_sweep import evidence_sweep_loop
-from app.services.nearby_sweep import nearby_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
 
 
@@ -175,9 +174,6 @@ async def lifespan(_: FastAPI):
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.
     evidence_sweep_task = asyncio.create_task(evidence_sweep_loop())
-    # Retention for expired People-Nearby check-ins (geohash buckets tied to a
-    # UIN were previously filtered on read but never deleted).
-    nearby_sweep_task = asyncio.create_task(nearby_sweep_loop())
     # Five-minute online samples for the hourly activity history. Every worker
     # runs one; the write is a max() into a shared Redis hash, so the extras
     # cost a SCARD each and change nothing.
@@ -229,7 +225,6 @@ async def lifespan(_: FastAPI):
         expire_task.cancel()
         offline_queue_sweep_task.cancel()
         evidence_sweep_task.cancel()
-        nearby_sweep_task.cancel()
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
         media_sweep_task.cancel()
@@ -343,7 +338,6 @@ app.include_router(groups.router)
 app.include_router(messages.router)
 app.include_router(keys.router)
 app.include_router(media.router)
-app.include_router(nearby.router, dependencies=[Depends(require_feature("nearby_enabled"))])
 app.include_router(presence.router)
 app.include_router(random_chat.router, dependencies=[Depends(require_feature("random_enabled"))])
 app.include_router(audio_rooms.router)

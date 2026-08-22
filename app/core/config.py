@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # Identity-bearing debug logging. OFF, and it has to stay off anywhere real
     # people are: with it on, the delivery lines in routers/messages.py, the two
-    # push senders and routers/nearby.py name the RECIPIENT of every message and
+    # push senders name the RECIPIENT of every message and
     # the geographic bucket of every checkin. Journald is capped at 1G, so that
     # is a few days of the who-talks-to-whom graph the database is deliberately
     # built not to keep, written in plain text one file away from the code
