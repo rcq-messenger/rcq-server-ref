@@ -144,6 +144,18 @@ async def sweep_once() -> tuple[int, int, int]:
                     Report.status != "open",
                     Report.resolved_at.is_not(None),
                     Report.resolved_at < cutoff,
+                    # ⚠⚠ AND NOT ALREADY DONE. The abuse path deletes its row so
+                    # it can never match twice, but the bug-bounty path REDACTS
+                    # IN PLACE and the row keeps satisfying every clause above
+                    # forever. Without this the pass re-selects the same rows
+                    # every hour: harmless noise at six rows, and a silent
+                    # failure of the whole guarantee once there are more than
+                    # MAX_PER_CYCLE of them, because `order_by(resolved_at asc)
+                    # limit N` would then return the same N oldest already-done
+                    # rows on every pass and never reach a newly expired one.
+                    # The marker in `reason` IS the redacted state, so it is
+                    # also the predicate.
+                    Report.reason != REDACTED_REASON,
                 )
                 .order_by(Report.resolved_at.asc())
                 .limit(MAX_PER_CYCLE)

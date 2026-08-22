@@ -191,6 +191,16 @@ async def main() -> None:
     check("the pass reports 1 deleted and 1 redacted",
           (deleted, redacted) == (1, 1), f"{deleted}/{redacted}")
 
+    # ⚠⚠ A SECOND pass must find nothing. The abuse row is gone so it cannot
+    # match again, but the bug row is redacted IN PLACE and still satisfies
+    # "closed, resolved, older than the horizon" forever. If it keeps matching,
+    # the hourly log lies and, once there are more than MAX_PER_CYCLE such rows,
+    # `order_by(resolved_at asc) limit N` returns the same N finished rows on
+    # every pass and a newly expired report is never redacted at all.
+    again = await report_sweep()
+    check("a second pass is a no-op (a redacted row must stop matching)",
+          again == (0, 0, 0), f"second pass did {again}")
+
     # The wall must still be able to count the redacted row.
     from app.services.hof_stats import bug_report_stats  # noqa: E402
 
