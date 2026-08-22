@@ -76,6 +76,31 @@ class _RedactSecretsInLogs(logging.Filter):
             out = self._RE_ID_PATH.sub("/<id>", out)
         return out
 
+    def _scrub_arg(self, value: object, paths: bool) -> object:
+        """One positional arg, rewritten without changing its type.
+
+        ⚠⚠ NOT EVERY ARG IS A STRING, and the first version of this filter
+        assumed one. uvicorn's HTTP access line passes the client address as
+        the already-formatted `"ip:port"` string, so it came out masked. Its
+        WEBSOCKET lines pass `scope["client"]`, the raw `(host, port)` TUPLE,
+        which `%s` renders in full, so `/ws/<id>` had its path masked and the
+        address next to it did not:
+
+            INFO: ('77.110.109.154', 0) - "WebSocket /ws/<id>?token=<redacted>"
+
+        That is one line per connect per device, measured at ~1760 lines and
+        182 distinct full addresses per half hour on the flagship, which is the
+        larger half of what the 22.08 access-log work was for. Walk into the
+        container and rewrite the strings inside it instead of skipping it.
+        """
+        if isinstance(value, str):
+            return self._scrub(value, paths=paths)
+        if isinstance(value, tuple):
+            return tuple(self._scrub_arg(v, paths) for v in value)
+        if isinstance(value, list):
+            return [self._scrub_arg(v, paths) for v in value]
+        return value
+
     def filter(self, record: logging.LogRecord) -> bool:
         # ⚠⚠ NEVER blank `record.args` on a uvicorn record. Its access formatter
         # unpacks them itself (`uvicorn/logging.py`: `(client_addr, method,
@@ -88,10 +113,7 @@ class _RedactSecretsInLogs(logging.Filter):
         # leave the shape alone.
         uvicorn_record = record.name.startswith("uvicorn")
         if uvicorn_record and isinstance(record.args, tuple) and record.args:
-            scrubbed = tuple(
-                self._scrub(a, paths=True) if isinstance(a, str) else a
-                for a in record.args
-            )
+            scrubbed = tuple(self._scrub_arg(a, True) for a in record.args)
             if scrubbed != record.args:
                 record.args = scrubbed
             return True

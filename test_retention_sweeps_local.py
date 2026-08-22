@@ -42,7 +42,7 @@ for f in ("test_retention.db",):
 
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
-from sqlalchemy import func, select, text  # noqa: E402
+from sqlalchemy import func, select, text, update  # noqa: E402
 
 from app.core.db import SessionLocal, init_db  # noqa: E402
 from app.models.access_token import AccessToken  # noqa: E402
@@ -110,9 +110,41 @@ async def main() -> None:
         3 in left, str(left),
     )
     check("an UNCONSUMED key is never touched, however old", 1 in left, str(left))
-    check("legacy stampless row falls back to created_at and goes", 4 not in left, str(left))
+    # ⚠⚠ These two used to assert the opposite, and the opposite was a bug that
+    # shipped: an unstamped row measured against `created_at` is measured
+    # against the UPLOAD, which is older than the consumption, so the row looks
+    # PAST the horizon when the tombstone is a day old. Row 4 is that exact
+    # case (claimed at an unknown time, uploaded 42 days ago) and deleting it
+    # is what re-opens the InvalidKeyId window the horizon exists to close.
+    check("legacy stampless row is stamped, not measured by its upload",
+          4 in left, str(left))
     check("legacy stampless row with a recent upload is spared", 5 in left, str(left))
-    check("the pass reports what it removed", n == 2, f"reported {n}")
+    async with SessionLocal() as db:
+        unstamped = (
+            await db.scalars(
+                select(OneTimePreKey.prekey_id).where(
+                    OneTimePreKey.consumed == True,  # noqa: E712
+                    OneTimePreKey.consumed_at.is_(None),
+                )
+            )
+        ).all()
+    check("the backfill leaves no consumed row without a clock",
+          not unstamped, str(sorted(unstamped)))
+    check("the pass reports what it removed", n == 1, f"reported {n}")
+    # A stamped row must then behave like any other: still inside the window on
+    # the pass that stamped it, and gone once the clock runs out.
+    async with SessionLocal() as db:
+        await db.execute(
+            update(OneTimePreKey)
+            .where(OneTimePreKey.prekey_id == 4)
+            .values(consumed_at=ago(days=CONSUMED_MAX_AGE_DAYS + 1))
+        )
+        await db.commit()
+    n2 = await prekey_sweep()
+    async with SessionLocal() as db:
+        left = sorted((await db.scalars(select(OneTimePreKey.prekey_id))).all())
+    check("a stamped row goes when ITS OWN clock runs out",
+          4 not in left and n2 == 1, f"{left} / reported {n2}")
 
     # The horizon is DERIVED, not typed in. If somebody edits the queue TTL
     # without reading this, the assertion is what tells them.
