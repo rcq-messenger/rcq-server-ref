@@ -1,6 +1,6 @@
 """Server-side gate for operator-toggleable features.
 
-A `require_feature("nearby_enabled")` dependency attached to a router makes
+A `require_feature("random_enabled")` dependency attached to a router makes
 every route under it 404 when the operator has turned that feature off in the
 admin console (Features tab). The 404 (rather than 403) makes a disabled feature
 look simply absent — cleaner, and consistent with a masquerade/closed island

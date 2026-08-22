@@ -27,7 +27,7 @@ What that cost before this module existed (migration path):
   silently stranded.
 
 Anything that DOES have `ForeignKey("users.uin", ondelete="CASCADE")`
-(one-time prekeys, devices, nearby check-ins) is deliberately absent: the
+(one-time prekeys, devices) is deliberately absent: the
 database already handles those, and listing them here would double-handle
 them.
 
@@ -56,7 +56,7 @@ delta rather than the whole set:
 
 * CASCADE off `users.uin`, so the database handles them and listing them here
   would double-handle: `device_tokens.uin`, `devices.uin`,
-  `one_time_prekeys.uin`, `nearby_checkins.uin`. (`/auth/account` deletes
+  `one_time_prekeys.uin`. (`/auth/account` deletes
   `device_tokens` explicitly as well, because push must stop before the row
   does.)
 * `report_messages.author_uin` has NO FK to `users`, but it rides

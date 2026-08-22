@@ -45,7 +45,6 @@ class ServerCapabilities(BaseModel):
     # a client that reads these hides the tab when the operator turns it off.
     # The backing routers are ALSO gated server-side, so flipping these off is
     # enforced regardless of client version.
-    nearby: bool = True
     random_chat: bool = True
     # Hood and Stories were deleted on 2026-08-22 (routers, tables and settings
     # keys all). Both stay on the wire as a permanent False so a shipped client
@@ -84,7 +83,6 @@ async def server_info() -> ServerInfo:
             uin_shop=settings.UIN_SHOP_ENABLED,
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=eff["registration_policy"],
-            nearby=eff["nearby_enabled"],
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],

@@ -164,13 +164,6 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     ("hof_bonus_confirmed", "INTEGER DEFAULT 0"),
 ]
 
-# Additive columns on `nearby_checkins`. Same idempotent
-# ADD COLUMN pattern as the user table — `create_all` doesn't
-# touch tables that already exist.
-_NEARBY_CHECKIN_COLUMNS: list[tuple[str, str]] = [
-    ("display_name", "VARCHAR(64)"),
-]
-
 # Additive on `one_time_prekeys` — multi-device pool tagging. NULL = the
 # primary device (phone); existing rows are all NULL so the primary OPK
 # paths (which now scope to `device_id IS NULL`) stay back-compatible. The
@@ -293,7 +286,7 @@ _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 
@@ -322,7 +315,6 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
     additive: list[tuple[str, list[tuple[str, str]]]] = [
         ("users", _USER_STAGE3_COLUMNS),
-        ("nearby_checkins", _NEARBY_CHECKIN_COLUMNS),
         ("groups", _GROUP_COLUMNS),
         ("group_members", _GROUP_MEMBER_COLUMNS),
         ("audio_rooms", _AUDIO_ROOM_COLUMNS),
@@ -617,6 +609,13 @@ async def init_db() -> None:
         "hood_messages", "hood_banners",
         "referrals",
         "audio_room_mutes",
+        # People Nearby, retired 22.08 on the founder's word. It was the most
+        # revealing row on the island: an account number against a geohash
+        # tile about 1.5 km across, and it had never been used once (zero
+        # check-ins, ever). Bounded by a TTL and swept, which made it look
+        # harmless, but the shape is the point: nothing else here tied a
+        # person to a place.
+        "nearby_checkins",
     ]
     for table in _DEAD_DROP_TABLES:
         if table in Base.metadata.tables:

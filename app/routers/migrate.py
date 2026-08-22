@@ -182,7 +182,7 @@ async def _perform_migration(
     old_epoch = await bump_uin_epoch(db, old_uin)
 
     # Step 4: drop the old User row. FK-cascading rows (prekeys, devices,
-    # nearby check-ins) go with it; everything without an FK was re-keyed
+    # ) go with it; everything without an FK was re-keyed
     # above.
     await db.delete(user)
     await db.flush()
