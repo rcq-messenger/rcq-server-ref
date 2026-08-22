@@ -9,7 +9,8 @@ don't go through the web-admin / console.rcq.app. Run from the backend root
 Prints the invite code and the ``rcq://server/<host>?invite=<code>`` URL to drop
 into a QR. ``--ttl`` accepts ``7d`` / ``12h`` / ``30m`` (or a bare number = hours);
 omit it for a never-expiring invite. List/revoke via the /admin/invites API or
-straight SQL on the ``invites`` table.
+straight SQL on the ``invites`` table (whose ``code`` column holds the sha256
+of the token, not the token; see app/models/invite.py).
 """
 
 import argparse
@@ -18,7 +19,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from app.core.db import SessionLocal
-from app.models.invite import Invite
+from app.models.invite import Invite, hash_invite_code
 
 _UNITS = {"d": 86_400, "h": 3_600, "m": 60, "s": 1}
 
@@ -41,7 +42,9 @@ async def _mint(args: argparse.Namespace) -> None:
     async with SessionLocal() as db:
         db.add(
             Invite(
-                code=code,
+                # The island stores the hash; this print is the only place the
+                # token itself ever exists outside the operator's clipboard.
+                code=hash_invite_code(code),
                 label=args.label,
                 max_uses=args.uses,
                 expires_at=expires_at,
@@ -49,6 +52,8 @@ async def _mint(args: argparse.Namespace) -> None:
         )
         await db.commit()
 
+    print("⚠ copy the code now: the island stores only its hash and")
+    print("  cannot show it again. Losing it means minting a new invite.")
     print(f"invite code: {code}")
     print(f"max uses:    {args.uses}")
     print(f"expires:     {expires_at.isoformat() if expires_at else 'never'}")

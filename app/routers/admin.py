@@ -30,7 +30,7 @@ from app.core.config import settings
 from app.core import metrics
 from app.core.db import engine, get_db
 from app.core.security import mark_suspended, require_admin
-from app.models.invite import Invite
+from app.models.invite import Invite, hash_invite_code
 from app.models.owned_uin import OwnedUin
 from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
@@ -1431,6 +1431,10 @@ class MintInviteIn(BaseModel):
 
 
 class InviteOut(BaseModel):
+    # ⚠ The sha256-hex, not the token: `invites.code` stopped holding the raw
+    # credential on 2026-08-22. Kept in the payload because it is this row's id
+    # everywhere else in the panel: the list keys on it and DELETE /invites/{code}
+    # revokes by it. Publishing a hash to an authenticated admin costs nothing.
     code: str
     label: str | None
     max_uses: int
@@ -1438,15 +1442,21 @@ class InviteOut(BaseModel):
     uin: int | None = None
     expires_at: datetime | None
     created_at: datetime
-    join_url: str
+    # The raw token and its join URL, present ONLY in the response to the mint
+    # that created it. The island cannot reproduce either afterwards, which is
+    # the entire point of hashing: a dump of this table no longer mints access.
+    # Both panels render the QR from the mint response and show
+    # "code shown once" on every older row.
+    raw_code: str | None = None
+    join_url: str | None = None
 
 
-def _join_url(request: Request, code: str) -> str:
+def _join_url(request: Request, raw_code: str) -> str:
     host = request.headers.get("x-forwarded-host") or (request.url.hostname or "")
-    return f"rcq://server/{host}?invite={code}"
+    return f"rcq://server/{host}?invite={raw_code}"
 
 
-def _invite_out(request: Request, inv: Invite) -> InviteOut:
+def _invite_out(request: Request, inv: Invite, raw_code: str | None = None) -> InviteOut:
     return InviteOut(
         code=inv.code,
         label=inv.label,
@@ -1455,7 +1465,8 @@ def _invite_out(request: Request, inv: Invite) -> InviteOut:
         uin=inv.uin,
         expires_at=inv.expires_at,
         created_at=inv.created_at,
-        join_url=_join_url(request, inv.code),
+        raw_code=raw_code,
+        join_url=_join_url(request, raw_code) if raw_code else None,
     )
 
 
@@ -1484,20 +1495,21 @@ async def mint_invite(
         )
         if already is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_reserved"})
-    code = secrets.token_urlsafe(16)
+    raw_code = secrets.token_urlsafe(16)
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=body.ttl_hours)
         if body.ttl_hours
         else None
     )
     inv = Invite(
-        code=code, label=body.label, max_uses=body.max_uses,
+        code=hash_invite_code(raw_code), label=body.label, max_uses=body.max_uses,
         expires_at=expires_at, uin=reserved_uin,
     )
     db.add(inv)
     await db.commit()
     await db.refresh(inv)
-    return _invite_out(request, inv)
+    # The one and only time the raw token leaves this process.
+    return _invite_out(request, inv, raw_code=raw_code)
 
 
 @router.get("/invites", response_model=list[InviteOut])

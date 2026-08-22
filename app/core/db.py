@@ -1,5 +1,7 @@
+import hashlib
 import logging
 import secrets
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -182,6 +184,10 @@ _BROKER_RELAY_COLUMNS: list[tuple[str, str]] = [
 
 _ONE_TIME_PREKEY_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "INTEGER"),
+    # When the key was handed to a sender, which is a different clock from the
+    # upload in `created_at`. `services/prekey_sweep` measures its horizon from
+    # this and explains at length why the difference matters.
+    ("consumed_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 # Additive on `contact_requests`. When the row left `pending`, which the
@@ -257,6 +263,10 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
 # random-allocation behaviour.
 _INVITE_COLUMNS: list[tuple[str, str]] = [
     ("uin", "BIGINT"),
+    # When the last use was spent, so `services/credential_sweep` can measure a
+    # horizon from the moment the invite stopped admitting anyone rather than
+    # from when it was minted.
+    ("spent_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 # Additive on `device_tokens` — a stable per-install id (kept in the client
@@ -452,6 +462,83 @@ async def init_db() -> None:
             ))
         except Exception:
             pass
+
+    # The consumed-prekey sweep's only query. `create_all` is checkfirst=True,
+    # so it skips the whole table and never adds an index to one that already
+    # exists. It has to be issued by hand or the hourly pass seq-scans a
+    # quarter of a million rows to find the ~7% that are tombstones.
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_one_time_prekeys_consumed_at "
+                "ON one_time_prekeys (consumed, consumed_at)"
+            ))
+        except Exception:
+            pass
+
+    # ── One-shot 2026-08-22: hash the invite codes in place ────────────────
+    #
+    # `invites.code` held the raw entry credential, so a dump of an
+    # invite-gated island MINTED ACCESS to it. It now holds the sha256-hex,
+    # matching the `access_tokens.token_hash` precedent next door.
+    #
+    # Rewriting the primary key of live rows is the one genuinely destructive
+    # step in this release, so it is a real one-shot with a marker rather than
+    # a loop that runs forever: `server_settings` gets a row nothing else reads
+    # (the service iterates its own typed REGISTRY, so an unknown key is inert),
+    # and a second boot skips the block entirely. Every code already handed out
+    # keeps working, because `/auth/register` hashes what the client presents
+    # and lands on the same row.
+    #
+    # ⚠ The operator's cost, and it is real: the admin list can no longer
+    # re-display the join URL for an invite minted before today. Both panels
+    # show "code shown once at creation" for those. Accepted in
+    # docs/metadata-map-2026-08-22.md under the `invites.code` HASH verdict.
+    _INVITE_HASH_MARKER = "_migration_invite_code_hashed"
+    async with engine.begin() as conn:
+        try:
+            done = (await conn.execute(
+                text("SELECT value FROM server_settings WHERE key = :k"),
+                {"k": _INVITE_HASH_MARKER},
+            )).scalar_one_or_none()
+        except Exception:
+            done = "skip"  # table not ready on this boot; try again next time
+        if done is None:
+            try:
+                rows = (await conn.execute(text("SELECT code FROM invites"))).fetchall()
+                converted = 0
+                for (raw,) in rows:
+                    # A 64-char lowercase hex string is already a hash. Belt to
+                    # the marker's braces: if the marker row is ever lost, a
+                    # re-run must not hash the hashes and lock everyone out.
+                    if raw is None or (len(raw) == 64 and all(
+                        c in "0123456789abcdef" for c in raw
+                    )):
+                        continue
+                    await conn.execute(
+                        text("UPDATE invites SET code = :new WHERE code = :old"),
+                        {"new": hashlib.sha256(raw.strip().encode()).hexdigest(), "old": raw},
+                    )
+                    converted += 1
+                await conn.execute(
+                    text(
+                        "INSERT INTO server_settings (key, value, updated_at) "
+                        "VALUES (:k, :v, :t)"
+                    ),
+                    {
+                        "k": _INVITE_HASH_MARKER,
+                        "v": str(converted),
+                        "t": datetime.now(timezone.utc),
+                    },
+                )
+                if converted:
+                    log.warning(
+                        "[db] hashed %d plaintext invite code(s); the join URL for "
+                        "those can no longer be re-displayed in the admin list",
+                        converted,
+                    )
+            except Exception:
+                log.exception("[db] invite code hashing did not complete; will retry")
 
     # ── Pivot 2026-05-27: drop tables for cut features ─────────────
     # Marketplace / trades / UIN auctions / casino games / items /

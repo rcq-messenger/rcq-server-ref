@@ -406,7 +406,15 @@ async def respond(
         # push is sent for a decline on purpose, and all three clients render
         # that state ("Declined", with a Dismiss that DELETEs the row). Drop it
         # and the request silently reverts to looking like it was never sent.
+        #
+        # Stamped all the same, since 2026-08-22. Un-stamped is not the same as
+        # un-swept: without a resolution clock the row was immortal, so "A
+        # asked, B said no" outlived the two accounts' interest in it by years.
+        # The stamp gives the long horizon in `contact_request_sweep` something
+        # honest to measure from, and it is the refusal's own clock, not the
+        # request's.
         req.state = "declined"
+        req.resolved_at = datetime.now(timezone.utc)
         state = "declined"
     await db.commit()
     delivered = await manager.send(

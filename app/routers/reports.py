@@ -490,5 +490,16 @@ async def delete_my_report(
         if target.parent == _EVIDENCE_DIR:
             with contextlib.suppress(OSError):
                 target.unlink()
+    # ⚠ The thread goes explicitly, not on the declared ON DELETE CASCADE.
+    # SQLite enforces a foreign key only under `PRAGMA foreign_keys`, which
+    # this codebase never sets, and SQLite is the default DATABASE_URL. So on
+    # a self-host island "delete my report" left the whole plaintext exchange
+    # behind, orphaned to an id nothing points at any more. Postgres was doing
+    # the right thing all along, which is why nobody saw it. Found while
+    # writing the same guard into services/report_sweep, 2026-08-22.
+    for turn in (
+        await db.scalars(select(ReportMessage).where(ReportMessage.report_id == report.id))
+    ).all():
+        await db.delete(turn)
     await db.delete(report)
     await db.commit()

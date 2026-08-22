@@ -62,6 +62,10 @@ async def _claim_opk(db: AsyncSession, *, uin: int, device_id: int | None):
     opk = (await db.execute(stmt)).scalar_one_or_none()
     if opk is not None:
         opk.consumed = True
+        # Starts the tombstone's clock (services/prekey_sweep). Set here rather
+        # than in a DB default because this is the moment of consumption and
+        # the row already existed.
+        opk.consumed_at = datetime.now(timezone.utc)
     return opk
 
 
@@ -613,6 +617,43 @@ async def fetch_device_bundle(
     )
 
 
+def _strip_revoked_device(device: Device, now: datetime) -> None:
+    """Reduce a revoked row to the (uin, device_id) tombstone and nothing else.
+
+    A revoked device kept its full libsignal bundle, its sealed-sender public
+    key, the user-typed label ("Web (Chrome)", a browser and OS fingerprint)
+    and its whole lifespan, forever. Verified by grep before this was written:
+    every read path in the codebase filters `revoked_at IS NULL`, and the ONE
+    consumer of a dead row is the id allocator in `register_device`, which does
+    `max(device_id) + 1` over every row of the account and needs the pair and
+    nothing else. So there is no reader to break.
+
+    Why the slot stays reserved rather than the row being deleted here: a
+    sender's cached device roster, and any copy already sitting in
+    `offline_messages` addressed to `to_device_id`, both outlive the revoke. If
+    the number were handed to a new device, ciphertext meant for the old one
+    would be delivered to an install that cannot open it. `services/device_sweep`
+    removes the tombstone once that is no longer possible.
+
+    `created_at` is NOT NULL and cannot go, so it is folded onto the revoke
+    instant: the row stops recording how long the device lived, which is the
+    part that says something about the person.
+    """
+    device.label = None
+    device.sealed_sender_pub = ""
+    device.signal_identity_key = ""
+    device.signal_registration_id = 0
+    device.signed_prekey_id = 0
+    device.signed_prekey_public = ""
+    device.signed_prekey_signature = ""
+    device.signed_prekey_uploaded_at = now
+    device.kyber_prekey_id = 0
+    device.kyber_prekey_public = ""
+    device.kyber_prekey_signature = ""
+    device.kyber_prekey_uploaded_at = now
+    device.created_at = now
+
+
 @router.post("/devices/{device_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_device_slot(
     device_id: int,
@@ -650,16 +691,19 @@ async def revoke_device_slot(
     from app.routers.devices import revoker_gate
 
     await revoker_gate(uin, caller_device, device.created_at)
-    device.revoked_at = datetime.now(timezone.utc)
+    label = device.label
+    now = datetime.now(timezone.utc)
+    device.revoked_at = now
     await db.execute(
         delete(OneTimePreKey).where(OneTimePreKey.uin == uin, OneTimePreKey.device_id == device_id)
     )
+    _strip_revoked_device(device, now)
     await db.commit()
     _announce_device_event(
         uin,
         "device_slot_revoked",
         device_id,
-        device.label,
+        label,
         "A device slot was removed from this account",
     )
 
