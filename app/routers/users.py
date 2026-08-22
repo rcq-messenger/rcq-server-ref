@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import secrets
 import hmac
 import time
 from datetime import datetime, timedelta, timezone
@@ -849,8 +850,17 @@ async def turn_credentials(uin: int = Depends(current_uin)) -> TurnCredentialsOu
     """Mint short-lived TURN credentials for `uin`. Implements the
     "TURN REST API" auth pattern (draft-uberti-behave-turn-rest):
     coturn's `static-auth-secret` is shared between us and the TURN
-    daemon; we sign `<unix_expiry>:<uin>` with HMAC-SHA1 and the daemon
+    daemon; we sign `<unix_expiry>:<opaque>` with HMAC-SHA1 and the daemon
     validates the same signature on the wire.
+
+    ⚠ The second half of the username used to be the account number. coturn
+    with `use-auth-secret` only needs the timestamp prefix; everything after
+    the colon is free text it logs on every allocation. So a seized or
+    compelled TURN host held a complete log of who called and when, keyed by
+    account, although the database keeps nothing about calls at all
+    (metadata map 1.7). A fresh random tag per issuance gives the TURN host
+    a per-call pseudonym that it cannot join back to an account; the only
+    party that ever knew the pair (this handler) does not write it down.
 
     No-ops to an empty list when TURN isn't configured (dev environments
     without coturn). The iOS client treats an empty `urls` list as
@@ -860,7 +870,7 @@ async def turn_credentials(uin: int = Depends(current_uin)) -> TurnCredentialsOu
         return TurnCredentialsOut(urls=[], username="", credential="", ttl=0)
 
     expiry = int(time.time()) + settings.TURN_TTL_SECONDS
-    username = f"{expiry}:{uin}"
+    username = f"{expiry}:{secrets.token_hex(8)}"
     digest = hmac.new(
         settings.TURN_SECRET.encode("utf-8"),
         username.encode("utf-8"),
