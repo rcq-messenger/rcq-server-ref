@@ -1197,11 +1197,14 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     # single-device account quiet for a month loses its cursor (there is a test
     # for it, `test_cursor_reap_local.py` case 3), the next drain finds none,
     # falls back to `account_watermark`, and with no cursors left that is
-    # (0, 0), so the device is handed every row still in the queue. Clients
-    # dedupe by envelope id, so nothing is shown twice; what it costs is a
-    # phone coming back from a month away re-downloading a month of mail.
-    # Deliberate as far as the test goes, worth revisiting, and either way the
-    # comment has to say what the code does.
+    # (0, 0). Which is FINE for the lone-cursor case, and precisely why: every
+    # ack reaps the rows below the minimum cursor, so a lone device's drained
+    # rows are already gone, and a floor of zero serves only the surviving,
+    # i.e. undrained, rows. The only re-serve window is multi-device with ALL
+    # cursors stale at once: a returning install is re-handed the slice it had
+    # drained but a lagging sibling had not. Clients dedupe by envelope id, so
+    # that costs transfer, not duplicates. Deliberate, tested, and now
+    # described as it is.
     stamps = [_as_utc(c.updated_at) for c in cursors if _as_utc(c.updated_at) is not None]
     newest = max(stamps) if stamps else None
     superseded_cutoff = now - timedelta(days=SUPERSEDED_CURSOR_DAYS)
