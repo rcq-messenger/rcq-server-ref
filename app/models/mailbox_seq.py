@@ -25,7 +25,15 @@ class MailboxSeq(Base):
 
     __tablename__ = "mailbox_seq"
 
-    to_uin: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # ⚠ autoincrement=False, and it is not decoration. SQLAlchemy treats a lone
+    # integer primary key as a serial and Postgres then hangs a
+    # nextval('mailbox_seq_to_uin_seq') default on the column. Harmless while
+    # every caller supplies `to_uin` (they all do today), and a loaded gun the
+    # first time one does not: the row would quietly be filed under a sequence
+    # number rather than under a recipient, and that mailbox's counter would be
+    # somebody else's. Same trap the comment in models/user.py records for the
+    # UIN column, where a forgotten value minted a trophy number.
+    to_uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     # Highest seq assigned so far for this mailbox. The first deposit sets it to
     # 1 (the value it also returns), each later one increments and returns.
     next_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
