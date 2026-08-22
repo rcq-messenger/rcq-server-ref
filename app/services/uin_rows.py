@@ -91,6 +91,7 @@ from app.models.group import (
     OfflineGroupMessage,
 )
 from app.models.invite import Invite
+from app.models.mailbox_seq import MailboxSeq
 from app.models.message import OfflineMessage
 from app.models.owned_uin import OwnedUin
 from app.models.poll import Poll, PollVote
@@ -106,6 +107,12 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (ContactRequest, ContactRequest.to_uin),
     (OfflineMessage, OfflineMessage.to_uin),
     (OfflineGroupMessage, OfflineGroupMessage.to_uin),
+    # The durable per-mailbox seq counter (stage 2b). It follows the account on
+    # a migration — the rekeyed offline_messages rows keep their old seqs, so a
+    # fresh counter at the new number would allocate seq 1 and collide with them
+    # (503 on the first post) — and it is deleted on a burn so a recycled number
+    # starts its mailbox clean.
+    (MailboxSeq, MailboxSeq.to_uin),
     (Group, Group.owner_uin),
     (GroupMember, GroupMember.uin),
     (AudioRoom, AudioRoom.owner_uin),

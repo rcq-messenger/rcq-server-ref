@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -130,3 +130,9 @@ class OfflineGroupMessage(Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # Stage 2a: the 3-value storage class beside envelope_type, same meaning as
+    # OfflineMessage.cls. The dormant sweep and `_keep_for` now branch on this
+    # (cls == 2 is key-distribution material that must survive the sweep, #544)
+    # while still falling back to envelope_type for the legacy rows that carry
+    # NULL here. Group rows keep envelope_type; stage 5 reshapes this queue.
+    cls: Mapped[int | None] = mapped_column(SmallInteger, nullable=True, default=None)

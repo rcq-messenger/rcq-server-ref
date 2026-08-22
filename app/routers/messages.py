@@ -6,12 +6,12 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, insert, or_, select
+from sqlalchemy import delete, func, insert, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import log_identity, settings
-from app.core.db import get_db
+from app.core.db import engine, get_db
 from app.core.rate_limit import (
     _client_ip,
     bucket_name,
@@ -40,31 +40,90 @@ from app.services.queue_drain import account_watermark, drain_floor
 
 log = logging.getLogger(__name__)
 
-# Envelope types where a push notification makes sense. We skip "ephemeral"
-# things like read receipts, typing relays, reactions, bounces, visits and
-# delete-tombstones — they're either delivery-state plumbing or cosmetic, no
-# benefit in waking the recipient's device for one.
-# "secscreen" carries BOTH the screenshot-taken notice (the recipient should be
-# alerted immediately, even backgrounded — it's a secret-chat security signal)
-# AND the silent secure-mode toggle. We push it so a screenshot taken while the
-# recipient's WS is down/stale doesn't sit unseen until they reopen the app; the
-# NSE shows a real "screenshot" body for the shot and suppresses the toggle.
-_PUSHABLE_TYPES = {"message", "system", "secscreen"}
+# Stage 2a: the server no longer branches on the legible per-recipient
+# interaction TYPE. It records a 3-value CLASS (`offline_messages.cls`) beside
+# envelope_type and branches on that. envelope_type stays as the INGEST ALIAS
+# every old client and the federation wire keep sending (islands upgrade
+# independently, so it is accepted forever); `_cls_for` maps it to a class on
+# the way in, and a new client sends `cls` directly.
+#
+#   cls 0 ephemeral  typing, read, visit, presence, nudge, bounce
+#                    delivery-state plumbing and cosmetic pings: never worth a
+#                    wake, and a dormant recipient loses nothing by missing one.
+#   cls 1 content    message, reaction, edit, delete, system, secscreen, gmsg,
+#                    call, and any unknown/future kind (fail toward keeping and
+#                    delivering rather than silently dropping). This is the
+#                    pushable class.
+#   cls 2 critical   skdm, sknack and every future key-distribution kind: never
+#                    a banner, but MUST survive the dormant sweep, because a
+#                    member who loses an skdm cannot read a single later
+#                    broadcast (#544). See `_keep_for` and the group sweep.
+#
+# secscreen stays content (cls 1) so the screenshot-taken notice still pushes:
+# it carries both that alert and the silent secure-mode toggle in one sealed
+# blob the server cannot open, and the NSE splits them client-side.
+_CRITICAL_TYPES = {"skdm", "sknack"}
+_EPHEMERAL_TYPES = {"typing", "read", "visit", "presence", "nudge", "bounce"}
 
-# Sender-key chain distribution + recovery (rcq-spec 6.5). These are never
-# pushed — they raise no banner — but they are the ONE class of group envelope
-# that must never be dropped from the offline queue: without the chain key a
-# member cannot read a single later broadcast, and the client has no way to
-# tell "no messages" from "cannot decrypt". See `_keep_for`.
-_SENDER_KEY_CONTROL = {"skdm", "sknack"}
-
-# ⚠ "call" is deliberately NOT in the set above. A cross-island call deposit
-# (§5d) needs a RINGING wake, not a message banner, and it must not get both:
-# an ordinary alert next to a CallKit screen is a duplicate notification for a
-# call that is already on screen. It takes the `_wake_for_sealed_call` branch
-# instead, which is the same VoIP/UnifiedPush pair a same-island `call_offer`
-# uses from app/routers/ws.py.
+# ⚠ "call" stays a content-class row, never a legible "call" kind. A call
+# deposit is already coerced to frame type "message" on the live socket (see the
+# comment in `send_sealed`), and the RINGING wake is now driven by the `ring`
+# request flag, not by the stored type. So a call is stored exactly like a text
+# message and only `ring` (which is never stored) tells the island to ring. Old
+# clients had no `ring` field and asked for a ring by typing the envelope
+# "call"; both are honoured. `_CALL_TYPE` survives only as that legacy alias.
 _CALL_TYPE = "call"
+
+
+def _cls_for(envelope_type: str) -> int:
+    """Map a legacy / federation `envelope_type` to its storage class.
+
+    The ingest alias, applied on every deposit that does not carry an explicit
+    `cls`: old clients and peer islands send only the type forever
+    (web-chat/src/lib/federation-send.ts), and this is how the island files it
+    into the 3-value class it actually branches on. Unknown kinds fall to
+    content (cls 1) so a future type from a lagging peer is still kept,
+    delivered and pushed rather than silently dropped.
+
+    It is also the read-side fallback for a stored row whose `cls` is NULL (the
+    ~4331 rows that predate the column), so a mixed table branches correctly.
+    """
+    if envelope_type in _CRITICAL_TYPES:
+        return 2
+    if envelope_type in _EPHEMERAL_TYPES:
+        return 0
+    return 1
+
+
+async def _next_mailbox_seq(db: AsyncSession, to_uin: int) -> int:
+    """Allocate the next durable per-mailbox sequence for `to_uin` (stage 2b).
+
+    ⚠ Durable, NOT MAX()-derived. A counter seeded from MAX(seq) reseeds to 0
+    the moment the sweep empties a quiet mailbox, and the fresh rows then land
+    BELOW every device's stored cursor where ?after= can never reach them:
+    silent permanent loss, the one thing the founder ruled out. The counter
+    lives in its own `mailbox_seq` row the queue sweep never touches, so an
+    emptied mailbox keeps counting up.
+
+    Allocated inside the caller's deposit transaction with an atomic
+    INSERT ... ON CONFLICT DO UPDATE ... RETURNING, which takes the mailbox
+    row's lock for the rest of that transaction: two concurrent deposits to the
+    same recipient serialise and get distinct numbers rather than colliding.
+    (to_uin, seq) is unique as the loud backstop if the counter ever drifts.
+    """
+    if engine.dialect.name == "postgresql":
+        sql = text(
+            "INSERT INTO mailbox_seq (to_uin, next_seq) VALUES (:u, 1) "
+            "ON CONFLICT (to_uin) DO UPDATE SET next_seq = mailbox_seq.next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    else:
+        sql = text(
+            "INSERT INTO mailbox_seq (to_uin, next_seq) VALUES (:u, 1) "
+            "ON CONFLICT (to_uin) DO UPDATE SET next_seq = next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    return int((await db.execute(sql, {"u": to_uin})).scalar_one())
 
 # Ceiling on the sealed envelope we are willing to carry INSIDE a wake payload.
 # APNs caps a VoIP push at 5KB total and ntfy (the common UnifiedPush
@@ -188,11 +247,21 @@ class SealedSendIn(BaseModel):
     to_uin: int
     # message | call | nudge | delete | system | read | reaction | bounce | visit.
     # The server is type-agnostic for ROUTING — it just forwards the opaque
-    # payload — so the list is informational and new envelope kinds don't need a
-    # server change. The one type that changes server behaviour is "call"
-    # (§5d cross-island call signalling): it rings instead of notifying. See
-    # `_wake_for_sealed_call` for exactly what that tells this island.
+    # payload. Stage 2a: this stays the INGEST ALIAS. It is accepted forever
+    # (old clients and the federation wire send only this), stored verbatim for
+    # old readers, and mapped to `cls` on the way in. The server branches on
+    # `cls` and `ring`, never on this string.
     envelope_type: str = Field(default="message")
+    # Stage 2a: the 3-value storage class a new client sends directly
+    # (0 ephemeral | 1 content | 2 critical). Absent (or out of range) = derive
+    # it from envelope_type via `_cls_for`.
+    cls: int | None = None
+    # Stage 2a: "wake this recipient's phone RINGING" — a request instruction we
+    # act on and NEVER store. It replaces typing the envelope "call": a new
+    # client sends a content deposit with ring=true, an old one still types
+    # "call", and both ring. See `_wake_for_sealed_call` for exactly what a ring
+    # discloses to the recipient's island.
+    ring: bool = False
     payload: str  # base64 LibSignal sealed-sender ciphertext (sender lives inside)
     # F3 deposit-auth: an OPTIONAL anonymous blinded token {epoch_id, prepared, sig}
     # the recipient's island issued (RFC 9474 RSABSSA). When present it is verified
@@ -218,9 +287,19 @@ class SendOut(BaseModel):
 class HistoryRow(BaseModel):
     id: int
     envelope_type: str
+    # Stage 2a: the 3-value storage class, served ALONGSIDE envelope_type so a
+    # new client reads `cls` and an old one keeps reading `envelope_type`.
+    # Derived from envelope_type for the legacy rows that predate the column, so
+    # it is never null on the wire.
+    cls: int | None = None
     payload: str
     received_at: datetime
     group_id: int | None = None
+    # Stage 2b: the durable per-mailbox sequence, served ALONGSIDE `id`. Present
+    # for 1:1 rows written after the column landed; null for legacy rows and for
+    # group rows (which get their own per-room log in stage 5). Clients read
+    # `seq` when present and fall back to `id`; ?after= still cursors on `id`.
+    seq: int | None = None
     # The libsignal device this copy was encrypted for, when the sender fanned
     # out. Echoed so a client can tell "this one is not mine" apart from "this
     # one is mine and broken" — the first is ACKed and dropped, the second is
@@ -273,6 +352,13 @@ async def send_sealed(
         raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, "a deposit token is required")
 
     now = datetime.now(timezone.utc)
+    # Stage 2a. The queue row keeps envelope_type verbatim (old readers + the
+    # federation wire), and ALSO records the class the server branches on. A new
+    # client sends `cls`; anything else (old client, peer island) is mapped from
+    # envelope_type. `ring` is the request instruction to wake the phone ringing
+    # and is never stored; an old client asked for it by typing "call".
+    cls = body.cls if body.cls in (0, 1, 2) else _cls_for(body.envelope_type)
+    ring = body.ring or body.envelope_type == _CALL_TYPE
     pkt = {
         # ⚠⚠ THE SOCKET FRAME FOR A CALL DEPOSIT IS LABELLED "message", NOT
         # "call". The deposit type is an instruction to THIS ISLAND (ring the
@@ -315,15 +401,31 @@ async def send_sealed(
     # next reconnect is a no-op. Drain-and-delete pattern in fetch_queue
     # keeps the table from growing.
     delivered = await manager.send(body.to_uin, pkt)
+    # Stage 2b: allocate the durable per-mailbox sequence in THIS deposit's
+    # transaction, right beside the row it numbers. `id` keeps being written too.
+    seq = await _next_mailbox_seq(db, body.to_uin)
     msg = OfflineMessage(
         to_uin=body.to_uin,
         envelope_type=body.envelope_type,
+        cls=cls,
+        seq=seq,
         payload=body.payload,
         received_at=now,
         to_device_id=body.to_device_id,
     )
     db.add(msg)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # (to_uin, seq) is unique as a loud backstop against a drifted counter.
+        # A collision must NEVER overwrite a queued envelope: roll back the whole
+        # deposit (which also releases the seq it tried to take) and tell the
+        # client to retry. This should not happen with the atomic allocator; if
+        # it does, it is a DB inconsistency worth a 503 rather than data loss.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "seq allocation collided, retry"
+        )
     queued = True
     pushed = 0
     # Wake the devices that did NOT get it over the socket.
@@ -337,7 +439,7 @@ async def send_sealed(
     # Endpoints that predate device-aware registration carry no device id; when
     # something IS connected they are skipped, exactly as before, since they
     # might belong to that connected device.
-    if body.envelope_type == _CALL_TYPE:
+    if ring:
         # §5d cross-island call. The live-socket send above already happened and
         # is byte-identical to a "message" deposit, so a call to somebody whose
         # app is in the foreground is completely unchanged by this branch. What
@@ -347,7 +449,7 @@ async def send_sealed(
         # still delivers the envelope if the wake is late or lost.
         if not delivered:
             pushed = await _wake_for_sealed_call(body.to_uin, body.payload)
-    elif body.envelope_type in _PUSHABLE_TYPES:
+    elif cls == 1:
         online_devices = frozenset(await manager.online_devices(body.to_uin))
         if not delivered or online_devices:
             pushed = await apns_send(
@@ -418,7 +520,7 @@ def _queueable(member_rows: list[tuple[int, datetime | None]]) -> set[int]:
 def _keep_for(
     recipients: Iterable[int],
     queueable: set[int],
-    envelope_type: str,
+    cls: int,
     wake: Iterable[int],
 ) -> set[int]:
     """Who this group envelope is actually stored for.
@@ -433,8 +535,9 @@ def _keep_for(
        "человек, которого я добавил, не получил звук ни на моё сообщение, ни на
        твоё". The dormant rule exists to stop us hoarding *content* nobody will
        read; key material is a few hundred bytes and it is the difference
-       between a working member and a broken one. So [_SENDER_KEY_CONTROL] is
-       kept for every recipient, dormant or not.
+       between a working member and a broken one. So the CRITICAL class (cls 2 —
+       stage 2a, the old `_SENDER_KEY_CONTROL` set) is kept for every recipient,
+       dormant or not.
 
     2. **It disagreed with the push.** The wake fan-out below never consulted
        it, so a member absent longer than OFFLINE_GROUP_DORMANT_DAYS got a
@@ -444,8 +547,13 @@ def _keep_for(
        are willing to wake somebody, we are willing to keep their copy: a
        registered push endpoint is also the best evidence we have that this
        member still comes back.
+
+    `cls` is the derived class of the deposit (always known here — the deposit
+    path maps envelope_type when a client does not send `cls`). The group
+    dormant sweep applies the same rule to STORED rows, falling back to
+    envelope_type for the legacy rows that carry NULL there.
     """
-    if envelope_type in _SENDER_KEY_CONTROL:
+    if cls == 2:
         return set(recipients)
     return set(queueable) | set(wake)
 
@@ -628,6 +736,10 @@ async def send_group_sealed(
     await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="sealed")
 
     now = datetime.now(timezone.utc)
+    # Stage 2a: the class the server branches on (push + keep), derived from the
+    # ingest alias. Group clients keep sending only envelope_type in this stage;
+    # stage 5 reshapes this queue. skdm/sknack -> cls 2, kept for everyone.
+    cls = _cls_for(body.envelope_type)
     # Drop entries that don't correspond to real group members. Cheap client
     # mistake guard — we don't error on it because the client is anonymous
     # (sealed sender) and we can't tell who they are.
@@ -675,7 +787,7 @@ async def send_group_sealed(
     # ⚠ Resolved BEFORE the queue rows are written, because who we wake now
     # decides who we keep the message for — see `_keep_for` below.
     wake: dict[int, PushEndpoints] = {}
-    if body.envelope_type in _PUSHABLE_TYPES:
+    if cls == 1:
         payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
         envelope_type = body.envelope_type
         group_id = body.group_id
@@ -699,13 +811,14 @@ async def send_group_sealed(
     # recipient drains anything they missed on their next /messages/queue
     # fetch and dedupes by UUID.
     keep = _keep_for(
-        (e.to_uin for e in entries), queueable, body.envelope_type, wake
+        (e.to_uin for e in entries), queueable, cls, wake
     )
     rows = [
         {
             "to_uin": e.to_uin,
             "group_id": body.group_id,
             "envelope_type": body.envelope_type,
+            "cls": cls,
             "payload": e.payload,
             "received_at": now,
         }
@@ -856,6 +969,11 @@ async def send_group_broadcast(
 
     now = datetime.now(timezone.utc)
     queueable = _queueable(recipient_rows)
+    # Stage 2a: class of the declared inner type (drives push + keep). The stored
+    # row rides as envelope_type "gmsg", which is also content (cls 1); a
+    # broadcast never carries key-distribution material (that goes per-member via
+    # /messages/group-sealed), so this is content in every real case.
+    cls = _cls_for(body.envelope_type)
     # The sender's own uin is included on purpose: their other devices get
     # the broadcast as the carbons copy (the sending device dedupes by
     # message UUID, same as the WS/queue double-delivery case).
@@ -877,7 +995,7 @@ async def send_group_broadcast(
     # keep the message for is a notification for a message that will never
     # arrive (#547). See `_keep_for`.
     wake: dict[int, PushEndpoints] = {}
-    if body.envelope_type in _PUSHABLE_TYPES:
+    if cls == 1:
         group_id = body.group_id
         payload = body.payload
         # Same as the sealed path above: the name is not sent, only the id.
@@ -890,12 +1008,13 @@ async def send_group_broadcast(
         wake = await group_push_targets(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
-    keep = _keep_for(recipients, queueable, body.envelope_type, wake)
+    keep = _keep_for(recipients, queueable, cls, wake)
     rows = [
         {
             "to_uin": uin,
             "group_id": body.group_id,
             "envelope_type": "gmsg",
+            "cls": cls,
             "payload": body.payload,
             "received_at": now,
         }
@@ -1212,13 +1331,22 @@ async def fetch_queue(
 
     out: list[HistoryRow] = []
     for r in rows_1to1:
+        # Stage 2: serve BOTH shapes. `envelope_type` and `id` still ride for old
+        # clients; `cls` (derived for legacy NULL rows so it is never null on the
+        # wire) and `seq` ride for new ones. ?after= still cursors on `id`.
         out.append(HistoryRow(
-            id=r.id, envelope_type=r.envelope_type, payload=r.payload,
+            id=r.id, envelope_type=r.envelope_type,
+            cls=r.cls if r.cls is not None else _cls_for(r.envelope_type),
+            seq=r.seq, payload=r.payload,
             received_at=r.received_at, group_id=None, to_device_id=r.to_device_id,
         ))
     for r in rows_group:
+        # Group rows carry cls but no per-mailbox seq (stage 5 gives them a
+        # per-room log). seq stays null; the client falls back to id, unchanged.
         out.append(HistoryRow(
-            id=r.id, envelope_type=r.envelope_type, payload=r.payload,
+            id=r.id, envelope_type=r.envelope_type,
+            cls=r.cls if r.cls is not None else _cls_for(r.envelope_type),
+            payload=r.payload,
             received_at=r.received_at, group_id=r.group_id,
         ))
     out.sort(key=lambda x: x.received_at)
