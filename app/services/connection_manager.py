@@ -53,6 +53,14 @@ log = logging.getLogger(__name__)
 # "all") and the inner payload — every worker filters on receive.
 _FANOUT_CHANNEL = "ws:fanout"
 # Set of UINs currently connected to ANY worker. Used by `is_online()`.
+#
+# It has no TTL and cannot have one: a TTL on a SET expires the whole key, i.e.
+# marks the entire island offline at once. Its ghosts (a worker that died
+# between the SADDs and its SREM) are pruned instead by
+# `services/presence_sweep`, which uses the per-account devs key below as the
+# liveness test. Before that existed the only prune was the admin console's,
+# which removes members with no `users` row, so it cleaned up burned accounts
+# and kept every live account's ghost forever.
 _ONLINE_KEY = "ws:online_uins"
 # Per-account set of the DEVICE ids currently connected to any worker, so a
 # push decision can be made per device instead of per account. Without it
@@ -560,9 +568,15 @@ class ConnectionManager:
 
             activity_bump("ws")
             redis = await get_redis()
-            await redis.sadd(_ONLINE_KEY, uin)
+            # ⚠ ORDER MATTERS, devs key FIRST. `services/presence_sweep` prunes
+            # a uin from `_ONLINE_KEY` when it has no `ws:online_devs:{uin}`,
+            # which is the only liveness signal in the cluster that expires on
+            # its own. Adding to the account set first would leave a window in
+            # which a connecting user looks exactly like a ghost and can be
+            # pruned out from under their own handshake.
             await redis.sadd(_online_devs_key(uin), device_id)
             await redis.expire(_online_devs_key(uin), _ONLINE_DEVS_TTL)
+            await redis.sadd(_ONLINE_KEY, uin)
             envelope = self._envelope(
                 target="supersede",
                 uin=uin,

@@ -162,6 +162,35 @@ async def lifespan(_: FastAPI):
     from app.services.media_sweep import media_sweep_loop
 
     media_sweep_task = asyncio.create_task(media_sweep_loop())
+    # ── Retention, stage 1b (2026-08-22) ────────────────────────────────────
+    # The metadata map's recurring finding was rows outliving the thing they
+    # describe. Each loop below closes one of those; each module's docstring
+    # carries the horizon and the reasoning for it, and each takes a
+    # RCQ_*_SWEEP_DRY_RUN=1 env switch. All are leader-elected, so only one of
+    # the four workers does the work in any cycle.
+    from app.services.credential_sweep import credential_sweep_loop
+    from app.services.device_sweep import device_sweep_loop
+    from app.services.poll_sweep import poll_sweep_loop
+    from app.services.prekey_sweep import prekey_sweep_loop
+    from app.services.presence_sweep import presence_sweep_loop
+    from app.services.report_sweep import report_sweep_loop
+
+    retention_tasks = [
+        # Consumed one-time prekeys: a dated per-account count of how many
+        # strangers opened a session toward you.
+        asyncio.create_task(prekey_sweep_loop()),
+        # Closed reports: operator notes about named people, attachment AES
+        # keys, and the plaintext support thread.
+        asyncio.create_task(report_sweep_loop()),
+        # Revoked device slots, once the id is safe to hand out again.
+        asyncio.create_task(device_sweep_loop()),
+        # Closed polls and their ballots, including the anonymous ones.
+        asyncio.create_task(poll_sweep_loop()),
+        # Spent invites and dead network-gate tokens.
+        asyncio.create_task(credential_sweep_loop()),
+        # Ghosts in the cluster-wide online set, which had no TTL at all.
+        asyncio.create_task(presence_sweep_loop()),
+    ]
     try:
         yield
     finally:
@@ -172,6 +201,8 @@ async def lifespan(_: FastAPI):
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
         media_sweep_task.cancel()
+        for task in retention_tasks:
+            task.cancel()
         await close_redis()
 
 

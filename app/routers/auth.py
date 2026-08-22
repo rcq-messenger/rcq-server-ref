@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -32,7 +32,7 @@ from app.core.security import (
 )
 from app.services import server_settings
 from app.models.contact import Contact
-from app.models.invite import Invite
+from app.models.invite import Invite, hash_invite_code
 from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
 from app.models.queue_cursor import QueueCursor
@@ -281,23 +281,39 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # not-exhausted code locks the row, so two simultaneous registrations can't
     # both spend the last use. It commits together with the user creation below.
     code = (body.invite or "").strip()
+    # ⚠ The `invites.code` COLUMN holds the sha256-hex, not the token (see the
+    # model). What the client presents is the raw code, so every lookup here
+    # hashes first. A code minted before 2026-08-22 still works: the migration
+    # hashed the stored value in place, so the same raw token maps to the same
+    # row.
+    code_hash = hash_invite_code(code) if code else ""
     # A redeemed invite may carry a reserved (vanity) UIN; capture it so the
     # holder gets exactly that number below.
     reserved_uin: int | None = None
     invite_gates = (
-        Invite.code == code,
+        Invite.code == code_hash,
         Invite.used_count < Invite.max_uses,
         or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
+    )
+    # Stamped in the same atomic UPDATE that spends the use, so an invite whose
+    # LAST use this is gets its retention clock started without a second
+    # statement that could lose the race. Anything short of the last use leaves
+    # the column alone.
+    _spent_now = case(
+        (Invite.used_count + 1 >= Invite.max_uses, datetime.now(timezone.utc)),
+        else_=Invite.spent_at,
     )
     if await server_settings.get("registration_policy") == "invite":
         if not code:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_required"})
         consumed = await db.execute(
-            update(Invite).where(*invite_gates).values(used_count=Invite.used_count + 1)
+            update(Invite)
+            .where(*invite_gates)
+            .values(used_count=Invite.used_count + 1, spent_at=_spent_now)
         )
         if consumed.rowcount == 0:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_invalid"})
-        reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code))
+        reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code_hash))
     elif code:
         # Open server, but a reserved-UIN invite was supplied → consume it so the
         # holder still gets their vanity number. A plain (uin-less) invite on an
@@ -305,10 +321,10 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         consumed = await db.execute(
             update(Invite)
             .where(*invite_gates, Invite.uin.isnot(None))
-            .values(used_count=Invite.used_count + 1)
+            .values(used_count=Invite.used_count + 1, spent_at=_spent_now)
         )
         if consumed.rowcount > 0:
-            reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code))
+            reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code_hash))
 
     # A reserved vanity UIN wins when it's still free; then a best-effort
     # desired UIN (multihoming "same number on every island"); otherwise fall

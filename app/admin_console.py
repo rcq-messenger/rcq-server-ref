@@ -229,11 +229,12 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
           <input id="i_ttl" type="number" placeholder="TTL hrs" title="Expires after N hours" style="width:96px">
           <button class="btn" onclick="mintInvite()">Create</button>
         </div>
-        <p class="sub" style="margin:10px 0 0"><b>Label</b> is just a note for you. <b>UIN</b> — leave blank for a random number, or set one to reserve a specific (vanity) number for the holder. <b>Max uses</b> — how many people may register with this code (use 1 for a single person). <b>TTL hrs</b> — auto-expire after N hours (blank = never). After Create, share the code (or its link) with the person; they paste it when signing up.</p>
+        <p class="sub" style="margin:10px 0 0"><b>Label</b> is just a note for you. <b>UIN</b>: leave blank for a random number, or set one to reserve a specific (vanity) number for the holder. <b>Max uses</b>: how many people may register with this code (use 1 for a single person). <b>TTL hrs</b>: auto-expire after N hours (blank = never). After Create, copy the code straight away: this island keeps only a hash of it and cannot show it to you again.</p>
         <div class="err" id="i_err"></div>
+        <div id="i_new" style="display:none;margin-top:12px"></div>
       </div>
       <div class="card pad">
-        <table><thead><tr><th>Code</th><th>UIN</th><th>Uses</th><th>Label</th><th></th><th></th></tr></thead>
+        <table><thead><tr><th>Code (hash)</th><th>UIN</th><th>Uses</th><th>Label</th><th></th></tr></thead>
           <tbody id="invites"></tbody></table>
       </div>
     </section>
@@ -488,27 +489,40 @@ async function loadActivity() {
   } catch(e){ $('activity').innerHTML='<div class="empty">'+e.message+'</div>'; }
 }
 
-/* ---- invites ---- */
+/* ---- invites ----
+   The `code` field is the sha256 of the token, not the token: since
+   2026-08-22 the island stores only the hash (app/models/invite.py), so a
+   dump of the invites table no longer mints access to an invite-gated
+   island. `join_url` therefore comes back ONLY in the mint response, and the
+   list shows the hash as a row id with no way to re-copy the link. Same
+   shape the access-tokens tab below has always had. */
 async function loadInvites() {
   try {
     const rows = await api('GET','/invites');
     $('invites').innerHTML = rows.map(v=>`<tr>
-      <td><span class="mono">${v.code.slice(0,10)}…</span></td>
+      <td><span class="mono">${v.code.slice(0,10)}…</span> <span style="color:var(--dim)">shown once at creation</span></td>
       <td>${v.uin?'<span class="pill vanity">'+v.uin+'</span>':'<span style="color:var(--dim)">random</span>'}</td>
       <td>${v.used_count}/${v.max_uses}</td>
       <td>${v.label||''}</td>
-      <td><span class="link" onclick="navigator.clipboard.writeText('${v.join_url}');this.textContent='copied ✓'">copy link</span></td>
       <td style="text-align:right"><button class="btn danger sm" onclick="revoke('${v.code}')">Revoke</button></td>
-    </tr>`).join('') || '<tr><td colspan="6" class="empty">No invites yet.</td></tr>';
-  } catch(e){ $('invites').innerHTML='<tr><td colspan="6" class="err">'+e.message+'</td></tr>'; }
+    </tr>`).join('') || '<tr><td colspan="5" class="empty">No invites yet.</td></tr>';
+  } catch(e){ $('invites').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
 }
 async function mintInvite() {
-  $('i_err').textContent='';
+  $('i_err').textContent=''; $('i_new').style.display='none';
   const body = { max_uses: parseInt($('i_uses').value)||1 };
   if ($('i_label').value.trim()) body.label=$('i_label').value.trim();
   if ($('i_uin').value.trim()) body.uin=parseInt($('i_uin').value);
   if ($('i_ttl').value.trim()) body.ttl_hours=parseInt($('i_ttl').value);
-  try { await api('POST','/invites',body); $('i_label').value='';$('i_uin').value=''; loadInvites(); }
+  try {
+    const out = await api('POST','/invites',body);
+    $('i_label').value='';$('i_uin').value='';
+    const n=$('i_new'); n.style.display='block';
+    n.innerHTML='<p class="sub">Copy this link now, it is shown only once. Send it to the person; they paste the code when signing up.</p>'+
+      '<div class="row"><input class="mono" readonly value="'+out.join_url+'" style="flex:1" onclick="this.select()">'+
+      `<button class="btn ghost" onclick="navigator.clipboard.writeText('${out.join_url}');this.textContent='copied ✓'">Copy</button></div>`;
+    loadInvites();
+  }
   catch(e){ $('i_err').textContent='Could not create: '+e.message; }
 }
 async function revoke(code){ try{ await api('DELETE','/invites/'+encodeURIComponent(code)); loadInvites(); }catch(e){ alert(e.message); } }
@@ -878,9 +892,10 @@ function mock(method, path, body) {
     {id:1, kind:'invite', label:'Alice', uses:1, max_uses:1, revoked:false, last_used_at:new Date(Date.now()-3600e3).toISOString(), parent_id:null},
     {id:2, kind:'standing', label:'Bridge bot', uses:42, max_uses:null, revoked:false, last_used_at:new Date(Date.now()-600e3).toISOString(), parent_id:null},
   ];
+  if (path==='/invites' && method==='POST') return {code:'9f2c'+'0'.repeat(60),uin:body.uin||null,used_count:0,max_uses:body.max_uses||1,label:body.label||null,raw_code:'demo_'+Math.random().toString(36).slice(2,18),join_url:'rcq://server/island.example?invite=demo'};
   if (path==='/invites') return [
-    {code:'ACME7H2K9Qd1',uin:777777,used_count:0,max_uses:1,label:'Acme HR (vanity)',join_url:'https://island.example/r/ACME7H2K9Qd1'},
-    {code:'TEAMx48fZb22',uin:null,used_count:3,max_uses:25,label:'Team launch',join_url:'https://island.example/r/TEAMx48fZb22'},
+    {code:'a3f19c22b4'+'0'.repeat(54),uin:777777,used_count:0,max_uses:1,label:'Acme HR (vanity)',raw_code:null,join_url:null},
+    {code:'7d0e5581aa'+'0'.repeat(54),uin:null,used_count:3,max_uses:25,label:'Team launch',raw_code:null,join_url:null},
   ];
   if (path.startsWith('/users')) return {items:[
     {uin:524060806,nickname:'dev',status:'online',is_suspended:false,reports_against:0},

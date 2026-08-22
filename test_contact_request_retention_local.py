@@ -138,7 +138,9 @@ async def main() -> None:
         # Fresh acceptances are inside the grace and must survive it...
         from app.services.contact_request_sweep import sweep_once
 
-        n = await sweep_once()
+        # Returns (accepted, declined) since 2026-08-22; this file only cares
+        # about the accepted half, which the declined retention test covers.
+        n, _ = await sweep_once()
         async with SessionLocal() as db:
             fresh = int(await db.scalar(
                 select(func.count(ContactRequest.id)).where(ContactRequest.state == "accepted")
@@ -154,7 +156,7 @@ async def main() -> None:
                 .values(resolved_at=datetime.now(timezone.utc) - timedelta(hours=3))
             )
             await db.commit()
-        n = await sweep_once()
+        n, _ = await sweep_once()
         check("the sweep takes them after the grace", n == fresh, f"swept {n}, expected {fresh}")
 
         # What is left island-wide: the one declined row, and the fresh pending

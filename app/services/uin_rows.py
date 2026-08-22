@@ -40,6 +40,14 @@ those tables is gone, so the absence is correct rather than a new hole.
 `groups.pinned_by` was never in this list and is now unmapped, which closes a
 real gap the erasure map missed: a burned account kept a byline on somebody
 else's pinned message.
+
+2026-08-22 (stage 1b) added `invites.created_by`, the last per-UIN column the
+map found missing. See the entry for what it does and does not cover.
+
+★★ Note for whoever reads this next: a table being SWEPT does not make it safe
+to drop from this list. A sweep runs on a horizon measured in months; a burn is
+supposed to be immediate. `polls` and `poll_votes` both gained a sweep in the
+same release as this note and both stay here for exactly that reason.
 """
 
 from __future__ import annotations
@@ -56,6 +64,7 @@ from app.models.group import (
     GroupMember,
     OfflineGroupMessage,
 )
+from app.models.invite import Invite
 from app.models.message import OfflineMessage
 from app.models.owned_uin import OwnedUin
 from app.models.poll import Poll, PollVote
@@ -88,6 +97,22 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     # Moderation history follows the PERSON, not the number: without this a
     # user could shed an open report simply by migrating to a new UIN.
     (Report, Report.target_uin),
+    # An operator's outstanding invites belong to the operator. On a migration
+    # they follow them to the new number; on a burn they go, because a code
+    # that still admits strangers to the island, minted by an account that no
+    # longer exists, is an entry credential with nobody behind it.
+    #
+    # ⚠ Currently always NULL: neither `POST /admin/invites` (Basic-auth, no
+    # session uin) nor `app.tools.mint_invite` writes it, so this matches
+    # nothing today. Listed anyway, because the whole job of this module is to
+    # be TRUE against the schema rather than against current behaviour: the
+    # day something starts stamping the minter, the burn path already covers it.
+    #
+    # ⚠ `Invite.uin` is deliberately NOT here. That column is a RESERVED vanity
+    # number promised to whoever redeems the code, not a row belonging to the
+    # burning account. Re-keying it would move somebody else's promise, and
+    # deleting it on burn would cancel a reservation the operator made.
+    (Invite, Invite.created_by),
 ]
 
 # Rows that must NOT ride along to the new UIN — they assert something about
