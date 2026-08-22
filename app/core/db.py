@@ -29,8 +29,8 @@ class Base(DeclarativeBase):
 # so sizing the app pool as if each client connection were a backend one
 # left the workers strangled: 4 × (2 + 1) = 12 client connections total,
 # and prod logged 423 `QueuePool limit of size 2 overflow 1 reached` timeouts
-# in 24h — each one an HTTP request or a background job (story sweep, push
-# fan-out) dying at the checkout, not at the database.
+# in 24h, each one an HTTP request or a background job (a retention sweep,
+# a push fan-out) dying at the checkout, not at the database.
 #
 # 4 × (5 + 5) = 40 client connections queue at PgBouncer instead of erroring
 # at SQLAlchemy, which is what PgBouncer is for. Pre-ping drops connections
@@ -107,7 +107,6 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     ("last_seen_visibility", "TEXT DEFAULT 'contacts'"),
     ("gender_visibility", "TEXT DEFAULT 'nobody'"),
     ("group_invite_policy", "TEXT DEFAULT 'contacts'"),
-    ("trade_policy", "TEXT DEFAULT 'everyone'"),
     ("call_policy", "TEXT DEFAULT 'contacts'"),
     # Tri-state gate iOS uses to decide whether to send a
     # `.readReceipt` envelope. Enforced client-side only — server
@@ -117,12 +116,6 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # Mirrors the other *_visibility columns; default "everyone"
     # keeps existing accounts unchanged.
     ("profile_visibility", "TEXT DEFAULT 'everyone'"),
-    # Vestigial pre-pivot columns (social-reputation feature cut
-    # 2026-05-27). No code reads or writes them; the ORM no longer maps
-    # them. Kept in the add-list ONLY so an existing deployment's schema
-    # is unchanged. Safe to DROP COLUMN by hand for a clean table.
-    ("reputation", "BIGINT DEFAULT 0"),
-    ("reputation_visibility", "TEXT DEFAULT 'everyone'"),
     # Per-user push toggles + muted-uin list. NULL = use code-side
     # defaults (`_pref` in apns.py); writes flow through PUT
     # /users/me/push-preferences. JSON gets cross-dialect support
@@ -132,16 +125,10 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # Admin-set ban flag. Default false — only flipped via
     # /admin/users/{uin}/ban after a Reports-queue review.
     ("is_suspended", "BOOLEAN DEFAULT FALSE"),
-    # Distinct-active-days counter + last-bumped day string. Drive
-    # referral activation; additive so existing rows start at 0/NULL.
-    ("active_days", "INTEGER DEFAULT 0"),
-    ("last_active_day", "VARCHAR(10)"),
     # Profile picture (see models/user.py). Additive: NULL on every existing
     # row means "no picture", which is exactly the old behaviour.
     ("avatar_media_id", "VARCHAR(64)"),
     ("avatar_media_key", "VARCHAR(96)"),
-    # Note: GroupMessageView is a fresh table created via create_all
-    # on first boot; no ALTER needed for additive-column case.
     # When TRUE, the user's chosen `status` (online/away/dnd) is
     # broadcast to contacts even when their WebSocket has been gone
     # for longer than PRESENCE_FRESHNESS_SECONDS. Lets users keep
@@ -223,7 +210,6 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     # waiting for X3DH to complete with every existing member.
     ("pinned_text", "VARCHAR(500)"),
     ("pinned_at", "TIMESTAMP WITH TIME ZONE"),
-    ("pinned_by", "BIGINT"),
     # Unguessable half of a share link (see the model comment). Backfilled
     # for existing rows by `_backfill_group_share_tokens` below.
     ("share_token", "VARCHAR(32)"),
@@ -297,7 +283,7 @@ _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, referral, story, hood_banner, hood_message, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, nearby, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 
@@ -496,6 +482,15 @@ async def init_db() -> None:
         "reputation_grants",
         "traffic_usage",
         "admin_grants",
+        # ── Missed by the 2026-05-27 sweep, found by the metadata audit on
+        # 2026-08-22. Four tables with no ORM model at all, unreachable from
+        # the application and present in every nightly dump: the two halves of
+        # the UIN-for-UIN trade graph (who traded with whom) and the two halves
+        # of the paid-content purchase graph (who bought whose content, with a
+        # per-buyer wrapped decryption key). `trades` and `premium_unlocks`
+        # above were dropped at the time; their siblings were not.
+        "trade_items", "trade_uins",
+        "premium_content_keys", "premium_contents",
     ]
     for table in _PIVOT_DROP_TABLES:
         async with engine.begin() as conn:
@@ -506,3 +501,150 @@ async def init_db() -> None:
                     await conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
             except Exception:
                 pass
+
+    # ── Metadata cut 2026-08-22: tables whose feature was deleted ──────────
+    #
+    # These DID have a model until this release, which is exactly the shape
+    # that destroyed `owned_uins`: create_all builds a table from the model on
+    # boot and the drop loop removes it again, silently, every restart. That
+    # cannot happen to anything here as long as the model is really gone, so
+    # the loop CHECKS rather than trusting the comment: a name that is still in
+    # `Base.metadata` is a live table somebody re-added, and it is skipped with
+    # a loud line instead of dropped.
+    #
+    # Unlike the pivot list this one is not gated on emptiness. The rows ARE
+    # the thing being deleted:
+    #   group_message_views: a per-person reading log, 4 rows, no FK, no sweep
+    #   story_views, stories: a posting timeline plus an attention graph, and
+    #                         `media_key_b64` sat in the row beside the blob,
+    #                         so the island could decrypt every story it held
+    #   hood_messages:        "anonymous" speech stored against a real UIN with
+    #                         a geohash, soft-deleted bodies kept forever, and
+    #                         reactions published as plaintext UIN lists
+    #   hood_banners:         a dead board still carrying a mock IAP receipt
+    #   referrals:            a permanent recruitment genealogy, zero rows ever
+    #   audio_room_mutes:     a dated record of who muted whom, now in Redis
+    _DEAD_DROP_TABLES: list[str] = [
+        "group_message_views",
+        "story_views", "stories",
+        "hood_messages", "hood_banners",
+        "referrals",
+        "audio_room_mutes",
+    ]
+    for table in _DEAD_DROP_TABLES:
+        if table in Base.metadata.tables:
+            log.error(
+                "[db] refusing to drop %s: it is still in the ORM metadata, so "
+                "create_all would recreate it on the next boot and this loop "
+                "would delete it again. Remove it from this list or from the "
+                "models, but not neither", table
+            )
+            continue
+        async with engine.begin() as conn:
+            try:
+                if dialect == "postgresql":
+                    await conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+                else:
+                    await conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+            except Exception:
+                pass
+
+    # ── Columns the ORM stopped mapping on 2026-08-22 ──────────────────────
+    #
+    # Dead metadata, each verified to have no reader before it was unmapped.
+    # What happens to the physical column now DEPENDS ON THE DIALECT, and the
+    # difference is not tidiness, it is which failure each one is exposed to.
+    #
+    # POSTGRES (the flagship, is2, every docker-compose island): the column
+    # STAYS for one release. Unmapping alone is safe there because the
+    # NOT-NULL self-heal above asks the database which unknown columns would
+    # block an insert and drops the constraint, and because a rollback to the
+    # previous release finds its columns still present. Dropping in the same
+    # release that unmaps would also leave a window during the restart where an
+    # old worker inserts a column the new schema no longer has. So the physical
+    # DROP is queued for the release AFTER this one:
+    #
+    #   users.trade_policy, users.active_days, users.last_active_day
+    #   groups.entry_price_tokens, groups.pinned_by
+    #   group_members.joined_at
+    #   contacts.created_at
+    #   user_capabilities.updated_at
+    #   audio_room_memberships.joined_at
+    #
+    # ⚠⚠ SQLITE (the default `DATABASE_URL`, so a real self-host shape): the
+    # column must GO NOW, because none of that safety net exists. SQLite cannot
+    # ALTER a column's NOT NULL away, so the self-heal skips it entirely, and
+    # four of these columns are NOT NULL with no default on any island whose
+    # tables `create_all` built. Leaving them unmapped there would mean the
+    # next added contact, the next group join and the next capability ping all
+    # die on a NOT NULL violation. Dropping the column removes the constraint
+    # with it. SQLite has had DROP COLUMN since 3.35 (2021); an island older
+    # than that gets a loud line rather than a silent breakage, because that is
+    # the one case where the operator has to act.
+    _UNMAPPED_DEAD_COLUMNS: list[tuple[str, str]] = [
+        ("users", "trade_policy"),
+        ("users", "active_days"),
+        ("users", "last_active_day"),
+        ("groups", "entry_price_tokens"),
+        ("groups", "pinned_by"),
+        ("group_members", "joined_at"),
+        ("contacts", "created_at"),
+        ("user_capabilities", "updated_at"),
+        ("audio_room_memberships", "joined_at"),
+    ]
+    # Unmapped by the 2026-05-27 pivot, not by this cut, which is why these two
+    # are the pair that drops on Postgres today: they have already spent months
+    # in the "model gone, column orphaned" state this release puts the others
+    # into. Their only remaining effect was `init_db` re-asserting a DEFAULT on
+    # every boot so inserts would not NULL-violate.
+    _PIVOT_DEAD_COLUMNS: list[tuple[str, str]] = [
+        ("users", "reputation"),
+        ("users", "reputation_visibility"),
+    ]
+    if dialect == "postgresql":
+        _drop_now = _PIVOT_DEAD_COLUMNS
+    else:
+        _drop_now = _UNMAPPED_DEAD_COLUMNS + _PIVOT_DEAD_COLUMNS
+    for table, col in _drop_now:
+        if table not in Base.metadata.tables:
+            continue
+        if col in {c.name for c in Base.metadata.tables[table].columns}:
+            log.error(
+                "[db] refusing to drop %s.%s: the ORM maps it again, so this "
+                "would delete a live column on every boot", table, col
+            )
+            continue
+        if dialect == "postgresql":
+            async with engine.begin() as conn:
+                try:
+                    await conn.execute(text(
+                        f'ALTER TABLE {table} DROP COLUMN IF EXISTS "{col}"'
+                    ))
+                except Exception:
+                    pass
+            continue
+        # SQLite has no IF EXISTS on DROP COLUMN, and a fresh island never had
+        # these columns at all, so ask before swinging: without this every boot
+        # of a clean database logs eleven "no such column" warnings and the one
+        # warning that matters is buried in them.
+        async with engine.begin() as conn:
+            try:
+                info = (await conn.execute(text(f"PRAGMA table_info({table})"))).all()
+            except Exception:
+                continue
+        if col not in {row[1] for row in info}:
+            continue
+        async with engine.begin() as conn:
+            try:
+                await conn.execute(text(f'ALTER TABLE {table} DROP COLUMN "{col}"'))
+            except Exception as exc:  # noqa: BLE001
+                # The column is there and would not go. On SQLite older than
+                # 3.35 that is the end of the road for an automatic migration,
+                # and writes to this table are about to start failing, so name
+                # the table rather than swallowing it.
+                log.warning(
+                    "[db] could not drop %s.%s (%s: %s). On SQLite older than "
+                    "3.35 the column has to be removed by hand, and until it "
+                    "is, inserts into %s will fail if it is NOT NULL",
+                    table, col, type(exc).__name__, exc, table,
+                )

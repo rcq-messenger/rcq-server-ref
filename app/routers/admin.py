@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 # (signups/DAU date aggregations, activity feed, online roster) checks out one
 # of the deliberately tiny pooled DB connections (pool_size=2 + overflow 1 per
 # worker), and a few concurrent polls starve everything else — users'
-# /contacts and the background story_sweep started returning 500 (QueuePool
+# /contacts and the background sweeps started returning 500 (QueuePool
 # timeout). In the browser that 500 looks like a CORS error, because an
 # unhandled 500 is produced above CORSMiddleware and so carries no
 # Access-Control-Allow-Origin header. Per-worker cache is fine: each worker

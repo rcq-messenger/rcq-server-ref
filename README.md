@@ -34,9 +34,8 @@ hosted-key tooling), keep an eye on releases.
   1:1 envelope, and never holds media decryption keys.
 * **UIN identity** — 6-9 digit anonymous handles, no phone number, no
   email. Allocator is a tiny secret-randbelow loop.
-* **WebSocket fan-out** — presence, typing, group changes, call
-  signalling, hood-bucket chat, story announcements. Cross-worker via
-  Redis pub/sub.
+* **WebSocket fan-out** — presence, typing, group changes, call and
+  audio-room signalling. Cross-worker via Redis pub/sub.
 * **APNs push** — both alert pushes (NSE-decrypted on the device) and
   VoIP pushes for inbound calls.
 * **Encrypted media blobs** — opaque bytes by mass; per-blob AES key
@@ -56,13 +55,6 @@ hosted-key tooling), keep an eye on releases.
 * **Account migration + UIN shop** — atomic re-key of every owned-by-uin
   row from old UIN to new. UIN shop uses a mock IAP receipt today; the
   real StoreKit hook lives at one function on the iOS side.
-* **Hood** — geohash-bucket chat: a thread per district, keyed off the
-  same geohash the Nearby surface uses. Optional on a self-hosted
-  instance; if you don't want it, every endpoint cleanly no-ops when
-  nobody calls it. (A paid district-banner board used to sit next to it
-  and was removed on 2026-08-07: in three months it took eight posts,
-  all tests, and it quoted dollar prices against a receipt check that
-  accepted any string.)
 * **Reports / moderation** — bug-bounty submissions, abuse reports
   with encrypted-media evidence, admin SPA at `admin.<your-domain>`. A report
   is a CONVERSATION since 2026-08-16: the reporter writes back on their own

@@ -50,10 +50,15 @@ _reg(SettingSpec("nearby_enabled", "bool", lambda: True, "features", "Nearby",
                  "Geo 'people near you' discovery."))
 _reg(SettingSpec("random_enabled", "bool", lambda: True, "features", "Random Chat",
                  "Anonymous roulette-style 1:1 chat."))
-_reg(SettingSpec("hood_enabled", "bool", lambda: True, "features", "Hood Chat",
-                 "Anonymous neighbourhood (geohash) chat."))
-_reg(SettingSpec("stories_enabled", "bool", lambda: True, "features", "Stories",
-                 "24h ephemeral photo/video stories."))
+# `hood_enabled` and `stories_enabled` were removed from the registry on
+# 2026-08-22 along with both routers and all four tables. Deleting the KEYS,
+# rather than flipping their defaults to False, is deliberate: an island that
+# had already written an override row saying `true` would otherwise keep
+# advertising a feature whose endpoints are gone, and every client that honours
+# the flag would show a tab that 404s. With no key in the registry the stale
+# override is ignored and `/server/info` reports both as off, permanently.
+# Leftover rows in `server_settings` are harmless: `describe()` iterates the
+# registry, and `validate()` refuses an unknown key.
 _reg(SettingSpec("reports_enabled", "bool", lambda: True, "features", "Reports",
                  "Let members report abuse and file bug reports to you, and read "
                  "your answers back. Turning this off closes intake; reports "

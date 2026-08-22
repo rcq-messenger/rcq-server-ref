@@ -121,21 +121,23 @@ async def _perform_migration(
         push_preferences=user.push_preferences,
         # Everything below describes the PERSON, not the number they answered
         # as, so it follows them across. Dropping it was never a decision:
-        #   * trade_policy — whether they accept UIN trade offers at all.
         #   * presence_* — the "stay visible for N minutes" setting. Losing it
         #     reset a privacy choice to the default without saying so.
-        #   * active_days / last_active_day — the activity streak the Hall of
-        #     Fame and the stats page read.
         #   * hof_* — their standing on the wall, including the founder's own
         #     approval. Without this a moved number quietly disappeared from
         #     the Hall of Fame and had to be approved a second time.
         # `last_seen` and `created_at` are deliberately NOT copied: they are
         # facts about this row, and created_at is when this number began.
-        trade_policy=user.trade_policy,
+        #
+        # Three fields left this list on 2026-08-22 with the columns behind
+        # them: `trade_policy` (guarded a router that has not existed since the
+        # pivot) and `active_days` / `last_active_day`. The claim above that
+        # the Hall of Fame read the activity streak was wrong, and it was the
+        # only reason anyone believed the streak had a consumer:
+        # `services/hof_stats.py` scores contributors from `reports` and
+        # `users.hof_bonus_*` and has never looked at it.
         presence_persistent=user.presence_persistent,
         presence_ttl_minutes=user.presence_ttl_minutes,
-        active_days=user.active_days,
-        last_active_day=user.last_active_day,
         hof_opt_in=user.hof_opt_in,
         hof_approved=user.hof_approved,
         hof_avatar=user.hof_avatar,

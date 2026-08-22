@@ -267,9 +267,11 @@ cross-island/federated delivery.)
 - **Size limit:** 2 GB per upload. Behind nginx, also raise
   `client_max_body_size` (see the nginx section) or the proxy rejects large
   uploads before they reach the app.
-- **Retention:** chat-media blobs are not auto-purged (only expired Stories are
-  swept). Account for disk growth, and include `media/uploads/` in backups if you
-  want media to survive a fresh device fetch. The text/queue side keeps nothing
+- **Retention:** a blob is swept once it is older than
+  `RCQ_MEDIA_MAX_AGE_DAYS` (30 by default) and no row still points at it;
+  avatars and report evidence are exempt. Account for disk growth, and include
+  `media/uploads/` in backups if you want media to survive a fresh device
+  fetch. The text/queue side keeps nothing
   durable — the offline queue holds only undelivered sealed envelopes, deleted on
   delivery.
 

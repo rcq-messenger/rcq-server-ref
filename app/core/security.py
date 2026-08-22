@@ -344,8 +344,8 @@ async def cache_uin_epoch(uin: int, epoch: int) -> None:
 # the WebSocket handshake (`routers/ws.py`). Everything else that read the
 # column was the admin UI or a public-listing filter, so a banned account
 # holding a live bearer token kept working over plain HTTP — it could still
-# POST stories, upload media and file reports; it just could not hold a
-# socket. Since phone tokens deliberately never expire, "banned" was closer
+# upload media and file reports; it just could not hold a socket.
+# Since phone tokens deliberately never expire, "banned" was closer
 # to "logged out of the socket" than to "banned".
 #
 # The set is mirrored into Redis rather than read from Postgres because this

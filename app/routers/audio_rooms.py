@@ -32,8 +32,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core.redis import get_redis
 from app.core.security import current_uin
-from app.models.audio_room import AudioRoom, AudioRoomMembership, AudioRoomMute
+from app.models.audio_room import AudioRoom, AudioRoomMembership
 
 router = APIRouter(prefix="/audio_rooms", tags=["audio_rooms"])
 
@@ -122,15 +123,68 @@ async def _serialize(db: AsyncSession, room: AudioRoom) -> AudioRoomOut:
     )
 
 
+# ── Owner-set mutes: Redis, not a table ─────────────────────────────────
+#
+# Until 2026-08-22 a mute was a row in `audio_room_mutes`: (room, uin, when),
+# no expiry, no sweep. That is a permanent record of who fell out with whom,
+# kept long after the room stopped being used, and it bought "the mute survives
+# a rejoin", which the live roster in Redis already delivers, because that is
+# the only window in which a mute means anything (mesh WebRTC is peer to peer,
+# so the mute is honoured by the muted person's client and by nothing else).
+#
+# The set sits beside the room's live roster and carries the same TTL discipline:
+# it is refreshed on every write and expires on its own, so a room nobody has
+# touched in a day leaves nothing behind. What is genuinely lost: a mute no
+# longer survives the island restarting, and the owner has to set it again.
+_MUTES_KEY_PREFIX = "room:mutes:"
+# Long enough to cover a room that runs all day plus the gaps between sessions,
+# short enough that an abandoned room's mute list is gone by tomorrow.
+_MUTES_TTL_SECONDS = 24 * 3600
+
+
+def _mutes_key(room_id: int) -> str:
+    return f"{_MUTES_KEY_PREFIX}{room_id}"
+
+
 async def muted_uins_for_room(db: AsyncSession, room_id: int) -> set[int]:
     """All UINs the owner has muted in this room. Used by the WS
-    layer to bake `muted_by_owner` into roster entries on entry."""
-    rows = (
-        await db.execute(
-            select(AudioRoomMute.uin).where(AudioRoomMute.room_id == room_id)
-        )
-    ).scalars().all()
-    return set(rows)
+    layer to bake `muted_by_owner` into roster entries on entry.
+
+    `db` is unused and kept in the signature because every caller already
+    holds a session and the storage moving to Redis is not their business.
+    """
+    redis = await get_redis()
+    members = await redis.smembers(_mutes_key(room_id)) or set()
+    out: set[int] = set()
+    for m in members:
+        if isinstance(m, bytes):
+            m = m.decode()
+        try:
+            out.add(int(m))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def _set_room_mute(room_id: int, uin: int, muted: bool) -> None:
+    """Add or drop one mute. Re-arms the TTL on every write so an actively
+    moderated room does not lose its mutes mid-session."""
+    redis = await get_redis()
+    key = _mutes_key(room_id)
+    pipe = redis.pipeline()
+    if muted:
+        pipe.sadd(key, str(uin))
+    else:
+        pipe.srem(key, str(uin))
+    pipe.expire(key, _MUTES_TTL_SECONDS)
+    await pipe.execute()
+
+
+async def _clear_room_mutes(room_id: int) -> None:
+    """Forget every mute for a room. Called when the room is deleted, so the
+    set does not sit out its TTL describing a room that no longer exists."""
+    redis = await get_redis()
+    await redis.delete(_mutes_key(room_id))
 
 
 # ── endpoints ───────────────────────────────────────────────────────────
@@ -450,8 +504,8 @@ async def set_member_mute(
     endpoints; we use the path version. Body's `muted: bool` is
     the new state.
 
-    Server-side this is a soft gate: writes a row to
-    `audio_room_mutes` (or deletes one), then WS-broadcasts
+    Server-side this is a soft gate: flips the room's mute set in
+    Redis (see `_set_room_mute`), then WS-broadcasts
     `audio_room_member_muted` to every member. Mesh WebRTC means
     we cannot drop the muted user's audio packets — enforcement
     runs on the muted user's CLIENT (their iOS app flips
@@ -469,22 +523,10 @@ async def set_member_mute(
             "owner cannot mute themselves — use the toolbar mic toggle",
         )
 
-    # Toggle the mute row. Composite (room_id, uin) is the natural
-    # key — query first so unmute is idempotent (no row to delete
-    # → still 200, just no-op).
-    existing = await db.scalar(
-        select(AudioRoomMute).where(
-            and_(AudioRoomMute.room_id == room_id, AudioRoomMute.uin == uin)
-        )
-    )
-    if body.muted:
-        if existing is None:
-            db.add(AudioRoomMute(room_id=room_id, uin=uin))
-            await db.commit()
-    else:
-        if existing is not None:
-            await db.delete(existing)
-            await db.commit()
+    # Toggle the mute. SADD / SREM are both idempotent, so re-muting an
+    # already-muted member and unmuting someone who was never muted are
+    # equally no-ops that still return 200.
+    await _set_room_mute(room_id, uin, body.muted)
 
     # Fan-out — every subscribed member gets the event so their tile
     # repaints with the badge. The muted user's client honors the
@@ -645,6 +687,8 @@ async def delete_room(
     # Wipe the cluster-wide roster — clients will see room_member_left
     # for every peer below, then room_deleted, and tear down cleanly.
     await purge_audio_room(room_id)
+    # And the owner's mute set, which used to cascade off the room row.
+    await _clear_room_mutes(room_id)
 
     from app.services.connection_manager import manager
 

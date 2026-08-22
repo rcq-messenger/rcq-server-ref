@@ -29,11 +29,10 @@ class Group(Base):
     #   "owner_only" — broadcast mode; only the owner can post, members
     #                  can read + react. Server enforces on every send.
     post_policy: Mapped[str] = mapped_column(String(16), default="all")
-    # Vestigial. The pre-pivot "paid groups" feature was cut on
-    # 2026-05-27; this column is always NULL now (all groups are free).
-    # Kept only so the existing schema + serializer don't need a
-    # destructive migration; nothing reads or writes a non-NULL value.
-    entry_price_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # (`entry_price_tokens` was unmapped on 2026-08-22. The pre-pivot "paid
+    # groups" feature was cut on 2026-05-27 and the column has been NULL on
+    # every row ever since. The physical DROP is queued in the "Columns the
+    # ORM stopped mapping" note at the end of `core/db.py:init_db`.)
     # Closed groups can only be joined via an explicit invitation
     # the owner extended (link-share inserts a GroupMember row
     # directly when the recipient accepts; bare /groups/{id}/join
@@ -69,7 +68,12 @@ class Group(Base):
     # scoped to a single column.
     pinned_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    pinned_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # (`pinned_by` was unmapped on 2026-08-22. It named the admin who set the
+    # current pin, was served on the wire, and no client ever rendered it: iOS
+    # decoded it into a property nothing reads, Android and web never asked.
+    # It was also missing from `uin_rows.PER_UIN_COLUMNS`, so a burned account
+    # kept a byline on somebody else's group. A UIN nobody displays is pure
+    # metadata; the pin itself stays.)
     # Unguessable half of a share link, so that "the link IS the capability"
     # actually holds. Group ids are sequential integers, which made the
     # capability a number an attacker could count to: walking the id space
@@ -100,35 +104,11 @@ class GroupMember(Base):
     # non-owner members. Enforcement of `delete` is client-side (sealed sender),
     # `members`/`info` are enforced here. See routers/groups.py.
     permissions: Mapped[str] = mapped_column(String(128), default="", server_default="")
-    joined_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
-
-
-class GroupMessageView(Base):
-    """One row per (member, group, message) pair recording that the
-    member opened the message in their chat view. Powers the "X viewed"
-    counter under each message in closed groups, similar to Telegram.
-
-    Closed-group-only by design (the iOS client gates the view-ping
-    on `group.is_closed`); open groups keep the no-view-count
-    semantics so the feature stays an opt-in privacy trade-off. The
-    server stores `viewer_uin` for dedup but never surfaces it to
-    other clients, only the aggregate count is returned.
-    """
-
-    __tablename__ = "group_message_views"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    # Message-id is the iOS-side UUID4 lowercase string used everywhere
-    # else (envelopes, reactions, edit ops). Server has no plaintext so
-    # this is just an opaque pointer for the (group, msg, viewer) tuple.
-    message_id: Mapped[str] = mapped_column(String(64), index=True)
-    viewer_uin: Mapped[int] = mapped_column(BigInteger, index=True)
-    viewed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    # (`joined_at` was unmapped on 2026-08-22. Its one reader picked the oldest
+    # member on owner succession, and `id` is monotonic on the same insert
+    # order, so ORDER BY id returns the same person. What it cost to keep was a
+    # per-person join timeline of every room: exactly when each relationship
+    # started, for every member of every group on the island.)
 
 
 class OfflineGroupMessage(Base):

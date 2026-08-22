@@ -8,7 +8,7 @@ Two flows have to agree on this list and historically did not:
   previous holder's data.
 
 Both used to carry their own hand-written list of UPDATE/DELETE statements,
-and both lists were incomplete — in different ways. Every table below keys on
+and both lists were incomplete, in different ways. Every table below keys on
 a UIN as a plain `BigInteger` with **no foreign key**, so nothing happens to
 these rows automatically when the old `users` row is deleted: they simply
 survive, pointing at a number that now belongs to somebody else.
@@ -23,13 +23,23 @@ What that cost before this module existed (migration path):
   following the person, i.e. migrating laundered your report history.
 * `home_island_records.uin` — the seller's SIGNED federation identity record
   followed the number to its new owner.
-* `user_capabilities`, `referrals`, `hood_*`, `group_message_views`,
-  `story_views` — silently stranded.
+* `user_capabilities` and the per-UIN tables of features since deleted were
+  silently stranded.
 
 Anything that DOES have `ForeignKey("users.uin", ondelete="CASCADE")`
-(one-time prekeys, devices, nearby check-ins, `stories.owner_uin`) is
-deliberately absent: the database already handles those, and listing them
-here would double-handle them.
+(one-time prekeys, devices, nearby check-ins) is deliberately absent: the
+database already handles those, and listing them here would double-handle
+them.
+
+★ Keeping this list TRUE against the live schema is the whole point of the
+module: diffing it against `\\dt` is what found the `gossip_records` gap.
+2026-08-22 removed seven entries with the features that owned them:
+`group_message_views`, `stories` + `story_views`, `hood_messages`,
+`hood_banners`, `referrals` (both directions) and `audio_room_mutes`. Each of
+those tables is gone, so the absence is correct rather than a new hole.
+`groups.pinned_by` was never in this list and is now unmapped, which closes a
+real gap the erasure map missed: a burned account kept a byline on somebody
+else's pinned message.
 """
 
 from __future__ import annotations
@@ -37,25 +47,20 @@ from __future__ import annotations
 from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.audio_room import AudioRoom, AudioRoomMembership, AudioRoomMute
+from app.models.audio_room import AudioRoom, AudioRoomMembership
 from app.models.capability import UserCapability
 from app.models.contact import Contact, ContactRequest
 from app.models.federation import HomeIslandRecord
 from app.models.group import (
     Group,
     GroupMember,
-    GroupMessageView,
     OfflineGroupMessage,
 )
-from app.models.hood_banner import HoodBanner
-from app.models.hood_message import HoodMessage
 from app.models.message import OfflineMessage
 from app.models.owned_uin import OwnedUin
 from app.models.poll import Poll, PollVote
 from app.models.queue_cursor import QueueCursor
-from app.models.referral import Referral
 from app.models.report import Report
-from app.models.story import Story, StoryView
 
 # (model, uin-bearing column). Order is irrelevant — none of these carry FKs
 # between each other on the UIN.
@@ -66,27 +71,19 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (ContactRequest, ContactRequest.to_uin),
     (OfflineMessage, OfflineMessage.to_uin),
     (OfflineGroupMessage, OfflineGroupMessage.to_uin),
-    (GroupMessageView, GroupMessageView.viewer_uin),
     (Group, Group.owner_uin),
     (GroupMember, GroupMember.uin),
     (AudioRoom, AudioRoom.owner_uin),
     (AudioRoomMembership, AudioRoomMembership.uin),
-    (AudioRoomMute, AudioRoomMute.uin),
     (Poll, Poll.creator_uin),
     (PollVote, PollVote.voter_uin),
-    (Story, Story.owner_uin),
-    (StoryView, StoryView.viewer_uin),
     (QueueCursor, QueueCursor.uin),
     (UserCapability, UserCapability.uin),
-    (Referral, Referral.inviter_uin),
     # The vault follows its holder when they move between their own
     # numbers, and empties when the account is burned — a released
     # number goes back in the pool rather than staying reserved by a
     # person who no longer exists.
     (OwnedUin, OwnedUin.owner_uin),
-    (Referral, Referral.invitee_uin),
-    (HoodMessage, HoodMessage.owner_uin),
-    (HoodBanner, HoodBanner.owner_uin),
     (Report, Report.reporter_uin),
     # Moderation history follows the PERSON, not the number: without this a
     # user could shed an open report simply by migrating to a new UIN.

@@ -76,7 +76,6 @@ class User(Base):
     # review. Suspended UINs:
     #   - cannot send 1:1 / group messages (sealed-sender path checks before
     #     queueing/relaying)
-    #   - cannot post Hood / Stories
     #   - cannot create or join audio rooms / random chat
     #   - their /users/search results are filtered out
     # Profile + receive paths stay open so a suspended user can still see
@@ -176,14 +175,12 @@ class User(Base):
     # to every other member of that group. Invite links still work for
     # people who are not contacts yet, so the growth path is intact.
     group_invite_policy: Mapped[str] = mapped_column(String(16), default="contacts")
-    # Who can propose a trade to me. Same tri-state as the other
-    # privacy controls. "everyone" — any user can send a trade
-    # offer; "contacts" — only mutual contacts can; "nobody" —
-    # trade endpoint refuses with 403. Default "everyone" so the
-    # trade system feels open by default; users worried about
-    # spam can dial it down. The setting is enforced server-side
-    # in `propose_trade`.
-    trade_policy: Mapped[str] = mapped_column(String(16), default="everyone")
+    # (`trade_policy` was unmapped on 2026-08-22. It guarded `propose_trade`,
+    # which went with the 2026-05-27 pivot: there is no trades router, the
+    # trade tables have no model, and the four remaining references were this
+    # column, its ALTER, its copy in /account/migrate, and a type in the web
+    # client that nothing reads. A preference that changes nothing is still a
+    # row in every dump.)
     # Who can call me (voice / video). Same tri-state. "nobody" hides
     # every call-affordance in the caller's UI and refuses incoming WS
     # call_offer events at the server.
@@ -230,12 +227,14 @@ class User(Base):
     # existing "always push when offline" behaviour and the user
     # mutes them via iOS system settings.
     push_preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    # Distinct-calendar-day activity counter, bumped once per UTC day
-    # on WS connect. Drives referral activation (3 days = "active").
-    # `last_active_day` is the YYYY-MM-DD string of the last bump so
-    # a same-day reconnect does not double-count.
-    active_days: Mapped[int] = mapped_column(Integer, default=0)
-    last_active_day: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # (`active_days` + `last_active_day` were unmapped on 2026-08-22 together
+    # with the referrals table they fed. They were a lifetime engagement
+    # dossier written for EVERY account on EVERY socket connect, and the only
+    # thing that ever read them was referral activation, on a table with zero
+    # rows in the project's life. The Hall of Fame was named as a second reader
+    # in a comment in /account/migrate; it is not one. `services/hof_stats.py`
+    # scores contributors off `reports` and `users.hof_bonus_*` and has never
+    # looked at an activity streak.)
     # Opt-in flag: when TRUE, the user's chosen `status` keeps being
     # broadcast to contacts even after the WS goes stale. Lets people
     # appear "around" with their selected status (online/away/dnd) when

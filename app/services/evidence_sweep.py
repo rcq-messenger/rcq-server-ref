@@ -44,8 +44,8 @@ log = logging.getLogger(__name__)
 SWEEP_INTERVAL_SECONDS: int = 60 * 60
 
 # Mirrors `routers/reports._EVIDENCE_DIR`. Read from env as a string rather
-# than imported, so this module stays import-decoupled from the router (same
-# reasoning as story_sweep vs the media router).
+# than imported, so this module stays import-decoupled from the router,
+# which would otherwise be a circular import at startup.
 EVIDENCE_DIR = Path(os.environ.get("RCQ_EVIDENCE_DIR", "evidence")).resolve()
 
 EVIDENCE_MAX_AGE_DAYS: int = int(os.environ.get("RCQ_EVIDENCE_MAX_AGE_DAYS", "30"))

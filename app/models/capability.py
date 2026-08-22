@@ -1,6 +1,4 @@
-from datetime import datetime, timezone
-
-from sqlalchemy import BigInteger, Boolean, DateTime
+from sqlalchemy import BigInteger, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -30,6 +28,8 @@ class UserCapability(Base):
     # BIGSERIAL, and a forgotten column then mints a trophy number silently.
     uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     sender_keys: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
-    )
+    # (`updated_at` was unmapped on 2026-08-22. Clients re-advertise on every
+    # app start, so the column was a second last-seen clock at app-launch
+    # granularity, per account, with no reader anywhere. The flag itself is one
+    # bit about which client generation an account runs and that is all this
+    # table needs to be.)

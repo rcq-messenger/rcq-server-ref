@@ -34,10 +34,10 @@ class CheckinIn(BaseModel):
 
     `display_name` is the anonymous label the client picked for
     this Nearby session (e.g. "Wandering Stranger #4982"). It's
-    what every other client will see in `/nearby/list` and Hood
-    Chat — the user's real nickname is deliberately not
-    surfaced. Optional for clients on older builds; the read path
-    falls back to the real nickname when null."""
+    what every other client will see in `/nearby/list`; the user's
+    real nickname is deliberately not surfaced. Optional for clients
+    on older builds; the read path falls back to the real nickname
+    when null."""
 
     bucket_id: str = Field(min_length=1, max_length=16)
     ttl_seconds: int = Field(ge=MIN_TTL, le=MAX_TTL)
@@ -194,9 +194,8 @@ async def list_nearby(
             .where(NearbyCheckin.expires_at > now)
             .where(NearbyCheckin.uin != me)
             # Hide users who set themselves to "offline" / invisible.
-            # They keep their checkin row (so they can still post in
-            # Hood Chat — that's the asymmetric "I want to read/say
-            # things but not be on a list" affordance) but they
+            # They keep their checkin row, which is the asymmetric "I
+            # want to read but not be on a list" affordance, but they
             # don't appear in anyone's Nearby roster.
             .where(User.status != "offline")
         )

@@ -14,9 +14,8 @@ from app.core.security import authorize_session, decode_device_id
 from app.models.contact import Contact
 from app.models.device_token import DeviceToken
 from app.models.user import User, _as_aware, presence_is_fresh, visible_status
-from app.routers import hood, random as random_chat
+from app.routers import random as random_chat
 from app.routers.presence import presence_watchers
-from app.routers.referrals import note_active_day
 from app.services.apns import send_voip_to_user
 from app.services.unifiedpush import send_call_to_user as up_call
 from app.services.connection_manager import manager
@@ -553,9 +552,9 @@ async def _on_connect(uin: int) -> None:
         if user.status == "offline":
             user.status = "online"
         user.last_seen = datetime.now(timezone.utc)
-        # Count this as an active day (once per UTC day) and pay out a
-        # referral the moment the invitee crosses the activation bar.
-        await note_active_day(db, user)
+        # No active-day bump here any more (2026-08-22). It wrote a lifetime
+        # distinct-days counter for every account on every connect to feed
+        # referral activation, and `referrals` went with the same cut.
         await db.commit()
 
         if was_stale:
@@ -617,7 +616,7 @@ async def _debounced_offline(uin: int) -> None:
             # stopped pinging, so it already reads as offline to everyone,
             # and writing "offline" would clobber a user-chosen
             # away/dnd/invisible. This block only fans out the live
-            # presence event + cleans up calls / rooms / hood.
+            # presence event + cleans up calls and audio rooms.
             # A user who opted to stay visible (presence_persistent within its
             # TTL) must NOT be flapped to offline just because the socket
             # dropped — that defeats the whole "stay online" setting and spams
@@ -642,14 +641,6 @@ async def _debounced_offline(uin: int) -> None:
                 # чтобы обновить, надо заново задать время".
                 await _schedule_presence_expiry(uin, user)
             await random_chat.on_disconnect(uin)
-            bucket, count = await hood.remove_subscriber(uin)
-            if bucket is not None:
-                remaining = await hood.subscribers_for(bucket)
-                if remaining:
-                    await manager.broadcast(
-                        remaining,
-                        {"type": "hood_count", "bucket_id": bucket, "count": count},
-                    )
 
             redis = await _get_redis()
             entry_raw = await redis.hget(_CALLS_KEY, str(uin))
@@ -698,7 +689,10 @@ async def _handle_client_message(
 ) -> None:
     """The WS channel is mostly server→client (presence + delivery). Clients send most
     things over HTTP. We accept a tiny client-initiated set: ping, typing relays,
-    Hood-Chat presence, and call signalling (offer / answer / ICE / end)."""
+    call signalling (offer / answer / ICE / end) and audio-room signalling.
+
+    Unknown frames fall through and are ignored, which is what shipped clients
+    still sending `hood_subscribe` now get (the Hood was deleted 2026-08-22)."""
     kind = msg.get("type")
     # Any frame proves this DEVICE is still here, which is what the per-device
     # push decision reads. Cheap (one SADD + EXPIRE) and it keeps the online
@@ -722,28 +716,6 @@ async def _handle_client_message(
         target = int(msg.get("to_uin", 0))
         if target:
             await manager.send(target, {"type": "typing", "from_uin": uin, "active": bool(msg.get("active", True))})
-        return
-    if kind == "hood_subscribe":
-        bucket = str(msg.get("bucket", "")).strip()
-        if not bucket:
-            return
-        count = await hood.add_subscriber(uin, bucket)
-        recipients = await hood.subscribers_for(bucket)
-        if recipients:
-            await manager.broadcast(
-                recipients,
-                {"type": "hood_count", "bucket_id": bucket, "count": count},
-            )
-        return
-    if kind == "hood_unsubscribe":
-        bucket, count = await hood.remove_subscriber(uin)
-        if bucket is not None:
-            recipients = await hood.subscribers_for(bucket)
-            if recipients:
-                await manager.broadcast(
-                    recipients,
-                    {"type": "hood_count", "bucket_id": bucket, "count": count},
-                )
         return
     # Call signalling — server is a dumb relay for SDP / ICE / hangups,
     # PLUS a single-call guard. Two parties can never be in two calls at

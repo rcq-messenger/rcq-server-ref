@@ -43,7 +43,6 @@ from app.routers.groups import (
     _members_with_users,
     _serialize,
 )
-from app.routers.referrals import record_referral
 from app.services.connection_manager import manager
 from app.services.queue_drain import account_watermark
 from app.services.uin import allocate_uin
@@ -103,6 +102,40 @@ def _pubkey32(value: str, field: str) -> str:
     return raw
 
 
+async def _connect_inviter(db: AsyncSession, inviter_uin: int, invitee_uin: int) -> bool:
+    """Make the inviter and the newcomer contacts of each other.
+
+    Caller (the /auth/register handler) owns the commit. Returns False and
+    writes nothing if the inviter is invalid, because a bad code must never
+    block registration.
+
+    This is all that is left of `routers/referrals.record_referral`, which also
+    wrote an inviter->invitee row with signup and activation dates that
+    deliberately survived a UIN migration. That was a permanent recruitment
+    genealogy backing a reward pipeline the code never had, so it went on
+    2026-08-22 and the half that does something for the user stayed.
+    """
+    if inviter_uin == invitee_uin:
+        return False
+    inviter = await db.scalar(
+        select(User).where(
+            User.uin == inviter_uin,
+            User.is_suspended.is_(False),
+        )
+    )
+    if inviter is None:
+        return False
+    for owner, contact in ((invitee_uin, inviter_uin), (inviter_uin, invitee_uin)):
+        exists = await db.scalar(
+            select(Contact.id).where(
+                Contact.owner_uin == owner, Contact.contact_uin == contact
+            )
+        )
+        if exists is None:
+            db.add(Contact(owner_uin=owner, contact_uin=contact))
+    return True
+
+
 class RegisterIn(BaseModel):
     nickname: str = Field(min_length=1, max_length=64)
     # Long-term X25519 ECDH public key (raw 32-byte, base64). Used by senders
@@ -111,7 +144,11 @@ class RegisterIn(BaseModel):
     # Long-term Ed25519 signing public key (raw 32-byte, base64). Used by
     # recipients to authenticate the sealed-sender envelope.
     signing_key: str
-    # Optional referral code — the inviter's UIN. Bad value is ignored.
+    # Whoever's invite link brought this install here, by UIN. Bad value is
+    # ignored. It connects the pair as contacts and nothing else: the referral
+    # genealogy this used to write went on 2026-08-22, since the reward
+    # pipeline its model described was never built and the table held zero rows
+    # in the project's life. The field stays because the link still has a job.
     inviter_uin: int | None = None
     # Server-join invite token. Required only when this server runs
     # REGISTRATION_POLICY=invite (ignored otherwise).
@@ -346,10 +383,12 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
             db.add(Contact(owner_uin=founder_uin, contact_uin=uin))
             await db.commit()
 
-    # Record any referral. Invalid code is rolled back, not raised —
-    # must never invalidate the already-committed registration above.
+    # Arrived by somebody's invite link: connect the two of them, both
+    # directions, so the account exists with a person in it instead of an empty
+    # list. Invalid code is rolled back, not raised: it must never invalidate
+    # the already-committed registration above.
     if body.inviter_uin:
-        if await record_referral(db, body.inviter_uin, uin):
+        if await _connect_inviter(db, body.inviter_uin, uin):
             await db.commit()
         else:
             await db.rollback()
@@ -752,8 +791,9 @@ async def delete_account(
     # The list lives in `app/services/uin_rows.py`, shared with the migration
     # path so the two can no longer drift: this block and that one were both
     # hand-maintained and both had gaps (queued GROUP ciphertext, the queue
-    # drain cursor, story views, capabilities, referrals, hood posts and the
-    # signed federation record were missed here).
+    # drain cursor, capabilities and the signed federation record were missed
+    # here, along with several per-feature tables that have since been
+    # deleted outright).
     await purge_uin_rows(db, uin)
     await db.execute(delete(DeviceToken).where(DeviceToken.uin == uin))
 
