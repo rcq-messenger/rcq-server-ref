@@ -206,9 +206,13 @@ async def send_request(
             # fire a push so they see "X accepted your request" on
             # their next wake. thread-id "peer-<UIN>" routes the
             # tap straight into the new chat.
-            accepter = await db.get(User, uin)
+            # ⚠ No name in the wake. The banner used to be titled with the
+            # ACCEPTER'S NICKNAME, which handed Apple and the Android
+            # distributor a real person's name tied to a device token
+            # (metadata-map-2026-08-22 §1.6, the sender-name half). The
+            # requester already knows who they asked, and `notif_kind` is
+            # what the client localizes the line from.
             push_args = dict(
-                alert_title=accepter.nickname if accepter else f"#{uin}",
                 alert_body="accepted your contact request",
                 thread_id=f"peer-{uin}",
                 notif_kind="contact_response_accepted",
@@ -252,8 +256,12 @@ async def send_request(
         if not delivered and await should_push_for(
             body.to_uin, kind="contact_request", sender_uin=uin,
         ):
+            # The requester is a STRANGER, so there is nothing local for the
+            # client to fill the name in from and the banner stays generic
+            # until the app is opened. That is the cost, and it is the right
+            # way round: a stranger's nickname on a third party's wire is
+            # exactly the pairing this stage exists to stop.
             push_args = dict(
-                alert_title=sender_nick,
                 alert_body="wants to add you as a contact",
                 thread_id="pending",
                 notif_kind="contact_request",
@@ -280,8 +288,8 @@ async def send_request(
     if not delivered and await should_push_for(
         body.to_uin, kind="contact_request", sender_uin=uin,
     ):
+        # Generic banner, same reasoning as the reopen path above.
         push_args = dict(
-            alert_title=sender_nick,
             alert_body="wants to add you as a contact",
             thread_id="pending",
             notif_kind="contact_request",
@@ -428,9 +436,8 @@ async def respond(
     if not delivered and body.accept and await should_push_for(
         req_from, kind="contact_response_accepted", sender_uin=uin,
     ):
-        accepter = await db.get(User, uin)
+        # Same as the auto-accept path above: no name in the wake.
         push_args = dict(
-            alert_title=accepter.nickname if accepter else f"#{uin}",
             alert_body="accepted your contact request",
             thread_id=f"peer-{uin}",
             notif_kind="contact_response_accepted",

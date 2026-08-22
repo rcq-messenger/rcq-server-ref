@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.config import log_identity, settings
 from app.core import metrics
 from app.core.db import engine, get_db
 from app.core.security import mark_suspended, require_admin
@@ -605,7 +605,6 @@ async def reply_to_report(
     await db.refresh(report)
 
     push_args = dict(
-        alert_title="RCQ",
         alert_body="We answered your report",
         thread_id="reports",
         notif_kind="report_reply",
@@ -1410,7 +1409,13 @@ async def grant_uin(
             select(OwnedUin.uin).where(OwnedUin.owner_uin == body.to_uin).order_by(OwnedUin.uin)
         )
     ).scalars().all()
-    log.warning("[uin-grant] %s -> %s", body.uin, body.to_uin)
+    # ⚠ Two accounts in the clear, at WARNING, on a line whose whole content
+    # was "this number now belongs to that person". The durable record of the
+    # grant is the `owned_uins` row with `source="granted"`, which is where an
+    # operator should read it; the journal only needs to know a grant happened
+    # and when. Both fields go behind the flag, the vanity number included:
+    # it is one lookup away from naming its new holder.
+    log.warning("[uin-grant] %s -> %s", log_identity(body.uin), log_identity(body.to_uin))
     return GrantUinOut(uin=body.uin, to_uin=body.to_uin, owned=[int(u) for u in owned])
 
 

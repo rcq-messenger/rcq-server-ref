@@ -139,6 +139,16 @@ async def lifespan(_: FastAPI):
     # missing Redis is a hard error we want to surface at boot, not on
     # the first user request.
     await get_redis()
+    # One-shot, idempotent, before anything is served: the linked-web-session
+    # registry and its revocation denylist move off key names that spelled out
+    # the account number. Folding them in rather than renaming is what makes
+    # this safe with four workers booting at once. See the module.
+    from app.core.redis_keys import migrate_legacy_account_keys
+
+    try:
+        await migrate_legacy_account_keys()
+    except Exception:  # noqa: BLE001, a key migration must never block boot
+        _log.exception("[boot] legacy per-account key migration failed")
     expire_task = asyncio.create_task(random_chat.expire_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.

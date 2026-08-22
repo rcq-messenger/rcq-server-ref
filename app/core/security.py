@@ -196,10 +196,14 @@ async def device_is_revoked(uin: int, device_id: str | None) -> bool:
     """
     if not device_id:
         return False
-    from app.core.redis import get_redis  # local import avoids an import cycle
+    # Local imports avoid an import cycle: `redis_keys` reaches `rate_limit`
+    # for the bucket derivation and `rate_limit` reaches back here for
+    # `decode_token`. By the time this runs, both are loaded.
+    from app.core.redis import get_redis
+    from app.core.redis_keys import DEV_REVOKED_PREFIX, account_key
 
     redis = await get_redis()
-    return bool(await redis.sismember(f"dev_revoked:{uin}", device_id))
+    return bool(await redis.sismember(account_key(DEV_REVOKED_PREFIX, uin), device_id))
 
 
 async def authorize_session(token: str) -> int:

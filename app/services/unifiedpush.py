@@ -15,6 +15,14 @@ content — exactly the exposure Apple already has on the iOS path. Call
 pushes carry the call payload (call_id/from/sdp) just like the iOS VoIP
 push does; the push server's exposure there matches APNs VoIP.
 
+⚠ It did not match on the part that mattered until 2026-08-22: `title`
+carried the PLAIN GROUP NAME and `group_name` repeated it, so the
+distributor (for most Android users a third party, and for our own
+`push.rcq.app` a Cloudflare edge that terminates TLS) read the room
+name next to the endpoint on every post (metadata-map-2026-08-22 §1.6).
+Both fields are gone and the title is a constant; see the note on
+`apns._ALERT_TITLE` for what a reader on this path still sees.
+
 Endpoints are stored in `device_tokens` with `platform="android-up"`
 (the URL in the `token` column), so they reuse the existing registration
 upsert (`POST /users/me/push-token`), the burn cascade, and the
@@ -72,6 +80,12 @@ from app.models.device_token import DeviceToken
 log = logging.getLogger(__name__)
 
 _PLATFORM = "android-up"
+
+# The banner title, for every wake of every kind. Spelled out here rather than
+# imported from `apns` for the same reason `_UP_PLATFORM` is spelled out there:
+# the two senders stay free of each other. See the note on `apns._ALERT_TITLE`
+# for why this is a constant and not a parameter.
+_ALERT_TITLE = "RCQ"
 
 # How often a still-healthy endpoint re-stamps `push_last_ok`. Not per push
 # (that would be a write on every wake for every device) and not never (which
@@ -497,7 +511,6 @@ def _schedule(
 async def send_to_user(
     uin: int,
     *,
-    alert_title: str = "RCQ",
     alert_body: str = "New message",
     envelope_b64: str | None = None,
     envelope_type: str | None = None,
@@ -505,7 +518,6 @@ async def send_to_user(
     thread_id: str | None = None,
     notif_kind: str | None = None,
     group_id: int | None = None,
-    group_name: str | None = None,
     exclude_tokens: frozenset[str] = frozenset(),
     skip_devices: frozenset[str] = frozenset(),
     endpoints: Sequence[EndpointRow] | None = None,
@@ -531,8 +543,17 @@ async def send_to_user(
     The opaque `env` (already E2E-encrypted) is carried so the woken receiver
     can decrypt + post the real notification in-process without a queue fetch,
     exactly like the iOS NSE — the push server sees only ciphertext.
+
+    ⚠ No `alert_title` and no `group_name`, same as `apns.send_to_user` and for
+    the same reason: those two fields were the room name and the sender's
+    nickname, handed to a third-party distributor in the clear on every wake.
+    Both are gone from the SIGNATURE so no caller can put them back by
+    accident. The receiver titles the banner from the envelope it opens or from
+    its own group cache.
     """
-    payload: dict[str, Any] = {"v": 1, "type": "msg", "to_uin": uin, "title": alert_title, "body": alert_body}
+    payload: dict[str, Any] = {
+        "v": 1, "type": "msg", "to_uin": uin, "title": _ALERT_TITLE, "body": alert_body,
+    }
     if envelope_b64:
         payload["env"] = envelope_b64
         payload["envType"] = envelope_type or "message"
@@ -548,9 +569,11 @@ async def send_to_user(
     if notif_kind:
         payload["notif_kind"] = notif_kind
     if group_id is not None:
+        # Kept, deliberately: the receiver's mute and mentions-only gates run
+        # before it opens anything and key on this id, so removing it would
+        # silently break muting for a release. It is an id, not a name, and it
+        # goes when group identity is sealed.
         payload["group_id"] = group_id
-    if group_name:
-        payload["group_name"] = group_name
     _schedule(uin, payload, _TTL_MESSAGE, "msg", exclude_tokens, skip_devices, endpoints)
     return 1
 

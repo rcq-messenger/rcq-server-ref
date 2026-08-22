@@ -591,12 +591,14 @@ async def send_group_sealed(
     # reads, typing, edits and deletes still fan out from any member so a
     # broadcast group keeps its reaction/read interactions (and web clients,
     # which always send a token, don't get their member reactions rejected).
-    # Fetched unconditionally: the push block below titles its banner with
-    # `g.name` for EVERY pushable type, so binding this only under the
-    # "message" gate left `g` unbound on a "system"/"secscreen" group send —
-    # an UnboundLocalError 500 raised AFTER the commit, i.e. recipients got
-    # the message and the sender saw a failure. iOS types systemNotice as
-    # "system", so that path is reachable from a shipped client.
+    # Fetched unconditionally, and it has to stay that way. It used to be
+    # bound only under the "message" gate, which left `g` unbound on a
+    # "system"/"secscreen" group send: an UnboundLocalError 500 raised AFTER
+    # the commit, i.e. recipients got the message and the sender saw a
+    # failure. iOS types systemNotice as "system", so that path is reachable
+    # from a shipped client. The reader below it was the push block titling
+    # its banner with `g.name`, which is gone; `_enforce_group_slowmode` runs
+    # unconditionally and takes `g` too, so the hazard is unchanged.
     g = await db.get(Group, body.group_id)
     if body.envelope_type == "message":
         if g is not None and g.post_policy == "owner_only" and caller is not None and caller != g.owner_uin:
@@ -677,10 +679,12 @@ async def send_group_sealed(
         payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
         envelope_type = body.envelope_type
         group_id = body.group_id
-        # Title the banner with the group's name + carry it in the payload so
-        # the client shows WHICH group (this sealed path used to send neither,
-        # so small-group pushes always read as the generic "New group message").
-        gname = (g.name if g is not None else None) or "RCQ"
+        # ⚠ The group's NAME used to be read here and sent twice, as the banner
+        # title and as a `group_name` field, so that the client could show WHICH
+        # group. It reached Apple and the Android distributor before it reached
+        # the client, which is the leak the map calls the strongest off-island
+        # one we had (§1.6). The wake now carries only `group_id`; the client
+        # titles the banner from its own copy of the roster.
         sender_tokens = await _sender_device_tokens(db, caller)
         # Never push the sender their OWN message (they backgrounded right
         # after sending); their other devices still get the queue carbon.
@@ -716,25 +720,21 @@ async def send_group_sealed(
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
                 target_uin,
-                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload_by_uin.get(target_uin),
                 envelope_type=envelope_type,
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
-                group_name=gname,
                 exclude_tokens=sender_tokens,
                 tokens=ends.ios,
             )
             await up_send(
                 target_uin,
-                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload_by_uin.get(target_uin),
                 envelope_type=envelope_type,
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
-                group_name=gname,
                 exclude_tokens=sender_tokens,
                 endpoints=ends.android,
             )
@@ -880,9 +880,7 @@ async def send_group_broadcast(
     if body.envelope_type in _PUSHABLE_TYPES:
         group_id = body.group_id
         payload = body.payload
-        # Title the banner with the group's name (not the generic "RCQ") so the
-        # user can tell which group a push came from at a glance.
-        gname = g.name or "RCQ"
+        # Same as the sealed path above: the name is not sent, only the id.
         sender_tokens = await _sender_device_tokens(db, caller)
         # Never push the sender their OWN message: they backgrounded right
         # after sending and fell into offline_recipients. Their other devices
@@ -912,25 +910,21 @@ async def send_group_broadcast(
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
                 target_uin,
-                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload,
                 envelope_type="gmsg",
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
-                group_name=gname,
                 exclude_tokens=sender_tokens,
                 tokens=ends.ios,
             )
             await up_send(
                 target_uin,
-                alert_title=gname,
                 alert_body="New group message",
                 envelope_b64=payload,
                 envelope_type="gmsg",
                 thread_id=f"group-{group_id}",
                 group_id=group_id,
-                group_name=gname,
                 exclude_tokens=sender_tokens,
                 endpoints=ends.android,
             )

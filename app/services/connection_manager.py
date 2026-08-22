@@ -46,6 +46,7 @@ from fastapi import WebSocket
 
 from app.core.config import log_identity
 from app.core.redis import get_redis
+from app.core.redis_keys import ONLINE_DEVS_PREFIX, account_key
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,15 @@ _FANOUT_CHANNEL = "ws:fanout"
 # liveness test. Before that existed the only prune was the admin console's,
 # which removes members with no `users` row, so it cleaned up burned accounts
 # and kept every live account's ghost forever.
+#
+# ⚠ Its MEMBERS are account numbers in the clear, and stayed that way when the
+# three per-account key NAMES around it were hashed on 2026-08-22. That is a
+# decision, not an oversight, and the reason is one-directional: every hot
+# reader below asks "is this uin a member" and would work unchanged against
+# hashes, but the admin console's roster (`admin._online_users`) reads the
+# members OUT and selects them from `users` to show nickname, status and last
+# seen. An HMAC does not run backwards, so hashing here deletes the operator's
+# online list. Whoever takes that trade should read core/redis_keys first.
 _ONLINE_KEY = "ws:online_uins"
 # Per-account set of the DEVICE ids currently connected to any worker, so a
 # push decision can be made per device instead of per account. Without it
@@ -85,7 +95,13 @@ _BUSY_ACCOUNT_HINT = 4
 
 
 def _online_devs_key(uin: int) -> str:
-    return f"ws:online_devs:{uin}"
+    # Hashed since 2026-08-22. It was `ws:online_devs:{uin}`, i.e. one live key
+    # per account that is connected right now, which made `KEYS *` on Redis
+    # alone a presence roster of the island. No migration: the key lives 180
+    # seconds and a deploy drops every socket anyway, so the legacy ones age
+    # out unread while the reconnects write the new names. See core/redis_keys,
+    # including why the `ws:online_uins` MEMBERS beside it are still plain.
+    return account_key(ONLINE_DEVS_PREFIX, uin)
 
 
 # How often each worker publishes a heartbeat on the fanout channel, so that
