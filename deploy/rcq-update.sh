@@ -98,7 +98,9 @@ if docker compose ps --services 2>/dev/null | grep -q '^postgres$'; then
     log "dumping the database to $BACKUP${SEAL:+ (sealed to /etc/rcq/backup.pub)}"
     if docker compose exec -T postgres pg_dump -U rcq rcq 2>/dev/null | gzip | ${SEAL:-cat} > "$BACKUP"; then
         # Keep the last five, not every one: this runs on somebody else's disk.
-        ls -1t "$STATE_DIR"/pre-update-*.sql.gz "$STATE_DIR"/pre-update-*.sql.gz.age 2>/dev/null | tail -n +6 | xargs -r rm -f
+        # `|| true`: under pipefail an unmatched glob makes ls fail and the
+        # whole script die silently right after a successful dump.
+        { ls -1t "$STATE_DIR"/pre-update-*.sql.gz "$STATE_DIR"/pre-update-*.sql.gz.age 2>/dev/null || true; } | tail -n +6 | xargs -r rm -f
         log "dump ok ($(du -h "$BACKUP" | cut -f1))"
     else
         rm -f "$BACKUP"
