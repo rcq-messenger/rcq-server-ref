@@ -418,10 +418,10 @@ async def fetch_bundle(
     from app.routers.devices import has_linked_devices  # local import: avoid cycle
     if await has_linked_devices(uin):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "multi-device: v=1 only")
-    return await _primary_bundle(uin, db, with_opk=await _may_take_opk(request, me))
+    return await _primary_bundle(uin, db, request, me)
 
 
-async def _primary_bundle(uin: int, db: AsyncSession, with_opk: bool = True) -> BundleOut:
+async def _primary_bundle(uin: int, db: AsyncSession, request: Request | None = None, me: int | None = None) -> BundleOut:
     """The primary device's (device 1) bundle, with no multi-device gate.
 
     Split out of `fetch_bundle` so the per-device path can reach device 1 while
@@ -440,6 +440,9 @@ async def _primary_bundle(uin: int, db: AsyncSession, with_opk: bool = True) -> 
         # 404 here as "fall back to v=1 envelope path".
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user has no signal bundle")
 
+    # The token is spent only once the bundle is known to exist: a token burnt
+    # on a 404 is a token the sender minted for nothing.
+    with_opk = True if request is None else await _may_take_opk(request, me)
     opk = await _claim_opk(db, uin=uin, device_id=None) if with_opk else None
     opk_out: OneTimePreKeyIn | None = None
     if opk is not None:
@@ -663,9 +666,8 @@ async def fetch_device_bundle(
     deviceId 1 = the primary (phone) bundle on the User row (delegates to the
     legacy path); >= 2 = a secondary device. Consumes one OPK from THAT
     device's pool."""
-    with_opk = await _may_take_opk(request, me)
     if device_id == PRIMARY_DEVICE_ID:
-        return await _primary_bundle(uin, db, with_opk=with_opk)
+        return await _primary_bundle(uin, db, request, me)
 
     device = (
         await db.execute(
@@ -679,6 +681,7 @@ async def fetch_device_bundle(
     if device is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
 
+    with_opk = await _may_take_opk(request, me)
     opk = await _claim_opk(db, uin=uin, device_id=device_id) if with_opk else None
     opk_out: OneTimePreKeyIn | None = None
     if opk is not None:
