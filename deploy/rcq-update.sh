@@ -79,11 +79,26 @@ fi
 # design: an island with no Postgres container (SQLite) has its file inside the
 # volume and is covered by the compose snapshot instead.
 if docker compose ps --services 2>/dev/null | grep -q '^postgres$'; then
-    BACKUP="$STATE_DIR/pre-update-$(date -u +%Y%m%d-%H%M%S).sql.gz"
-    log "dumping the database to $BACKUP"
-    if docker compose exec -T postgres pg_dump -U rcq rcq 2>/dev/null | gzip > "$BACKUP"; then
+    # ⚠ Sealed when the operator has set it up: a plaintext dump kept beside
+    # the database extends every "deleted" on the island by however long it
+    # sits there (a burnt account, a swept queue row, a resolved request all
+    # live on in it). With `age` installed and a recipient key at
+    # /etc/rcq/backup.pub (the PRIVATE half kept OFF this box), the dump is
+    # encrypted on the way to disk and the plaintext never touches it:
+    #   age-keygen -o backup.key          # on your own machine, keep it there
+    #   grep "public key" backup.key      # -> /etc/rcq/backup.pub on the island
+    #   restore: age -d -i backup.key pre-update-*.sql.gz.age | gunzip | psql
+    # Without both, the dump is plaintext as before: a dump you cannot read on
+    # the day you need it is worse than one the disk can.
+    SEAL=""
+    if command -v age >/dev/null 2>&1 && [ -s /etc/rcq/backup.pub ]; then
+        SEAL="age -R /etc/rcq/backup.pub"
+    fi
+    BACKUP="$STATE_DIR/pre-update-$(date -u +%Y%m%d-%H%M%S).sql.gz${SEAL:+.age}"
+    log "dumping the database to $BACKUP${SEAL:+ (sealed to /etc/rcq/backup.pub)}"
+    if docker compose exec -T postgres pg_dump -U rcq rcq 2>/dev/null | gzip | ${SEAL:-cat} > "$BACKUP"; then
         # Keep the last five, not every one: this runs on somebody else's disk.
-        ls -1t "$STATE_DIR"/pre-update-*.sql.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
+        ls -1t "$STATE_DIR"/pre-update-*.sql.gz "$STATE_DIR"/pre-update-*.sql.gz.age 2>/dev/null | tail -n +6 | xargs -r rm -f
         log "dump ok ($(du -h "$BACKUP" | cut -f1))"
     else
         rm -f "$BACKUP"
