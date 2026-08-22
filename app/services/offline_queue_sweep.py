@@ -97,8 +97,9 @@ SWEEP_INTERVAL_SECONDS = int(os.environ.get("OFFLINE_QUEUE_SWEEP_INTERVAL_SECOND
 # `cutoff` (or whose account is gone). Written as SQL because the ORM's
 # `delete().where(...)` cannot express a LIMIT, and the LIMIT is the point.
 #
-# ⚠ `skdm` is EXEMPT, and the exemption is the whole point of the write-side
-# rule it mirrors (`app.routers.messages._keep_for`). A sender-key
+# ⚠ The CRITICAL class (cls 2 — stage 2a: skdm, sknack, every future
+# key-distribution kind) is EXEMPT, and the exemption is the whole point of the
+# write-side rule it mirrors (`app.routers.messages._keep_for`). A sender-key
 # distribution is not backlog: it is the chain key, and a member who loses it
 # cannot read a single later broadcast — no bubble, no unread, no sound, and
 # no way for their client to tell "no messages" from "cannot decrypt" (#544).
@@ -107,8 +108,14 @@ SWEEP_INTERVAL_SECONDS = int(os.environ.get("OFFLINE_QUEUE_SWEEP_INTERVAL_SECOND
 # not what filled this table; content addressed to people who never return is,
 # and that is still swept. The 30-day TTL above still bounds these rows.
 #
-# `sknack` is deliberately NOT exempt — it is a QUESTION, worthless once
-# stale, and it has its own much shorter TTL below.
+# ⚠ MIXED TABLE. New rows carry `cls`; the rows that predate the column carry
+# NULL and are read through the envelope_type fallback, exactly as the router
+# does. So the exemption is `cls = 2 OR (legacy) envelope_type = 'skdm'`, and
+# the delete candidate is everything that is NEITHER. `sknack` used to fall
+# under the dormant rule while `skdm` did not; now a NEW sknack (cls 2) is
+# spared here too, but it is still reaped fast by its own short TTL below, so
+# nothing hoards. A LEGACY sknack (cls NULL) keeps the old behaviour: not
+# spared here, caught by its TTL.
 _DORMANT_SQL = text(
     """
     DELETE FROM offline_group_messages
@@ -116,6 +123,7 @@ _DORMANT_SQL = text(
         SELECT o.id FROM offline_group_messages o
         LEFT JOIN users u ON u.uin = o.to_uin
         WHERE (u.uin IS NULL OR u.last_seen < :cutoff)
+          AND (o.cls IS NULL OR o.cls <> 2)
           AND o.envelope_type <> 'skdm'
         LIMIT :batch
     )

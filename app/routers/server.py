@@ -75,6 +75,16 @@ class ServerCapabilities(BaseModel):
     # mint + attach them to sealed deposits. Default false so old clients ignore
     # it and self-hosters stay on the open mailbox + per-IP cap.
     deposit_auth: bool = False
+    # Stage 2 metadata cut: this island understands the 3-value envelope CLASS.
+    # It accepts `cls` + `ring` on POST /messages/sealed (envelope_type stays an
+    # ingest alias forever), and serves `cls` + the durable per-mailbox `seq`
+    # alongside envelope_type + id on the queue drain. A new client keys its
+    # switch to reading `seq` / sending `cls` on this flag; islands upgrade
+    # independently, so an OLDER peer that lacks the field is treated as "off" by
+    # a new client and keeps getting envelope_type only. It is a permanent
+    # capability of THIS codebase (not an operator toggle), so it is always True
+    # here — the same reasoning that pins hood/stories/nearby to a constant.
+    envelope_class: bool = True
 
 
 class ServerInfo(BaseModel):

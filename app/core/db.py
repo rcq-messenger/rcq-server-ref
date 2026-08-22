@@ -274,8 +274,26 @@ _QUEUE_CURSOR_COLUMNS: list[tuple[str, str]] = [
 # Fan-out addressing: which of the recipient's libsignal devices a queued
 # ciphertext is for. NULL on every row written before fan-out existed, which is
 # exactly the "any device may read it" meaning the drain gives it.
+#
+# Stage 2: `cls` is the 3-value storage class beside envelope_type (2a) and
+# `seq` is the durable per-mailbox sequence beside id (2b). Both nullable and
+# additive: the ~4331 rows live at the time of the migration keep NULL in both
+# and are read back through the envelope_type / id fallbacks. envelope_type and
+# id keep being written; they are dropped only in a later release, after every
+# client reads the new fields.
 _OFFLINE_MESSAGE_COLUMNS: list[tuple[str, str]] = [
     ("to_device_id", "INTEGER"),
+    ("cls", "SMALLINT"),
+    ("seq", "BIGINT"),
+]
+
+# Stage 2a on `offline_group_messages`: the same 3-value class beside
+# envelope_type. The dormant sweep and `_keep_for` branch on it (cls == 2 is
+# key-distribution material that must survive the sweep), falling back to
+# envelope_type for the legacy rows that carry NULL. No `seq` here: the group
+# queue gets its own per-room log in stage 5, not a per-mailbox sequence.
+_OFFLINE_GROUP_MESSAGE_COLUMNS: list[tuple[str, str]] = [
+    ("cls", "SMALLINT"),
 ]
 
 _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
@@ -286,7 +304,7 @@ _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry, mailbox_seq  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 
@@ -321,6 +339,7 @@ async def init_db() -> None:
         ("reports", _REPORT_COLUMNS),
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
         ("offline_messages", _OFFLINE_MESSAGE_COLUMNS),
+        ("offline_group_messages", _OFFLINE_GROUP_MESSAGE_COLUMNS),
         ("invites", _INVITE_COLUMNS),
         ("device_tokens", _DEVICE_TOKEN_COLUMNS),
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
@@ -464,6 +483,22 @@ async def init_db() -> None:
             await conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_one_time_prekeys_consumed_at "
                 "ON one_time_prekeys (consumed, consumed_at)"
+            ))
+        except Exception:
+            pass
+
+    # Stage 2b: (to_uin, seq) is unique — the loud backstop the plan requires so
+    # a drifted per-mailbox counter raises (503, the client retries) instead of
+    # silently overwriting a queued envelope. Added by hand for the same reason
+    # as the two indexes above: `create_all` is checkfirst=True and skips a table
+    # that already exists, so it never touches the live `offline_messages`. The
+    # ~4331 rows that predate `seq` all carry NULL, and NULLs are distinct in a
+    # unique index on both Postgres and SQLite, so none of them collide.
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_offline_messages_to_uin_seq "
+                "ON offline_messages (to_uin, seq)"
             ))
         except Exception:
             pass
