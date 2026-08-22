@@ -616,6 +616,7 @@ async def register_device(
 )
 async def list_devices(
     uin: int,
+    me: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> DevicesOut:
     """Every device of `uin` a sender should fan out to: the primary device
@@ -624,11 +625,16 @@ async def list_devices(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # The user-typed label ("Web (Chrome)", a browser and OS fingerprint) is
+    # served to the OWNER only, whose key-slots screen names the slots by it
+    # and who authenticates this one call about their own account (no pair to
+    # leak there). A sender asking about somebody else gets "".
+    own = me is not None and me == uin
     devices: list[DeviceInfo] = []
     if user.signal_identity_key is not None:
         devices.append(DeviceInfo(
             device_id=PRIMARY_DEVICE_ID,
-            label="",
+            label="primary" if own else "",
             signal_identity_key=user.signal_identity_key,
         ))
     rows = (
@@ -641,10 +647,7 @@ async def list_devices(
     for d in rows:
         devices.append(DeviceInfo(
             device_id=d.device_id,
-            # The user-typed label ("Web (Chrome)", a browser and OS
-            # fingerprint) was served to any authenticated stranger and no
-            # sender consumes it; the owner's own list (GET /devices) keeps it.
-            label="",
+            label=(d.label or "") if own else "",
             signal_identity_key=d.signal_identity_key,
         ))
     return DevicesOut(uin=uin, devices=devices)
