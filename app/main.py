@@ -68,22 +68,41 @@ class _RedactSecretsInLogs(logging.Filter):
     # line still says which endpoint was called and how it answered.
     _RE_ID_PATH = re.compile(r"/(\d{3,10})(?=[/?\s\"]|$)")
 
+    def _scrub(self, text: str, paths: bool) -> str:
+        out = text
+        if "token=" in out or "invite=" in out:
+            out = self._RE.sub(r"\1=<redacted>", out)
+        if paths:
+            out = self._RE_ADDR.sub(r"\1.0", out)
+            out = self._RE_ID_PATH.sub("/<id>", out)
+        return out
+
     def filter(self, record: logging.LogRecord) -> bool:
+        # ⚠⚠ NEVER blank `record.args` on a uvicorn record. Its access formatter
+        # unpacks them itself (`uvicorn/logging.py`: `(client_addr, method,
+        # full_path, http_version, status_code) = recordcopy.args`), so an empty
+        # tuple raises inside the formatter, and Python's logging then prints a
+        # full traceback AND an `Arguments:` line holding the untouched original
+        # values. Rewriting the message and dropping the args therefore turned
+        # one clean line into a traceback that leaked exactly what the rewrite
+        # was hiding, on every single request. Rewrite the ARGS in place and
+        # leave the shape alone.
+        uvicorn_record = record.name.startswith("uvicorn")
+        if uvicorn_record and isinstance(record.args, tuple) and record.args:
+            scrubbed = tuple(
+                self._scrub(a, paths=True) if isinstance(a, str) else a
+                for a in record.args
+            )
+            if scrubbed != record.args:
+                record.args = scrubbed
+            return True
         try:
             msg = record.getMessage()
         except Exception:  # noqa: BLE001 — a broken record must not kill logging
             return True
-        original = msg
-        if "token=" in msg or "invite=" in msg:
-            msg = self._RE.sub(r"\1=<redacted>", msg)
-        # Only access-shaped lines: the quoted request line is the tell. This
-        # keeps the rewrite away from application logs that legitimately print
-        # numbers, and away from tracebacks.
-        if '"' in msg and ("HTTP/" in msg or "WebSocket " in msg):
-            msg = self._RE_ADDR.sub(r"\1.0", msg)
-            msg = self._RE_ID_PATH.sub("/<id>", msg)
-        if msg is not original:
-            record.msg = msg
+        cleaned = self._scrub(msg, paths=uvicorn_record)
+        if cleaned != msg:
+            record.msg = cleaned
             record.args = ()
         return True
 
