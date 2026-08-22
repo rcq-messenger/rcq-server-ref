@@ -296,6 +296,11 @@ _OFFLINE_GROUP_MESSAGE_COLUMNS: list[tuple[str, str]] = [
     ("cls", "SMALLINT"),
 ]
 
+# Report #695: the bridge from a key slot to the auth session that claimed it.
+_DEVICE_COLUMNS: list[tuple[str, str]] = [
+    ("auth_device_id", "TEXT"),
+]
+
 _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
     ("device_id", "VARCHAR(64)"),
     # Push health (UnifiedPush sender). NULL error = healthy / never tried.
@@ -342,6 +347,7 @@ async def init_db() -> None:
         ("offline_group_messages", _OFFLINE_GROUP_MESSAGE_COLUMNS),
         ("invites", _INVITE_COLUMNS),
         ("device_tokens", _DEVICE_TOKEN_COLUMNS),
+        ("devices", _DEVICE_COLUMNS),
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
         ("broker_relays", _BROKER_RELAY_COLUMNS),
         ("contact_requests", _CONTACT_REQUEST_COLUMNS),
