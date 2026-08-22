@@ -45,13 +45,45 @@ class _RedactSecretsInLogs(logging.Filter):
 
     _RE = re.compile(r"(?i)\b(token|access_token|invite)=[A-Za-z0-9._\-]+")
 
+    # ⚠ The token was only half of it. The same access line carries the client's
+    # FULL address next to an account number in the path:
+    #
+    #     INFO: ('185.102.11.202', 0) - "WebSocket /ws/68650924?token=<redacted>"
+    #     INFO: ('185.102.11.202', 0) - "GET /users/68650924/info HTTP/1.1" 200
+    #
+    # so the journal was an IP-to-account map plus a per-second activity feed
+    # for every account, about 1.2 million lines a day over the 2.4 days the
+    # 1G cap holds. The metadata audit of 22.08 closed the application's own
+    # `uin=` log lines and left this one, which is larger than all of them
+    # together. Caddy has masked its own copy to /24 since 11.08; this is the
+    # same masking arriving at the channel that still had the raw value.
+    #
+    # Both halves are rewritten rather than the line dropped: an access log
+    # with no addresses and no account numbers still answers "is it serving,
+    # what is it answering, how fast", which is what it is read for.
+    _RE_ADDR = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b")
+    # Any long-ish number that is a whole path segment: account numbers, and
+    # group ids too, which name a room and are metadata in their own right. A
+    # device id or an API version is one or two digits and survives, so the
+    # line still says which endpoint was called and how it answered.
+    _RE_ID_PATH = re.compile(r"/(\d{3,10})(?=[/?\s\"]|$)")
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
         except Exception:  # noqa: BLE001 — a broken record must not kill logging
             return True
+        original = msg
         if "token=" in msg or "invite=" in msg:
-            record.msg = self._RE.sub(r"\1=<redacted>", msg)
+            msg = self._RE.sub(r"\1=<redacted>", msg)
+        # Only access-shaped lines: the quoted request line is the tell. This
+        # keeps the rewrite away from application logs that legitimately print
+        # numbers, and away from tracebacks.
+        if '"' in msg and ("HTTP/" in msg or "WebSocket " in msg):
+            msg = self._RE_ADDR.sub(r"\1.0", msg)
+            msg = self._RE_ID_PATH.sub("/<id>", msg)
+        if msg is not original:
+            record.msg = msg
             record.args = ()
         return True
 
