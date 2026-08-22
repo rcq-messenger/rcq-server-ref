@@ -1191,7 +1191,17 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_CURSOR_DAYS)
     # The freshest cursor is the proof that somebody is still reading this
-    # account somewhere; it is never itself a candidate, whatever its age.
+    # account somewhere, and the SUPERSEDED rule below never takes it.
+    #
+    # ⚠ The 30-day rule does, and this comment used to claim otherwise. A
+    # single-device account quiet for a month loses its cursor (there is a test
+    # for it, `test_cursor_reap_local.py` case 3), the next drain finds none,
+    # falls back to `account_watermark`, and with no cursors left that is
+    # (0, 0), so the device is handed every row still in the queue. Clients
+    # dedupe by envelope id, so nothing is shown twice; what it costs is a
+    # phone coming back from a month away re-downloading a month of mail.
+    # Deliberate as far as the test goes, worth revisiting, and either way the
+    # comment has to say what the code does.
     stamps = [_as_utc(c.updated_at) for c in cursors if _as_utc(c.updated_at) is not None]
     newest = max(stamps) if stamps else None
     superseded_cutoff = now - timedelta(days=SUPERSEDED_CURSOR_DAYS)
