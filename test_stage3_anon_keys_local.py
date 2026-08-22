@@ -116,6 +116,10 @@ async def main():
         devs = r.json()["devices"]
         check("device list names device 1", [d["device_id"] for d in devs] == [1])
         check("device list carries no label", all(not d.get("label") for d in devs))
+        r = await c.get(f"/keys/{RECIPIENT}/devices", headers={"Authorization": f"Bearer {owner}"})
+        check("the owner still sees labels on their own list", r.json()["devices"][0].get("label") == "primary")
+        r = await c.get(f"/keys/{RECIPIENT}/devices", headers={"Authorization": f"Bearer {sender}"})
+        check("another account does not", all(not d.get("label") for d in r.json()["devices"]))
         r = await c.get(f"/keys/{RECIPIENT}/bundle")
         check("bundle without a token is 200", r.status_code == 200)
         check("  ... with the signed prekey", r.json()["signed_prekey"]["id"] == 1)
