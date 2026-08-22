@@ -191,6 +191,23 @@ class ConnectionManager:
                 "race with subscribe. Continuing anyway."
             )
 
+    async def shutdown(self) -> None:
+        """Stop the subscriber and its watchdog BEFORE the Redis client is
+        closed. Without this every deploy ended with one full traceback per
+        worker: `close_redis()` pulled the connection from under the blocking
+        read, the loop saw "Connection closed by server" and logged it as a
+        hiccup it was about to recover from, and then the process exited.
+        Eleven deploys in one night, forty-four tracebacks, none of them news.
+        """
+        for attr in ("_watchdog_task", "_pubsub_task"):
+            task = getattr(self, attr)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
     async def _pubsub_watchdog(self) -> None:
         """Restart the subscriber when this worker has gone deaf.
 
@@ -328,7 +345,7 @@ class ConnectionManager:
                             transit,
                             ended - began,
                             target,
-                            envelope.get("uin"),
+                            log_identity(envelope.get("uin")),
                             fanned,
                             os.getpid(),
                         )
@@ -385,7 +402,7 @@ class ConnectionManager:
                 log.warning(
                     "ws send took %.2fs uin=%s dev=%s bytes=%d pid=%d",
                     took,
-                    uin,
+                    log_identity(uin),
                     self._device_of.get(ws, "?"),
                     len(text),
                     os.getpid(),

@@ -17,6 +17,7 @@ from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
 from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, uin_shop, users, ws
 from app.routers import random as random_chat
+from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
 
@@ -230,6 +231,10 @@ async def lifespan(_: FastAPI):
         media_sweep_task.cancel()
         for task in retention_tasks:
             task.cancel()
+        # The fanout subscriber first, while Redis is still there to say
+        # goodbye to; closing the client under it logged a traceback per
+        # worker on every deploy.
+        await manager.shutdown()
         await close_redis()
 
 
