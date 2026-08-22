@@ -59,6 +59,18 @@ class Device(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
 
+    # The AUTH install id (the token's `dev` claim) of the session that claimed
+    # this slot, so revoking the SLOT can also end the SESSION. Report #695: the
+    # key-slot table and the session registry were two disjoint registries with
+    # no bridge, and "deleting" an old phone from the device list only stopped
+    # senders encrypting to it; the phone itself stayed signed in, reading and
+    # writing, until the account keys were rotated. Nullable: rows claimed
+    # before the column exist without it (their revoke still only retires the
+    # slot), and it is blanked together with the rest on revoke, since an
+    # install id is metadata about a person's hardware that no read path needs
+    # afterwards.
+    auth_device_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

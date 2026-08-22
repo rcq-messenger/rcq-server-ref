@@ -489,6 +489,7 @@ class DevicesOut(BaseModel):
 async def register_device(
     body: DeviceRegisterIn,
     uin: int = Depends(current_uin),
+    auth_device: str | None = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceRegisterOut:
     """Register a SECONDARY device (e.g. the web client) under the caller's UIN.
@@ -512,6 +513,9 @@ async def register_device(
         uin=uin,
         device_id=next_id,
         label=body.label,
+        # The bridge report #695 was missing: remember WHICH auth session
+        # claimed this slot, so retiring the slot can also end the session.
+        auth_device_id=auth_device,
         sealed_sender_pub=body.sealed_sender_pub,
         signal_identity_key=body.signal_identity_key,
         signal_registration_id=body.registration_id,
@@ -648,6 +652,7 @@ def _strip_revoked_device(device: Device, now: datetime) -> None:
     part that says something about the person.
     """
     device.label = None
+    device.auth_device_id = None
     device.sealed_sender_pub = ""
     device.signal_identity_key = ""
     device.signal_registration_id = 0
@@ -700,6 +705,22 @@ async def revoke_device_slot(
 
     await revoker_gate(uin, caller_device, device.created_at)
     label = device.label
+    # Report #695: retiring the slot alone was a polite fiction. The slot table
+    # and the session registry were two disjoint registries with no bridge, so
+    # "deleting" an old phone here stopped senders encrypting to it and nothing
+    # else: the phone stayed signed in, its socket stayed up, and it went on
+    # reading and writing. When the slot knows which auth session claimed it,
+    # that session is ended the same way the linked-devices screen ends one:
+    # token denylisted (enforced on presentation AND on minting, #607) and the
+    # open sockets kicked. Not for the CALLER's own slot: revoking the slot you
+    # are speaking through means "stop fanning out to me", not "log me out".
+    #
+    # ⚠ This cuts the session, not the knowledge. An install that holds the
+    # recovery phrase can register itself anew under a fresh install id; the
+    # only full eviction of a seed-holder is a key rotation (/auth/reissue).
+    # Slots claimed before `auth_device_id` existed carry NULL and keep the
+    # old retire-only behaviour.
+    session_to_end = device.auth_device_id
     now = datetime.now(timezone.utc)
     device.revoked_at = now
     await db.execute(
@@ -707,6 +728,10 @@ async def revoke_device_slot(
     )
     _strip_revoked_device(device, now)
     await db.commit()
+    if session_to_end and session_to_end != caller_device:
+        from app.routers.devices import _revoke as _revoke_session
+
+        await _revoke_session(uin, session_to_end, db)
     _announce_device_event(
         uin,
         "device_slot_revoked",
