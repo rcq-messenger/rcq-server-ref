@@ -144,8 +144,15 @@ async def migrate_legacy_account_keys() -> int:
                     # shortened back to whatever was left on the legacy one.
                     if current < ttl:
                         await redis.expire(target, ttl)
-                await redis.delete(key)
-                moved += 1
+                # Count the DELETE's own answer, not the trip round the loop.
+                # All four workers run this pass at once and they see the same
+                # keys: a key another worker has already folded still comes back
+                # from this worker's SCAN cursor, its HGETALL answers empty, and
+                # counting the iteration made every worker claim work it did not
+                # do. Observed on the flagship's first run, where four workers
+                # reported 10 + 69 + 70 + 58 folds over 71 real keys. DELETE
+                # answers 1 only for the worker that actually removed it.
+                moved += int(await redis.delete(key) or 0)
             except Exception:  # noqa: BLE001, a stuck key must not block boot
                 log.exception("[redis-keys] could not fold %s", legacy_prefix + "<uin>")
     if moved:
