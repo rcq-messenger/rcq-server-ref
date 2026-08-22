@@ -1,6 +1,7 @@
 """Expiry for the cluster-wide online set, `ws:online_uins`.
 
-The set has no TTL and its sibling `ws:online_devs:{uin}` does: 180 seconds,
+The set has no TTL and its sibling (`_online_devs_key`, one key per connected
+account, its name hashed since 2026-08-22) does: 180 seconds,
 refreshed on connect and on every client frame. The asymmetry was deliberate
 for the devs key (`connection_manager` explains why: a device wrongly believed
 online is a message the user never hears about) and simply absent for the

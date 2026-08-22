@@ -7,11 +7,19 @@ fall back to v=1 (the Double Ratchet can't be shared across devices, so v=2 to
 a multi-homed identity silently desyncs on whichever device didn't decrypt
 first). Removing the last device auto-restores v=2 (the hash disappears).
 
-Redis-backed — these are ephemeral session state, not durable account data:
-  devices:{uin}      hash  device_id -> JSON{label, created_at}
-  dev_revoked:{uin}  set   revoked device_ids (the denylist `device_is_revoked`
-                           answers from — consulted both when a token is
-                           PRESENTED and when one is MINTED, see auth.py)
+Redis-backed. These are session state rather than account rows, though on a
+90-day TTL they are durable enough that losing them is a real incident (see
+`core/redis_keys.migrate_legacy_account_keys`):
+  dev:{bucket}    hash  device_id -> JSON{label, created_at}
+  devrv:{bucket}  set   revoked device_ids (the denylist `device_is_revoked`
+                        answers from, consulted both when a token is
+                        PRESENTED and when one is MINTED, see auth.py)
+
+`{bucket}` is the HMAC of the account, not the account: these were
+`devices:{uin}` and `dev_revoked:{uin}` until 2026-08-22, which made a bare
+`KEYS *` a list of every account holding or having revoked a linked browser.
+See `core/redis_keys` for the derivation and for the one family deliberately
+left in the clear.
 
 ⚠ A revoke can only ever be as good as the id it names. The linked session must
 keep refreshing under the `device_id` minted here, because that is the only
@@ -33,8 +41,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import log_identity
 from app.core.db import get_db
 from app.core.redis import get_redis
+from app.core.redis_keys import DEV_REVOKED_PREFIX, DEVICES_PREFIX, account_key
 from app.core.security import current_device_id, current_uin, issue_device_token, uin_epoch
 from app.models.queue_cursor import QueueCursor
 from app.services.connection_manager import manager
@@ -55,11 +65,11 @@ REVOKE_COOLDOWN_SECONDS = int(os.environ.get("RCQ_REVOKE_COOLDOWN_SECONDS", str(
 
 
 def _devices_key(uin: int) -> str:
-    return f"devices:{uin}"
+    return account_key(DEVICES_PREFIX, uin)
 
 
 def _revoked_key(uin: int) -> str:
-    return f"dev_revoked:{uin}"
+    return account_key(DEV_REVOKED_PREFIX, uin)
 
 
 async def has_linked_devices(uin: int) -> bool:
@@ -315,7 +325,9 @@ async def _announce(uin: int, kind: str, device_id: str, label: str | None = Non
     try:
         await manager.send(uin, payload)
     except Exception:  # noqa: BLE001 — bookkeeping must not break the operation
-        log.exception("[devices] failed to announce %s uin=%s", kind, uin)
+        # Same treatment as `keys._announce`: the failure and its traceback are
+        # what an operator reads this for, the account number is not.
+        log.exception("[devices] failed to announce %s uin=%s", kind, log_identity(uin))
 
 
 async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
@@ -344,5 +356,9 @@ async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
     try:
         await manager.kick_device(uin, device_id)
     except Exception:  # noqa: BLE001 — the registry write is the source of truth
-        log.exception("[devices] failed to kick sockets uin=%s dev=%s", uin, device_id)
+        # The device id stays: it is a random opaque handle this module minted,
+        # it is what a revoke is ABOUT, and it names nobody on its own.
+        log.exception(
+            "[devices] failed to kick sockets uin=%s dev=%s", log_identity(uin), device_id,
+        )
     return {"ok": True}

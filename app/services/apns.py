@@ -5,12 +5,29 @@ Apple's HTTP/2 endpoint with ES256-signed JWT auth. JWTs are valid for
 re-signing on every request is technically allowed but burns CPU and
 Apple recommends reuse.
 
-Sealed-sender story: the push body intentionally carries NO sender info.
-It's a generic "you have something to fetch" trigger. The iOS client
-wakes (via content-available), fetches `/messages/queue`, decrypts each
-envelope locally, and posts the resulting local notification with the
-real sender info. Apple sees only "RCQ pushed an opaque payload to UIN
-X's device" — not "Y messaged X."
+Sealed-sender story: the push body carries NO sender info and, since
+2026-08-22, no room name either. It's a generic "you have something to
+fetch" trigger. The iOS client wakes, decrypts the envelope in the
+notification-service extension (or fetches `/messages/queue` when it
+can't), and replaces the generic banner with the real title locally.
+
+⚠ What this header used to claim, and what is actually true. It said
+Apple sees "an opaque payload", while `alert_title` carried the PLAIN
+GROUP NAME on every group post and a `group_name` field repeated it.
+Apple learned (device token, group name, timestamp) per message, and
+`push.rcq.app` is orange-clouded so Cloudflare terminated TLS and read
+the same. That was the strongest off-island leak in the product
+(metadata-map-2026-08-22 §1.6). Both are gone; the alert title is the
+constant below for every push of every kind, and the non-sealed kinds
+(contact request, accepted request) no longer title the banner with the
+SENDER'S NICKNAME either.
+
+What a third party on this path still sees, stated rather than implied:
+`to_uin` (the recipient, needed to pick the local account before any
+decrypt can be tried), `group_id` (the mute and mentions-only gates run
+before the decrypt and key on it), `envType`, and the `thread-id`. A
+group id is not a name but the membership table turns it into one, so
+this is a real remainder and it closes when group identity is sealed.
 
 `send_to_user(uin, ...)` is the public entrypoint. It's a no-op when
 APNs config isn't populated (dev environments without a .p8 key).
@@ -32,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import log_identity, settings
 from app.core.db import SessionLocal
+from app.core.rate_limit import bucket_name
 from app.models.device_token import DeviceToken
 from app.models.user import User
 
@@ -40,6 +58,32 @@ log = logging.getLogger(__name__)
 # UnifiedPush rows live in the same table under this platform tag. Named here
 # (rather than imported) to keep the two push services free of each other.
 _UP_PLATFORM = "android-up"
+
+# The banner title, for every push of every kind. A constant rather than a
+# parameter on purpose: a caller-supplied title is how the group name and the
+# sender nickname reached Apple in the first place, and a signature that cannot
+# carry one cannot regress. The client replaces it from its own state.
+_ALERT_TITLE = "RCQ"
+
+
+def _token_label(token: str) -> str:
+    """A safe name for one APNs device token in a log line.
+
+    ⚠⚠ This replaces `token[:12]`, which the first strike left behind two lines
+    under the one where the uin had just been put behind RCQ_LOG_IDENTITIES. A
+    device token is stable for the life of an install, so forty-eight bits of it
+    is a stable pseudonym for the DEVICE, printed at WARNING on every single
+    send: it re-identified exactly what suppressing the uin had hidden, and the
+    journal held days of it. Same role, and the same answer, as the UnifiedPush
+    endpoint that was hashed in `unifiedpush._endpoint_label`.
+
+    An HMAC under the server secret, so two lines about the same device still
+    join up (the transport-error line and the drop line are one story) and the
+    value is worth nothing to a reader who does not hold `/opt/rcq/.env`. Not a
+    prefix of a hash of nothing: a truncated token is guessable against a token
+    the reader already has, a keyed digest is not.
+    """
+    return f"#{bucket_name('apns-token:' + token)}"
 
 
 # Default push-preference values. Applied when a user's
@@ -295,7 +339,7 @@ async def _try_send(
             timeout=15.0,
         )
     except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-        log.warning("APNs transport error for token %s on %s: %s", token[:12], host, exc)
+        log.warning("APNs transport error for token %s on %s: %s", _token_label(token), host, exc)
         return 0, None
     body_text = (resp.text or "").strip()
     reason: str | None = None
@@ -306,7 +350,7 @@ async def _try_send(
             reason = None
     log.warning(
         "[apns] _try_send token=%s host=%s status=%s reason=%s topic=%s push_type=%s",
-        token[:12], host.split("//")[-1], resp.status_code, reason, topic, push_type,
+        _token_label(token), host.split("//")[-1], resp.status_code, reason, topic, push_type,
     )
     return resp.status_code, reason
 
@@ -369,11 +413,11 @@ async def _send_one(
     if should_drop:
         log.warning(
             "APNs %s reason=%s for %s — will drop stale token",
-            status_code, reason, token[:12],
+            status_code, reason, _token_label(token),
         )
         return False, True
 
-    log.warning("APNs %s reason=%s for %s — non-fatal", status_code, reason, token[:12])
+    log.warning("APNs %s reason=%s for %s, non-fatal", status_code, reason, _token_label(token))
     return False, False
 
 
@@ -394,7 +438,6 @@ async def _drop_dead_tokens(token_ids: list[int]) -> None:
 async def send_to_user(
     uin: int,
     *,
-    alert_title: str = "RCQ",
     alert_body: str = "New message",
     envelope_b64: str | None = None,
     envelope_type: str | None = None,
@@ -402,7 +445,6 @@ async def send_to_user(
     thread_id: str | None = None,
     notif_kind: str | None = None,
     group_id: int | None = None,
-    group_name: str | None = None,
     exclude_tokens: frozenset[str] = frozenset(),
     skip_devices: frozenset[str] = frozenset(),
     tokens: Sequence[tuple[int, str, str | None]] | None = None,
@@ -426,17 +468,35 @@ async def send_to_user(
     Always sends a `mutable-content: 1` alert so the iOS Notification
     Service Extension can intercept, decrypt the envelope, and replace
     the generic title/body with the real sender + preview before the
-    user sees it. Non-envelope pushes (contact request, trade offer,
-    etc.) skip the `env` field — NSE passes them through unchanged
-    and iOS displays the server-set `alert_title` + `alert_body`
-    directly.
+    user sees it. Non-envelope pushes (contact request, accepted
+    request) skip the `env` field, so NSE localizes the body off
+    `notif_kind` and leaves the title as the constant.
+
+    ⚠ There is no `alert_title` parameter and no `group_name`. Both used to
+    exist and both put a real name in front of Apple and Cloudflare on every
+    push: the group's name for a group post, the sender's nickname for a
+    contact request. The title is `_ALERT_TITLE` for everyone; the client
+    fills in the real one from its own local state (GroupNameCache on iOS,
+    the decrypted envelope for 1:1). Removed from the SIGNATURE rather than
+    ignored inside, so a future caller cannot reintroduce the leak by
+    passing one and having it quietly work.
 
     `thread_id` becomes `aps.thread-id` so iOS groups multiple pushes
     of the same kind AND so the iOS-side `RCQAppDelegate.didReceive`
     can route the user to the right surface on tap. Convention:
       - "peer-<UIN>" → 1:1 chat with that contact
+      - "group-<id>" → that group's chat
       - "pending"    → pending contact requests
-      - "trades"     → trades list
+      - "reports"    → the user's report threads
+
+    ⚠ It stays legible on purpose, and the reasoning is worth writing down
+    because it looks like an oversight next to everything above. An opaque
+    per-room token would hide nothing while `group_id` and `to_uin` sit in
+    the same payload for the mute gate and account routing, and iOS parses
+    this string in two places, tap routing in `RCQApp.parsePushTarget` and
+    badge clearing in `BadgeCounter`, on every build already installed. So
+    an opaque token would cost working tap-through and badge counts on the
+    whole fleet and buy a reader nothing they did not already have.
     """
     if not _is_configured():
         log.warning("[apns] send_to_user uin=%s skipped: APNs not configured", log_identity(uin))
@@ -489,7 +549,7 @@ async def send_to_user(
     if not tokens:
         return 0
     aps: dict[str, Any] = {
-        "alert": {"title": alert_title, "body": alert_body},
+        "alert": {"title": _ALERT_TITLE, "body": alert_body},
         "sound": "default",
         "mutable-content": 1,
     }
@@ -533,13 +593,13 @@ async def send_to_user(
         # otherwise opening the group chat can't clear the
         # bump that this push made (different keys).
         payload["group_id"] = group_id
-    if group_name:
-        # Plaintext group name so the NSE can title the banner with the group
-        # even when it can't decrypt the envelope (sender-keys `gmsg` is not
-        # decryptable out-of-process) — without it the fallback shows a generic
-        # "RCQ / New group message". A member already knows the group name, so
-        # this doesn't weaken sealed-SENDER (the sender uin stays hidden).
-        payload["group_name"] = group_name
+    # ⚠ No `group_name` here any more. The argument for it was that a member
+    # already knows the name so sending it cannot tell THEM anything, and that
+    # is true and beside the point: the reader who learns something is Apple,
+    # and Cloudflare in front of it. The NSE reads the id above and titles the
+    # banner from its own GroupNameCache; a room it has never synced shows the
+    # generic banner for one message, which is the trade Signal has shipped
+    # for years.
 
     sent = 0
     dead_ids: list[int] = []

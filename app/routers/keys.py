@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import log_identity
 from app.core.db import engine, get_db
 from app.core.security import current_device_id, current_uin
 from app.models.device import Device
@@ -192,9 +193,13 @@ async def _announce_device_event_now(
             payload["label"] = label
         await manager.send(uin, payload)
     except Exception:  # noqa: BLE001 — bookkeeping must not break the claim
-        log.exception("[keys] failed to announce %s uin=%s", kind, uin)
+        # ⚠ `uin=` behind RCQ_LOG_IDENTITIES like every other line that names
+        # a person. A `log.exception` is not exempt: it runs on a path that
+        # fires for every device claim and every key rotation, and the account
+        # it prints is the same one the push senders one layer down stopped
+        # printing. The traceback is the operational half and it stays whole.
+        log.exception("[keys] failed to announce %s uin=%s", kind, log_identity(uin))
     push_args = dict(
-        alert_title="RCQ",
         alert_body=push_body,
         thread_id="devices",
         notif_kind=kind,
@@ -208,7 +213,10 @@ async def _announce_device_event_now(
         try:
             await send(uin, **push_args)
         except Exception:  # noqa: BLE001
-            log.exception("[keys] failed to push %s uin=%s via %s", kind, uin, send.__module__)
+            log.exception(
+                "[keys] failed to push %s uin=%s via %s",
+                kind, log_identity(uin), send.__module__,
+            )
 
 
 # Strong refs to in-flight announces: asyncio holds only a weak one, and a
