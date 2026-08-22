@@ -48,6 +48,32 @@ map found missing. See the entry for what it does and does not cover.
 to drop from this list. A sweep runs on a horizon measured in months; a burn is
 supposed to be immediate. `polls` and `poll_votes` both gained a sweep in the
 same release as this note and both stay here for exactly that reason.
+
+★ Diffed against the flagship's live schema on 2026-08-22 (stage 1 review).
+Twenty-seven columns on the island name a person; this list carries eighteen of
+them and the other nine are accounted for, so the next reader can start from the
+delta rather than the whole set:
+
+* CASCADE off `users.uin`, so the database handles them and listing them here
+  would double-handle: `device_tokens.uin`, `devices.uin`,
+  `one_time_prekeys.uin`, `nearby_checkins.uin`. (`/auth/account` deletes
+  `device_tokens` explicitly as well, because push must stop before the row
+  does.)
+* `report_messages.author_uin` has NO FK to `users`, but it rides
+  `report_id -> reports.id ON DELETE CASCADE` and its only writer
+  (`reports.add_message`) requires the caller to BE the report's reporter, so
+  every row it names is reachable through the two `Report` entries below.
+  ⚠ On a MIGRATION the column is therefore left pointing at the old number
+  while the report itself is re-keyed. That is cosmetic today: `author_uin` is
+  served to the admin console only, and the reporter/operator split the clients
+  render is the `from_admin` flag beside it.
+* `uin_epochs.uin` must OUTLIVE the user row (see the model) and is the one
+  deliberate exception on the island.
+* `invites.uin` and `owned_uins.uin` are numbers being held or promised, not
+  rows belonging to the burning account; see the notes at their entries.
+* `gossip_records` has no uin column at all. It is keyed by the global signing
+  key, which is why `purge_uin_rows` structurally cannot reach it, and it is the
+  one item in section 2 of the metadata map still open.
 """
 
 from __future__ import annotations

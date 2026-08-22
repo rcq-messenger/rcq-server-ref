@@ -42,12 +42,23 @@ their island does not silently shorten this guarantee. Plus a margin, because
 the queue sweep runs on its own six-hour cycle and the recipient still has to
 come back and decrypt after the row is served.
 
-Rows consumed BEFORE `consumed_at` existed have a NULL stamp and fall back to
-`created_at`, the upload. That is the wrong clock and it is deliberately the
-conservative direction: the upload is always older than the consumption, so the
-fallback can only ever make a legacy row look YOUNGER than the horizon, never
-older. It cannot delete anything early. The whole backlog clears on the first
-few passes and the fallback then never fires again.
+Rows consumed BEFORE `consumed_at` existed have a NULL stamp, and the first
+version of this module measured those against `created_at`, the upload, on the
+argument that "the upload is always older than the consumption, so the fallback
+can only ever make a legacy row look YOUNGER than the horizon". ⚠⚠ THAT IS
+BACKWARDS and it shipped. The predicate is `clock < cutoff`, so substituting an
+OLDER timestamp makes a row MORE likely to match, not less: a key uploaded 40
+days ago and claimed yesterday was a one-day-old tombstone measured as
+forty-day-old and deleted, while the PreKeySignalMessage it protects can sit in
+`offline_messages` for another thirty. That is exactly the failure the horizon
+exists to prevent, and `models/prekey.py` states the rule correctly two files
+over ("a key uploaded in June and claimed yesterday is a live tombstone").
+
+So a legacy row is STAMPED rather than guessed at: the first pass writes
+`consumed_at = now` on every consumed row that has none, and its horizon runs
+from this release. Same shape, and the same reasoning, as the legacy declined
+rows in `contact_request_sweep`. The backfill matches nothing after the first
+pass, so a second cycle costs one indexed query.
 
 Hourly, leader-elected, bounded per cycle.
 `RCQ_PREKEY_SWEEP_DRY_RUN=1` counts and logs without deleting.
@@ -59,7 +70,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, select, update
 
 from app.core.db import SessionLocal
 from app.models.prekey import OneTimePreKey
@@ -92,13 +103,16 @@ DRY_RUN: bool = os.environ.get("RCQ_PREKEY_SWEEP_DRY_RUN", "") == "1"
 
 def _expired(cutoff: datetime):
     """The predicate, shared by the count and the delete so a dry run reports
-    exactly what a real pass would remove."""
+    exactly what a real pass would remove.
+
+    No `created_at` fallback: an unstamped row is stamped by the backfill in
+    `sweep_once` and waits its full horizon from there. See the ⚠⚠ in the
+    module docstring for what the fallback did instead.
+    """
     return (
         OneTimePreKey.consumed == True,  # noqa: E712
-        or_(
-            OneTimePreKey.consumed_at < cutoff,
-            OneTimePreKey.consumed_at.is_(None) & (OneTimePreKey.created_at < cutoff),
-        ),
+        OneTimePreKey.consumed_at.is_not(None),
+        OneTimePreKey.consumed_at < cutoff,
     )
 
 
@@ -106,6 +120,27 @@ async def sweep_once() -> int:
     """One pass. Returns how many tombstones went (or would have, dry)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=CONSUMED_MAX_AGE_DAYS)
     async with SessionLocal() as db:
+        if not DRY_RUN:
+            # Give every legacy tombstone a clock before anything is measured
+            # against one. Covered by `ix_one_time_prekeys_consumed_at`, so on
+            # every pass after the first this is an index scan that matches
+            # nothing, which is cheaper than a one-shot marker for one UPDATE.
+            stamped = (
+                await db.execute(
+                    update(OneTimePreKey)
+                    .where(
+                        OneTimePreKey.consumed == True,  # noqa: E712
+                        OneTimePreKey.consumed_at.is_(None),
+                    )
+                    .values(consumed_at=datetime.now(timezone.utc))
+                )
+            ).rowcount or 0
+            if stamped:
+                await db.commit()
+                log.warning(
+                    "[prekey-sweep] stamped %d legacy consumed prekey(s); their %dd "
+                    "starts now", stamped, CONSUMED_MAX_AGE_DAYS,
+                )
         if DRY_RUN:
             n = int(
                 (
