@@ -83,8 +83,17 @@ class Settings(BaseSettings):
     # first-contact cost knob (SHA-256 hashcash leading-zero-bits; raise under
     # abuse). REQUIRED makes /messages/sealed reject deposits lacking a valid
     # token — a deliberate flag-day flip ONLY after all clients mint tokens.
-    DEPOSIT_AUTH_ENABLED: bool = False
-    DEPOSIT_AUTH_POW_BITS: int = 20
+    #
+    # ENABLED defaults to true since stage 3 of the metadata plan: the same
+    # tokens price one-time prekeys on the now-anonymous key lookups, and a
+    # client only drops its session token from those lookups on an island
+    # that issues tokens. An island with it off keeps the old, named path.
+    # The issuer key lives in Redis and is minted on first use; nothing to
+    # configure. POW_BITS 18: about a quarter of a million hashes per token,
+    # well under a second on a phone and a couple of seconds in a browser;
+    # enough to make draining a 100-key pool cost minutes, not milliseconds.
+    DEPOSIT_AUTH_ENABLED: bool = True
+    DEPOSIT_AUTH_POW_BITS: int = 18
     DEPOSIT_AUTH_REQUIRED: bool = False
 
     # APNs config — populated in production via /opt/rcq/.env. Empty values
