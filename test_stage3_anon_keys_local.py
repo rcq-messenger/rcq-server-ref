@@ -140,6 +140,8 @@ async def main():
         r = await c.get(f"/keys/{RECIPIENT}/bundle", headers={"X-Deposit-Token": "bm90IGEgdG9rZW4"})
         check("a garbage token is 403, not a silent downgrade", r.status_code == 403)
         tok2 = await mint_token(c)
+        r = await c.get("/keys/999999/bundle", headers={"X-Deposit-Token": tok2})
+        check("a token presented to a 404 is not spent", r.status_code == 404)
         r = await c.get(f"/keys/{RECIPIENT}/bundle", headers={"X-Deposit-Token": tok2})
         check("a fresh token works on the legacy bundle path too", r.status_code == 200 and r.json()["one_time_prekey"] is not None)
         check("  ... pool now 2", await free_opks(RECIPIENT) == 2)
