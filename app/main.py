@@ -15,12 +15,11 @@ from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, hood, keys, link, media, messages, migrate, nearby, news, polls, presence, public, referrals, reports, server, stories, uin_shop, users, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, nearby, news, polls, presence, public, reports, server, uin_shop, users, ws
 from app.routers import random as random_chat
 from app.services.evidence_sweep import evidence_sweep_loop
 from app.services.nearby_sweep import nearby_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
-from app.services.story_sweep import story_sweep_loop
 
 
 class _RedactSecretsInLogs(logging.Filter):
@@ -141,7 +140,6 @@ async def lifespan(_: FastAPI):
     # the first user request.
     await get_redis()
     expire_task = asyncio.create_task(random_chat.expire_loop())
-    story_sweep_task = asyncio.create_task(story_sweep_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.
     evidence_sweep_task = asyncio.create_task(evidence_sweep_loop())
@@ -160,7 +158,7 @@ async def lifespan(_: FastAPI):
 
     contact_request_sweep_task = asyncio.create_task(contact_request_sweep_loop())
     # Retention for the encrypted media store — see media_sweep's docstring
-    # (30-day age sweep that spares avatars, stories and report evidence).
+    # (30-day age sweep that spares avatars and report evidence).
     from app.services.media_sweep import media_sweep_loop
 
     media_sweep_task = asyncio.create_task(media_sweep_loop())
@@ -168,7 +166,6 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         expire_task.cancel()
-        story_sweep_task.cancel()
         offline_queue_sweep_task.cancel()
         evidence_sweep_task.cancel()
         nearby_sweep_task.cancel()
@@ -287,17 +284,14 @@ app.include_router(nearby.router, dependencies=[Depends(require_feature("nearby_
 app.include_router(presence.router)
 app.include_router(random_chat.router, dependencies=[Depends(require_feature("random_enabled"))])
 app.include_router(audio_rooms.router)
-app.include_router(hood.router, dependencies=[Depends(require_feature("hood_enabled"))])
 app.include_router(reports.router)
 app.include_router(polls.router)
 app.include_router(polls.group_polls_router)
 app.include_router(news.public_router)
 app.include_router(news.admin_router)
 app.include_router(admin.router)
-app.include_router(stories.router, dependencies=[Depends(require_feature("stories_enabled"))])
 app.include_router(migrate.router)
 app.include_router(uin_shop.router)
-app.include_router(referrals.router)
 app.include_router(public.router)
 app.include_router(server.router)
 app.include_router(link.router)

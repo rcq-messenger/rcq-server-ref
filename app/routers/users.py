@@ -749,13 +749,14 @@ async def set_capabilities(
     fire it on every start without tracking whether they already did."""
     if body.sender_keys is None:
         return
-    now = datetime.now(timezone.utc)
+    # No timestamp. Clients fire this on every app start, so stamping the row
+    # made it a second last-seen clock nobody read (unmapped 2026-08-22).
     stmt = (
         pg_insert(UserCapability)
-        .values(uin=uin, sender_keys=body.sender_keys, updated_at=now)
+        .values(uin=uin, sender_keys=body.sender_keys)
         .on_conflict_do_update(
             index_elements=["uin"],
-            set_={"sender_keys": body.sender_keys, "updated_at": now},
+            set_={"sender_keys": body.sender_keys},
         )
     )
     await db.execute(stmt)

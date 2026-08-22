@@ -40,7 +40,7 @@ from app.core.rate_limit import rate_limit
 from app.core.security import current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.contact import Contact
-from app.models.group import Group, GroupMember, GroupMessageView, OfflineGroupMessage
+from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.user import User
 from app.services.connection_manager import manager
 
@@ -94,7 +94,8 @@ class GroupOut(BaseModel):
     # the rules / welcome / link-of-the-day.
     pinned_text: str | None = None
     pinned_at: datetime | None = None
-    pinned_by: int | None = None
+    # (`pinned_by` left the wire and the column on 2026-08-22: the UIN of
+    # whoever set the pin, which no client has ever rendered.)
     # Uploaded avatar (encrypted blob id + per-blob AES key). Both NULL
     # for legacy groups — iOS falls back to the generic glyph.
     avatar_media_id: str | None = None
@@ -485,7 +486,6 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
         slowmode_sec=g.slowmode_sec,
         pinned_text=g.pinned_text,
         pinned_at=g.pinned_at,
-        pinned_by=g.pinned_by,
         avatar_media_id=g.avatar_media_id,
         avatar_media_key=g.avatar_media_key,
         share_token=g.share_token,
@@ -926,7 +926,11 @@ async def remove_member(
     # If the owner leaves and group still has members, hand the crown to the oldest one.
     if member_uin == g.owner_uin:
         next_owner = await db.scalar(
-            select(GroupMember).where(GroupMember.group_id == group_id).order_by(GroupMember.joined_at.asc())
+            # Oldest member, by insert order. This used to read `joined_at`,
+            # which existed for this one query; `id` is allocated on the same
+            # insert and answers it identically without keeping a dated join
+            # record for every member of every room.
+            select(GroupMember).where(GroupMember.group_id == group_id).order_by(GroupMember.id.asc())
         )
         if next_owner is not None:
             next_owner.role = "owner"
@@ -1017,11 +1021,9 @@ async def patch_group(
         if cleaned:
             g.pinned_text = cleaned
             g.pinned_at = datetime.now(timezone.utc)
-            g.pinned_by = uin
         else:
             g.pinned_text = None
             g.pinned_at = None
-            g.pinned_by = None
 
     # Avatar swap: any admin can change it (matches the name-change
     # gate). Empty string clears. Both fields must move together —
@@ -1110,97 +1112,14 @@ async def delete_group(
 
 
 # ---------------------------------------------------------------------------
-# Group message views (Telegram-style counter under each message)
-# ---------------------------------------------------------------------------
-
-
-class ViewPingIn(BaseModel):
-    """Single-message view-ack. iOS fires this when a bubble in a
-    closed group enters the viewport for the first time."""
-    message_id: str
-
-
-class ViewCountsIn(BaseModel):
-    """Batch fetch — current ChatView's visible window asks for view
-    counts of all message IDs at once instead of one round-trip per
-    bubble. The map can be partial: missing keys mean zero views."""
-    message_ids: list[str]
-
-
-class ViewCountsOut(BaseModel):
-    counts: dict[str, int]
-
-
-@router.post("/{group_id}/messages/{message_id}/viewed", status_code=status.HTTP_204_NO_CONTENT)
-async def mark_message_viewed(
-    group_id: int,
-    message_id: str,
-    uin: int = Depends(current_uin),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    """Record that the caller has seen `message_id` in `group_id`.
-    Idempotent: re-posting from the same caller is a no-op. Only
-    broadcast-mode groups (post_policy='owner_only') participate in
-    the view-count feature — in any-member-can-post groups it would
-    feel like surveillance. iOS gates this client-side too; server
-    rejects with 404 as a belt-and-suspenders check."""
-    g = await db.get(Group, group_id)
-    if g is None or g.post_policy != "owner_only":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "broadcast group not found")
-    member = await db.scalar(
-        select(GroupMember.id).where(
-            and_(GroupMember.group_id == group_id, GroupMember.uin == uin)
-        )
-    )
-    if member is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "not a member")
-    existing = await db.scalar(
-        select(GroupMessageView.id).where(
-            and_(
-                GroupMessageView.group_id == group_id,
-                GroupMessageView.message_id == message_id,
-                GroupMessageView.viewer_uin == uin,
-            )
-        )
-    )
-    if existing is not None:
-        return
-    db.add(GroupMessageView(
-        group_id=group_id,
-        message_id=message_id,
-        viewer_uin=uin,
-        viewed_at=datetime.now(timezone.utc),
-    ))
-    await db.commit()
-
-
-@router.post("/{group_id}/view-counts", response_model=ViewCountsOut)
-async def view_counts(
-    group_id: int,
-    body: ViewCountsIn,
-    uin: int = Depends(current_uin),
-    db: AsyncSession = Depends(get_db),
-) -> ViewCountsOut:
-    """Aggregate view counts per message in batch. Members of a
-    broadcast-mode group (post_policy='owner_only') can query; the
-    response is just `{message_id: count}`. Identity of viewers is
-    never surfaced. Non-broadcast groups 404."""
-    g = await db.get(Group, group_id)
-    if g is None or g.post_policy != "owner_only":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "broadcast group not found")
-    member = await db.scalar(
-        select(GroupMember.id).where(
-            and_(GroupMember.group_id == group_id, GroupMember.uin == uin)
-        )
-    )
-    if member is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "not a member")
-    if not body.message_ids:
-        return ViewCountsOut(counts={})
-    rows = (await db.execute(
-        select(GroupMessageView.message_id, func.count(GroupMessageView.id))
-        .where(GroupMessageView.group_id == group_id)
-        .where(GroupMessageView.message_id.in_(body.message_ids))
-        .group_by(GroupMessageView.message_id)
-    )).all()
-    return ViewCountsOut(counts={mid: cnt for mid, cnt in rows})
+# The group read-receipt endpoints lived here until 2026-08-22.
+#
+# `POST /{id}/messages/{mid}/viewed` and `POST /{id}/view-counts` were backed by
+# `group_message_views`: one row per (viewer, group, message), no foreign key,
+# no sweep, outliving both the group and the messages it described. That is a
+# per-person reading log for every bubble scrolled past in a broadcast room,
+# and it bought a "seen by N" number under owner posts on iOS. Four rows in the
+# table's lifetime.
+#
+# An iOS build that still fires them gets a 404 and drops it: the view ping was
+# already fire-and-forget, and a missing count renders as no count.

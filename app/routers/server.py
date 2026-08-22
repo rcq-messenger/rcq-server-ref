@@ -47,8 +47,11 @@ class ServerCapabilities(BaseModel):
     # enforced regardless of client version.
     nearby: bool = True
     random_chat: bool = True
-    hood: bool = True
-    stories: bool = True
+    # Hood and Stories were deleted on 2026-08-22 (routers, tables and settings
+    # keys all). Both stay on the wire as a permanent False so a shipped client
+    # that reads them hides the tab instead of discovering the 404 by tapping.
+    hood: bool = False
+    stories: bool = False
     # Abuse + bug reports to this island's operator, and reading their answers
     # back. Off means the client hides "Report" and "Report a bug" entirely;
     # reports already filed stay readable on both sides, so switching it off
@@ -83,8 +86,6 @@ async def server_info() -> ServerInfo:
             registration_policy=eff["registration_policy"],
             nearby=eff["nearby_enabled"],
             random_chat=eff["random_enabled"],
-            hood=eff["hood_enabled"],
-            stories=eff["stories_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
             deposit_auth=settings.DEPOSIT_AUTH_ENABLED,

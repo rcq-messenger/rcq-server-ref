@@ -15,7 +15,7 @@ grows." It is not a size problem — prod holds all of 168 rows — it is a
 retention problem, and the fix is the same either way.
 
 Runs every 15 minutes; one worker per cycle via `periodic_leader`, same as
-the story and offline-queue sweeps.
+the offline-queue and media sweeps.
 """
 
 from __future__ import annotations

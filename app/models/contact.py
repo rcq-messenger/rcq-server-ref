@@ -14,9 +14,10 @@ class Contact(Base):
     owner_uin: Mapped[int] = mapped_column(BigInteger, index=True)
     contact_uin: Mapped[int] = mapped_column(BigInteger, index=True)
     blocked: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    # (`created_at` was unmapped on 2026-08-22. Nothing read it: not a query,
+    # not an ordering, not a served field. It was a relationship-start ledger
+    # the island kept for itself, one dated edge per friendship, and the whole
+    # social graph is already the thing stage 4 wants off the island.)
 
 
 class ContactRequest(Base):

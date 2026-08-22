@@ -28,8 +28,8 @@ class NearbyCheckin(Base):
     bucket_id: Mapped[str] = mapped_column(String(16))
     # Anonymous display name the client picked for this check-in
     # (e.g. "Wandering Stranger #4982"). Surfaced through
-    # `/nearby/list` and `/hood/messages` instead of the real user
-    # nickname so Nearby and Hood Chat are anonymous by default.
+    # `/nearby/list` instead of the real user nickname so Nearby is
+    # anonymous by default.
     # Nullable for backwards compat with rows written before the
     # column was added — the read path falls back to the real
     # nickname in that case.

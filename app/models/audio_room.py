@@ -46,34 +46,15 @@ class AudioRoomMembership(Base):
         ForeignKey("audio_rooms.id", ondelete="CASCADE"), index=True
     )
     uin: Mapped[int] = mapped_column(BigInteger, index=True)
-    joined_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    # (`joined_at` was unmapped on 2026-08-22. Write-only since the feature
+    # shipped: nothing ordered by it, nothing displayed it. Membership itself
+    # is what the room needs; when each person joined the crew is not.)
 
 
-class AudioRoomMute(Base):
-    """Owner-set mute on a single member of a room. Existence of
-    the row = "owner has muted this UIN in this room". Survives
-    leave/rejoin: if the owner muted you, you stay muted on next
-    re-entry until they unmute or you leave the room from the list
-    entirely (membership-revoked cascade-deletes related mutes).
-
-    Mesh WebRTC means the server can't drop the muted user's audio
-    packets directly (audio flows peer-to-peer, not through us).
-    Enforcement is client-side: every member receives
-    `audio_room_member_muted` over WS, the muted user's client
-    flips its own `setMicMuted(true)`, and other members render a
-    "muted by owner" badge on the user's tile. A modified client
-    could ignore — acceptable, normal users honor.
-    """
-
-    __tablename__ = "audio_room_mutes"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    room_id: Mapped[int] = mapped_column(
-        ForeignKey("audio_rooms.id", ondelete="CASCADE"), index=True
-    )
-    uin: Mapped[int] = mapped_column(BigInteger, index=True)
-    muted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+# `AudioRoomMute` was deleted on 2026-08-22. The row was a permanent record of
+# social conflict, unbounded in time and reachable only through the owner:
+# "owner muted UIN X in room Y at time T", surviving leave, rejoin, and the end
+# of the room's actual use. Mutes now live in Redis alongside the live roster
+# (`routers/audio_rooms.muted_uins_for_room`), so the enforcement is unchanged
+# while a member is in the room and nothing is written down afterwards. The
+# cost, and it is a real one: a mute no longer survives the island restarting.

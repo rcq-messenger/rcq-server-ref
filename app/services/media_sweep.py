@@ -12,10 +12,6 @@ What a pass never touches, regardless of age (the ids the DB still points
 at):
 - user avatars (`users.avatar_media_id`) and group avatars
   (`groups.avatar_media_id`) — long-lived by design, same directory;
-- story blobs (`stories.media_id`) — `story_sweep` owns their 24h lifecycle
-  (and a story deleted by hand leaves an unreferenced blob, which THIS sweep
-  finally reaps by age — closing the leak `stories.py` used to claim a
-  nonexistent orphan sweep handled);
 - report evidence (`reports.attachments[*].media_id`) — few, and an open
   investigation must not lose its screenshots.
 
@@ -35,14 +31,14 @@ from sqlalchemy import select
 from app.core.db import SessionLocal
 from app.models.group import Group
 from app.models.report import Report
-from app.models.story import Story
 from app.models.user import User
 from app.services.periodic_leader import lead_this_cycle
 
 SWEEP_INTERVAL_SECONDS: int = 60 * 60
 
 # Mirrors `routers/media.MEDIA_ROOT` — env-read, not imported, so this module
-# stays import-decoupled from the router (same reasoning as story_sweep).
+# stays import-decoupled from the router, which would otherwise be a
+# circular import during app startup.
 MEDIA_ROOT = Path(os.environ.get("RCQ_MEDIA_DIR", "./media/uploads"))
 
 MEDIA_MAX_AGE_DAYS: int = int(os.environ.get("RCQ_MEDIA_MAX_AGE_DAYS", "30"))
@@ -61,9 +57,6 @@ async def _referenced_ids() -> set[str]:
             for v in (await db.scalars(select(col).where(col.is_not(None)))).all():
                 if v:
                     ids.add(v.lower())
-        for v in (await db.scalars(select(Story.media_id))).all():
-            if v:
-                ids.add(v.lower())
         for atts in (await db.scalars(select(Report.attachments).where(Report.attachments.is_not(None)))).all():
             for a in atts or []:
                 mid = (a or {}).get("media_id")
