@@ -46,11 +46,22 @@ class ServerCapabilities(BaseModel):
     # The backing routers are ALSO gated server-side, so flipping these off is
     # enforced regardless of client version.
     random_chat: bool = True
-    # Hood and Stories were deleted on 2026-08-22 (routers, tables and settings
-    # keys all). Both stay on the wire as a permanent False so a shipped client
-    # that reads them hides the tab instead of discovering the 404 by tapping.
+    # Hood, Stories and People Nearby were deleted on 2026-08-22 (routers,
+    # tables and settings keys all). All three stay on the wire as a permanent
+    # False so a shipped client hides the tab instead of discovering the 404 by
+    # tapping.
+    #
+    # ⚠⚠ NOT optional, and dropping the field is NOT the same as sending False.
+    # Every client defaults an ABSENT capability to True on purpose, so that an
+    # old island that never heard of a feature still shows it. Nearby was cut
+    # from this model rather than pinned to False for a few hours, and the
+    # result was worse than a dead button: tapping it asked for the location
+    # permission FIRST, then 404'd, and told the person their GPS had failed.
+    # A deleted feature has to keep answering "off" for as long as any shipped
+    # client still asks.
     hood: bool = False
     stories: bool = False
+    nearby: bool = False
     # Abuse + bug reports to this island's operator, and reading their answers
     # back. Off means the client hides "Report" and "Report a bug" entirely;
     # reports already filed stay readable on both sides, so switching it off
