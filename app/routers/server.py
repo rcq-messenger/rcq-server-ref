@@ -85,6 +85,14 @@ class ServerCapabilities(BaseModel):
     # capability of THIS codebase (not an operator toggle), so it is always True
     # here — the same reasoning that pins hood/stories/nearby to a constant.
     envelope_class: bool = True
+    # Stage 3 metadata cut: GET /keys/{uin}/devices and the two bundle
+    # lookups take no session token; a one-time prekey is handed out against
+    # an anonymous deposit token (`X-Deposit-Token`) instead. A client that
+    # sees this true stops authenticating those three calls. Permanent
+    # capability of this codebase, like `envelope_class`; whether the island
+    # also ISSUES tokens is `deposit_auth` (without it a sender still gets the
+    # signed prekey anonymously and the OPK only under its session token).
+    anon_keys: bool = True
 
 
 class ServerInfo(BaseModel):

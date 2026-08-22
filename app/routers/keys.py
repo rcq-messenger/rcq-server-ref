@@ -2,14 +2,16 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import log_identity
 from app.core.db import engine, get_db
-from app.core.security import current_device_id, current_uin
+from app.core.config import settings
+from app.core.rate_limit import rate_limit
+from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.models.device import Device
 from app.models.prekey import OneTimePreKey
 from app.models.user import User, _as_aware
@@ -320,10 +322,72 @@ async def replenish_prekeys(
     await db.commit()
 
 
-@router.get("/{uin}/bundle", response_model=BundleOut)
+# ── Stage 3 of the metadata plan: key lookup stops naming the pair ─────────
+#
+# The three lookups below used to require the sender's own session token. The
+# token bought nothing the endpoints need (they serve PUBLIC key material) and
+# cost exactly one thing: every lookup told this island, under A's identity,
+# whose keys A was fetching, i.e. "A is about to talk to B", on every session
+# start and on every device-list refresh. The queue row was being stripped of
+# the sender; this was the same pair, written elsewhere.
+#
+# Now they are open. What bounds them instead:
+#   * a per-IP rate limit on all three (the device list is harmless to read;
+#     a bundle without a one-time prekey is too: the signed prekey is public);
+#   * the one thing worth protecting, the one-time prekey pool, is handed out
+#     only against an anonymous deposit token (RFC 9474 blind signature, spent
+#     once, unlinkable to its issuance) in `X-Deposit-Token`, or, for a client
+#     that has not yet learned to mint one, against its session token as
+#     before. A caller with neither gets the bundle minus the OPK, which
+#     libsignal accepts (weaker first-message initiation, nothing else).
+# The session-token path is the transition and goes when every client mints;
+# the `anon_keys` capability tells a client which path this island offers.
+_TOKEN_HEADER = "x-deposit-token"
+
+
+def _token_from_request(request: Request) -> dict | None:
+    """`X-Deposit-Token: <base64 of the {epoch_id, prepared, sig} JSON>`, or None."""
+    raw = request.headers.get(_TOKEN_HEADER)
+    if not raw:
+        return None
+    import base64
+    import json
+    try:
+        pad = "=" * (-len(raw) % 4)
+        blob = base64.urlsafe_b64decode(raw + pad)
+        obj = json.loads(blob)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _may_take_opk(request: Request, me: int | None) -> bool:
+    """Whether this bundle fetch is allowed to consume a one-time prekey.
+
+    A presented token is verified and spent; a bad or replayed one is a 403
+    rather than a silent downgrade, so a client with a stale epoch learns to
+    re-fetch `/deposit-auth/params` instead of quietly losing its OPKs."""
+    token = _token_from_request(request)
+    if token is not None:
+        if not settings.DEPOSIT_AUTH_ENABLED:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "this island issues no deposit tokens")
+        from app.core import deposit_auth_store
+        from app.core.redis import get_redis
+        if not await deposit_auth_store.verify_and_consume_token(token, await get_redis()):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid or spent deposit token")
+        return True
+    return me is not None
+
+
+@router.get(
+    "/{uin}/bundle",
+    response_model=BundleOut,
+    dependencies=[Depends(rate_limit("keys_bundle", 300, 60))],
+)
 async def fetch_bundle(
     uin: int,
-    _me: int = Depends(current_uin),
+    request: Request,
+    me: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> BundleOut:
     """Hand a sender what they need to start an X3DH session with `uin`.
@@ -354,10 +418,10 @@ async def fetch_bundle(
     from app.routers.devices import has_linked_devices  # local import: avoid cycle
     if await has_linked_devices(uin):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "multi-device: v=1 only")
-    return await _primary_bundle(uin, db)
+    return await _primary_bundle(uin, db, with_opk=await _may_take_opk(request, me))
 
 
-async def _primary_bundle(uin: int, db: AsyncSession) -> BundleOut:
+async def _primary_bundle(uin: int, db: AsyncSession, with_opk: bool = True) -> BundleOut:
     """The primary device's (device 1) bundle, with no multi-device gate.
 
     Split out of `fetch_bundle` so the per-device path can reach device 1 while
@@ -376,7 +440,7 @@ async def _primary_bundle(uin: int, db: AsyncSession) -> BundleOut:
         # 404 here as "fall back to v=1 envelope path".
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user has no signal bundle")
 
-    opk = await _claim_opk(db, uin=uin, device_id=None)
+    opk = await _claim_opk(db, uin=uin, device_id=None) if with_opk else None
     opk_out: OneTimePreKeyIn | None = None
     if opk is not None:
         opk_out = OneTimePreKeyIn(id=opk.prekey_id, public=opk.public_key)
@@ -542,10 +606,13 @@ async def register_device(
     return DeviceRegisterOut(device_id=next_id)
 
 
-@router.get("/{uin}/devices", response_model=DevicesOut)
+@router.get(
+    "/{uin}/devices",
+    response_model=DevicesOut,
+    dependencies=[Depends(rate_limit("keys_devices", 600, 60))],
+)
 async def list_devices(
     uin: int,
-    _me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> DevicesOut:
     """Every device of `uin` a sender should fan out to: the primary device
@@ -558,7 +625,7 @@ async def list_devices(
     if user.signal_identity_key is not None:
         devices.append(DeviceInfo(
             device_id=PRIMARY_DEVICE_ID,
-            label="primary",
+            label="",
             signal_identity_key=user.signal_identity_key,
         ))
     rows = (
@@ -571,25 +638,34 @@ async def list_devices(
     for d in rows:
         devices.append(DeviceInfo(
             device_id=d.device_id,
-            label=d.label,
+            # The user-typed label ("Web (Chrome)", a browser and OS
+            # fingerprint) was served to any authenticated stranger and no
+            # sender consumes it; the owner's own list (GET /devices) keeps it.
+            label="",
             signal_identity_key=d.signal_identity_key,
         ))
     return DevicesOut(uin=uin, devices=devices)
 
 
-@router.get("/{uin}/devices/{device_id}/bundle", response_model=BundleOut)
+@router.get(
+    "/{uin}/devices/{device_id}/bundle",
+    response_model=BundleOut,
+    dependencies=[Depends(rate_limit("keys_bundle", 300, 60))],
+)
 async def fetch_device_bundle(
     uin: int,
     device_id: int,
-    _me: int = Depends(current_uin),
+    request: Request,
+    me: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> BundleOut:
     """Per-device prekey bundle for X3DH against a SPECIFIC device of `uin`.
     deviceId 1 = the primary (phone) bundle on the User row (delegates to the
     legacy path); >= 2 = a secondary device. Consumes one OPK from THAT
     device's pool."""
+    with_opk = await _may_take_opk(request, me)
     if device_id == PRIMARY_DEVICE_ID:
-        return await _primary_bundle(uin, db)
+        return await _primary_bundle(uin, db, with_opk=with_opk)
 
     device = (
         await db.execute(
@@ -603,7 +679,7 @@ async def fetch_device_bundle(
     if device is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
 
-    opk = await _claim_opk(db, uin=uin, device_id=device_id)
+    opk = await _claim_opk(db, uin=uin, device_id=device_id) if with_opk else None
     opk_out: OneTimePreKeyIn | None = None
     if opk is not None:
         opk_out = OneTimePreKeyIn(id=opk.prekey_id, public=opk.public_key)
