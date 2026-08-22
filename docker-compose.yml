@@ -28,6 +28,11 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
     ports:
       - "80:80"
       - "443:443"
@@ -47,6 +52,14 @@ services:
   app:
     build: .
     restart: unless-stopped
+    # The app's access log is identity-free (uvicorn masks the account number
+    # and the address), but without a cap docker keeps every line forever:
+    # bounded so the disk is not a history of when the island was busy.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     env_file:
       - .env
     environment:
