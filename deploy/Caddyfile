@@ -111,9 +111,11 @@ api.rcq.app {
         format filter {
             wrap json
             fields {
-                request>uri query {
-                    replace token REDACTED
-                }
+                # The token, the account number in the path (/ws/123456789,
+                # /users/123456789/info) and a vault slot name (/vault/<32
+                # hex>, a stable per-account pseudonym) are all masked; the
+                # same rule as the flagship's and the compose Caddyfile's.
+                request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+" "${1}${2}${3}REDACTED"
             }
         }
     }
