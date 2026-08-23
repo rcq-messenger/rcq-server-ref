@@ -235,13 +235,6 @@ _AUDIO_ROOM_COLUMNS: list[tuple[str, str]] = [
 # Additive on `reports` — evidence-attachment fields for the
 # premium / media report flow. Existing rows have NULL in all three;
 # reason-only reports never populate them.
-# Stage 5: an account whose client reads the room log. Set implicitly by the
-# first /messages/group-log/fetch from any of its devices; until then the
-# writers still fan the post out to it the old way.
-_USER_CAPABILITY_COLUMNS: list[tuple[str, str]] = [
-    ("group_log", "BOOLEAN NOT NULL DEFAULT FALSE"),
-]
-
 _REPORT_COLUMNS: list[tuple[str, str]] = [
     ("evidence_path", "VARCHAR(255)"),
     ("evidence_mime", "VARCHAR(64)"),
@@ -358,7 +351,6 @@ async def init_db() -> None:
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
         ("broker_relays", _BROKER_RELAY_COLUMNS),
         ("contact_requests", _CONTACT_REQUEST_COLUMNS),
-        ("user_capabilities", _USER_CAPABILITY_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:

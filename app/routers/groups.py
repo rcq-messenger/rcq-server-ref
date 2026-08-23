@@ -42,6 +42,7 @@ from app.models.capability import UserCapability
 from app.models.contact import Contact
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.group_log import GroupLog, GroupLogCursor, GroupSeq
+from app.services.group_log import seed_cursors_on_join
 from app.models.user import User
 from app.services.connection_manager import manager
 
@@ -419,6 +420,9 @@ async def create_group(
     for member_uin in member_set:
         role = "owner" if member_uin == uin else "member"
         db.add(GroupMember(group_id=group.id, uin=member_uin, role=role))
+    await db.flush()
+    for member_uin in member_set:
+        await seed_cursors_on_join(db, group.id, member_uin)
     await db.commit()
     await db.refresh(group)
 
@@ -816,6 +820,8 @@ async def join_group(
         )
 
     db.add(GroupMember(group_id=group_id, uin=uin, role="member"))
+    await db.flush()
+    await seed_cursors_on_join(db, group_id, uin)
     await db.commit()
 
     members = await _members_with_users(db, group_id)
@@ -869,6 +875,8 @@ async def add_member(
     )
     if existing is None:
         db.add(GroupMember(group_id=group_id, uin=body.uin, role="member"))
+        await db.flush()
+        await seed_cursors_on_join(db, group_id, body.uin)
         await db.commit()
 
     g = await _load_group(db, group_id)
