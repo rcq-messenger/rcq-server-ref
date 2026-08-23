@@ -110,6 +110,13 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .frow .flabel { font-weight:600; font-size:13.5px; display:flex; align-items:center; gap:8px; }
   .frow .fhelp { color:var(--mut); font-size:12px; margin-top:2px; }
   .frow .fctl { flex:none; display:flex; gap:8px; align-items:center; }
+  /* The island's logo preview, and the lettered tile a client draws when there
+     is none. Rounded square, not a circle: a person is a circle and a group is
+     a circle, and an island is neither (same shape iOS IslandAvatarView draws). */
+  .logoimg, .logotile { width:44px; height:44px; border-radius:12px; flex:none; }
+  .logoimg { object-fit:cover; background:var(--line-2); }
+  .logotile { display:flex; align-items:center; justify-content:center;
+    color:#fff; font-weight:700; font-size:20px; line-height:1; }
   .ftitle { font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin:0 0 8px; font-weight:600; }
 
   .seg { display:inline-flex; background:var(--line-2); border-radius:10px; padding:3px; gap:2px; }
@@ -397,7 +404,7 @@ async function api(method, path, body) {
   const r = await fetch('/admin' + path, opt);
   if (r.status === 204) return null;
   const txt = await r.text(); let data=null; try{ data = txt?JSON.parse(txt):null; }catch(e){}
-  if (!r.ok) { const d=data&&data.detail; throw new Error((d&&(d.code||d))||('HTTP '+r.status)); }
+  if (!r.ok) { const d=data&&data.detail; throw new Error((d&&(d.message||d.code||d))||('HTTP '+r.status)); }
   return data;
 }
 async function serverInfo() {
@@ -806,11 +813,165 @@ async function loadFeatures(){
 }
 function renderFeatures(list){
   const groups = {}; list.forEach(s=>{ (groups[s.group]=groups[s.group]||[]).push(s); });
+  ISLAND_NAME = (list.find(s=>s.key==='island_name')||{}).value || '';
   $('features').innerHTML = Object.keys(FGROUPS).filter(g=>groups[g]).map(g=>`
     <div class="card pad"><div class="ftitle">${FGROUPS[g]}</div>
-      ${groups[g].map((s,i)=>frow(s,i===0)).join('')}</div>`).join('')
+      ${g==='branding'?'<div id="logorow"></div>':''}
+      ${groups[g].map((s,i)=>frow(s,i===0&&g!=='branding')).join('')}</div>`).join('')
     || '<div class="card pad"><div class="empty">No settings.</div></div>';
+  if ($('logorow')) loadLogo();
 }
+
+/* ---- the island's logo ----
+ *
+ * The one branding setting that is a picture rather than a string, and the one
+ * that is NOT in /admin/settings: that endpoint stores strings in a
+ * VARCHAR(2048) and truncates to fit, and a truncated data URI is an image
+ * that will not open. Its own endpoints, its own single-row table.
+ *
+ * Everything here exists so nobody learns a rule by having an upload refused:
+ * the accepted types and the ceiling are printed next to the button BEFORE the
+ * file dialog opens, and the browser resizes the picture down to LOGO_EDGE on
+ * the way out so an ordinary file never meets the ceiling at all. */
+const LOGO_EDGE = 256;
+let ISLAND_NAME = '';
+let ISLAND_LOGO = null;
+
+function fmtBytes(n){ return n>=1024 ? Math.round(n/1024)+' KB' : n+' bytes'; }
+
+/* The lettered tile every client falls back to with no logo. Shown rather than
+ * an empty box so the operator sees what members see today.
+ * ⚠ FNV-1a over the host, matching iOS IslandAvatarView.tint(for:) byte for
+ * byte: any other hash would tint this preview differently from the phones and
+ * quietly make it a lie. */
+function tileTint(host){
+  let h = 2166136261;
+  for (const b of new TextEncoder().encode(String(host||'').toLowerCase())) {
+    h = Math.imul(h ^ b, 16777619) >>> 0;
+  }
+  return 'hsl('+(h%360)+' 46% 62%)';
+}
+function tileInitial(name, host){
+  const src = String(name||host||'').trim();
+  const ch = [...src].find(c=>/\\p{L}|\\p{N}/u.test(c));
+  return ch ? ch.toUpperCase() : '#';
+}
+
+async function loadLogo(){
+  if (MOCK) { ISLAND_LOGO = MOCK_LOGO; renderLogo(null); return; }
+  try { ISLAND_LOGO = await api('GET','/server/logo'); renderLogo(null); }
+  catch(e){ renderLogo(e.message); }
+}
+
+function renderLogo(err){
+  const el = $('logorow'); if (!el) return;
+  const st = ISLAND_LOGO || {has_logo:false, version:'', max_bytes:65536, mimes:['image/png','image/jpeg','image/webp','image/gif']};
+  const types = st.mimes.map(m=>m.replace('image/','').toUpperCase()).join(', ');
+  const tile = '<span class="logotile" id="logotile" style="background:'+tileTint(location.host)+'">'
+    + escAttr(tileInitial(ISLAND_NAME, location.host)) + '</span>';
+  // The preview is the PUBLIC url, the very one the phones build, so what the
+  // operator sees here cannot drift from what members see.
+  const shot = st.has_logo
+    ? '<img class="logoimg" id="logoimg" alt="" src="/server/logo?v='+encodeURIComponent(st.version)+'">'
+    : tile;
+  el.innerHTML = ''
+    + '<div class="frow first"><div class="finfo">'
+    +   '<div class="flabel">Island logo'+(st.has_logo?' <span class="pill green">custom</span>':'')+'</div>'
+    +   '<div class="fhelp">Your island&rsquo;s picture, shown next to its name wherever a client names it: '
+    +     'the account switcher, the confirm before somebody joins, and the island card in Settings. '
+    +     'With no logo, every client draws the lettered tile shown here.</div>'
+    // ⚠ The rules, BEFORE the picker. Nobody should learn a limit by having a
+    // file refused after they chose it.
+    +   '<div class="fhelp">'+types+' &middot; up to '+fmtBytes(st.max_bytes)+' &middot; square works best. '
+    +     'Anything larger is resized to '+LOGO_EDGE+'&times;'+LOGO_EDGE+' in your browser before it is sent '
+    +     '(animated GIFs are sent as they are, so they have to be under the limit already).</div>'
+    +   (err?'<div class="fhelp err">'+escAttr(err)+'</div>':'')
+    + '</div><div class="fctl">'
+    +   shot
+    +   '<input type="file" id="logofile" accept="'+escAttr(st.mimes.join(','))+'" style="display:none">'
+    +   '<button class="btn sm" id="logopick">'+(st.has_logo?'Replace':'Upload')+'</button>'
+    +   (st.has_logo?'<button class="btn sm ghost" id="logodrop">Remove</button>':'')
+    + '</div></div>';
+  // Handlers bound here rather than inline: an inline onerror carrying the
+  // tile markup has to be quoted twice over, and the picture that fails to
+  // load is exactly the case that must not itself be broken.
+  const img = $('logoimg');
+  // A logo the browser cannot draw falls back to the SAME tile the clients
+  // draw, never to a broken-image glyph and never to an empty box.
+  if (img) img.onerror = () => { img.outerHTML = tile; };
+  $('logofile').onchange = function(){ pickLogo(this); };
+  $('logopick').onclick = () => $('logofile').click();
+  if ($('logodrop')) $('logodrop').onclick = removeLogo;
+}
+
+/* Read the file as a data URI, downscaled to LOGO_EDGE.
+ * GIF is passed through untouched: a canvas resize keeps only the first frame,
+ * and an operator who picked an animated mark would get a still one back with
+ * nothing saying why. It is therefore the one format that can arrive over the
+ * ceiling, and it is refused with a sentence that says what to do. */
+function prepareLogo(file, maxBytes){
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onerror = () => reject(new Error('Could not read that file.'));
+    r.onload = () => {
+      const raw = String(r.result);
+      if (file.type === 'image/gif') {
+        if (raw.length*0.75 > maxBytes) return reject(new Error(
+          'That GIF is about '+fmtBytes(Math.round(raw.length*0.75))+'; the limit is '+fmtBytes(maxBytes)+
+          '. Animated logos are uploaded as they are (resizing one would leave only its first frame), '+
+          'so it has to be made smaller first.'));
+        return resolve(raw);
+      }
+      const img = new Image();
+      img.onerror = () => reject(new Error('That file is not an image the browser can open.'));
+      img.onload = () => {
+        const scale = Math.min(1, LOGO_EDGE/Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width*scale)), h = Math.max(1, Math.round(img.height*scale));
+        const cv = document.createElement('canvas'); cv.width=w; cv.height=h;
+        const ctx = cv.getContext('2d');
+        if (!ctx) return reject(new Error('This browser cannot resize the picture.'));
+        ctx.drawImage(img, 0, 0, w, h);
+        // PNG first: a logo is usually flat colour with transparency, which PNG
+        // keeps and JPEG does not. A photographic mark compresses badly as PNG,
+        // so fall back to JPEG on a white ground if PNG lands over the ceiling.
+        const png = cv.toDataURL('image/png');
+        if (png.length*0.75 <= maxBytes) return resolve(png);
+        ctx.globalCompositeOperation = 'destination-over';
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,w,h);
+        for (const q of [0.9, 0.75, 0.6]) {
+          const jpg = cv.toDataURL('image/jpeg', q);
+          if (jpg.length*0.75 <= maxBytes) return resolve(jpg);
+        }
+        reject(new Error('That picture is still over '+fmtBytes(maxBytes)+' after resizing. Try a simpler mark, or one with fewer colours.'));
+      };
+      img.src = raw;
+    };
+    r.readAsDataURL(file);
+  });
+}
+
+async function pickLogo(input){
+  const file = input.files && input.files[0];
+  input.value = '';  // so the same file twice in a row still fires a change
+  if (!file) return;
+  const max = (ISLAND_LOGO && ISLAND_LOGO.max_bytes) || 65536;
+  try {
+    const uri = await prepareLogo(file, max);
+    ISLAND_LOGO = MOCK ? Object.assign(MOCK_LOGO, {has_logo:true, version:String(Date.now())})
+                : await api('PUT','/server/logo', {data_uri: uri});
+    renderLogo(null);
+  } catch(e){ renderLogo(e.message); }
+}
+
+async function removeLogo(){
+  try {
+    ISLAND_LOGO = MOCK ? Object.assign(MOCK_LOGO, {has_logo:false, version:''})
+                : await api('DELETE','/server/logo');
+    renderLogo(null);
+  } catch(e){ renderLogo(e.message); }
+}
+
+let MOCK_LOGO = {has_logo:false, version:'', max_bytes:65536, mimes:['image/png','image/jpeg','image/webp','image/gif']};
 function frow(s, first){
   let ctl;
   if (s.type==='bool')

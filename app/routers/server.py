@@ -14,12 +14,13 @@ to a value that keeps old clients working, and gate the new client-side
 feature behind the lookup.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header, status
+from fastapi.responses import Response as RawResponse
 from pydantic import BaseModel
 
 from app.core.config import settings
 from app.routers import media, vault
-from app.services import server_settings
+from app.services import island_logo, server_settings
 
 
 router = APIRouter(prefix="/server", tags=["server"])
@@ -150,6 +151,30 @@ class ServerInfo(BaseModel):
     name: str
     # Optional operator welcome / rules text ("" = none).
     welcome: str = ""
+    # The island's logo, as a 12-character digest of the picture. "" = this
+    # island has no logo and the client draws the lettered tile it always drew.
+    #
+    # ⚠ A VERSION, NOT THE PICTURE, and not a URL either. Three reasons, in
+    # order of how much they cost when got wrong:
+    #
+    #   1. This reply is fetched on every connect, for every account, and by
+    #      the cross-island paths before a key lookup or a waking call. On the
+    #      web it is awaited under the cross-tab provisioning lock before every
+    #      v=2 send. Inlining even a 20 KB data URI puts the whole picture on
+    #      that path, every time, with no way to revalidate it separately from
+    #      the flags. As a digest it is 12 bytes and the picture is one
+    #      `GET /server/logo` the client caches for as long as this string
+    #      does not change.
+    #   2. A URL would let an island point a client at a third-party host, and
+    #      a client that loaded it would be handing its IP to whoever the
+    #      operator named -- on an island it does not even have an account on,
+    #      since these probes are made against strangers. Clients build the URL
+    #      themselves from the host they were already talking to; the only
+    #      thing this field decides is WHETHER, and WHICH.
+    #   3. An island older than this field omits it, a client reads "" and
+    #      falls back to the tile: the same permissive-default rule the
+    #      capability flags follow.
+    logo_version: str = ""
     capabilities: ServerCapabilities
 
 
@@ -159,6 +184,7 @@ async def server_info() -> ServerInfo:
     return ServerInfo(
         name=eff["island_name"] or settings.APP_NAME,
         welcome=eff["welcome_text"],
+        logo_version=await island_logo.version(),
         capabilities=ServerCapabilities(
             uin_shop=settings.UIN_SHOP_ENABLED,
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
@@ -172,3 +198,43 @@ async def server_info() -> ServerInfo:
             media_max_blob_bytes=media.MAX_BLOB_SIZE,
         ),
     )
+
+
+@router.get("/logo", include_in_schema=False)
+async def server_logo(
+    if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+) -> RawResponse:
+    """This island's logo, as raw image bytes. Unauthenticated, like
+    `/server/info`: it is the island's public face, drawn on a join confirm
+    before anybody has an account here.
+
+    404 when no logo is set, which is the common case and is not an error: a
+    client that gets it draws the lettered tile, the same one it draws while
+    this request is still in flight and the same one it draws if the bytes
+    arrive corrupt. There is no state in which a client is left with a broken
+    image or an empty box.
+
+    Cached hard, and safely: clients are expected to append the
+    `logo_version` from `/server/info` as `?v=`, so a changed logo is a
+    changed URL. `ETag` covers the clients (and the CDN in front of the
+    flagship) that ask again anyway -- a revalidation costs a 304 with no body.
+    """
+    row = await island_logo.current()
+    if row is None:
+        return RawResponse(status_code=status.HTTP_404_NOT_FOUND)
+    mime, blob, version = row
+    etag = f'"{version}"'
+    headers = {
+        "ETag": etag,
+        # A day, not a year: an operator who fixes a logo without the client
+        # re-reading /server/info (a long-lived desktop window, say) should not
+        # be stuck with the old one until the app restarts. With `?v=` on the
+        # URL the practical lifetime is unbounded anyway.
+        "Cache-Control": "public, max-age=86400",
+        # The picture is the same for everyone and carries no account, but the
+        # header costs nothing and keeps a shared cache honest.
+        "Vary": "Accept-Encoding",
+    }
+    if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
+        return RawResponse(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return RawResponse(content=blob, media_type=mime, headers=headers)

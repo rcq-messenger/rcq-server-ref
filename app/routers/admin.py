@@ -36,7 +36,7 @@ from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
 from app.models.report_message import ReportMessage
 from app.models.user import User, effective_status
-from app.services import server_settings
+from app.services import island_logo, server_settings
 from app.services.apns import send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
 from app.services.hof_stats import bug_report_stats
@@ -119,6 +119,89 @@ async def patch_settings(
         await server_settings.apply(db, serialized)
         await db.commit()
     return {"settings": await server_settings.describe()}
+
+
+# ── the island's logo (Features tab -> Branding) ─────────────────────
+# Sits next to the island NAME and the welcome text, which are ordinary
+# settings-registry strings. The logo is not one: the registry stores strings in
+# a VARCHAR(2048) and silently truncates to it, which for a data URI means an
+# image that cannot be opened. It gets its own endpoints and its own single-row
+# table (models/island_logo.py explains why not a file and why not the settings
+# row); what reaches the clients is a 12-character version on /server/info plus
+# the public GET /server/logo.
+class IslandLogoState(BaseModel):
+    """What the console needs to draw the control. Deliberately WITHOUT the
+    picture: the console renders the public `/server/logo?v=<version>` in a
+    plain <img>, which is the same URL every client uses, so the preview cannot
+    disagree with what members see."""
+
+    has_logo: bool
+    version: str
+    #: The cap, so the console can state it BEFORE the operator picks a file
+    #: rather than after they have waited for an upload to be refused.
+    max_bytes: int
+    mimes: list[str]
+
+
+def _logo_state(version: str) -> IslandLogoState:
+    return IslandLogoState(
+        has_logo=bool(version),
+        version=version,
+        max_bytes=island_logo.MAX_LOGO_BYTES,
+        mimes=list(island_logo.ALLOWED_MIMES),
+    )
+
+
+@router.get("/server/logo", include_in_schema=False)
+async def get_island_logo() -> IslandLogoState:
+    return _logo_state(await island_logo.version())
+
+
+class IslandLogoIn(BaseModel):
+    #: `data:image/png;base64,...`. A data URI rather than a multipart upload
+    #: because the console is a single static page with no upload form, and
+    #: because it is the shape a browser FileReader / canvas already produces
+    #: after the client-side downscale. Same shape as the HoF avatar
+    #: (routers/users.py).
+    data_uri: str
+
+
+@router.put("/server/logo", include_in_schema=False)
+async def put_island_logo(
+    body: IslandLogoIn,
+    db: AsyncSession = Depends(get_db),
+) -> IslandLogoState:
+    """Set the island's logo. Refuses, and changes nothing, on anything the
+    clients could not draw: a non-image, a type outside the allow-list, base64
+    that does not decode, or an image over the cap. Never scales, never crops,
+    never truncates. An island keeps the logo it had rather than gaining a
+    broken one."""
+    try:
+        mime, blob = island_logo.parse_data_uri(body.data_uri)
+    except island_logo.LogoTooLarge as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={"code": "logo_too_large", "message": str(exc), "max_bytes": island_logo.MAX_LOGO_BYTES},
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={"code": "bad_logo", "message": str(exc)},
+        )
+    version = await island_logo.store(db, mime, blob)
+    await db.commit()
+    return _logo_state(version)
+
+
+@router.delete("/server/logo", include_in_schema=False)
+async def delete_island_logo(
+    db: AsyncSession = Depends(get_db),
+) -> IslandLogoState:
+    """Drop the logo. Every client falls back to the lettered tile it drew
+    before one was set. Idempotent."""
+    await island_logo.clear(db)
+    await db.commit()
+    return _logo_state("")
 
 
 # ── self-host update check ──────────────────────────────────────────
