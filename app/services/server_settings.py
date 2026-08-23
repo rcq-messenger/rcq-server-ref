@@ -73,29 +73,38 @@ _reg(SettingSpec("max_accounts_per_device", "int", lambda: 5, "limits",
 
 # ── Branding
 #
-# ⚠ Both of these are served on /server/info and BOTH ARE CURRENTLY IGNORED BY
-# EVERY CLIENT. Checked 2026-08-08 across all three:
-#   iOS      — ServerInfoResponse decodes `name` and ServerInfoService.fetch()
-#              returns only ServerCapabilities, so the name is dropped on the
-#              floor; `welcome` is not in the struct at all.
-#   Android  — Session.kt reads `api.serverInfo().capabilities`; the data class
-#              has `name` and never reads it, and no `welcome` field.
-#   web-chat — neither field is referenced.
+# ⚠ HISTORY, because the help text below is a promise and it has been broken
+# before. Both of these were served on /server/info from the day islands
+# existed and read by NOTHING: on 2026-08-08 iOS decoded `name` and threw it
+# away, Android had the field and never read it, and web-chat referenced
+# neither. An operator could type both and see nothing change anywhere. Android
+# picked them up in 0.100 and the rest followed with the logo. If a client ever
+# stops rendering one of these, this help text is a lie and has to say so.
 #
 # These carried a warning that nothing rendered them, which was true for as
-# long as it took somebody to ask why typing here changed nothing. Android
-# reads both as of 0.100; iOS and the web client do not yet, so the help says
-# where it shows and where it does not rather than going quiet about it.
+# long as it took somebody to ask why typing here changed nothing. All four
+# clients read the name now, and it travels with the logo: wherever an island
+# is drawn it is drawn as picture + name (the account switcher, the join
+# confirm, the island card in Settings).
+#
+# ⚠ The LOGO is not in this registry and cannot be. Values here are strings in
+# a VARCHAR(2048) that `validate()` truncates to fit, and a truncated data URI
+# is an image that will not open; `describe()` also hands every value back to
+# the admin console on every poll. It lives in its own single-row table with
+# its own endpoints (models/island_logo.py has the full reasoning), and reaches
+# clients as a 12-character `logo_version` on /server/info plus the public
+# GET /server/logo.
 _reg(SettingSpec("island_name", "str", lambda: _env.APP_NAME, "branding",
                  "Island name",
-                 "Shown on Android: on the confirm before somebody joins this "
-                 "island, and beside the address in Settings → Network. iOS and "
-                 "the web client do not render it yet."))
+                 "What your island calls itself. Shown next to your logo "
+                 "wherever a client names this island: the account switcher, "
+                 "the confirm before somebody joins, and the island card in "
+                 "Settings. Leave empty to use the server's own default name."))
 _reg(SettingSpec("welcome_text", "str", lambda: "", "branding",
                  "Welcome / rules",
-                 "Shown on Android on the confirm before somebody joins this "
-                 "island, which is the one moment house rules get read. Leave "
-                 "empty for none. iOS and the web client do not render it yet."))
+                 "Shown on the confirm before somebody joins this island, "
+                 "which is the one moment house rules get read, and under the "
+                 "island card in Settings. Leave empty for none."))
 
 
 def _parse(spec: SettingSpec, raw: str) -> Any:
