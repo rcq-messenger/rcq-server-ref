@@ -35,10 +35,11 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, text
+from sqlalchemy import delete, select, text
 
 from app.core.db import SessionLocal
-from app.models.group import OfflineGroupMessage
+from app.models.group import GroupMember, OfflineGroupMessage
+from app.models.group_log import GroupLog, GroupLogCursor
 from app.models.message import OfflineMessage
 from app.services.periodic_leader import lead_this_cycle
 
@@ -206,6 +207,38 @@ async def _sweep_once() -> tuple[int, int, int, int]:
         dormant_deleted = await _sweep_dormant(
             datetime.now(timezone.utc) - timedelta(days=DORMANT_DAYS)
         )
+
+    # Stage 5: the room log has ONE window per room, the same TTL as the
+    # queues, and no per-member keep. A row that falls out of the window falls
+    # out for everyone; a device further behind than that gets nothing from
+    # the island, the same as a 1:1 mailbox after the sweep. `sknack` rows in
+    # the log share the queue's short TTL. A cursor whose owner is no longer
+    # in the room is removed too: it would otherwise record how far somebody
+    # who left had read.
+    async with SessionLocal() as db:
+        async with db.begin():
+            result = await db.execute(delete(GroupLog).where(GroupLog.received_at < cutoff))
+            log_deleted = result.rowcount or 0
+        if SKNACK_TTL_SECONDS > 0:
+            async with db.begin():
+                result = await db.execute(
+                    delete(GroupLog).where(
+                        GroupLog.envelope_type == "sknack",
+                        GroupLog.received_at
+                        < datetime.now(timezone.utc) - timedelta(seconds=SKNACK_TTL_SECONDS),
+                    )
+                )
+                log_deleted += result.rowcount or 0
+        async with db.begin():
+            member = (
+                select(GroupMember.uin)
+                .where(GroupMember.group_id == GroupLogCursor.group_id, GroupMember.uin == GroupLogCursor.uin)
+                .exists()
+            )
+            result = await db.execute(delete(GroupLogCursor).where(~member))
+            cursors_deleted = result.rowcount or 0
+    if log_deleted or cursors_deleted:
+        log.warning("[group-log-sweep] reaped rows=%d orphan_cursors=%d (ttl=%dd)", log_deleted, cursors_deleted, TTL_DAYS)
 
     return direct_deleted, group_deleted, dormant_deleted, sknack_deleted
 

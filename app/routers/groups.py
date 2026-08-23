@@ -41,6 +41,7 @@ from app.core.security import current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.contact import Contact
 from app.models.group import Group, GroupMember, OfflineGroupMessage
+from app.models.group_log import GroupLog, GroupLogCursor, GroupSeq
 from app.models.user import User
 from app.services.connection_manager import manager
 
@@ -921,6 +922,16 @@ async def remove_member(
             )
         )
     )
+    # Stage 5: the same for the room log. The rows sealed to this member go
+    # (nobody else can open them), and so do the member's cursors into the
+    # room: a membership that no longer exists reads nothing, and a cursor
+    # left behind would be a record of how far somebody who left had read.
+    await db.execute(
+        delete(GroupLog).where(GroupLog.group_id == group_id, GroupLog.to_uin == member_uin)
+    )
+    await db.execute(
+        delete(GroupLogCursor).where(GroupLogCursor.group_id == group_id, GroupLogCursor.uin == member_uin)
+    )
     await db.commit()
 
     # If the owner leaves and group still has members, hand the crown to the oldest one.
@@ -1104,6 +1115,10 @@ async def delete_group(
     members = (
         await db.execute(select(GroupMember.uin).where(GroupMember.group_id == group_id))
     ).scalars().all()
+    # Stage 5: the room's log, its cursors and its counter go with the room.
+    await db.execute(delete(GroupLog).where(GroupLog.group_id == group_id))
+    await db.execute(delete(GroupLogCursor).where(GroupLogCursor.group_id == group_id))
+    await db.execute(delete(GroupSeq).where(GroupSeq.group_id == group_id))
     await db.delete(g)
     await db.commit()
     for member_uin in members:

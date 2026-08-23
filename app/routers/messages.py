@@ -23,6 +23,7 @@ from app.core.security import current_device_id, current_uin, current_uin_option
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.group import Group, GroupMember, OfflineGroupMessage
+from app.models.group_log import GroupLog, GroupLogCursor
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User, _as_aware
@@ -132,6 +133,64 @@ async def _next_mailbox_seq(db: AsyncSession, to_uin: int) -> int:
 # never ring at all. Above the ceiling we send the wake WITHOUT the envelope:
 # the app still comes up, connects its socket, and drains the deposit from the
 # queue — a beat slower, but it rings.
+# ── Stage 5: one log per room ───────────────────────────────────────────────
+#
+# A post into a room used to be written once per member. Now it is one row in
+# the room's log (`group_log`), read through a per-(room, account, device)
+# cursor. The per-member table is kept only for accounts whose client has not
+# yet read the log: iOS ships through the founder's Xcode and can be weeks
+# behind, so "new posts go only to the log from day one" would have silenced
+# every room on every old install. The switch is per account and implicit:
+# the first /messages/group-log/fetch from any of its devices sets
+# `user_capabilities.group_log`, and from then on the writers stop producing
+# legacy rows for it. The rows it already has stay in the old queue and the
+# new client keeps draining that queue too (dual read), deduping by UUID.
+
+
+async def _next_group_seq(db: AsyncSession, group_id: int) -> int:
+    """Allocate the next durable per-room sequence. Same shape and same
+    reasons as `_next_mailbox_seq`: never MAX()-derived, allocated inside the
+    post's transaction so two concurrent posts serialise on the room's row."""
+    if engine.dialect.name == "postgresql":
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, 1) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = group_seq.next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    else:
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, 1) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    return int((await db.execute(sql, {"g": group_id})).scalar_one())
+
+
+async def _group_log_readers(db: AsyncSession, uins: Iterable[int]) -> set[int]:
+    """Which of these accounts read the room log (and so need no legacy row)."""
+    uins = list(set(uins))
+    if not uins:
+        return set()
+    rows = (
+        await db.execute(
+            select(UserCapability.uin).where(
+                UserCapability.uin.in_(uins), UserCapability.group_log.is_(True)
+            )
+        )
+    ).scalars().all()
+    return set(rows)
+
+
+async def _mark_group_log_reader(db: AsyncSession, uin: int) -> None:
+    """The account's client just read the room log: from now on the writers
+    keep nothing for it in the per-member table."""
+    row = await db.get(UserCapability, uin)
+    if row is None:
+        db.add(UserCapability(uin=uin, group_log=True))
+    elif not row.group_log:
+        row.group_log = True
+
+
 _CALL_WAKE_ENV_MAX = 3500
 
 
@@ -810,8 +869,28 @@ async def send_group_sealed(
     # optimistic (bytes in an OS buffer != client ingested them), so the
     # recipient drains anything they missed on their next /messages/queue
     # fetch and dedupes by UUID.
+    # Stage 5: a member whose client reads the room log gets an ADDRESSED log
+    # row (sealed to them, served only to them); everyone else gets the legacy
+    # per-member row under the old dormancy rules. Every addressed row is kept:
+    # the dormancy machinery existed to bound the per-member table, and a room
+    # log has one retention window for the whole room instead.
+    readers = await _group_log_readers(db, (e.to_uin for e in entries))
+    log_rows = []
+    for e in entries:
+        if e.to_uin in readers:
+            log_rows.append({
+                "group_id": body.group_id,
+                "seq": await _next_group_seq(db, body.group_id),
+                "to_uin": e.to_uin,
+                "envelope_type": body.envelope_type,
+                "cls": cls,
+                "payload": e.payload,
+                "received_at": now,
+            })
+    if log_rows:
+        await db.execute(insert(GroupLog), log_rows)
     keep = _keep_for(
-        (e.to_uin for e in entries), queueable, cls, wake
+        (e.to_uin for e in entries if e.to_uin not in readers), queueable, cls, wake
     )
     rows = [
         {
@@ -823,7 +902,7 @@ async def send_group_sealed(
             "received_at": now,
         }
         for e in entries
-        if e.to_uin in keep
+        if e.to_uin in keep and e.to_uin not in readers
     ]
     if rows:
         await db.execute(insert(OfflineGroupMessage), rows)
@@ -861,9 +940,9 @@ async def send_group_sealed(
     # (is the fan-out working, how big was it, how much of it went to the queue)
     # without naming the room.
     log.warning(
-        "[group-sealed] gid=%s type=%s payloads=%d queued=%d delivered_any=%s offline=%d",
+        "[group-sealed] gid=%s type=%s payloads=%d queued=%d logged=%d delivered_any=%s offline=%d",
         log_identity(body.group_id), body.envelope_type, len(body.payloads), len(rows),
-        delivered_any, len(offline_recipients),
+        len(log_rows), delivered_any, len(offline_recipients),
     )
     activity_bump("gmsg")
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
@@ -974,6 +1053,23 @@ async def send_group_broadcast(
     # broadcast never carries key-distribution material (that goes per-member via
     # /messages/group-sealed), so this is content in every real case.
     cls = _cls_for(body.envelope_type)
+    # Stage 5: ONE row in the room's log for everyone who reads it, written
+    # before the live publish so the frame can carry its `seq` and a reader
+    # can move its cursor without a round trip. Members still on the
+    # per-member queue get their legacy copies below.
+    readers = await _group_log_readers(db, recipients)
+    seq: int | None = None
+    if readers:
+        seq = await _next_group_seq(db, body.group_id)
+        await db.execute(insert(GroupLog), [{
+            "group_id": body.group_id,
+            "seq": seq,
+            "to_uin": None,
+            "envelope_type": "gmsg",
+            "cls": cls,
+            "payload": body.payload,
+            "received_at": now,
+        }])
     # The sender's own uin is included on purpose: their other devices get
     # the broadcast as the carbons copy (the sending device dedupes by
     # message UUID, same as the WS/queue double-delivery case).
@@ -983,6 +1079,8 @@ async def send_group_broadcast(
         "group_id": body.group_id,
         "server_time": now.isoformat(),
     }
+    if seq is not None:
+        pkt["seq"] = seq
     online = await manager.fanout(recipients, pkt)
     delivered_any = bool(online)
     offline_recipients = [uin for uin in recipients if uin not in online]
@@ -1008,7 +1106,7 @@ async def send_group_broadcast(
         wake = await group_push_targets(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
-    keep = _keep_for(recipients, queueable, cls, wake)
+    keep = _keep_for((u for u in recipients if u not in readers), queueable, cls, wake)
     rows = [
         {
             "to_uin": uin,
@@ -1019,7 +1117,7 @@ async def send_group_broadcast(
             "received_at": now,
         }
         for uin in recipients
-        if uin in keep
+        if uin in keep and uin not in readers
     ]
     if rows:
         await db.execute(insert(OfflineGroupMessage), rows)
@@ -1052,9 +1150,9 @@ async def send_group_broadcast(
             asyncio.create_task(_push(uin, ends))
     # Identity-free by default, same reasoning as [group-sealed] above.
     log.warning(
-        "[group-broadcast] gid=%s type=%s recipients=%d queued=%d delivered_any=%s offline=%d",
+        "[group-broadcast] gid=%s type=%s recipients=%d queued=%d logged=%s delivered_any=%s offline=%d",
         log_identity(body.group_id), body.envelope_type, len(recipients), len(rows),
-        delivered_any, len(offline_recipients),
+        seq is not None, delivered_any, len(offline_recipients),
     )
     activity_bump("gmsg")
     return SendOut(delivered=delivered_any, queued=True, server_time=now)
@@ -1403,3 +1501,194 @@ async def ack_queue(
     reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
     await db.commit()
     return AckOut(deleted=reaped)
+
+
+# ── Stage 5: reading the room log ───────────────────────────────────────────
+
+
+class GroupLogRoomIn(BaseModel):
+    gid: int
+    # The client's own idea of where it is. Omitted = the island's stored
+    # cursor for this device (a device that has never read a room starts at
+    # the room's head: a fresh install owes nobody a replay of the backlog,
+    # the same rule as the 1:1 account watermark). Given = read from there,
+    # which a client uses to re-drain after it lost local state; it never
+    # moves the stored cursor, only an ack does.
+    after: int | None = None
+
+
+class GroupLogFetchIn(BaseModel):
+    # Omitted = every room the account is a member of. Batched on purpose:
+    # a client with thirty rooms makes one round trip, not thirty.
+    rooms: list[GroupLogRoomIn] | None = None
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+class GroupLogRow(BaseModel):
+    gid: int
+    seq: int
+    envelope_type: str
+    cls: int
+    payload: str
+    received_at: datetime
+
+
+class GroupLogFetchOut(BaseModel):
+    rows: list[GroupLogRow]
+    # Per room: the head of the log as of this fetch, so a client can tell
+    # "nothing new" from "the room has no log yet", and where its cursor
+    # stands after the call (for a device that had none, the head).
+    heads: dict[int, int]
+    cursors: dict[int, int]
+    # True when `limit` cut the answer short; fetch again from the last seq.
+    more: bool
+
+
+class GroupLogAckRoomIn(BaseModel):
+    gid: int
+    upto: int
+
+
+class GroupLogAckIn(BaseModel):
+    rooms: list[GroupLogAckRoomIn]
+
+
+async def _group_head(db: AsyncSession, group_id: int) -> int:
+    row = (await db.execute(
+        text("SELECT next_seq FROM group_seq WHERE group_id = :g"), {"g": group_id}
+    )).scalar_one_or_none()
+    return int(row or 0)
+
+
+@router.post(
+    "/group-log/fetch",
+    response_model=GroupLogFetchOut,
+    dependencies=[Depends(rate_limit("group_log_fetch", 120, 60))],
+)
+async def fetch_group_log(
+    body: GroupLogFetchIn,
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> GroupLogFetchOut:
+    """Drain the room logs this device is behind on, all rooms in one call.
+
+    Rows are the broadcasts every member reads plus the rows sealed to THIS
+    member, in one sequence per room, above this device's cursor. The cursor
+    is created at the room's head on a device's first read and moved only by
+    /group-log/ack, so a client that crashes between fetch and persist sees
+    the same rows again rather than losing them.
+
+    ⚠ The first fetch also marks the ACCOUNT as a log reader: from then on the
+    writers stop producing per-member legacy rows for it. Anything already in
+    the legacy queue stays there and the client keeps draining /messages/queue
+    too, deduping by message UUID, until that queue runs dry.
+    """
+    from app.routers.devices import mark_device_seen
+    await mark_device_seen(uin, device_id)
+
+    # Which rooms. The island keeps the roster in this stage, so "all my
+    # rooms" is one query; a named room the caller is not in is skipped, not
+    # an error (membership can change between the client's view and ours).
+    member_of = set((
+        await db.execute(select(GroupMember.group_id).where(GroupMember.uin == uin))
+    ).scalars().all())
+    if body.rooms is None:
+        wanted: list[tuple[int, int | None]] = [(g, None) for g in sorted(member_of)]
+    else:
+        wanted = [(r.gid, r.after) for r in body.rooms if r.gid in member_of]
+
+    cursors = {
+        c.group_id: c
+        for c in (await db.execute(
+            select(GroupLogCursor).where(
+                GroupLogCursor.uin == uin, GroupLogCursor.device_id == device_id,
+                GroupLogCursor.group_id.in_([g for g, _ in wanted] or [-1]),
+            )
+        )).scalars().all()
+    }
+    now = datetime.now(timezone.utc)
+    out_rows: list[GroupLogRow] = []
+    heads: dict[int, int] = {}
+    cur_out: dict[int, int] = {}
+    budget = body.limit
+    more = False
+    for gid, after in wanted:
+        head = await _group_head(db, gid)
+        heads[gid] = head
+        cursor = cursors.get(gid)
+        if cursor is None:
+            # First read of this room from this device: start at the head.
+            cursor = GroupLogCursor(group_id=gid, uin=uin, device_id=device_id, last_seq=head, updated_at=now)
+            db.add(cursor)
+            cursors[gid] = cursor
+        cur_out[gid] = cursor.last_seq
+        start = after if after is not None else cursor.last_seq
+        if budget <= 0:
+            if head > start:
+                more = True
+            continue
+        rows = (await db.execute(
+            select(GroupLog)
+            .where(
+                GroupLog.group_id == gid,
+                GroupLog.seq > start,
+                or_(GroupLog.to_uin.is_(None), GroupLog.to_uin == uin),
+            )
+            .order_by(GroupLog.seq.asc())
+            .limit(budget + 1)
+        )).scalars().all()
+        if len(rows) > budget:
+            more = True
+            rows = rows[:budget]
+        budget -= len(rows)
+        for r in rows:
+            out_rows.append(GroupLogRow(
+                gid=gid, seq=r.seq, envelope_type=r.envelope_type, cls=r.cls,
+                payload=r.payload, received_at=r.received_at,
+            ))
+    await _mark_group_log_reader(db, uin)
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Two devices of one account, or one device twice, racing on their
+        # first read: the cursors are already there, the rows were read.
+        await db.rollback()
+    return GroupLogFetchOut(rows=out_rows, heads=heads, cursors=cur_out, more=more)
+
+
+@router.post(
+    "/group-log/ack",
+    response_model=AckOut,
+    dependencies=[Depends(rate_limit("group_log_ack", 240, 60))],
+)
+async def ack_group_log(
+    body: GroupLogAckIn,
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> AckOut:
+    """Move this device's cursor in each room forward to `upto`. Forward only,
+    so a stale or out-of-order ack is harmless. The row is not deleted here:
+    a room log has one retention window for the whole room (the sweep), not
+    a per-member keep, which is the whole point of the stage."""
+    now = datetime.now(timezone.utc)
+    moved = 0
+    for r in body.rooms:
+        cursor = await db.get(GroupLogCursor, (r.gid, uin, device_id))
+        if cursor is None:
+            # An ack for a room this device never fetched: record it as the
+            # cursor rather than dropping it, a client that persisted the row
+            # from the live socket is telling us where it is.
+            cursor = GroupLogCursor(group_id=r.gid, uin=uin, device_id=device_id, last_seq=r.upto, updated_at=now)
+            db.add(cursor)
+            moved += 1
+        elif r.upto > cursor.last_seq:
+            cursor.last_seq = r.upto
+            cursor.updated_at = now
+            moved += 1
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+    return AckOut(deleted=moved)

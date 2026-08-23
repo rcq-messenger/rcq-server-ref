@@ -93,6 +93,12 @@ class ServerCapabilities(BaseModel):
     # also ISSUES tokens is `deposit_auth` (without it a sender still gets the
     # signed prekey anonymously and the OPK only under its session token).
     anon_keys: bool = True
+    # Stage 5 metadata cut: rooms are served from one log per room
+    # (POST /messages/group-log/fetch + /ack) instead of a per-member copy of
+    # every post. A client that sees this true drains rooms from the log and
+    # keeps draining /messages/queue for whatever legacy rows it still holds.
+    # Permanent capability of this codebase, like `envelope_class`.
+    group_log: bool = True
 
 
 class ServerInfo(BaseModel):
