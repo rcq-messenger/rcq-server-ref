@@ -309,7 +309,7 @@ _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry, mailbox_seq, group_log  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry, mailbox_seq, group_log, vault  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 

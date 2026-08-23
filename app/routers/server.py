@@ -18,6 +18,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.routers import vault
 from app.services import server_settings
 
 
@@ -99,6 +100,13 @@ class ServerCapabilities(BaseModel):
     # keeps draining /messages/queue for whatever legacy rows it still holds.
     # Permanent capability of this codebase, like `envelope_class`.
     group_log: bool = True
+    # Stage 4a: PUT/GET/DELETE /vault/{slot}, opaque versioned client-sealed
+    # slots per account (see routers/vault.py). Permanent capability of this
+    # codebase. A client that sees it keeps its contact list in the vault and
+    # on the device; one that does not keeps using /contacts.
+    vault: bool = True
+    vault_max_blob_bytes: int = 0
+    vault_max_slots: int = 0
 
 
 class ServerInfo(BaseModel):
@@ -122,5 +130,7 @@ async def server_info() -> ServerInfo:
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
             deposit_auth=settings.DEPOSIT_AUTH_ENABLED,
+            vault_max_blob_bytes=vault.MAX_BLOB_BYTES,
+            vault_max_slots=vault.MAX_SLOTS,
         ),
     )

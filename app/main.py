@@ -15,7 +15,7 @@ from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, uin_shop, users, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, uin_shop, users, vault, ws
 from app.routers import random as random_chat
 from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
@@ -66,6 +66,11 @@ class _RedactSecretsInLogs(logging.Filter):
     # device id or an API version is one or two digits and survives, so the
     # line still says which endpoint was called and how it answered.
     _RE_ID_PATH = re.compile(r"/(\d{3,10})(?=[/?\s\"]|$)")
+    # A vault slot name (stage 4a) is 32 hex characters the client derives from
+    # its identity: not an account number, but a stable per-account pseudonym
+    # all the same, and one line per read or write would make the access log
+    # an activity feed per account again. Same treatment as the number.
+    _RE_VAULT_PATH = re.compile(r"/vault/[0-9a-f]{32}(?=[/?\s\"]|$)")
 
     def _scrub(self, text: str, paths: bool) -> str:
         out = text
@@ -74,6 +79,8 @@ class _RedactSecretsInLogs(logging.Filter):
         if paths:
             out = self._RE_ADDR.sub(r"\1.0", out)
             out = self._RE_ID_PATH.sub("/<id>", out)
+            if "/vault/" in out:
+                out = self._RE_VAULT_PATH.sub("/vault/<slot>", out)
         return out
 
     def _scrub_arg(self, value: object, paths: bool) -> object:
@@ -358,6 +365,7 @@ app.include_router(public.router)
 app.include_router(server.router)
 app.include_router(link.router)
 app.include_router(devices.router)
+app.include_router(vault.router)
 app.include_router(gate.router)
 app.include_router(ws.router)
 

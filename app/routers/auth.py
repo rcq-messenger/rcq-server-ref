@@ -37,6 +37,7 @@ from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User
+from app.models.vault import VaultSlot
 from app.routers.groups import (
     SNAPSHOT_BROADCAST_LIMIT,
     _load_group,
@@ -735,6 +736,13 @@ async def reissue(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found"})
     user.identity_key = ik
     user.signing_key = sk
+    # The vault (stage 4a) is sealed under, and its slots named by, keys the
+    # first-party clients derive from the identity being retired here. Every
+    # slot would be unreachable under the new derivation, and ciphertext
+    # under a key the user just declared compromised has no business staying,
+    # so the account's vault goes in the same transaction. The client reads
+    # its slots BEFORE calling this and writes them back AFTER.
+    await db.execute(delete(VaultSlot).where(VaultSlot.uin == uin))
     await db.commit()
     return RegisterOut(
         uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))

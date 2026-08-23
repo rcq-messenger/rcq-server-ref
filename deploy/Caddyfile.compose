@@ -32,7 +32,7 @@
 		format filter {
 			wrap console
 			fields {
-				request>uri regexp "(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+" "${1}${2}REDACTED"
+				request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+" "${1}${2}${3}REDACTED"
 				request>remote_ip ip_mask {
 					ipv4 24
 					ipv6 32

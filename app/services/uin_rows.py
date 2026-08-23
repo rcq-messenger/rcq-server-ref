@@ -49,10 +49,14 @@ to drop from this list. A sweep runs on a horizon measured in months; a burn is
 supposed to be immediate. `polls` and `poll_votes` both gained a sweep in the
 same release as this note and both stay here for exactly that reason.
 
-★ Diffed against the flagship's live schema on 2026-08-22 (stage 1 review).
-Twenty-seven columns on the island name a person; this list carries eighteen of
-them and the other nine are accounted for, so the next reader can start from the
-delta rather than the whole set:
+★ Diffed against the flagship's live schema on 2026-08-22 (stage 1 review),
+when twenty-seven columns on the island named a person, eighteen of them in
+this list. Stages 2b, 5 and 4a have since added `mailbox_seq.to_uin`,
+`group_log.to_uin`, `group_log_cursors.uin`, `group_log_readers.uin` and
+`vault_slots.uin` to the list. ★ The authoritative check is section 2 of
+`test_dead_weight_local.py`, which walks the live metadata and fails on any
+uin-bearing column that is neither listed here, cascaded, nor allowlisted
+with a reason; the nine that are accounted for elsewhere:
 
 * CASCADE off `users.uin`, so the database handles them and listing them here
   would double-handle: `device_tokens.uin`, `devices.uin`,
@@ -85,7 +89,7 @@ from app.models.audio_room import AudioRoom, AudioRoomMembership
 from app.models.capability import UserCapability
 from app.models.contact import Contact, ContactRequest
 from app.models.federation import HomeIslandRecord
-from app.models.group_log import GroupLog, GroupLogCursor
+from app.models.group_log import GroupLog, GroupLogCursor, GroupLogReader
 from app.models.group import (
     Group,
     GroupMember,
@@ -98,6 +102,7 @@ from app.models.owned_uin import OwnedUin
 from app.models.poll import Poll, PollVote
 from app.models.queue_cursor import QueueCursor
 from app.models.report import Report
+from app.models.vault import VaultSlot
 
 # (model, uin-bearing column). Order is irrelevant — none of these carry FKs
 # between each other on the UIN.
@@ -112,6 +117,11 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     # cursors into every room. Broadcast rows name nobody and stay.
     (GroupLog, GroupLog.to_uin),
     (GroupLogCursor, GroupLogCursor.uin),
+    # The per-device "reads the log" switch. It follows the person on a
+    # migration (else the writers resume the legacy per-member rows for the
+    # new number until the first fetch) and goes on a burn. Missed by stage 5
+    # and found by test_dead_weight_local on 2026-08-23.
+    (GroupLogReader, GroupLogReader.uin),
     # The durable per-mailbox seq counter (stage 2b). It follows the account on
     # a migration — the rekeyed offline_messages rows keep their old seqs, so a
     # fresh counter at the new number would allocate seq 1 and collide with them
@@ -126,10 +136,14 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (PollVote, PollVote.voter_uin),
     (QueueCursor, QueueCursor.uin),
     (UserCapability, UserCapability.uin),
-    # The vault follows its holder when they move between their own
-    # numbers, and empties when the account is burned — a released
-    # number goes back in the pool rather than staying reserved by a
-    # person who no longer exists.
+    # Stage 4a: the sealed slots. They follow the person on a migration (the
+    # key is derived from the identity, not the number) and go on a burn.
+    (VaultSlot, VaultSlot.uin),
+    # The held-number collection (`owned_uins`, "the UIN vault" in
+    # uin_shop.py; not the sealed-blob vault above) follows its holder when
+    # they move between their own numbers, and empties when the account is
+    # burned — a released number goes back in the pool rather than staying
+    # reserved by a person who no longer exists.
     (OwnedUin, OwnedUin.owner_uin),
     (Report, Report.reporter_uin),
     # Moderation history follows the PERSON, not the number: without this a
