@@ -1,3 +1,38 @@
+"""The contact graph, and stage 4 of the core-metadata plan.
+
+Stage 4a (2026-08-23) gave every account a vault (SPEC 4.9) and all four
+clients started mirroring their contact list into the `contacts` slot. Stage
+4b adds the per-install `vault_contacts` mark (SPEC 2.12,
+`services/contact_source`) and the batch read that replaces the `/contacts`
+JOIN (`POST /users/lookup`, SPEC 4.10). Nothing about the WRITES in this
+router changes yet, and that is the correction the review made:
+
+  * every accept still records both directed rows, for every pair. The
+    island stops writing them at the DROP, together with the five rules that
+    read them and with the client halves that replace those rules; a freeze
+    on its own turns a brand-new mutual contact into a stranger for calls,
+    room invites, presence, last_seen and the picture, and lets a sibling
+    install still on the 4a mirror tombstone the pair out of the shared
+    vault slot. `services/contact_source` carries the long version and the
+    one flag that flips it.
+  * `GET /contacts` is untouched and stays untouched. It serves every row
+    that exists, for everyone, which is what keeps the plan's invariant that
+    "at no point is a contact list only in one place".
+  * Removals land as they always did. `DELETE /contacts/{uin}` and the block
+    toggle are unchanged: a relationship that has ended has to stop granting
+    calls and room invites.
+  * The CONSENT flow is untouched from end to end. Requests, the 202, the
+    `contact_request` / `contact_response` frames, `/pending`, `/outgoing`
+    and the cross-island `contactreq` envelope of federation §5f all behave
+    identically -- consent is a short-lived record with a reader on both
+    sides, not a relationship ledger, and stage 4 keeps it.
+
+⚠ One consequence lands at the drop and is the honest cost of it rather than
+a bug: with no row, `POST /contacts/request` can no longer answer "already in
+your contact list" with a 409, because the island no longer knows. It will
+open a fresh request instead, and the client hides its Add button off its own
+vault list. Marked at the call site.
+"""
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,9 +44,10 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.contact import Contact, ContactRequest
-from app.models.user import User, visible_status
+from app.models.user import User, card_openable_for_viewer, visible_status
 from app.services.apns import send_to_user as apns_send, should_push_for
 from app.services.connection_manager import manager
+from app.services.contact_source import add_edges
 from app.services.unifiedpush import send_to_user as up_send
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
@@ -43,6 +79,20 @@ class ContactRow(BaseModel):
     # "nobody" hides the call buttons. The server still enforces the policy on
     # the call_offer itself; this just keeps the UI honest.
     callable: bool = True
+    # Whether WE may open THIS contact's profile card, per THEIR
+    # `profile_card_policy` (founder item 22). Exact twin of `callable`
+    # above and computed the same way: the viewer is a mutual contact by
+    # construction on this row, so "everyone" and "contacts" both pass and
+    # only "nobody" turns the name into plain text.
+    #
+    # ⚠ The FIELDS on this row are deliberately NOT gated by the card
+    # policy. Every one of them (nickname, status, status_message, gender,
+    # last_seen, picture) is a contact-LIST field with its own rule, shown
+    # on a screen the viewer built by deliberately adding this person. Item
+    # 22 is about being found on surfaces nobody chose to appear on; a
+    # contact list is the opposite of one. What the flag changes here is
+    # whether the row is a link.
+    profile_openable: bool = True
     # Profile picture. The viewer is always a mutual contact on this row, which
     # is exactly the relationship the picture is handed out for, so it needs no
     # gate of its own here.
@@ -78,6 +128,14 @@ async def list_contacts(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> list[ContactRow]:
+    """Every row the island still holds for this account.
+
+    Unchanged by stage 4 so far and deliberately so: an account that has
+    moved its list into the vault keeps reading its rows here, and an install
+    of it that has NOT moved reads them too. The replacement a moved client
+    renders from is its own vault slot plus `POST /users/lookup` (SPEC 4.10);
+    this endpoint goes when the rows do, not before.
+    """
     rows = (
         await db.execute(
             select(Contact, User)
@@ -125,6 +183,11 @@ async def list_contacts(
                 gender=gender_visible,
                 last_seen=last_seen_visible,
                 callable=(u.call_policy or "everyone") != "nobody",
+                # `is_contact=True` is not an assumption: this row exists
+                # because the caller owns a contact edge to `u`. No lookup.
+                profile_openable=card_openable_for_viewer(
+                    u, viewer_uin=uin, is_contact=True
+                ),
             )
         )
     return out
@@ -163,6 +226,12 @@ async def send_request(
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
 
+    # ⚠ At the drop this check finds nothing for a pair that lives only in
+    # the vault, so a re-add will open a fresh request rather than answering
+    # 409: the island cannot tell an old friend from a stranger any more,
+    # which is the point, and the client suppresses its own Add button off
+    # the list it holds. Until then every accepted pair still has rows and
+    # this answers exactly as it always did.
     already_contact = await db.scalar(
         select(Contact.id).where(
             and_(Contact.owner_uin == uin, Contact.contact_uin == body.to_uin)
@@ -188,10 +257,12 @@ async def send_request(
         reverse_id, reverse_from = reverse.id, reverse.from_uin
         reverse.state = "accepted"
         reverse.resolved_at = datetime.now(timezone.utc)
-        db.add_all([
-            Contact(owner_uin=reverse.from_uin, contact_uin=reverse.to_uin),
-            Contact(owner_uin=reverse.to_uin, contact_uin=reverse.from_uin),
-        ])
+        # The single writer of a contact edge (`services/contact_source`),
+        # which is also where the drop will one day stop writing. The consent
+        # flow itself is untouched either way -- what the two of them just
+        # agreed to is carried by this response and by the WS event below,
+        # not by the rows.
+        await add_edges(db, reverse.from_uin, reverse.to_uin)
         await db.commit()
         delivered = await manager.send(
             reverse_from,
@@ -400,10 +471,7 @@ async def respond(
         # banner on any exception. The sweep's short delay costs an hour of
         # retention and keeps the endpoint idempotent, which is the better
         # trade for a row that used to live forever.
-        db.add_all([
-            Contact(owner_uin=req.from_uin, contact_uin=req.to_uin),
-            Contact(owner_uin=req.to_uin, contact_uin=req.from_uin),
-        ])
+        await add_edges(db, req.from_uin, req.to_uin)
         req.state = "accepted"
         req.resolved_at = datetime.now(timezone.utc)
         state = "accepted"
@@ -455,7 +523,17 @@ async def remove_contact(
 ) -> None:
     """ICQ-style mutual remove. Caller drops the contact AND the peer's
     row pointing back at the caller goes with it, so the peer's iOS
-    contact list refreshes them out. A WS `contact_removed` event
+    contact list refreshes them out.
+
+    ⚠ Stage 4 keeps this endpoint alive on purpose, and a client that has
+    moved its list into the vault must keep calling it for as long as its
+    rows exist: the five server-side rules that read them (callability, the
+    group invite policy, the block filter, the card gate, avatar and
+    last_seen) would otherwise go on granting a stranger what an ex-contact
+    had. A pair that never had rows 404s here, and the client is expected to
+    treat that as done rather than as a failure (iOS `ContactService.remove`
+    swallows exactly this code) -- the removal then lives only in the vault.
+    A WS `contact_removed` event
     notifies the peer if they're online so the change is immediate
     rather than waiting for their next /contacts refresh. The actual
     spam-block (silently dropping the peer's future sealed messages)
@@ -500,6 +578,13 @@ async def block_contact(
     )
     contact = rows.scalar_one_or_none()
     if contact is None:
+        # ⚠ Stage 4b: a pair with no row cannot be blocked here, because the
+        # flag is a column ON the row and creating one would be exactly the
+        # new edge the phase stops writing. The block lives in the caller's
+        # vault and their client honours it; what is lost server-side is the
+        # group-add filter (`_filter_blocked` in routers/groups.py), which
+        # stage 4's own "features that die" list already names. It goes pair
+        # by pair as pairs move, never all at once.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not in list")
     contact.blocked = not contact.blocked
     await db.commit()

@@ -40,6 +40,10 @@ from app.services import server_settings
 from app.services.apns import send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
 from app.services.hof_stats import bug_report_stats
+# Shared with `services/uin.uin_is_taken`, which now asks the same question of
+# every number it hands out. Three readers of one predicate; when they drift a
+# number gets promised twice and neither side is told (see the docstring).
+from app.services.uin import invite_is_live
 
 import time as _time
 
@@ -1399,6 +1403,19 @@ async def grant_uin(
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "in_use"})
     if await db.scalar(select(OwnedUin.uin).where(OwnedUin.uin == body.uin)) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "already_held"})
+    # PROMISED is as unavailable as held, and this is the other direction of the
+    # check `POST /admin/invites` already makes (it answers `uin_held`). A live
+    # invite reserving this number has no `users` row and no `owned_uins` row,
+    # so both checks above see free space and the operator ends up having
+    # promised the same number twice. It fails on the redeemer's side and
+    # silently: `auth.register` spends the invite use in the atomic UPDATE
+    # BEFORE it tests availability, so the newcomer gets an unrelated random
+    # number, the single-use code is burnt, and nobody is told anything.
+    reserved = await db.scalar(
+        select(Invite.code).where(Invite.uin == body.uin, *invite_is_live())
+    )
+    if reserved is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_reserved"})
     if await db.get(User, body.to_uin) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "no_such_user"})
 
@@ -1491,12 +1508,18 @@ async def mint_invite(
             )
         if await db.scalar(select(User.uin).where(User.uin == reserved_uin)) is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_taken"})
+        # Held is as unavailable as registered. A number in somebody's
+        # collection has no `users` row, so the check above sees nothing and
+        # the operator would be promising the same number twice: once to the
+        # holder (who was told nobody else could take it) and once to whoever
+        # redeems this code. Same rule `POST /admin/uin/grant` already applies
+        # in the other direction, where it answers "already_held".
+        if await db.scalar(
+            select(OwnedUin.uin).where(OwnedUin.uin == reserved_uin)
+        ) is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_held"})
         already = await db.scalar(
-            select(Invite.code).where(
-                Invite.uin == reserved_uin,
-                Invite.used_count < Invite.max_uses,
-                or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
-            )
+            select(Invite.code).where(Invite.uin == reserved_uin, *invite_is_live())
         )
         if already is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_reserved"})

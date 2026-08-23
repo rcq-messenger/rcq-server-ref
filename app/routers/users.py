@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import String, and_, case, cast, delete, false, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,12 +15,13 @@ from app.core.config import settings
 from app.models.contact import Contact
 from app.models.group import GroupMember
 from app.core.db import get_db
-from app.core.rate_limit import rate_limit
-from app.core.security import current_uin
+from app.core.rate_limit import enforce_cost_budget, rate_limit
+from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
-from app.models.user import User, visible_status
+from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status
 from app.services.connection_manager import manager
+from app.services.contact_source import mark_vault_device, unmark_vault_device
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -107,12 +108,43 @@ class PublicUser(BaseModel):
     # Owner-only mirror of the profile-card visibility setting.
     # Same tri-state as the others; null for third-party callers.
     profile_visibility: str | None = None
-    # Owner-only mirror of the persistent-presence opt-in. When TRUE,
-    # the owner's chosen `status` keeps broadcasting to contacts even
-    # after their WS goes stale. Null for third-party callers.
-    presence_persistent: bool | None = None
-    # Optional TTL (minutes) for `presence_persistent`. NULL/0 =
-    # forever; >0 = visible for N minutes past last_seen.
+    # Owner-only mirror of "who may OPEN my card" (founder item 22).
+    # Same tri-state, same owner-only rule as every policy above it: this
+    # field tells you about YOURSELF and never about a peer. Whether a
+    # PEER's card may be opened is `profile_openable` below.
+    profile_card_policy: str | None = None
+    # The per-viewer verdict, and the only half of item 22 a client can act
+    # on: may THIS caller open THIS person's card? The twin of `callable`
+    # on a contact row, and it exists for the same reason — a policy that
+    # belongs to somebody else can only reach a client as an answer the
+    # island already computed, never as the raw setting.
+    #
+    # Always present on this endpoint (it is the card route; it always has
+    # viewer context). `true` for a self-fetch. Clients that predate the
+    # field ignore it and simply get a card with nothing on it, which is
+    # the belt to this suspenders.
+    profile_openable: bool | None = None
+    # "Stay visible after leaving", removed on 2026-08-23 with the columns
+    # behind it (models/user.py says why). The COLUMNS are gone; these two keys
+    # are not, and they are pinned to a constant off rather than dropped from
+    # the response, for the same reason `hood` / `stories` / `nearby` are
+    # pinned False on /server/info instead of disappearing: a missing key is
+    # not the same message as an explicit one.
+    #
+    # ⚠⚠ Dropping them was tried first and was wrong. The shipped iOS Privacy
+    # screen seeds its toggle from `UserDefaults` and only ever writes that
+    # cache from `if let v = p.presencePersistent`, so an ABSENT key reads as
+    # "keep what I have" and the toggle stays ON forever on every iPhone that
+    # had it enabled: the picker under it stays, the contact-list countdown
+    # keeps ticking, and each tap PUTs a field this server now ignores and gets
+    # a 200 back. A privacy screen telling somebody they are visible when
+    # presence is pure `last_seen` freshness is worse than a dead switch.
+    # A literal `false` makes that `if let` fire and the toggle fall to off.
+    #
+    # Constants, never assigned from the model: there is no column left to read
+    # and no per-viewer answer to give. A PUT that still carries them is
+    # accepted and ignored (see UpdateMeIn).
+    presence_persistent: bool = False
     presence_ttl_minutes: int | None = None
     # Owner-only mirror of the Hall-of-Fame opt-in (consent to be
     # considered). Approval is a separate founder-only flag, never
@@ -139,6 +171,11 @@ class PublicUser(BaseModel):
         last_seen = _last_seen_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
         gender = _gender_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
         owner_self = viewer_uin == u.uin
+        # ── The card gate (founder item 22) ──────────────────────────────
+        # Costs nothing: `is_contact` was already computed above this call
+        # for last_seen, gender and the picture, so the island evaluates no
+        # relationship it was not evaluating before this field existed.
+        openable = card_openable_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
         # Profile gate — applied to first_name, last_name, age, city,
         # country, about, interests, homepage, status_message.
         # Identity-level fields (nickname, uin, keys, status,
@@ -146,7 +183,23 @@ class PublicUser(BaseModel):
         # break otherwise. `gender` already has its own gate above,
         # but ALSO falls under profile_visibility — if profile is
         # hidden, gender is hidden regardless of its own setting.
-        profile_visible = _profile_visible_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
+        #
+        # `and openable` is the second half of item 22, and it is the half
+        # that survives a client which ignores `profile_openable`: a card
+        # nobody may open is served with nothing on it. The two settings
+        # compose one way only — the card gate can hide what
+        # profile_visibility would have shown, never the reverse.
+        profile_visible = (
+            _profile_visible_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
+            and openable
+        )
+        # `last_seen` is a card field too, and it is the one field with its
+        # own tri-state, so be explicit: a shut-out viewer gets nothing here
+        # even when `last_seen_visibility` is "everyone". Nothing is lost by
+        # it — a contact still reads the timestamp off their contact list,
+        # which `GET /contacts` serves on its own relationship rule.
+        if not openable:
+            last_seen = None
         # A picture is not part of the profile card gate: it follows the
         # relationship, not the "who may see my details" setting. Strangers get
         # nothing here regardless of how open the rest of the profile is.
@@ -189,17 +242,17 @@ class PublicUser(BaseModel):
             last_seen_visibility=(u.last_seen_visibility if owner_self else None),
             gender_visibility=(u.gender_visibility if owner_self else None),
             profile_visibility=(u.profile_visibility if owner_self else None),
+            profile_card_policy=(u.profile_card_policy if owner_self else None),
+            profile_openable=openable,
             group_invite_policy=(u.group_invite_policy if owner_self else None),
             call_policy=(u.call_policy if owner_self else None),
             read_receipts_visibility=(u.read_receipts_visibility if owner_self else None),
-            presence_persistent=(u.presence_persistent if owner_self else None),
-            presence_ttl_minutes=(u.presence_ttl_minutes if owner_self else None),
             hof_opt_in=(u.hof_opt_in if owner_self else None),
             hof_avatar=(u.hof_avatar if owner_self else None),
         )
 
     @classmethod
-    def from_model(cls, u: User) -> "PublicUser":
+    def from_model(cls, u: User, *, viewer_uin: int | None = None, is_contact: bool = False) -> "PublicUser":
         # Legacy entry point — used by /users/search where we can't
         # cheaply gate every result against the contact graph. Search
         # results never include last_seen; viewers see the precise
@@ -211,10 +264,22 @@ class PublicUser(BaseModel):
         # find them via nickname) but the row reveals only nickname
         # + uin — full data is unveiled once they tap into the
         # /users/{uin}/info endpoint that has viewer context.
+        #
+        # `viewer_uin` / `is_contact` arrived with the card gate (item 22).
+        # A search row IS a surface that opens a card, so it has to carry
+        # the verdict; the caller resolves `is_contact` for the whole page
+        # in one query, and only when the page actually contains somebody on
+        # "contacts" (see `search`). Defaulting to the anonymous answer
+        # keeps every other caller of this classmethod correct.
         visible = (u.profile_visibility or "everyone") == "everyone"
+        openable = card_openable_for_viewer(u, viewer_uin=viewer_uin, is_contact=is_contact)
+        # Same composition as `from_model_for_viewer`: the card gate can
+        # take away what profile_visibility would have given, never add.
+        visible = visible and openable
         return cls(
             uin=u.uin,
             nickname=u.nickname,
+            profile_openable=openable,
             first_name=u.first_name if visible else None,
             last_name=u.last_name if visible else None,
             age=u.age if visible else None,
@@ -295,17 +360,28 @@ class ProfileUpdate(BaseModel):
     last_seen_visibility: str | None = None
     gender_visibility: str | None = None
     profile_visibility: str | None = None
+    # Who may OPEN my card (founder item 22). Distinct from
+    # `profile_visibility` above: that one blanks the optional FIELDS and
+    # still lets an empty card open, this one decides whether the card is
+    # served at all and whether other clients draw the name as a link.
+    #
+    # ⚠ Until 2026-08-23 this key was simply absent, and `extra="ignore"`
+    # meant every shipped client's Privacy screen PUT it, got a 200 and
+    # changed nothing. iOS and web ship the tri-state picker; Android ships
+    # the same idea as one switch and maps off → "nobody", on → "everyone".
+    profile_card_policy: str | None = None
     group_invite_policy: str | None = None
     call_policy: str | None = None
     read_receipts_visibility: str | None = None
-    # Opt-in toggle. When TRUE the server keeps broadcasting the user's
-    # chosen `status` (online/away/dnd) to contacts even after the WS
-    # goes stale — see `effective_status()` in models/user.py.
-    presence_persistent: bool | None = None
-    # Optional TTL cap (minutes) for `presence_persistent`. Pass 0 (or
-    # NULL) for "forever". Server validates against a small allow-list
-    # so we don't accept arbitrary precision the UI can't render.
-    presence_ttl_minutes: int | None = None
+    # ⚠ `presence_persistent` and `presence_ttl_minutes` were REMOVED from this
+    # model on 2026-08-23, deliberately without a 400 replacing them. Every
+    # shipped iOS and Android build still PUTs the toggle from its Privacy
+    # screen, and those builds stay in the field for weeks; rejecting the body
+    # would fail the whole profile save (nickname, avatar, every other privacy
+    # tri-state travelling in the same request), not just the dead field.
+    # Pydantic's default `extra="ignore"` drops the two keys, so those clients
+    # keep getting a 200 and the value goes nowhere. Do NOT put an
+    # `extra="forbid"` config on this model.
     # Hall-of-Fame consent toggle. User opts in; the founder approves
     # separately (admin-only). `hof_approved` is NOT settable here.
     hof_opt_in: bool | None = None
@@ -413,7 +489,315 @@ async def search(
             .limit(limit)
         )
     ).scalars().all()
-    return [PublicUser.from_model(u) for u in rows]
+    # Card gate (item 22). A search row is a surface that opens a card, so it
+    # has to carry `profile_openable` — and "contacts" is the only value that
+    # needs the graph to answer. So ask the graph ONLY when this page actually
+    # contains somebody on "contacts", and then ask once for the whole page
+    # instead of once per row. On the overwhelmingly common page (everybody on
+    # the default) this adds no query at all.
+    #
+    # Metadata: the set being read is the CALLER'S OWN contact list, restricted
+    # to uins already in their hands. `GET /contacts` hands them the same set
+    # wholesale, so the island learns nothing here it does not already store,
+    # and it writes nothing down.
+    contact_set: set[int] = set()
+    gated = [u.uin for u in rows if (u.profile_card_policy or "everyone") == "contacts"]
+    if gated:
+        contact_set = set(
+            (
+                await db.scalars(
+                    select(Contact.contact_uin).where(
+                        and_(Contact.owner_uin == me, Contact.contact_uin.in_(gated))
+                    )
+                )
+            ).all()
+        )
+    return [
+        PublicUser.from_model(u, viewer_uin=me, is_contact=u.uin in contact_set)
+        for u in rows
+    ]
+
+
+# ── Stage 4b: POST /users/lookup ──────────────────────────────────────────
+# A batch of `GET /users/{uin}/info`, and deliberately nothing more.
+#
+# It exists because stage 4 takes the contact list off the island. Today a
+# client renders its list from `GET /contacts`, which JOINs the caller's
+# `contacts` rows onto `users` and returns nickname, keys, status, picture
+# and the two policy verdicts in one request. When the rows go, the JOIN goes
+# with them and the client is left holding a list of numbers it read out of
+# its own vault. This is how it turns those numbers back into rows.
+#
+# HOW MANY UINS THE ISLAND MAY SEE AT ONCE. 256 is not a privacy number, it
+# is a cost number: the per-uin endpoint is capped at 180/min, and 120
+# batches of 256 an hour is the same order of work. The privacy of this
+# endpoint does not come from the cap.
+MAX_LOOKUP_UINS = 256
+# Resolved uins per account per day. The named risk on a batch read of the
+# directory is bulk harvesting, not one person's contact list: at 50k a day a
+# scraper needs a new account every 50k numbers, which registration already
+# prices.
+LOOKUP_DAILY_UINS = 50_000
+# ⚠ The budget is charged in whole quanta, never in exact uins. The counter
+# behind `enforce_cost_budget` is a per-account number that lives in Redis
+# for 24 hours, so charging `len(wanted)` would write the caller's render-set
+# SIZE into it on every refresh -- |contacts(A)|, sampled live, from the one
+# endpoint built to take the contact graph out of storage. Rounded up, the
+# key holds a bucket count instead. 64 keeps the daily ceiling meaningful
+# (781 full batches) while making a list of 3 and a list of 60 the same
+# charge.
+LOOKUP_COST_QUANTUM = 64
+
+
+class LookupIn(BaseModel):
+    # ⚠ A body, never a query string: a uin in a URL is a uin in an access
+    # log, and this list is the most sensitive thing a client sends.
+    uins: list[int] = Field(min_length=1, max_length=MAX_LOOKUP_UINS)
+
+    @field_validator("uins")
+    @classmethod
+    def _ascending(cls, v: list[int]) -> list[int]:
+        """Strictly ascending, enforced rather than requested.
+
+        ⚠ A client that passes its rendered list straight through sends it in
+        DISPLAY order, which is most-recent-conversation first, and that is
+        "who A talks to most" written into the request body -- the exact fact
+        this endpoint is built not to carry. The island sees the body as sent,
+        before any of the code below turns it into a set, so a SHOULD in the
+        spec is a property nobody enforces. Ascending also means no repeats,
+        which is why the handler's de-duplication is a belt to this.
+        """
+        if any(b <= a for a, b in zip(v, v[1:])):
+            raise ValueError("uins must be strictly ascending")
+        return v
+
+
+class LookupRow(BaseModel):
+    """A contact-list row, gated as if the caller had asked for this one
+    person by number.
+
+    Exactly the `ContactRow` fields of SPEC 4.2 minus `blocked`. That
+    omission is the point rather than an oversight: whether you have blocked
+    somebody is yours, it lives in your vault, and an island that answers it
+    is keeping the negative half of the graph after giving up the positive
+    half."""
+
+    uin: int
+    nickname: str
+    status: str
+    status_message: str | None = None
+    identity_key: str
+    signing_key: str
+    signal_identity_key: str | None = None
+    gender: str | None = None
+    last_seen: datetime | None = None
+    # UI hint only, computed the way `_caller_allowed` in routers/ws.py
+    # computes it. The ring itself is still gated server-side there.
+    #
+    # ⚠ ANSWERED ONLY FOR A CONTACT, True for everybody else, and that is not
+    # laziness. `PublicUser` has no such field and returns `call_policy` as
+    # null to every non-self viewer, so a real verdict here for an arbitrary
+    # uin would be a bit of a third party's call settings that no other
+    # endpoint gives: 256 strangers classified per request into "accepts
+    # calls from anyone" and "does not". `GET /contacts` computes it for
+    # contacts and only for contacts, and this matches that exactly. For a
+    # stranger, True means what clients already do today -- show the button,
+    # let the island refuse the ring.
+    #
+    # ⚠ At the drop this settles at True for every row, and that is the
+    # right end state rather than an accident: `is_contact` is False for
+    # everyone once the table is gone, `_caller_allowed` becomes "let it
+    # ring, the callee's client refuses", and a client draws the button and
+    # handles the refusal. The alternative, answering `policy != "nobody"`
+    # for the whole batch, would hand a caller 256 people's call settings at
+    # exactly the moment the island stops being able to tell which of them
+    # it is allowed to describe.
+    callable: bool = True
+    profile_openable: bool = True
+    avatar_media_id: str | None = None
+    avatar_media_key: str | None = None
+
+
+class LookupOut(BaseModel):
+    users: list[LookupRow]
+
+
+@router.post(
+    "/lookup",
+    response_model=LookupOut,
+    # Per ACCOUNT, and never per looked-up uin. A limiter keyed on the
+    # numbers in the body would write the caller's contact list into Redis
+    # one key at a time, which is how sealed sender was defeated once already
+    # (metadata-map-2026-08-22 §1.1). `bucket_name` HMACs even this.
+    dependencies=[Depends(rate_limit("users_lookup", 120, 3600))],
+)
+async def lookup(
+    body: LookupIn,
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> LookupOut:
+    """Resolve a batch of uins the caller already holds into list rows.
+
+    THE RULE. For every uin in the batch this answers exactly what
+    `GET /users/{uin}/info` would answer the same caller: same visibility
+    gates, same card gate, same picture rule, evaluated per row. It is one
+    round trip instead of N, and it is not a second way in. If a field is
+    hidden from you one at a time it is hidden from you here.
+
+    WHAT THE ISLAND LEARNS, PLAINLY. That this account asked about these
+    numbers, at this moment. That is the same SHAPE of knowledge
+    `GET /contacts` handed over -- a set of uins attached to an account --
+    and stage 4 is not honest about removing the contact graph if the
+    replacement posts it back on every boot. So, precisely:
+
+      * it is a SUPERSET of a contact list, not a contact list. The batch is
+        the caller's render set: contacts, group co-members, strangers who
+        wrote first, a number typed into search a minute ago. Sending nothing
+        but the contact list is a client choice, not something this endpoint
+        forces.
+      * ⚠ PADDING DOES NOT HIDE A NUMBER FROM THE ISLAND, only from a reader
+        of the request. The island runs the query, so it knows exactly which
+        of the numbers asked about resolved; chaff made of unknown or
+        suspended uins falls out of its own answer. Only chaff naming LIVE
+        accounts is indistinguishable from real interest, and that kind
+        charges budget like any other read, so a client padding 3x reaches
+        the daily 429 three times sooner. The identical omission below is a
+        property of the RESPONSE (a miss, a suspension and a stranger look
+        the same to whoever gets the answer), not a defence against the
+        island.
+      * the ORDER carries nothing, because the island refuses any other one:
+        `LookupIn` requires strictly ascending uins and the answer comes back
+        in the same order. A client's own list ordering ("who I talk to
+        most") therefore cannot ride along in the body.
+      * it writes no ROW and no log line: the path holds no digits so the
+        access-log redactor has nothing to mask, and the body is never
+        logged. It does write the two limiter keys, and they are the honest
+        residue: `rl:users_lookup:<hmac(account)>` holds one timestamp per
+        request for an hour, which is a refresh-activity trace for an account
+        that may be hiding its presence, and `rlc:users_lookup_uins:` holds a
+        24-hour running total charged in quanta of [LOOKUP_COST_QUANTUM] so
+        that it is a count of reads and not a live measure of the caller's
+        list size. Both are keyed by an HMAC of the ACCOUNT and never by a
+        looked-up number -- keying a limiter on the numbers in the body is
+        how sealed sender was defeated once already (metadata-map §1.1).
+      * it says nothing about the reverse direction. "Who holds A in their
+        list" is the question the table could answer and this cannot: an
+        account that never calls this is never named by anyone else's call.
+
+    ⚠ IT NAMES THE CALLER, AND FOR NOW IT HAS TO. Stage 3 took the session
+    token OFF the key lookups (`routers/keys.py`) precisely so the island
+    would stop recording "A is about to talk to B" under A's identity, and
+    this endpoint hands back `identity_key` / `signing_key` /
+    `signal_identity_key` for a batch, with a session. The reason is the
+    per-viewer gating below -- the card gate, the picture, `last_seen`,
+    `gender` all need to know who is asking, and today they resolve real
+    `contacts` rows. When those rows drop, `contact_set` is empty by
+    construction and the only gate left needing an identity is the
+    group-co-member picture rule, which `GET /groups/{id}/members` already
+    serves. THAT is the moment this moves to `current_uin_optional` plus an
+    `X-Deposit-Token` like the key routes, and it is a field-level change
+    rather than a wire break, which is why the shape here is already the
+    shape it needs then.
+
+    ⚠ BOTH BOUNDS ARE FAIL-SOFT. `rate_limit` and `enforce_cost_budget` log a
+    warning and allow the request when Redis is unreachable (island-wide
+    policy, `core/rate_limit`), so during a Redis outage this endpoint has no
+    ceiling at 256 uins a request. The same outage lifts the per-uin cap on
+    `/users/{uin}/info` too, but there it leaves a scraper at one number per
+    request; here it leaves it at 256. Not fixed by failing closed, which
+    would make the contact list the one screen that dies with Redis.
+
+    What it therefore still gives an island that decides to watch: a live,
+    repeatable, per-account interest set, and its changes over time if it
+    keeps snapshots. That is a real residue and it is smaller than the table
+    it replaces, not zero.
+    """
+    # De-duplicated, self dropped (the caller has `/users/me` and the
+    # owner-self view differs on every gate), non-positive dropped.
+    wanted = {u for u in body.uins if u > 0 and u != me}
+    if not wanted:
+        return LookupOut(users=[])
+    # Rounded UP to a whole quantum, never the exact count; see the note on
+    # [LOOKUP_COST_QUANTUM]. Charged before the query, so a padded batch pays
+    # for what it asks about rather than for what came back.
+    charged = -(-len(wanted) // LOOKUP_COST_QUANTUM) * LOOKUP_COST_QUANTUM
+    await enforce_cost_budget(
+        f"uin:{me}", "users_lookup_uins", charged, LOOKUP_DAILY_UINS, 86400
+    )
+    rows = (
+        await db.execute(
+            select(User)
+            .where(User.uin.in_(wanted))
+            .where(User.is_suspended.is_(False))
+            .order_by(User.uin)
+        )
+    ).scalars().all()
+    if not rows:
+        return LookupOut(users=[])
+    found = [u.uin for u in rows]
+    # The caller's OWN edges, narrowed to numbers already in their hands.
+    # `GET /contacts` hands them the same edges wholesale; nothing is learned
+    # here that the island does not already store, and nothing is written.
+    # ⚠ When the rows drop this set is empty and every "contacts"-scoped
+    # field in the answer closes. That is the correct end state, not a bug:
+    # the island stops being able to tell a contact from a stranger, and the
+    # settings that said "contacts" become the recipient's client's job.
+    contact_set = set(
+        (
+            await db.scalars(
+                select(Contact.contact_uin).where(
+                    and_(Contact.owner_uin == me, Contact.contact_uin.in_(found))
+                )
+            )
+        ).all()
+    )
+    shares = set(
+        (
+            await db.scalars(
+                select(GroupMember.uin).where(
+                    GroupMember.uin.in_(found),
+                    GroupMember.group_id.in_(
+                        select(GroupMember.group_id).where(GroupMember.uin == me)
+                    ),
+                )
+            )
+        ).all()
+    )
+    out: list[LookupRow] = []
+    for u in rows:
+        is_contact = u.uin in contact_set
+        openable = card_openable_for_viewer(u, viewer_uin=me, is_contact=is_contact)
+        # Same composition as PublicUser.from_model_for_viewer: the card gate
+        # can hide what profile_visibility would have shown, never the reverse.
+        profile_visible = (
+            _profile_visible_for_viewer(u, viewer_uin=me, is_contact=is_contact)
+            and openable
+        )
+        last_seen = _last_seen_for_viewer(u, viewer_uin=me, is_contact=is_contact)
+        if not openable:
+            last_seen = None
+        gender = _gender_for_viewer(u, viewer_uin=me, is_contact=is_contact)
+        policy = (u.call_policy or "everyone").lower()
+        out.append(
+            LookupRow(
+                uin=u.uin,
+                nickname=u.nickname,
+                status=visible_status(u),
+                status_message=u.status_message if profile_visible else None,
+                identity_key=u.identity_key,
+                signing_key=u.signing_key,
+                signal_identity_key=u.signal_identity_key,
+                gender=gender if profile_visible else None,
+                last_seen=last_seen,
+                callable=(policy != "nobody") if is_contact else True,
+                profile_openable=openable,
+                # The picture follows the relationship, not the card setting,
+                # exactly as on `/users/{uin}/info`.
+                avatar_media_id=(u.avatar_media_id if (is_contact or u.uin in shares) else None),
+                avatar_media_key=(u.avatar_media_key if (is_contact or u.uin in shares) else None),
+            )
+        )
+    return LookupOut(users=out)
 
 
 @router.get(
@@ -511,6 +895,9 @@ async def update_me(
     if "profile_visibility" in data:
         if data["profile_visibility"] not in ("everyone", "contacts", "nobody"):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid profile_visibility")
+    if "profile_card_policy" in data:
+        if data["profile_card_policy"] not in POLICY_VALUES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid profile_card_policy")
     if "group_invite_policy" in data:
         if data["group_invite_policy"] not in ("everyone", "contacts", "nobody"):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid group_invite_policy")
@@ -544,13 +931,10 @@ async def update_me(
             )
         data["avatar_media_id"] = new_id
         data["avatar_media_key"] = new_key
-    if "presence_ttl_minutes" in data and data["presence_ttl_minutes"] is not None:
-        # Allowlist matches the iOS picker options so we don't accept
-        # arbitrary values from a poked client. 0 = forever; the rest
-        # are 30 min / 1 h / 3 h / 8 h / 24 h.
-        allowed = {0, 30, 60, 180, 480, 1440}
-        if data["presence_ttl_minutes"] not in allowed:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid presence_ttl_minutes")
+    # (The `presence_ttl_minutes` allow-list check stood here until 2026-08-23.
+    # It guarded a column that no longer exists; the key cannot reach `data` at
+    # all now, because `ProfileUpdate` no longer declares it and unknown keys
+    # are dropped before we get here.)
     renamed = "nickname" in data and data["nickname"] != user.nickname
     for key, value in data.items():
         setattr(user, key, value)
@@ -738,16 +1122,31 @@ class CapabilitiesIn(BaseModel):
     # the legacy per-member fan-out. Optional so future flags can ride the
     # same endpoint without old clients clearing them.
     sender_keys: bool | None = None
+    # Stage 4b: THIS INSTALL keeps its contact list in the vault (SPEC 4.9)
+    # and no longer reads `GET /contacts` as the truth. Per DEVICE, unlike
+    # `sender_keys` above, and stored in `contact_vault_devices` rather than
+    # on this row: an account whose phone updated first must keep receiving
+    # contact rows for its still-old desktop, or a person added on the phone
+    # would silently never appear on the desktop. False unmarks this install,
+    # which is the way back out of a rolled-back release.
+    vault_contacts: bool | None = None
 
 
 @router.post("/me/capabilities", status_code=status.HTTP_204_NO_CONTENT)
 async def set_capabilities(
     body: CapabilitiesIn,
     uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Upsert this account's client-capability flags. Idempotent — clients
     fire it on every start without tracking whether they already did."""
+    if body.vault_contacts is not None:
+        if body.vault_contacts:
+            await mark_vault_device(db, uin, device_id)
+        else:
+            await unmark_vault_device(db, uin, device_id)
+        await db.commit()
     if body.sender_keys is None:
         return
     # No timestamp. Clients fire this on every app start, so stamping the row

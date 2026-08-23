@@ -96,6 +96,40 @@ class Report(Base):
     replied_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Set when the REPORTER dropped this report from their own list. It is a
+    # soft delete and the row is deliberately kept, because a hard DELETE here
+    # rewrote history: `services/hof_stats` counts a contributor's bug-bounty
+    # reports (filed, and how many were confirmed) live over this table, so the
+    # way to improve your standing on the wall was to file everything you could
+    # think of and then delete whatever came back dismissed. The number of
+    # reports you filed is not yours to revise after the fact.
+    #
+    # What it changes: the row disappears from GET /reports/mine and stops
+    # accepting turns. What it does NOT change: the admin queue (the operator
+    # keeps the evidence of the report he rejected) or the Hall of Fame counts.
+    #
+    # It is also a RETENTION timestamp, and has to be. A closed report is swept
+    # 90 days after `resolved_at` whether it is hidden or not, but a report
+    # withdrawn while still OPEN has no `resolved_at` and would then have no
+    # clock at all: its free text would outlive every other report on the island
+    # because the one person who would have chased it to a verdict is the one
+    # who dropped it. So `services/report_sweep` measures the same 90 days from
+    # here when that is the only stamp there is.
+    hidden_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Last time the reporter rewrote `reason` through PATCH /reports/mine/{id}.
+    # NULL = never edited, which is every row that predates the endpoint.
+    #
+    # This is the whole edit trail on purpose. Keeping the superseded drafts
+    # would mean storing MORE user free text per report, permanently, which is
+    # the exact thing `services/report_sweep` exists to stop; and an edit is
+    # only allowed before anyone has answered, so there is no operator reply
+    # left standing next to text that has since changed. The stamp is what the
+    # queue needs: "this is not what I read yesterday".
+    edited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )

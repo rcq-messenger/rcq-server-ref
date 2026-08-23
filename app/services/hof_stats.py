@@ -41,6 +41,15 @@ async def bug_report_stats(
     result; callers default them to (0, 0). One grouped query regardless of how
     many uins.
 
+    ⚠⚠ `hidden_at` IS NOT FILTERED HERE AND MUST NOT BE. A reporter can drop a
+    report from their own list (DELETE /reports/mine/{id}); that used to be a
+    real DELETE, and since these two numbers are computed live over the rows, it
+    was a way to edit your own history: file everything, delete whatever came
+    back `dismissed`, and the ratio the podium ranks by only ever improved. The
+    delete is a soft delete precisely so that this query keeps seeing the row.
+    Adding `Report.hidden_at.is_(None)` to the WHERE below restores the exploit
+    exactly.
+
     Founder-granted credit for reports filed OUTSIDE the in-app form
     (`users.hof_bonus_*`) is added on top, so a tester who does the work in the
     closed tester chat is not shown as having contributed nothing. That credit
@@ -63,6 +72,8 @@ async def bug_report_stats(
                 Report.reporter_uin.in_(uins),
                 Report.context == "bug_bounty",
                 ~Report.reason.contains(_CRASH_MARKER),
+                # No `hidden_at` clause on purpose. See the docstring: a report
+                # the reporter hid from their own list still counts as filed.
             )
             .group_by(Report.reporter_uin)
         )

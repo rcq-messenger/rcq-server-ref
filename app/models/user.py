@@ -163,6 +163,44 @@ class User(Base):
     # surfacing their personal info to strangers flip it to
     # "contacts" or "nobody".
     profile_visibility: Mapped[str] = mapped_column(String(16), default="everyone")
+    # Who may OPEN my profile card (founder item 22). Same
+    # {"everyone","contacts","nobody"} tri-state as its neighbours.
+    #
+    # NOT a second `profile_visibility`. That one decides which optional
+    # FIELDS survive the trip to an outsider, and it always leaves a card
+    # that opens — an empty one. Item 22 is about the tap itself: a card is
+    # reachable from surfaces nobody chose to appear on. React to a message
+    # in a group and your name lands in the "who reacted" sheet; send a
+    # photo and your name sits over it in the viewer; join anything and you
+    # are a row in a member list. Every one of those names is a link, so
+    # being in a room is enough for a stranger to read your card.
+    #
+    # ⚠ WHAT IT DOES NOT TOUCH, and why. The card gate never removes the
+    # IDENTITY FLOOR — uin, nickname, identity_key, signing_key, signal_*,
+    # status — and never removes the avatar:
+    #   * A group roster has to carry every member's uin and keys (group
+    #     ciphertext is sealed per recipient), and a roster of bare numbers
+    #     is not a member list anybody can use. Hiding the nickname would
+    #     not protect the person, it would break the group.
+    #   * The picture follows the RELATIONSHIP, not this setting: `GET
+    #     /users/{uin}/info` hands it to a mutual contact or a group
+    #     co-member and `GroupMemberOut` hands it to co-members, and those
+    #     two agreeing is a bug we already fixed once. Stripping it here
+    #     would put them back into disagreement.
+    #   * The founder's own copy says it out loud: someone shut out "will
+    #     still be able to write to you". A 403 on the card endpoint would
+    #     take away `identity_key` and with it the ability to send at all.
+    # So what the gate removes is exactly the set of fields that only ever
+    # appear on the card: first/last name, age, gender, city, country,
+    # about, interests, homepage, status_message, last_seen.
+    #
+    # Default "everyone": both shipped clients seed their local mirror with
+    # "everyone", so any other default would show a fresh account one thing
+    # in Settings while the island enforced another. Unlike
+    # `last_seen_visibility` (pushed continuously, closed by default since
+    # 2026-08-11) a card is PULLED, and `profile_visibility` already stands
+    # in front of it.
+    profile_card_policy: Mapped[str] = mapped_column(String(16), default="everyone")
     # Gender visibility — same {"everyone","contacts","nobody"}
     # tri-state as last-seen. Default "nobody" because gender is
     # optional info that the user opts in to surfacing, unlike
@@ -235,18 +273,22 @@ class User(Base):
     # in a comment in /account/migrate; it is not one. `services/hof_stats.py`
     # scores contributors off `reports` and `users.hof_bonus_*` and has never
     # looked at an activity streak.)
-    # Opt-in flag: when TRUE, the user's chosen `status` keeps being
-    # broadcast to contacts even after the WS goes stale. Lets people
-    # appear "around" with their selected status (online/away/dnd) when
-    # the app is killed. Default FALSE keeps the historical behaviour
-    # where killing the app shows the user as offline.
-    presence_persistent: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Optional TTL for `presence_persistent`. NULL/0 = no cap, the
-    # user stays "visible" forever after exit. >0 = stay visible for
-    # N minutes past `last_seen`, then revert to offline. Lets the
-    # user pick "show me as online for the next hour" without leaving
-    # themselves visible indefinitely after they put the phone down.
-    presence_ttl_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # (`presence_persistent` + `presence_ttl_minutes`, the "stay visible after
+    # leaving" pair, were unmapped on 2026-08-23. The setting could not do what
+    # its own screen promised and never could:
+    #   * No shipped client ever sent the TTL with the toggle, only the
+    #     boolean, so the column stayed NULL, and NULL meant FOREVER. Everyone
+    #     who turned it on got the unbounded version of a setting the UI
+    #     presented as bounded.
+    #   * Even when a duration WAS sent, the window was anchored on
+    #     `last_seen`, which the 25s heartbeat rewrites. The countdown restarted
+    #     on every ping instead of burning down, so it only ever expired for
+    #     someone already offline.
+    #   * It bought the user no privacy in either direction. `last_seen` is
+    #     written every 25s for every account regardless, so the server learned
+    #     nothing less; the only effect was telling the user's contacts they
+    #     were around when they were not.
+    # Presence is now one rule for everyone: fresh `last_seen` or offline.)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -280,37 +322,16 @@ def presence_is_fresh(last_seen: datetime | None) -> bool:
 
 
 def effective_status(user: "User") -> str:
-    """The real presence state. Fake users are decoration (no live
-    connection) so their stored status is used verbatim. For real users a
-    stale `last_seen` means offline regardless of what `status` says;
-    while fresh, a user-chosen away/dnd/invisible is honoured, otherwise
+    """The real presence state, one rule for every account: a stale
+    `last_seen` means offline regardless of what `status` says; while
+    fresh, a user-chosen away/dnd/invisible is honoured, otherwise
     online.
 
-    `presence_persistent` opts the user OUT of the staleness check —
-    their chosen `status` is broadcast regardless of WS liveness. The
-    implicit "offline" default (which only appears when status was never
-    explicitly set) is mapped to "online" so a persistent user without
-    a deliberate pick still shows as around. Anyone who wants to look
-    offline picks `invisible`, which `visible_status` reduces to
-    `offline` for other viewers.
+    There is no opt-out of the staleness check any more (see the note
+    where `presence_persistent` used to be declared). Someone who wants
+    to look offline while connected picks `invisible`, which
+    `visible_status` reduces to `offline` for other viewers.
     """
-    if user.presence_persistent:
-        # TTL gate (when set): persistent presence expires after N
-        # minutes past last_seen. NULL/0 = forever (legacy behaviour).
-        ttl = user.presence_ttl_minutes or 0
-        within_ttl = (
-            ttl == 0
-            or (
-                user.last_seen is not None
-                and _as_aware(user.last_seen)
-                > datetime.now(timezone.utc) - timedelta(minutes=ttl)
-            )
-        )
-        if within_ttl:
-            chosen = user.status or "offline"
-            return "online" if chosen == "offline" else chosen
-        # TTL expired → fall through to staleness check, which will
-        # render the user offline.
     if not presence_is_fresh(user.last_seen):
         return "offline"
     if user.status in ("away", "dnd", "invisible"):
@@ -323,3 +344,35 @@ def visible_status(user: "User") -> str:
     offline, ICQ-style."""
     s = effective_status(user)
     return "offline" if s == "invisible" else s
+
+
+# ── Profile card gate (founder item 22) ─────────────────────────────
+# One rule, one place. Four routers publish a name that some client turns
+# into a link (`/users/{uin}/info`, `/users/search`, `/contacts`, the group
+# and audio-room rosters) and a fifth serves a cross-island key card; every
+# one of them answers the question with this function so they cannot drift
+# the way the avatar rule once did.
+POLICY_VALUES = ("everyone", "contacts", "nobody")
+
+
+def card_openable_for_viewer(user: "User", *, viewer_uin: int | None, is_contact: bool) -> bool:
+    """May `viewer_uin` open `user`'s profile card?
+
+    Owner always yes — the setting is about OUTSIDERS, exactly like
+    `last_seen_visibility` and the rest. `viewer_uin=None` is the
+    unauthenticated / not-this-island caller (the federation key card), who
+    cannot be in this island's contact graph at all, so only "everyone"
+    passes for them.
+
+    ⚠ Reads no table. `is_contact` is a boolean the caller already had to
+    compute for something else — this function must never become a reason
+    to go and look the contact graph up.
+    """
+    if viewer_uin is not None and viewer_uin == user.uin:
+        return True
+    policy = user.profile_card_policy or "everyone"
+    if policy == "everyone":
+        return True
+    if policy == "contacts":
+        return viewer_uin is not None and is_contact
+    return False

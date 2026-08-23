@@ -6,25 +6,37 @@ groups move atomically; libsignal material is deliberately NOT moved
 on next message via the standard prekey flow).
 
 After commit:
-- Old UIN row is deleted (UIN goes back into the allocator pool —
-  if reissued later, the new owner has a fresh empty account)
+- Old UIN row is deleted, and the number itself is kept for the caller as an
+  `owned_uins` row rather than falling back into the allocator pool (§10.1.3):
+  the account that just left it is the only one that may take it again. Two
+  exceptions, both in step 2b: a collection already past the shop's cap, and a
+  number somebody else turns out to be holding. In both the number goes back
+  into the pool instead, which is what this route did before it kept anything
 - Old UIN's WebSocket sessions get an `account_burned` push so
   multi-device clients tear down stale state
+- Every group the account belongs to gets a `group_membership_changed`, the
+  same event any other roster change rides. Until 2026-08-23 the line above
+  was the whole of the socket traffic, so the only people told were the ones
+  who already knew: every other member's cached roster kept the OLD number and
+  the per-member sealed group path silently dropped the entry addressed to it
+  (step 6, and `groups.broadcast_roster_rekey` for the fan-out cost)
 - The router returns the new UIN + a fresh JWT; client persists
   both, drops its old socket, and reconnects under the new identity
 """
 
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.rate_limit import rate_limit
 from app.core.security import (
     bump_uin_epoch,
     cache_uin_epoch,
@@ -35,10 +47,13 @@ from app.core.security import (
     uin_epoch,
 )
 from app.models.device_token import DeviceToken
+from app.models.owned_uin import OwnedUin
 from app.models.user import User
 from app.services.connection_manager import manager
 from app.services.uin import allocate_uin
 from app.services.uin_rows import rekey_uin_rows
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/account", tags=["account"])
 
@@ -115,14 +130,17 @@ async def _perform_migration(
         last_seen_visibility=user.last_seen_visibility,
         gender_visibility=user.gender_visibility,
         profile_visibility=user.profile_visibility,
+        # Item 22. Not copying it would have silently re-opened the card of
+        # everybody who bought a shorter number — the same class of bug as the
+        # avatar the copy above forgot, and worse, because it undoes a privacy
+        # choice rather than losing a picture.
+        profile_card_policy=user.profile_card_policy,
         group_invite_policy=user.group_invite_policy,
         call_policy=user.call_policy,
         read_receipts_visibility=user.read_receipts_visibility,
         push_preferences=user.push_preferences,
         # Everything below describes the PERSON, not the number they answered
         # as, so it follows them across. Dropping it was never a decision:
-        #   * presence_* — the "stay visible for N minutes" setting. Losing it
-        #     reset a privacy choice to the default without saying so.
         #   * hof_* — their standing on the wall, including the founder's own
         #     approval. Without this a moved number quietly disappeared from
         #     the Hall of Fame and had to be approved a second time.
@@ -136,8 +154,11 @@ async def _perform_migration(
         # only reason anyone believed the streak had a consumer:
         # `services/hof_stats.py` scores contributors from `reports` and
         # `users.hof_bonus_*` and has never looked at it.
-        presence_persistent=user.presence_persistent,
-        presence_ttl_minutes=user.presence_ttl_minutes,
+        #
+        # Two more left on 2026-08-23: `presence_persistent` and
+        # `presence_ttl_minutes`, the "stay visible after leaving" pair. There
+        # is no privacy choice left to carry across, the setting is gone
+        # entirely (models/user.py says why).
         hof_opt_in=user.hof_opt_in,
         hof_approved=user.hof_approved,
         hof_avatar=user.hof_avatar,
@@ -170,6 +191,99 @@ async def _perform_migration(
     # changed hands.
     await rekey_uin_rows(db, old_uin, target_uin)
 
+    # Step 2b: the number they are leaving joins their collection instead of
+    # dropping back into the allocator pool (§10.1.1 and §10.1.3 item 3: "the
+    # old UIN is stamped as OwnedUin(owner=new_uin, source=migrated) so it
+    # doesn't fall back into the allocator pool and so the user can swap back
+    # later via a second migration").
+    #
+    # This lived in `uin_shop._take` and so applied to /uin/purchase and
+    # /uin/activate only: "new number" in settings, the route people actually
+    # press, released the number to the next registration while every client
+    # says the number you leave stays yours. Doing it HERE, before the commit
+    # below, also closes the window the shop had between two transactions where
+    # the number belonged to nobody.
+    #
+    # ⚠ WHAT IT COSTS, so nobody has to rediscover it: this row IS an
+    # old-identity to new-identity mapping, with a timestamp, and it survives
+    # for as long as the number is held. `/uin/purchase` and `/uin/activate`
+    # have always written one and there it matches what the user asked for
+    # (they are collecting numbers); on THIS route it is new, and this route is
+    # also the one somebody presses to stop being findable. Nothing else on the
+    # island answers "which account used to be 100200300": `rekey_uin_rows`
+    # rewrites rows onto the new number rather than recording the pair, and
+    # `uin_epochs` only counts how many times a number changed hands. The
+    # metadata map already marks `owned_uins.source` and `acquired_at` for
+    # removal (docs/metadata-map-2026-08-22.md) and calls the `source` marker
+    # "the alias feature creating the alias-linkage record it exists to
+    # prevent". Kept anyway, because §10.1.3 item 3 says to and because a
+    # migration that silently loses your number is the louder failure. The
+    # escape is `DELETE /uin/mine/{uin}`, which puts the number back in the
+    # pool; whether the "new number" flow should offer that in the same breath
+    # is a founder question, not one to settle by quietly changing this line.
+    #
+    # The migration itself is never REFUSED over the cap: this is the one route
+    # whose whole value is being available on demand, no client maps a
+    # `too_many_uins` refusal on it, and the caller is not acquiring anything,
+    # they already had this number. What the cap does bound is how far the
+    # collection may run: a full one is allowed to go ONE over here, and after
+    # that the number a migration leaves behind goes back into the pool like it
+    # always did. Without that ceiling the exemption was unbounded rather than
+    # "one over": there is no cooldown by default and no rate limit on this
+    # route, so a caller could simply loop /account/migrate and accumulate as
+    # many numbers as it had patience for, and since `allocate_uin` now rejects
+    # anything in anybody's collection (services/uin.uin_is_taken), each one is
+    # permanently out of everyone else's reach.
+    #
+    # Counted AFTER the re-key above, so these rows already name `target_uin`.
+    # Imported inside the function because uin_shop imports this module.
+    from app.routers.uin_shop import MAX_OWNED_UINS  # noqa: PLC0415
+
+    held = await db.scalar(
+        select(func.count())
+        .select_from(OwnedUin)
+        .where(OwnedUin.owner_uin == target_uin)
+    )
+    stale = await db.get(OwnedUin, old_uin)
+    if stale is not None and int(stale.owner_uin) != target_uin:
+        # ⚠⚠ SOMEBODY ELSE holds the number this account is answering as. That
+        # is a corrupt state (registration used to check only `users`, so a
+        # number sitting in a collection could be handed to a stranger), and it
+        # is not one this route may resolve in its own favour: re-pointing the
+        # row would silently transfer the holder's number to whoever happened
+        # to be occupying it, and there is no way back: the holder's
+        # /uin/activate answers `not_owned` and DELETE /uin/mine/{uin} 404s, so
+        # they cannot even see it any more.
+        #
+        # Leaving the row with its owner is also the recovery: deleting the old
+        # `User` row below frees the number, and the holder's /uin/activate
+        # works again, which is what this code path did by accident before it
+        # touched `owned_uins` at all. The caller simply does not keep this one.
+        # Skipping rather than inserting is what avoids the duplicate primary
+        # key that would otherwise fail the whole migration at commit.
+        #
+        # No numbers on the line: naming either of them here would write the
+        # old-identity/new-identity pair into the journal, which is the one
+        # thing this flow exists to make unanswerable. The durable record is
+        # the `owned_uins` row itself.
+        log.warning(
+            "[migrate] the vacated number is held by ANOTHER account, so it was "
+            "not stamped; the holder's row is left alone and the number returns "
+            "to the pool"
+        )
+    elif stale is not None:
+        # Already ours (the re-key above moved it), so only the provenance is
+        # out of date. No INSERT, the primary key is taken.
+        stale.source = "migrated"
+    elif (held or 0) > MAX_OWNED_UINS:
+        # Already one over. The number goes back into the allocator pool.
+        log.warning(
+            "[migrate] vacated number returned to the pool: the collection is "
+            "already at %d, past the cap of %d", held, MAX_OWNED_UINS
+        )
+    else:
+        db.add(OwnedUin(uin=old_uin, owner_uin=target_uin, source="migrated"))
+
     # Device push tokens belong to the device, not the account. After
     # migration the iOS client re-registers under the new UIN, so we
     # drop the old DeviceToken rows here to avoid double-pushing the
@@ -196,10 +310,57 @@ async def _perform_migration(
     # commit left clients wiping state for a migration that never happened.
     await manager.broadcast([old_uin], {"type": "account_burned"})
 
+    # Step 6: and tell the GROUPS. Until 2026-08-23 step 5 was the whole of the
+    # socket traffic a migration produced, which meant the only people told
+    # were the ones who already knew. Every other member of every group this
+    # account is in kept a cached roster naming the OLD number, and
+    # `POST /messages/group-sealed` filters the sender's payload entries
+    # against the LIVE roster: the entry addressed to the number that no longer
+    # exists was dropped, silently and necessarily silently (sealed sender
+    # leaves the island no sender to answer), so the migrated member received
+    # nothing and the sender saw only a smaller `delivered` count. It lasted
+    # until each sender independently refetched the roster.
+    #
+    # `broadcast_roster_rekey` rides the ordinary `group_membership_changed`
+    # path, so nothing new lands on any client, and it is built to be cheap for
+    # somebody in many large groups; its docstring says what that cost is
+    # and what was traded for it.
+    #
+    # AFTER the commit, like step 5 and for the same reason, and after it in
+    # order too: the roster it reads has to be the one the migration left
+    # behind. Imported here rather than at module scope only to keep this
+    # module importable from `uin_shop`, which imports it at module scope.
+    from app.routers.groups import broadcast_roster_rekey  # noqa: PLC0415
+
+    try:
+        notified = await broadcast_roster_rekey(db, target_uin)
+    except Exception:  # noqa: BLE001
+        # A committed migration must not become a 500 over a nudge. The client
+        # already has the new number and the fallback is the refresh every
+        # client does on reconnect.
+        log.exception("[migrate] telling the groups failed; rosters refresh on their own")
+    else:
+        if notified:
+            # No numbers on the line (see step 2b): the count is the whole of
+            # what is useful here anyway.
+            log.info("[migrate] %d group(s) told their roster moved", len(notified))
+
     return target_uin
 
 
-@router.post("/migrate", response_model=MigrateOut)
+# ⚠ A LIMIT, not the cooldown. `RCQ_MIGRATION_COOLDOWN_SECONDS` is the
+# product decision (how often a person may change their number, dialled by the
+# operator) and it defaults to 0, so until 2026-08-23 this route had no ceiling
+# of any kind: `step 6` fans a `group_membership_changed` out to every group
+# the account is in, and looping the route looped that fan-out as well as the
+# UIN accumulation the `owned_uins` comment already describes. Five an hour is
+# far above any real use of "new number" and far below anything that can hurt
+# the cluster.
+@router.post(
+    "/migrate",
+    response_model=MigrateOut,
+    dependencies=[Depends(rate_limit("account_migrate", 5, 3600))],
+)
 async def migrate(
     uin: int = Depends(current_uin),
     device_id: str = Depends(current_device_id),

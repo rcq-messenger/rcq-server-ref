@@ -206,7 +206,6 @@ async def lifespan(_: FastAPI):
     # the four workers does the work in any cycle.
     from app.services.credential_sweep import credential_sweep_loop
     from app.services.device_sweep import device_sweep_loop
-    from app.services.poll_sweep import poll_sweep_loop
     from app.services.prekey_sweep import prekey_sweep_loop
     from app.services.presence_sweep import presence_sweep_loop
     from app.services.report_sweep import report_sweep_loop
@@ -220,8 +219,10 @@ async def lifespan(_: FastAPI):
         asyncio.create_task(report_sweep_loop()),
         # Revoked device slots, once the id is safe to hand out again.
         asyncio.create_task(device_sweep_loop()),
-        # Closed polls and their ballots, including the anonymous ones.
-        asyncio.create_task(poll_sweep_loop()),
+        # (The poll sweep was here. Polls were removed whole on 2026-08-23, so
+        # there is nothing left to age out: no writer, no model, and the two
+        # orphaned tables are frozen until the operator drops them by hand.
+        # See routers/polls.py and the block in core/db.py.)
         # Spent invites and dead network-gate tokens.
         asyncio.create_task(credential_sweep_loop()),
         # Ghosts in the cluster-wide online set, which had no TTL at all.
@@ -354,6 +355,9 @@ app.include_router(presence.router)
 app.include_router(random_chat.router, dependencies=[Depends(require_feature("random_enabled"))])
 app.include_router(audio_rooms.router)
 app.include_router(reports.router)
+# Polls were removed on 2026-08-23. These two routers are the 410 tombstone
+# that keeps a shipped composer from meeting a bare routing 404, NOT a feature.
+# routers/polls.py carries the reasoning and the condition for deleting them.
 app.include_router(polls.router)
 app.include_router(polls.group_polls_router)
 app.include_router(news.public_router)

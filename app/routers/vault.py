@@ -28,14 +28,21 @@ delete is a write that lands on top of something, and the unconditional form
 is exactly the #605 pattern. Deleting what is already gone is 204 either way,
 so a retried delete cannot fail.
 
-Every accepted write and every delete nudges the account's sessions with
+Every accepted write and every delete nudges the account's OTHER devices with
 `{"type": "vault_changed", "slot", "version"}` (the NEW version, which on a
-delete is the tombstone's). The writer sees its own nudge and ignores it by
-version; every other device of the account re-reads the slot. ⚠ The nudge is
-pub/sub to live sockets with no queue and no replay: a device whose socket
-was down at that moment never hears it. Clients therefore re-read every
-slot they use on EVERY socket (re)connect, not only on boot, and `GET /vault`
-exists so that check is one small request (slots and versions, no blobs).
+delete is the tombstone's), and they re-read the slot. The writing install is
+skipped by name (see `_nudge`). ⚠ The nudge is pub/sub to live sockets with
+no queue and no replay: a device whose socket was down at that moment never
+hears it. Clients therefore re-read every slot they use on EVERY socket
+(re)connect, not only on boot, and `GET /vault` exists so that check is one
+small request (slots and versions, no blobs).
+
+The slot name is 32 hex characters and nothing else, and the island attaches
+no meaning to any of them: a client that wants a second slot beside the
+contact list (the chat-list sections of stage 4b, say) derives another name
+and writes it. No server change, no schema, no list of known names. The
+version rule below is per (account, slot), so every new slot inherits the
+whole #605 discipline the moment it exists.
 
 What the island cannot tell a client: whether a blob it serves is the latest
 one ever written. The version is the only handle. First-party clients seal
@@ -51,6 +58,16 @@ transaction, because every slot would be unreachable under the new
 derivation and the ciphertext under a key the user just retired has no
 business staying. The client that rotates reads its slots BEFORE the reissue
 and writes them back under the new derivation AFTER it.
+
+That emptying announces itself with ONE account-level frame, `{"type":
+"vault_reset", "reason": "identity_reissued"}`, to the account's other
+sessions (the rotating install is skipped by name, as on a write). Not a
+`vault_changed` per slot: the slot NAMES are derived from the identity, so
+after a reissue the slots are not at a new version, they are at new names, and
+a per-slot nudge would send a device to re-read a name that will never exist
+again. It means "the island's copy is gone and your derivation is retired,
+re-derive and republish", never "wipe what you have": an unnamed "primary"
+install cannot be skipped and so hears its own reset.
 
 Limits, also advertised in /server/info: MAX_BLOB_BYTES decoded per slot,
 MAX_SLOTS live slots per account, and per account per hour 1200 reads, 240
@@ -78,7 +95,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import enforce_cost_budget, rate_limit
-from app.core.security import current_uin
+from app.core.security import current_device_id, current_uin
 from app.models.vault import VaultSlot
 from app.services.connection_manager import manager
 
@@ -163,8 +180,30 @@ def _stale(current: int) -> HTTPException:
     return HTTPException(status.HTTP_409_CONFLICT, detail={"code": "stale", "version": current})
 
 
-async def _nudge(uin: int, slot: str, version: int) -> None:
-    await manager.broadcast([uin], {"type": "vault_changed", "slot": slot, "version": version})
+async def _nudge(uin: int, slot: str, version: int, writer: str) -> None:
+    """Tell the account's OTHER devices that this slot moved.
+
+    The writer is skipped by install name rather than left to recognise its
+    own version. The nudge is published the instant the transaction commits,
+    while the reply to the PUT is still in flight, so the writer regularly
+    hears "slot X is at version 5" BEFORE it learns that it is the one that
+    wrote version 5, and a client that compares against what it last read (4)
+    then re-reads its own write in the middle of its own read-merge-write
+    loop. Harmless once, but it is a second round trip and a second merge on
+    every write, and with sections and contacts in separate slots there are
+    more writes.
+
+    ⚠ "primary" is the ABSENCE of an install name (see
+    `security.carry_device_id`), not a device: two unnamed installs of one
+    account are indistinguishable here, so excluding that name would silence
+    the real other device. An unnamed writer therefore still hears itself,
+    which is why the version comparison stays on the client as well.
+    """
+    await manager.send(
+        uin,
+        {"type": "vault_changed", "slot": slot, "version": version},
+        except_device=writer if writer != "primary" else None,
+    )
 
 
 @router.get("", response_model=VaultListOut, dependencies=[Depends(rate_limit("vault_list", 600, 3600))])
@@ -201,6 +240,7 @@ async def put_slot(
     body: VaultPutIn,
     slot: str = _slot_path,
     uin: int = Depends(current_uin),
+    writer: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> VaultVersionOut:
     blob = _canonical_blob(body.blob)
@@ -244,7 +284,7 @@ async def put_slot(
         new_version = body.version + 1
 
     await db.commit()
-    await _nudge(uin, slot, new_version)
+    await _nudge(uin, slot, new_version, writer)
     return VaultVersionOut(version=new_version)
 
 
@@ -253,6 +293,7 @@ async def delete_slot(
     slot: str = _slot_path,
     version: int = Query(ge=1, le=MAX_VERSION, description="the version this delete is based on"),
     uin: int = Depends(current_uin),
+    writer: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     row = await db.get(VaultSlot, (uin, slot))
@@ -269,5 +310,5 @@ async def delete_slot(
     if res.rowcount != 1:
         raise _stale(await _current_version(db, uin, slot))
     await db.commit()
-    await _nudge(uin, slot, version + 1)
+    await _nudge(uin, slot, version + 1, writer)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

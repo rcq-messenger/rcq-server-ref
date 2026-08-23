@@ -16,9 +16,19 @@ bytes. Without an evidence path that's a moderation black hole. The
 after explicit consent, uploads the DECRYPTED media along with the
 reason text. The server stores it under `evidence/<uuid>.<ext>`
 (admin-only path) and records the path on the Report row.
+
+The number, and why deleting is a hide
+--------------------------------------
+Every user-facing response here carries `number`, and it is `reports.id`, the
+same integer the founder triages by. There is exactly one number for a report,
+because he answers people by quoting it (see _report_number).
+
+Dropping a report from your own list is a SOFT delete (`hidden_at`), which is
+not tidiness: the Hall of Fame counts these rows live, so a hard DELETE let a
+contributor erase the reports that came back dismissed and rank as somebody who
+is never wrong. See delete_my_report for the rule and what it costs.
 """
 
-import contextlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -86,6 +96,16 @@ _EVIDENCE_DIR = Path(os.environ.get("RCQ_EVIDENCE_DIR", "evidence")).resolve()
 _EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# Auto-submitted crash reports ride this same channel: clients prefix `reason`
+# with "[<platform> <version>] [CRASH]". Mirrors CRASH_MARKER in
+# app/routers/admin.py and _CRASH_MARKER in app/services/hof_stats.py, which is
+# where it does the real work (a crash dump is not a contributor's effort and is
+# kept out of the Hall of Fame counts). Kept as a literal here rather than
+# imported from the admin router, so this module stays free of it. Keep the
+# three in sync.
+CRASH_MARKER = "[CRASH]"
+
+
 # Bug-bounty attachment caps. Each row references a previously
 # uploaded /media blob; we never hold plaintext. Three attachments per
 # report is comfortably more than the typical "one screenshot, one
@@ -114,8 +134,32 @@ class CreateReportIn(BaseModel):
     attachments: list[ReportAttachmentIn] = Field(default_factory=list)
 
 
+# The number a person can quote when they write "обращение #123", and the
+# number the operator answers by. It is `reports.id` verbatim, on purpose.
+#
+# The alternative was a per-account counter (your first report is #1), which
+# hides how many reports the whole island has taken. That privacy is worth
+# less than it looks: the founder triages from /admin/reports, which lists the
+# primary key, and the reply channel refers to reports by that number. A second
+# numbering would mean the person and the person answering them are looking at
+# two different numbers for the same report, and the first time that goes wrong
+# is the first time somebody quotes a number in a support thread. So: ONE
+# number, and it is the admin's.
+#
+# What it leaks is the row id, i.e. roughly how many reports have ever been
+# filed on this island, to anyone who files one. It is already leaked by the
+# `id` field these responses have always carried; naming it does not widen
+# anything, it only tells the client which integer to print.
+def _report_number(report: Report) -> int:
+    return report.id
+
+
 class CreateReportOut(BaseModel):
     id: int
+    # Same integer as `id`. Present as its own field so clients render the
+    # number instead of guessing whether `id` is an internal key they should
+    # keep out of the UI. See _report_number.
+    number: int
     created_at: datetime
 
 
@@ -193,7 +237,9 @@ async def create_report(
     db.add(report)
     await db.commit()
     await db.refresh(report)
-    return CreateReportOut(id=report.id, created_at=report.created_at)
+    return CreateReportOut(
+        id=report.id, number=_report_number(report), created_at=report.created_at
+    )
 
 
 @router.post(
@@ -311,7 +357,9 @@ async def create_report_with_evidence(
     db.add(report)
     await db.commit()
     await db.refresh(report)
-    return CreateReportOut(id=report.id, created_at=report.created_at)
+    return CreateReportOut(
+        id=report.id, number=_report_number(report), created_at=report.created_at
+    )
 
 
 class ReportTurnOut(BaseModel):
@@ -323,9 +371,16 @@ class ReportTurnOut(BaseModel):
 
 class MyReportOut(BaseModel):
     id: int
+    # The number to print: "обращение #123". Same integer as `id` and the same
+    # one the operator sees in the queue, which is the point. See
+    # _report_number.
+    number: int
     reason: str
     status: str
     created_at: datetime
+    # Set once the reporter has rewritten their own text (PATCH below). NULL on
+    # every report nobody edited, which is all of them before 2026-08-23.
+    edited_at: datetime | None = None
     # The operator's answer, empty until one is written. This is the whole
     # point of the endpoint: before it existed a report was a one-way box.
     #
@@ -360,6 +415,23 @@ async def _thread_of(db: AsyncSession, report_ids: list[int]) -> dict[int, list[
     return out
 
 
+def _mine_out(report: Report, thread: list[ReportTurnOut]) -> MyReportOut:
+    """One place that shapes a report for its own author. The list and the edit
+    endpoint both return it, and building it twice by hand is how two callers
+    end up disagreeing about which fields a report has."""
+    return MyReportOut(
+        id=report.id,
+        number=_report_number(report),
+        reason=report.reason,
+        status=report.status,
+        created_at=report.created_at,
+        edited_at=report.edited_at,
+        reply=report.reply_text or "",
+        replied_at=report.replied_at,
+        thread=thread,
+    )
+
+
 class AddTurnIn(BaseModel):
     body: str = Field(..., min_length=1, max_length=4000)
 
@@ -382,29 +454,19 @@ async def my_reports(
 
     Only the reporter's own rows, and only the reader-safe columns:
     `resolution_notes` is the operator's internal reasoning and never leaves
-    the admin side.
+    the admin side. Rows the reporter dropped (`hidden_at`) are gone from here
+    and from nowhere else, which is the whole of what dropping one means.
     """
     rows = (
         await db.execute(
             select(Report)
-            .where(Report.reporter_uin == uin)
+            .where(Report.reporter_uin == uin, Report.hidden_at.is_(None))
             .order_by(Report.created_at.desc())
             .limit(50)
         )
     ).scalars().all()
     threads = await _thread_of(db, [r.id for r in rows])
-    return [
-        MyReportOut(
-            id=r.id,
-            reason=r.reason,
-            status=r.status,
-            created_at=r.created_at,
-            reply=r.reply_text or "",
-            replied_at=r.replied_at,
-            thread=threads.get(r.id, []),
-        )
-        for r in rows
-    ]
+    return [_mine_out(r, threads.get(r.id, [])) for r in rows]
 
 
 @router.post(
@@ -433,10 +495,12 @@ async def add_to_my_report(
     must still be finishable.
 
     Only your own report, and only while it is open — a closed one that starts
-    receiving text again is a ticket nobody is watching.
+    receiving text again is a ticket nobody is watching. A report you dropped
+    from your list answers 404 like any other id you cannot see: it is not on
+    your screen, so there is nothing there to write on.
     """
     report = await db.get(Report, report_id)
-    if report is None or report.reporter_uin != uin:
+    if report is None or report.reporter_uin != uin or report.hidden_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such report")
     if report.status != "open":
         raise HTTPException(
@@ -458,18 +522,55 @@ async def delete_my_report(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Let a reporter drop their own report.
+    """Let a reporter drop their own report from their own list.
 
     A tester asked for this the obvious way: the list shows a stale piece of
-    feedback from weeks ago and there is no way to be rid of it. The text is
-    theirs, so they may take it back.
+    feedback from weeks ago and there is no way to be rid of it.
 
-    One exception, and it is not a technicality: a still-open report ABOUT
-    ANOTHER user is the only record moderation has of that complaint, and a
-    "delete" button over it would let someone file an accusation, watch the
-    consequences land, and then erase the evidence. Those wait for a verdict;
-    everything else (feedback, bug reports, anything already resolved) goes.
-    Deleting is a real DELETE — no tombstone, nothing kept "just in case".
+    ⚠⚠ IT IS A HIDE, NOT A DELETE, AND THAT IS THE BUG THIS FIXES. This used to
+    be a real DELETE with no tombstone, which sounded principled and was in fact
+    a scoreboard exploit: `services/hof_stats` counts a contributor's bug-bounty
+    reports (how many filed, how many confirmed) live over these rows, so
+    deleting the ones that came back `dismissed` or `duplicate` raised the
+    confirmed-to-filed ratio the public wall ranks people by. File thirty, keep
+    the four that were real, and the wall shows a contributor who is never
+    wrong. So the row stays and only leaves the reporter's screen.
+
+    THE RULE, and it has no exceptions because every exception is a loophole:
+    once filed, a report counts as filed forever. Not "unless it was still
+    pending": the operator says "это не баг" in the thread before he flips the
+    status, so a pending carve-out would just move the exploit to the window
+    between the answer and the verdict, and someone watching for it would never
+    have a rejected report on their record at all. You cannot edit the number of
+    times you asked, only what happened next, and `confirmed` never falls, so
+    nobody is punished for filing (see hof_stats.podium_score).
+
+    Still refused: a still-open report ABOUT ANOTHER user. Not for the evidence
+    any more (the row survives now either way) but because the reporter is a
+    live party to that case, and the operator's only way to ask them anything is
+    the thread they would be hiding. It waits for a verdict; everything else
+    (feedback, bug reports, anything already closed) goes off the list at once.
+
+    What is deliberately NOT done here:
+      * the thread is kept, because it is the operator's record of the exchange
+        he is being asked to remember having had;
+      * the evidence blob is kept, because deleting it is exactly how the
+        founder loses the proof behind a report he rejected. It is not kept
+        forever: `services/evidence_sweep` unlinks every evidence file 48h after
+        the report closes and 30 days after it was filed regardless;
+      * the horizon does not move. An abuse report is still deleted outright
+        and a bug report still redacted down to its tally 90 days after the
+        operator closes it, hidden or not (`services/report_sweep`).
+
+    What DID have to change with the soft delete: a report withdrawn while it is
+    still OPEN has no `resolved_at`, so on the resolution clock alone it had no
+    clock at all, and the free text would have stayed on the island forever
+    unless an operator happened to close a report nobody was asking about any
+    more. The reporter cannot get at it either: it is off their list, and the
+    edit and turn paths 404 on a hidden row, so they cannot even ask for it to
+    be closed. `report_sweep` therefore also measures 90 days from `hidden_at`.
+    Same length, different starting gun, and one that only ever applies to a row
+    the reporter has already walked away from.
     """
     report = await db.get(Report, report_id)
     if report is None or report.reporter_uin != uin:
@@ -481,25 +582,97 @@ async def delete_my_report(
             status.HTTP_409_CONFLICT,
             detail={"code": "under_review"},
         )
-    if report.evidence_path:
-        # The decrypted evidence blob outlives the row otherwise: the sweep
-        # only ever looked at expiry, never at deletions. Resolve by NAME under
-        # the evidence dir, the way the sweep does — `evidence_path` is stored
-        # relative and must never be able to point outside it.
-        target = (_EVIDENCE_DIR / Path(report.evidence_path).name).resolve()
-        if target.parent == _EVIDENCE_DIR:
-            with contextlib.suppress(OSError):
-                target.unlink()
-    # ⚠ The thread goes explicitly, not on the declared ON DELETE CASCADE.
-    # SQLite enforces a foreign key only under `PRAGMA foreign_keys`, which
-    # this codebase never sets, and SQLite is the default DATABASE_URL. So on
-    # a self-host island "delete my report" left the whole plaintext exchange
-    # behind, orphaned to an id nothing points at any more. Postgres was doing
-    # the right thing all along, which is why nobody saw it. Found while
-    # writing the same guard into services/report_sweep, 2026-08-22.
-    for turn in (
-        await db.scalars(select(ReportMessage).where(ReportMessage.report_id == report.id))
-    ).all():
-        await db.delete(turn)
-    await db.delete(report)
+    # Idempotent: hiding an already-hidden report is a no-op, not a second
+    # timestamp. A client retrying a 204 it never saw must not rewrite when.
+    if report.hidden_at is None:
+        report.hidden_at = datetime.now(timezone.utc)
+        await db.commit()
+
+
+class EditReportIn(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=MAX_REASON_LEN)
+
+
+@router.patch(
+    "/mine/{report_id}",
+    response_model=MyReportOut,
+    # Same budget as writing a turn: rewording your own question a few times is
+    # normal, rewriting it in a loop is a client bug.
+    dependencies=[Depends(rate_limit("report_edit", 20, 3600))],
+)
+async def edit_my_report(
+    report_id: int,
+    body: EditReportIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> MyReportOut:
+    """Rewrite your own report while nobody has answered it yet.
+
+    People send the report and immediately notice the typo, the missing version
+    number, or that they described the wrong screen. Until now the only fix was
+    a second report saying "sorry, I meant", which is how the queue collected
+    the same issue three times.
+
+    ⚠ Deliberately NOT gated on the island's "reports open" switch, same as
+    reading and writing back: intake can be closed while a report already in
+    the queue must still be correctable.
+
+    The rules, and each one is load-bearing:
+
+      only your own, and not one you dropped from your list (404 either way, a
+        wrong id must not confirm somebody else's report exists);
+
+      only while `status == "open"`. Editing a closed report is editing the
+        thing a verdict was written about;
+
+      only while nothing has been said back. If the operator has replied, the
+        text he replied to cannot change under him, or the thread reads as an
+        answer to a question nobody asked;
+
+      never on a crash dump, and the new text may not carry the [CRASH] marker.
+        That marker is what `services/hof_stats` uses to keep auto-submitted
+        crashes out of a contributor's count, so letting a person put it into
+        their own text by hand would hand them a switch that takes a report out
+        of the tally: file, wait, and mark as crash whatever looks like it is
+        heading for a dismissal. Clients generate that prefix, people do not.
+
+    The trail is `edited_at` and nothing more, on purpose: see Report.edited_at.
+    """
+    report = await db.get(Report, report_id)
+    if report is None or report.reporter_uin != uin or report.hidden_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+    if report.status != "open":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "closed", "message": "this report is closed"},
+        )
+    # `or ""` like every other read of this column: a row that predates the
+    # column's DEFAULT can still hold NULL on an island that upgraded across it.
+    if (report.reply_text or "").strip():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "already_answered"},
+        )
+    answered = await db.scalar(
+        select(ReportMessage.id)
+        .where(ReportMessage.report_id == report.id, ReportMessage.from_admin.is_(True))
+        .limit(1)
+    )
+    if answered is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "already_answered"},
+        )
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid reason length")
+    if CRASH_MARKER in reason or CRASH_MARKER in (report.reason or ""):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={"code": "not_editable"},
+        )
+    report.reason = reason
+    report.edited_at = datetime.now(timezone.utc)
     await db.commit()
+    await db.refresh(report)
+    return _mine_out(report, (await _thread_of(db, [report.id])).get(report.id, []))

@@ -27,7 +27,7 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.federation import GossipRecord, HomeIslandRecord
-from app.models.user import User
+from app.models.user import User, card_openable_for_viewer
 
 router = APIRouter(prefix="/federation", tags=["federation"])
 
@@ -297,14 +297,27 @@ class PublicKeysOut(BaseModel):
     optional `gender`/`status_message` are gated by the user's
     `profile_visibility` ("everyone" only), so a privacy-conscious user on an
     open island still leaks only their nickname here.
+
+    ⚠ This endpoint is the reason the card gate cannot live only in
+    `/users/{uin}/info`: it is UNAUTHENTICATED, it serves two card fields, and
+    anyone who could not open a card the front way could have asked here
+    instead. It now applies `profile_card_policy` as well, at its strictest
+    reading — there is no caller identity to test a relationship against, and a
+    caller on another island is not in this island's contact graph at all, so
+    only "everyone" passes. That is the same test `profile_visibility` already
+    gets here and for the same reason.
     """
     uin: int
     identity_key: str                        # v=1 X25519 (seal an envelope to them)
     signing_key: str                         # v=1 Ed25519 (verify their sigs + the record `sk`)
     signal_identity_key: str | None = None   # v=2 libsignal (safety-number key + the record `ik`)
     nickname: str | None = None              # always-visible identity (display name)
-    gender: str | None = None                # profile_visibility=="everyone" only
-    status_message: str | None = None        # profile_visibility=="everyone" only
+    gender: str | None = None                # open profile AND open card only
+    status_message: str | None = None        # open profile AND open card only
+    # Whether a cross-island client should draw this peer's name as a link to
+    # a card. Viewer-independent by necessity (see above), so it is `true`
+    # only on "everyone". Absent-means-open on older clients, as everywhere.
+    profile_openable: bool = True
 
 
 @router.get(
@@ -333,6 +346,12 @@ async def get_public_keys(
     # gate /users/{uin}/info applies to outsiders. Nickname is always-visible
     # identity and ships regardless.
     profile_open = (u.profile_visibility or "everyone") == "everyone"
+    # And only when the card may be opened at all (item 22). `viewer_uin=None`
+    # is the honest description of this caller: no session, and no edge in
+    # this island's contact graph even if they are a contact on theirs. So
+    # "contacts" and "nobody" both close the optional fields here.
+    card_open = card_openable_for_viewer(u, viewer_uin=None, is_contact=False)
+    profile_open = profile_open and card_open
     return PublicKeysOut(
         uin=u.uin,
         identity_key=u.identity_key,
@@ -341,6 +360,7 @@ async def get_public_keys(
         nickname=u.nickname,
         gender=u.gender if (profile_open and (u.gender_visibility or "nobody") == "everyone") else None,
         status_message=u.status_message if profile_open else None,
+        profile_openable=card_open,
     )
 
 
