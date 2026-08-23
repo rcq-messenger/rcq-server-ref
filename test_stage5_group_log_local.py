@@ -43,7 +43,8 @@ from app.core.security import issue_token  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models.capability import UserCapability  # noqa: E402
 from app.models.group import Group, GroupMember, OfflineGroupMessage  # noqa: E402
-from app.models.group_log import GroupLog, GroupLogCursor  # noqa: E402
+from app.models.group_log import GroupLog, GroupLogCursor, GroupLogReader  # noqa: E402
+from app.models.queue_cursor import QueueCursor  # noqa: E402
 from app.models.user import User  # noqa: E402
 
 fails = 0
@@ -60,7 +61,7 @@ def b64(n=40):
     return base64.b64encode(os.urandom(n)).decode()
 
 
-A, B, OWNER = 5101, 5102, 5100
+A, B, OWNER, C = 5101, 5102, 5100, 5103
 
 
 async def count(model, *where):
@@ -72,17 +73,22 @@ async def main():
     global fails
     await init_db()
     async with SessionLocal() as db:
-        for u in (OWNER, A, B):
+        for u in (OWNER, A, B, C):
             db.add(User(uin=u, nickname=f"u{u}", identity_key=b64(32), signing_key=b64(32)))
             db.add(UserCapability(uin=u, sender_keys=True))
         g = Group(name="log-room", owner_uin=OWNER)
         db.add(g)
         await db.flush()
         gid = g.id
-        for u in (OWNER, A, B):
+        for u in (OWNER, A, B, C):
             db.add(GroupMember(group_id=gid, uin=u, role="owner" if u == OWNER else "member"))
+        # C drains the legacy queue from two devices (phone and desktop).
+        db.add(QueueCursor(uin=C, device_id="c-phone", last_direct_id=0, last_group_id=0))
+        db.add(QueueCursor(uin=C, device_id="c-desktop", last_direct_id=0, last_group_id=0))
         await db.commit()
     tok = {u: issue_token(u, 0, "phone") for u in (OWNER, A, B)}
+    tokC1 = issue_token(C, 0, "c-phone")
+    tokC2 = issue_token(C, 0, "c-desktop")
     tokA2 = issue_token(A, 0, "desktop")
     H = lambda t: {"Authorization": f"Bearer {t}"}  # noqa: E731
     transport = httpx.ASGITransport(app=app)
@@ -90,7 +96,7 @@ async def main():
         print("\nBefore anyone reads the log:")
         r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid, "payload": b64()})
         check("broadcast accepted", r.status_code == 200)
-        check("  ... three legacy rows (owner, A, B)", await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid) == 3)
+        check("  ... four legacy rows (owner, A, B, C)", await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid) == 4)
         check("  ... and no log row", await count(GroupLog, GroupLog.group_id == gid) == 0)
 
         print("\nA reads the log for the first time:")
@@ -98,16 +104,14 @@ async def main():
         check("fetch is 200", r.status_code == 200)
         body = r.json()
         check("  ... nothing to read yet (cursor starts at the head)", body["rows"] == [] and body["cursors"].get(str(gid)) == 0)
-        async with SessionLocal() as db:
-            cap = await db.get(UserCapability, A)
-        check("  ... A is now marked a log reader", cap is not None and cap.group_log)
+        check("  ... A's phone is now marked a log reader", await count(GroupLogReader, GroupLogReader.uin == A) == 1)
 
         print("\nA broadcast after that:")
         p2 = b64()
         r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid, "payload": p2})
         check("broadcast accepted", r.status_code == 200)
         check("  ... ONE log row", await count(GroupLog, GroupLog.group_id == gid) == 1)
-        check("  ... legacy rows for owner and B only (+2)", await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid) == 5)
+        check("  ... legacy rows for owner, B and C only (+3)", await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid) == 7)
         r = await c.post("/messages/group-log/fetch", headers=H(tok[A]), json={})
         rows = r.json()["rows"]
         check("A's fetch returns the post with seq 1", len(rows) == 1 and rows[0]["seq"] == 1 and rows[0]["payload"] == p2 and rows[0]["envelope_type"] == "gmsg")
@@ -142,6 +146,35 @@ async def main():
         rows = r.json()["rows"]
         check("B (now a reader) reading from 0 sees the broadcast but not A's skdm", [x["seq"] for x in rows] == [1])
 
+        print("\nPer-device flip (C has an old desktop):")
+        r = await c.post("/messages/group-log/fetch", headers=H(tokC1), json={})
+        check("C's phone reads the log", r.status_code == 200)
+        before = await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid, OfflineGroupMessage.to_uin == C)
+        r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid, "payload": b64()})
+        after = await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid, OfflineGroupMessage.to_uin == C)
+        check("  ... C still gets a legacy row (its desktop has not read the log)", after == before + 1)
+        r = await c.post("/messages/group-log/fetch", headers=H(tokC2), json={})
+        check("C's desktop reads the log too", r.status_code == 200)
+        r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid, "payload": b64()})
+        after2 = await count(OfflineGroupMessage, OfflineGroupMessage.group_id == gid, OfflineGroupMessage.to_uin == C)
+        check("  ... now C gets no legacy row", after2 == after)
+
+        print("\nJoining a room as a reader:")
+        async with SessionLocal() as db:
+            g2 = Group(name="second-room", owner_uin=OWNER, share_token="tok2")
+            db.add(g2); await db.flush(); gid2 = g2.id
+            db.add(GroupMember(group_id=gid2, uin=OWNER, role="owner"))
+            await db.commit()
+        r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid2, "payload": b64()})
+        r = await c.post(f"/groups/{gid2}/join", headers=H(tok[A]))
+        check(f"A joins the second room ({r.status_code})", r.status_code in (200, 201))
+        check("  ... A's cursors (phone and desktop) were seeded at the head at join time", await count(GroupLogCursor, GroupLogCursor.group_id == gid2, GroupLogCursor.uin == A) == 2)
+        joined_at = b64()
+        r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid2, "payload": joined_at})
+        r = await c.post("/messages/group-log/fetch", headers=H(tok[A]), json={})
+        rows2 = [x for x in r.json()["rows"] if x["gid"] == gid2]
+        check("  ... A's first fetch after joining serves the post made since, not the one before", len(rows2) == 1 and rows2[0]["payload"] == joined_at)
+
         print("\nLeaving:")
         async with SessionLocal() as db:
             db.add(GroupMember(group_id=gid, uin=A, role="member")) if False else None
@@ -150,7 +183,7 @@ async def main():
             r = await c.delete(f"/groups/{gid}/members/{A}", headers=H(tok[A]))
         check(f"A left ({r.status_code})", r.status_code in (200, 204))
         check("  ... A's cursors are gone", await count(GroupLogCursor, GroupLogCursor.group_id == gid, GroupLogCursor.uin == A) == 0)
-        check("  ... A's addressed row is gone, the broadcast stays", await count(GroupLog, GroupLog.group_id == gid) == 1)
+        check("  ... A's addressed row is gone, the three broadcasts stay", await count(GroupLog, GroupLog.group_id == gid) == 3)
 
         print("\nThe counter survives an emptied log:")
         async with SessionLocal() as db:
@@ -159,7 +192,7 @@ async def main():
         r = await c.post("/messages/group-broadcast", headers=H(tok[OWNER]), json={"group_id": gid, "payload": b64()})
         async with SessionLocal() as db:
             seqs = (await db.execute(select(GroupLog.seq).where(GroupLog.group_id == gid))).scalars().all()
-        check("next post is seq 3, not 1", seqs == [3])
+        check("next post is seq 5, not 1", seqs == [5])
 
         print("\nCapabilities:")
         info = (await c.get("/server/info")).json()["capabilities"]

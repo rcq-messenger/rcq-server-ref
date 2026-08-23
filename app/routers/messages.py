@@ -24,6 +24,7 @@ from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.group_log import GroupLog, GroupLogCursor
+from app.services.group_log import log_readers as _group_log_readers, mark_reader as _mark_group_log_reader, room_head as _group_head
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User, _as_aware
@@ -141,10 +142,12 @@ async def _next_mailbox_seq(db: AsyncSession, to_uin: int) -> int:
 # yet read the log: iOS ships through the founder's Xcode and can be weeks
 # behind, so "new posts go only to the log from day one" would have silenced
 # every room on every old install. The switch is per account and implicit:
-# the first /messages/group-log/fetch from any of its devices sets
-# `user_capabilities.group_log`, and from then on the writers stop producing
-# legacy rows for it. The rows it already has stay in the old queue and the
-# new client keeps draining that queue too (dual read), deduping by UUID.
+# the switch is per DEVICE and implicit: a /messages/group-log/fetch marks
+# the device a reader (`group_log_readers`), and the writers stop producing
+# legacy rows for an account once every device that drains its legacy queue
+# is a reader (services/group_log.log_readers). The rows it already has stay
+# in the old queue and the new client keeps draining that queue too (dual
+# read), deduping by UUID.
 
 
 async def _next_group_seq(db: AsyncSession, group_id: int) -> int:
@@ -164,31 +167,6 @@ async def _next_group_seq(db: AsyncSession, group_id: int) -> int:
             "RETURNING next_seq"
         )
     return int((await db.execute(sql, {"g": group_id})).scalar_one())
-
-
-async def _group_log_readers(db: AsyncSession, uins: Iterable[int]) -> set[int]:
-    """Which of these accounts read the room log (and so need no legacy row)."""
-    uins = list(set(uins))
-    if not uins:
-        return set()
-    rows = (
-        await db.execute(
-            select(UserCapability.uin).where(
-                UserCapability.uin.in_(uins), UserCapability.group_log.is_(True)
-            )
-        )
-    ).scalars().all()
-    return set(rows)
-
-
-async def _mark_group_log_reader(db: AsyncSession, uin: int) -> None:
-    """The account's client just read the room log: from now on the writers
-    keep nothing for it in the per-member table."""
-    row = await db.get(UserCapability, uin)
-    if row is None:
-        db.add(UserCapability(uin=uin, group_log=True))
-    elif not row.group_log:
-        row.group_log = True
 
 
 _CALL_WAKE_ENV_MAX = 3500
@@ -1553,13 +1531,6 @@ class GroupLogAckIn(BaseModel):
     rooms: list[GroupLogAckRoomIn]
 
 
-async def _group_head(db: AsyncSession, group_id: int) -> int:
-    row = (await db.execute(
-        text("SELECT next_seq FROM group_seq WHERE group_id = :g"), {"g": group_id}
-    )).scalar_one_or_none()
-    return int(row or 0)
-
-
 @router.post(
     "/group-log/fetch",
     response_model=GroupLogFetchOut,
@@ -1579,9 +1550,10 @@ async def fetch_group_log(
     /group-log/ack, so a client that crashes between fetch and persist sees
     the same rows again rather than losing them.
 
-    ⚠ The first fetch also marks the ACCOUNT as a log reader: from then on the
-    writers stop producing per-member legacy rows for it. Anything already in
-    the legacy queue stays there and the client keeps draining /messages/queue
+    ⚠ The fetch also marks THIS DEVICE as a log reader. Once every device
+    that drains the account's legacy queue is a reader, the writers stop
+    producing per-member legacy rows for the account. Anything already in the
+    legacy queue stays there and the client keeps draining /messages/queue
     too, deduping by message UUID, until that queue runs dry.
     """
     from app.routers.devices import mark_device_seen
@@ -1647,7 +1619,7 @@ async def fetch_group_log(
                 gid=gid, seq=r.seq, envelope_type=r.envelope_type, cls=r.cls,
                 payload=r.payload, received_at=r.received_at,
             ))
-    await _mark_group_log_reader(db, uin)
+    await _mark_group_log_reader(db, uin, device_id)
     try:
         await db.commit()
     except IntegrityError:

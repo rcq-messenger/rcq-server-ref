@@ -73,3 +73,25 @@ class GroupLogCursor(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+
+class GroupLogReader(Base):
+    """One row per (account, device) that has read the room log at least once.
+
+    The writers keep producing the legacy per-member rows for an account
+    until EVERY device that drains the legacy queue for it (every
+    `queue_cursors` row of the account) is also a log reader. Per device, not
+    per account: an account's phone updating first must not silence its
+    still-old desktop or iPhone (iOS ships through the founder's Xcode and
+    can be weeks behind). An abandoned old device stops holding the account
+    back when its legacy cursor is reaped as stale (30 days)."""
+    __tablename__ = "group_log_readers"
+
+    uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    device_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )

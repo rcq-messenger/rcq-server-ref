@@ -28,12 +28,6 @@ class UserCapability(Base):
     # BIGSERIAL, and a forgotten column then mints a trophy number silently.
     uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     sender_keys: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Stage 5: the account's client drains rooms from the per-room log
-    # (POST /messages/group-log/fetch) instead of the per-member fan-out.
-    # Flipped implicitly by the first fetch; the writers then stop producing
-    # legacy `offline_group_messages` rows for this account. Per-ACCOUNT like
-    # `sender_keys`, with the same stale-second-device caveat.
-    group_log: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # (`updated_at` was unmapped on 2026-08-22. Clients re-advertise on every
     # app start, so the column was a second last-seen clock at app-launch
     # granularity, per account, with no reader anywhere. The flag itself is one
