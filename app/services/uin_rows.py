@@ -85,6 +85,7 @@ from app.models.audio_room import AudioRoom, AudioRoomMembership
 from app.models.capability import UserCapability
 from app.models.contact import Contact, ContactRequest
 from app.models.federation import HomeIslandRecord
+from app.models.group_log import GroupLog, GroupLogCursor
 from app.models.group import (
     Group,
     GroupMember,
@@ -107,6 +108,10 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (ContactRequest, ContactRequest.to_uin),
     (OfflineMessage, OfflineMessage.to_uin),
     (OfflineGroupMessage, OfflineGroupMessage.to_uin),
+    # Stage 5: the rows of the room log sealed to this account, and its
+    # cursors into every room. Broadcast rows name nobody and stay.
+    (GroupLog, GroupLog.to_uin),
+    (GroupLogCursor, GroupLogCursor.uin),
     # The durable per-mailbox seq counter (stage 2b). It follows the account on
     # a migration — the rekeyed offline_messages rows keep their old seqs, so a
     # fresh counter at the new number would allocate seq 1 and collide with them
