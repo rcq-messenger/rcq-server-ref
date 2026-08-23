@@ -44,10 +44,25 @@ else's pinned message.
 2026-08-22 (stage 1b) added `invites.created_by`, the last per-UIN column the
 map found missing. See the entry for what it does and does not cover.
 
+2026-08-23 removed `polls` and `poll_votes` with the polls feature. ⚠ Unlike
+the seven above, their TABLES are still there: that release drops the models
+and leaves the physical tables for a manual DROP (the reasoning is in
+`core/db.py`, in the block that logs the remaining row counts on every boot).
+They are therefore absent from the list below and always will be, because the
+models they would name no longer exist. The BURN still reaches them: see the
+raw-SQL tail of `purge_uin_rows`, which deletes by table and column name from
+whichever of the two this island turns out to have. Do not re-add entries here,
+and do not remove that tail before the DROP has run everywhere: an erasure
+promise that waits for an operator to get round to something is not one.
+The re-key path deliberately does NOT follow: a migration leaves
+`polls.creator_uin` / `poll_votes.voter_uin` naming the number the account
+left, which is dead metadata on a dead feature rather than something the new
+number needs to inherit, and the burn is what has to be true.
+
 ★★ Note for whoever reads this next: a table being SWEPT does not make it safe
 to drop from this list. A sweep runs on a horizon measured in months; a burn is
-supposed to be immediate. `polls` and `poll_votes` both gained a sweep in the
-same release as this note and both stay here for exactly that reason.
+supposed to be immediate. Every table below that also has a retention sweep is
+listed here as well, and that is deliberate rather than duplication.
 
 ★ Diffed against the flagship's live schema on 2026-08-22 (stage 1 review),
 when twenty-seven columns on the island named a person, eighteen of them in
@@ -82,12 +97,14 @@ with a reason; the nine that are accounted for elsewhere:
 
 from __future__ import annotations
 
-from sqlalchemy import delete, update
+from sqlalchemy import delete, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import LEGACY_POLL_TABLES
 
 from app.models.audio_room import AudioRoom, AudioRoomMembership
 from app.models.capability import UserCapability
-from app.models.contact import Contact, ContactRequest
+from app.models.contact import Contact, ContactRequest, ContactVaultDevice
 from app.models.federation import HomeIslandRecord
 from app.models.group_log import GroupLog, GroupLogCursor, GroupLogReader
 from app.models.group import (
@@ -99,7 +116,6 @@ from app.models.invite import Invite
 from app.models.mailbox_seq import MailboxSeq
 from app.models.message import OfflineMessage
 from app.models.owned_uin import OwnedUin
-from app.models.poll import Poll, PollVote
 from app.models.queue_cursor import QueueCursor
 from app.models.report import Report
 from app.models.vault import VaultSlot
@@ -111,6 +127,11 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (Contact, Contact.contact_uin),
     (ContactRequest, ContactRequest.from_uin),
     (ContactRequest, ContactRequest.to_uin),
+    # Stage 4b: the per-install "my contact list lives in the vault" switch.
+    # It follows the person on a migration (else the island resumes writing
+    # `contacts` rows for the new number, which is the exact thing the flip
+    # stopped) and goes on a burn like every other per-device mark.
+    (ContactVaultDevice, ContactVaultDevice.uin),
     (OfflineMessage, OfflineMessage.to_uin),
     (OfflineGroupMessage, OfflineGroupMessage.to_uin),
     # Stage 5: the rows of the room log sealed to this account, and its
@@ -132,8 +153,6 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     (GroupMember, GroupMember.uin),
     (AudioRoom, AudioRoom.owner_uin),
     (AudioRoomMembership, AudioRoomMembership.uin),
-    (Poll, Poll.creator_uin),
-    (PollVote, PollVote.voter_uin),
     (QueueCursor, QueueCursor.uin),
     (UserCapability, UserCapability.uin),
     # Stage 4a: the sealed slots. They follow the person on a migration (the
@@ -198,3 +217,25 @@ async def purge_uin_rows(db: AsyncSession, uin: int) -> None:
     """Delete every per-UIN row for `uin`, so a recycled number starts clean."""
     for model, column in PER_UIN_COLUMNS + DROP_ON_REKEY:
         await db.execute(delete(model).where(column == uin))
+    # The polls leftovers, by raw SQL because there is no model to point at any
+    # more. This is the ONE place in the codebase that still touches them, and
+    # it is here rather than deferred to the manual DROP because a burn is a
+    # promise that runs today: `poll_votes` holds (poll_id, voter_uin,
+    # option_index, created_at) for every ballot ever cast on this island, the
+    # ones marked anonymous included, and `polls.creator_uin` sits beside
+    # `polls.message_id` and so names the author of one encrypted group
+    # envelope. Neither has a foreign key to `users`, so nothing else reaches
+    # them; without this a burned account stays named in both until an operator
+    # gets round to the DROP.
+    #
+    # ⚠ `LEGACY_POLL_TABLES` is populated at BOOT (core/db.init_db) and is empty
+    # unless the table is really there. Do not turn this into a try/except
+    # around the statement: on Postgres a failed statement poisons the whole
+    # transaction, and the transaction this runs in is an account deletion.
+    #
+    # ⚠ The column names are not user input, they are the two literals in
+    # `_LEGACY_POLL_TABLES`; the uin is bound.
+    for table, column in LEGACY_POLL_TABLES.items():
+        await db.execute(
+            text(f"DELETE FROM {table} WHERE {column} = :uin"), {"uin": uin}
+        )

@@ -45,6 +45,7 @@ from app.core.security import carry_device_id, current_device_id, current_uin, i
 from app.models.owned_uin import OwnedUin
 from app.models.user import User
 from app.routers.migrate import _perform_migration
+from app.services.uin import uin_is_taken
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
 
@@ -78,18 +79,6 @@ _PRICES_CENTS: dict[int, int] = {
 
 def _length(uin: int) -> int:
     return len(str(uin))
-
-
-async def _is_taken(db: AsyncSession, uin: int) -> bool:
-    """A number is unavailable if somebody is USING it or HOLDING it.
-
-    The vault half is new and load-bearing: a held number has no `users` row,
-    so without this check the shop would happily sell #111 to a second person
-    while the first one still had it in their collection.
-    """
-    if await db.scalar(select(User.uin).where(User.uin == uin)) is not None:
-        return True
-    return await db.scalar(select(OwnedUin.uin).where(OwnedUin.uin == uin)) is not None
 
 
 class QuoteIn(BaseModel):
@@ -141,7 +130,7 @@ async def quote(
     if body.uin == me:
         return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="self")
 
-    taken = await _is_taken(db, body.uin)
+    taken = await uin_is_taken(db, body.uin)
     cents = _PRICES_CENTS[length]
     display = f"${cents / 100:.2f}"
     return QuoteOut(
@@ -194,7 +183,7 @@ async def suggestions(
         if candidate == me or candidate in seen:
             continue
         seen.add(candidate)
-        if await _is_taken(db, candidate):
+        if await uin_is_taken(db, candidate):
             continue
         cents = _PRICES_CENTS[length]
         out.append(SuggestionOut(
@@ -372,13 +361,13 @@ async def _take(
         await db.commit()
         return PurchaseOut(switched=False, owned=await _owned_uins(db, owner))
 
-    previous = owner
+    # Keeping the number they were using is `_perform_migration`'s job now, not
+    # this function's. It used to be written here, one commit AFTER the swap:
+    # the same two lines were missing from `/account/migrate`, which is how
+    # migrating could still lose your number, and between the two commits the
+    # number was in nobody's hands. Now it rides inside the migration's own
+    # transaction and both callers inherit it.
     new_uin = await _perform_migration(db, user, target_uin=target)
-    # Keep the number they were using. Before the vault existed a migration
-    # released it back into the pool, so buying a second number silently cost
-    # you the first one.
-    db.add(OwnedUin(uin=previous, owner_uin=new_uin, source="previous"))
-    await db.commit()
     return PurchaseOut(
         new_uin=new_uin,
         # Keep naming this install on the new token (see carry_device_id).
@@ -420,7 +409,7 @@ async def claim(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
     if body.uin == me:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "self_target"})
-    if await _is_taken(db, body.uin):
+    if await uin_is_taken(db, body.uin):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
 
     user = await db.get(User, me)

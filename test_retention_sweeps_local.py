@@ -13,7 +13,6 @@ quietly break the product, taken from reading the code it touches:
               moderation queue and is never touched at any age
   devices     a revoked slot must keep (uin, device_id) so the allocator does
               not hand the number to a new install a stale roster still points at
-  polls       an open poll inside its window still resolves tallies
   invites     an exhausted invite with a LIVE child is the revocation handle
               for that child and outlives its own horizon
   gate tokens a `standing` token that has merely gone quiet is not dead
@@ -48,9 +47,7 @@ from app.core.db import SessionLocal, init_db  # noqa: E402
 from app.models.access_token import AccessToken  # noqa: E402
 from app.models.contact import ContactRequest  # noqa: E402
 from app.models.device import Device  # noqa: E402
-from app.models.group import Group  # noqa: E402
 from app.models.invite import Invite, hash_invite_code  # noqa: E402
-from app.models.poll import Poll, PollVote  # noqa: E402
 from app.models.prekey import OneTimePreKey  # noqa: E402
 from app.models.report import Report  # noqa: E402
 from app.models.report_message import ReportMessage  # noqa: E402
@@ -290,41 +287,6 @@ async def main() -> None:
           3 in slots, str(slots))
     check("a LIVE device is never swept", 2 in slots, str(slots))
     check("the device sweep reports one release", n == 1, f"reported {n}")
-
-    # ── polls ───────────────────────────────────────────────────────────────
-    print("\npolls")
-    from app.services.poll_sweep import POLL_MAX_AGE_DAYS, sweep_once as poll_sweep  # noqa: E402
-
-    async with SessionLocal() as db:
-        db.add(Group(id=500, name="room", owner_uin=1001))
-        await db.flush()
-        old_closed = Poll(group_id=500, creator_uin=1001, message_id="m1", num_options=2,
-                          closed_at=ago(days=POLL_MAX_AGE_DAYS + 5), created_at=ago(days=400))
-        recent_closed = Poll(group_id=500, creator_uin=1001, message_id="m2", num_options=2,
-                             closed_at=ago(days=POLL_MAX_AGE_DAYS - 5), created_at=ago(days=400))
-        open_old = Poll(group_id=500, creator_uin=1001, message_id="m3", num_options=2,
-                        closed_at=None, created_at=ago(days=POLL_MAX_AGE_DAYS + 5))
-        open_recent = Poll(group_id=500, creator_uin=1001, message_id="m4", num_options=2,
-                           closed_at=None, created_at=ago(days=2))
-        db.add_all([old_closed, recent_closed, open_old, open_recent])
-        await db.flush()
-        for p in (old_closed, recent_closed, open_old, open_recent):
-            db.add(PollVote(poll_id=p.id, voter_uin=1001, option_index=0))
-        keep_ids = (old_closed.id, recent_closed.id, open_old.id, open_recent.id)
-        await db.commit()
-
-    n = await poll_sweep()
-    async with SessionLocal() as db:
-        left_polls = set((await db.scalars(select(Poll.id))).all())
-        left_votes = int(await db.scalar(select(func.count()).select_from(PollVote)) or 0)
-    check("a poll closed past the horizon is gone", keep_ids[0] not in left_polls)
-    check("a recently closed poll survives", keep_ids[1] in left_polls)
-    check("a poll left OPEN past the horizon is treated as abandoned",
-          keep_ids[2] not in left_polls)
-    check("a fresh open poll survives", keep_ids[3] in left_polls)
-    check("the ballots go with the poll, explicitly (SQLite does not cascade "
-          "without PRAGMA foreign_keys)", left_votes == 2, f"{left_votes} vote(s) left")
-    check("the poll sweep reports two", n == 2, f"reported {n}")
 
     # ── invites: the hash migration, then the sweep ─────────────────────────
     print("\ninvites")

@@ -18,7 +18,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.core.config import settings
-from app.routers import vault
+from app.routers import media, vault
 from app.services import server_settings
 
 
@@ -63,6 +63,18 @@ class ServerCapabilities(BaseModel):
     hood: bool = False
     stories: bool = False
     nearby: bool = False
+    # Group polls, removed on 2026-08-23 (routers/polls.py carries the why).
+    #
+    # ⚠ This key is NEW and False from birth, which is a different situation
+    # from the three above: they already had a flag every client read, so
+    # pinning it to False hid them the same day. Polls never had one, so not a
+    # single build in the field can see this yet and all of them still show the
+    # composer. The endpoints answer 410 Gone with `feature_removed` in the
+    # meantime, which is the half of the promise that works today; this key is
+    # the half that works from the next client release on, and it then stays on
+    # the wire as a permanent False for exactly as long as any shipped client
+    # still asks, same as hood/stories/nearby.
+    polls: bool = False
     # Abuse + bug reports to this island's operator, and reading their answers
     # back. Off means the client hides "Report" and "Report a bug" entirely;
     # reports already filed stay readable on both sides, so switching it off
@@ -107,6 +119,31 @@ class ServerCapabilities(BaseModel):
     vault: bool = True
     vault_max_blob_bytes: int = 0
     vault_max_slots: int = 0
+    # Stage 4b: this island understands the per-install `vault_contacts`
+    # capability of SPEC 2.12 and serves `POST /users/lookup` (SPEC 4.10), so
+    # a client can turn the numbers in its own vault slot into list rows
+    # without the `/contacts` JOIN. Permanent capability of this codebase,
+    # like `envelope_class` and `group_log`.
+    users_lookup: bool = True
+    # ⚠ FALSE, and it answers false rather than disappearing (the `hood` /
+    # `stories` / `nearby` rule: a missing key is not the same message as an
+    # explicit one). The read-only phase is NOT on. The island still records
+    # both directed rows for every accepted pair, because the five
+    # server-side rules that read them (calls, room invites, presence,
+    # last_seen, the picture) only move at the DROP and their client halves
+    # are not shipped -- `services/contact_source` has the long version. A
+    # client must keep treating `GET /contacts` as a live list while this is
+    # false; when it flips, its own vault slot is the truth.
+    contacts_readonly: bool = False
+    # The `/media` blob ceiling this island enforces while reading an upload
+    # body (routers/media.py MAX_BLOB_SIZE, env-tunable per island). Purely
+    # informational: nothing here changes what the endpoint does. It exists so
+    # a client can refuse an oversize video in the composer instead of
+    # discovering the limit at byte 536,870,913 of an upload the person has
+    # been watching for twenty minutes. A client that does not read it behaves
+    # exactly as before, and an island that predates the field omits it, which
+    # a client reads as "did not say" and falls back to its own default.
+    media_max_blob_bytes: int = 0
 
 
 class ServerInfo(BaseModel):
@@ -132,5 +169,6 @@ async def server_info() -> ServerInfo:
             deposit_auth=settings.DEPOSIT_AUTH_ENABLED,
             vault_max_blob_bytes=vault.MAX_BLOB_BYTES,
             vault_max_slots=vault.MAX_SLOTS,
+            media_max_blob_bytes=media.MAX_BLOB_SIZE,
         ),
     )

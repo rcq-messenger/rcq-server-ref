@@ -31,7 +31,6 @@ from app.core.security import (
     verify_recover_challenge,
 )
 from app.services import server_settings
-from app.models.contact import Contact
 from app.models.invite import Invite, hash_invite_code
 from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
@@ -45,8 +44,9 @@ from app.routers.groups import (
     _serialize,
 )
 from app.services.connection_manager import manager
+from app.services.contact_source import add_edges
 from app.services.queue_drain import account_watermark
-from app.services.uin import allocate_uin
+from app.services.uin import allocate_uin, uin_is_taken
 from app.services.uin_rows import purge_uin_rows
 
 log = logging.getLogger(__name__)
@@ -126,14 +126,11 @@ async def _connect_inviter(db: AsyncSession, inviter_uin: int, invitee_uin: int)
     )
     if inviter is None:
         return False
-    for owner, contact in ((invitee_uin, inviter_uin), (inviter_uin, invitee_uin)):
-        exists = await db.scalar(
-            select(Contact.id).where(
-                Contact.owner_uin == owner, Contact.contact_uin == contact
-            )
-        )
-        if exists is None:
-            db.add(Contact(owner_uin=owner, contact_uin=contact))
+    # Stage 4b: skipped when both accounts keep their list in the vault. In
+    # practice the invitee is seconds old here and has advertised nothing, so
+    # this writes; it goes through the one helper anyway so there is no write
+    # path to `contacts` that a future flip can miss.
+    await add_edges(db, invitee_uin, inviter_uin)
     return True
 
 
@@ -330,10 +327,27 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # A reserved vanity UIN wins when it's still free; then a best-effort
     # desired UIN (multihoming "same number on every island"); otherwise fall
     # back to a random allocation.
+    #
+    # ⚠ "Still free" means free in ALL THREE tables, `users`, `owned_uins` and
+    # `invites` (see services/uin.uin_is_taken). This used to read `users`
+    # alone, so an invite minted before somebody was granted the same number,
+    # or minted on an older build that did not check either, handed a
+    # registration a number sitting in a member's collection. When that happens
+    # the invite use is already spent, and the registration falls through to a
+    # desired or random number rather than failing: refusing here would cost
+    # the newcomer their sign-up over an operator's bookkeeping mistake.
+    #
+    # ⚠⚠ `except_invite` is not optional here. The UPDATE above already spent
+    # one use of THIS invite, but a multi-use code (max_uses > 1) is still live
+    # afterwards, so without the exclusion the row would report its own
+    # redeemer's reserved number as taken and this branch would skip it: the
+    # code would be consumed and grant nothing. Any OTHER live invite reserving
+    # the same number still counts, which is the case an operator creates by
+    # minting twice on an old build.
     uin = None
-    if reserved_uin is not None and await db.scalar(
-        select(User.uin).where(User.uin == reserved_uin)
-    ) is None:
+    if reserved_uin is not None and not await uin_is_taken(
+        db, reserved_uin, except_invite=code_hash
+    ):
         uin = reserved_uin
     # `desired_uin` is attacker-controlled on an UNAUTHENTICATED endpoint, so it
     # is bounded — but the ceiling is what matters, not a floor at UIN_MIN.
@@ -367,12 +381,24 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # the request degrades them to a fresh number on the backup island — what
     # they got before multihoming existed — while a squatter, who cannot sign
     # for the key, cannot pick a number at all.
+    #
+    # ⚠⚠ A HELD number is not free either, and this read `users` alone until
+    # 2026-08-23: a number in somebody's collection has no `users` row, so a
+    # `desired_uin` naming one was granted. The holder was told (by every
+    # client, in as many words) that nobody else could take it. Proving the
+    # signing key is no defence here: the squatter proves their OWN key, which
+    # says nothing about who holds the number.
+    #
+    # Nor is a number a live invite RESERVES, for the same reason and with the
+    # same silent ending. No `except_invite` on this call, deliberately: if the
+    # caller's own invite reserved this number the branch above already granted
+    # it, so anything still reserving it here is somebody else's promise.
     if (
         uin is None
         and proven
         and body.desired_uin is not None
         and 0 < body.desired_uin <= settings.UIN_MAX
-        and await db.scalar(select(User.uin).where(User.uin == body.desired_uin)) is None
+        and not await uin_is_taken(db, body.desired_uin)
     ):
         uin = body.desired_uin
     if uin is None:
@@ -396,8 +422,16 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
             select(User).where(User.uin == founder_uin)
         )
         if founder is not None:
-            db.add(Contact(owner_uin=uin, contact_uin=founder_uin))
-            db.add(Contact(owner_uin=founder_uin, contact_uin=uin))
+            # ⚠ Stage 4's "features that die" list has this edge on it: it is
+            # written for every account that has ever registered, which makes
+            # `contacts` a census of the island on top of being a graph, and
+            # nobody consented to it. It is NOT dropped here, because the
+            # founder's own client does not auto-add unknown senders and would
+            # silently stop showing a new tester's first message; the
+            # replacement (a room invite carrying the welcome) ships with the
+            # drop phase. Until then it goes through the same helper as every
+            # other write.
+            await add_edges(db, uin, founder_uin)
             await db.commit()
 
     # Arrived by somebody's invite link: connect the two of them, both
@@ -720,7 +754,11 @@ class ReissueIn(BaseModel):
     signing_key: str
 
 
-@router.post("/reissue", response_model=RegisterOut)
+@router.post(
+    "/reissue",
+    response_model=RegisterOut,
+    dependencies=[Depends(rate_limit("auth_reissue", 10, 3600))],
+)
 async def reissue(
     body: ReissueIn,
     uin: int = Depends(current_uin),
@@ -734,6 +772,19 @@ async def reissue(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found"})
+    if user.identity_key == ik and user.signing_key == sk:
+        # ⚠ THE SAME KEYS ARE NOT A ROTATION, and this route is destructive
+        # enough that "do it again" has to be free. The documented flow is
+        # read the slots, call this, write them back under the new derivation,
+        # and a retry of a call that actually succeeded (a gateway timeout on
+        # the reply, a double tap) would otherwise land AFTER the republish:
+        # the vault delete below would take out the slots the client had just
+        # rewritten, and `vault_reset` would tell every other session that a
+        # derivation which has not moved is retired. Nothing to change and
+        # nothing to announce, so only the token is reissued.
+        return RegisterOut(
+            uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))
+        )
     user.identity_key = ik
     user.signing_key = sk
     # The vault (stage 4a) is sealed under, and its slots named by, keys the
@@ -742,8 +793,56 @@ async def reissue(
     # under a key the user just declared compromised has no business staying,
     # so the account's vault goes in the same transaction. The client reads
     # its slots BEFORE calling this and writes them back AFTER.
+    #
+    # ⚠ A HARD DELETE, deliberately, and NOT the tombstone-at-version+1 that
+    # `DELETE /vault/{slot}` leaves. That difference is load-bearing for the
+    # device that did not rotate: it holds the retired `identity_priv`, so it
+    # keeps deriving the OLD slot names, and reading one at version 0 when it
+    # remembers version 12 is what trips its rollback floor and stops it. A
+    # tombstone would answer "version 13, nothing there", which reads as an
+    # ordinary empty slot, and the device would cheerfully republish its whole
+    # contact list under the retired name, sealed with the retired key. The
+    # ABA hazard the tombstone rule exists for is covered here by the same
+    # floor: the recreated slot counts from 1 again, which is below it.
     await db.execute(delete(VaultSlot).where(VaultSlot.uin == uin))
     await db.commit()
+
+    # ...and the account's OTHER sessions are told, which until 2026-08-23 they
+    # were not: this route emptied the vault and announced nothing at all. What
+    # a second device saw was a slot name reading 404 with version 0, which is
+    # byte for byte what a slot NOBODY HAS EVER WRITTEN reads, so it concluded
+    # "fresh account, publish what I have", wrote its own cached list as
+    # version 1 under the OLD derivation, and the rotating device then wrote
+    # version 2 over it from its own copy. Two devices, silently
+    # un-publishing each other: the #605 shape the version rule exists to
+    # prevent, walked in through the one door the version rule cannot watch.
+    #
+    # ⚠ WHY NOT `vault_changed`. That frame names one slot and one version, and
+    # both of those change here. The names are derived from `identity_priv`
+    # (§4.9), so after this call the account's slots are not "at a new version",
+    # they are at NEW NAMES: a per-slot nudge would send a device off to re-read
+    # a name that will never exist again, and the versions it carried would be
+    # the retired derivation's. What actually happened is one account-level
+    # event, so it gets one account-level frame.
+    #
+    # ⚠ The rotating install is skipped by name, exactly as `vault._nudge`
+    # skips a writer and for the same reason: it is the device that is about to
+    # write the state back, and it must not be told to drop the copy it is
+    # holding. "primary" is the ABSENCE of a name rather than a device, so an
+    # unnamed rotator is NOT skipped and hears its own reset. That is why the
+    # frame means "the island's copy is gone and your derivation is retired,
+    # re-derive and republish" and never "wipe what you have": a client that
+    # reads it as a wipe loses the only remaining copy the moment it rotates
+    # from an unnamed install.
+    #
+    # No queue and no replay, like every other socket nudge: a device that was
+    # offline learns the same thing the same way it always did, by re-reading
+    # its slots on reconnect and finding them gone.
+    await manager.send(
+        uin,
+        {"type": "vault_reset", "reason": "identity_reissued"},
+        except_device=carry_device_id(device_id),
+    )
     return RegisterOut(
         uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))
     )
@@ -795,8 +894,11 @@ async def delete_account(
                 "reason": "owner_burned",
             })
 
-    # Delete owned groups. CASCADE on GroupMember.group_id and
-    # Poll.group_id removes those rows automatically.
+    # Delete owned groups. CASCADE on GroupMember.group_id removes those rows
+    # automatically. (`polls.group_id` used to be named here too. Polls were
+    # removed on 2026-08-23; the orphaned table still carries its physical FK
+    # on Postgres, so it keeps cascading, but nothing in the app depends on
+    # that either way. See the block in core/db.py.)
     if owned_group_ids:
         await db.execute(
             delete(Group).where(Group.id.in_(owned_group_ids))

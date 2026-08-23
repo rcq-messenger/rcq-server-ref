@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select, update
@@ -13,7 +13,12 @@ from app.core.rate_limit import allow_ws_connect
 from app.core.security import authorize_session, decode_device_id
 from app.models.contact import Contact
 from app.models.device_token import DeviceToken
-from app.models.user import User, _as_aware, presence_is_fresh, visible_status
+from app.models.user import (
+    User,
+    card_openable_for_viewer,
+    presence_is_fresh,
+    visible_status,
+)
 from app.routers import random as random_chat
 from app.routers.presence import presence_watchers
 from app.services.apns import send_voip_to_user
@@ -464,79 +469,18 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
 _pending_offline_tasks: dict[int, asyncio.Task] = {}
 _OFFLINE_DEBOUNCE_SECONDS = 60.0
 
-# "Stay visible for the next N minutes" ends N minutes after `last_seen`, and
-# nothing about that moment is an event anyone reacts to. These tasks are the
-# alarm clock: one per user who disconnects while still inside their window,
-# firing once at expiry to fan out the offline nobody else would.
-#
-# Best-effort by design, like the debounce above: it lives in the worker that
-# held the socket, so a restart drops it. That costs a watcher a stale row
-# until their next fetch, which is exactly today's behaviour — never worse.
-# The longest TTL the API accepts is 24h, and the sleep is capped there so a
-# poked row cannot park a coroutine for a week.
-_pending_expiry_tasks: dict[int, asyncio.Task] = {}
-_MAX_PRESENCE_EXPIRY_SECONDS = 24 * 3600 + 120
-
-
-async def _schedule_presence_expiry(uin: int, user: User) -> None:
-    """Fan out `offline` when a persistent-presence window runs out."""
-    ttl = user.presence_ttl_minutes or 0
-    if not user.presence_persistent or ttl <= 0 or user.last_seen is None:
-        return  # no window, or a window with no end
-    ends_at = _as_aware(user.last_seen) + timedelta(minutes=ttl)
-    delay = (ends_at - datetime.now(timezone.utc)).total_seconds()
-    if delay > _MAX_PRESENCE_EXPIRY_SECONDS:
-        return
-    existing = _pending_expiry_tasks.get(uin)
-    if existing is not None and not existing.done():
-        existing.cancel()
-    _pending_expiry_tasks[uin] = asyncio.create_task(
-        _presence_expired(uin, max(delay, 0.0))
-    )
-
-
-async def _presence_expired(uin: int, delay: float) -> None:
-    try:
-        await asyncio.sleep(delay)
-        # Back online in the meantime → their socket owns presence again.
-        if await manager.is_online(uin):
-            return
-        async with SessionLocal() as db:
-            user = await db.get(User, uin)
-            # Re-read rather than trust the row we closed over: the user may
-            # have extended the window, turned the setting off, or connected
-            # from another device (which moves `last_seen` and so moves the
-            # expiry). Anything other than "offline now" means this alarm is
-            # stale — and if a LATER expiry is due, re-arm for that one.
-            if user is None:
-                return
-            if visible_status(user) != "offline":
-                await _schedule_presence_expiry(uin, user)
-                return
-            watchers = await presence_watchers(db, uin)
-            await manager.broadcast(
-                list(watchers),
-                {"type": "presence", "uin": uin, "status": "offline", "status_message": None},
-            )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        _log.exception("presence expiry fan-out failed for %s", log_identity(uin))
-    finally:
-        _pending_expiry_tasks.pop(uin, None)
+# (A second set of timers lived here until 2026-08-23: one alarm clock per
+# user who disconnected inside a "stay visible for N minutes" window, firing at
+# expiry to fan out the offline that nothing else would. It went with the
+# setting itself, see models/user.py. Nothing replaces it: the debounce above
+# is now the only path to an offline fan-out, and it always fires, because
+# presence is `last_seen` freshness for everybody.)
 
 
 async def _on_connect(uin: int) -> None:
     pending = _pending_offline_tasks.pop(uin, None)
     if pending is not None and not pending.done():
         pending.cancel()
-    # Back before the visibility window ran out: the socket owns presence
-    # again, and `last_seen` starts moving, so the alarm set at disconnect is
-    # aimed at a moment that no longer means anything. A new one is set on the
-    # next disconnect.
-    expiry = _pending_expiry_tasks.pop(uin, None)
-    if expiry is not None and not expiry.done():
-        expiry.cancel()
     async with SessionLocal() as db:
         user = await db.get(User, uin)
         if user is None:
@@ -617,29 +561,21 @@ async def _debounced_offline(uin: int) -> None:
             # and writing "offline" would clobber a user-chosen
             # away/dnd/invisible. This block only fans out the live
             # presence event + cleans up calls and audio rooms.
-            # A user who opted to stay visible (presence_persistent within its
-            # TTL) must NOT be flapped to offline just because the socket
-            # dropped — that defeats the whole "stay online" setting and spams
-            # watchers with online/offline (+ knock sounds) every time the app
-            # backgrounds. effective/visible_status keeps them online; only fan
-            # out a real offline.
+            #
+            # The guard is still a read of `visible_status`, not an
+            # unconditional broadcast: the debounce window is the same length
+            # as the freshness window, so a user whose `last_seen` moved after
+            # this disconnect (another device on another worker that
+            # `manager.is_online` had not yet seen) is not flapped to offline
+            # while they are demonstrably alive. Anyone genuinely gone reads
+            # offline here, since nothing has touched `last_seen` for at least
+            # the whole debounce.
             if visible_status(user) == "offline":
                 final_watchers = await presence_watchers(db, uin)
                 await manager.broadcast(
                     list(final_watchers),
                     {"type": "presence", "uin": uin, "status": "offline", "status_message": None},
                 )
-            else:
-                # Still visible — because `presence_persistent` says so. If
-                # that visibility has an END, somebody has to announce it when
-                # it arrives, and until now nobody did: expiry is a transition
-                # in TIME, not an event, so watchers kept the last "online"
-                # they were handed forever. The status was computed correctly
-                # on every fresh read, which is why re-saving the setting
-                # "fixed" it — that path refetches the card. Founder: "онлайн
-                # не гаснет после истечения установленного времени видимости,
-                # чтобы обновить, надо заново задать время".
-                await _schedule_presence_expiry(uin, user)
             await random_chat.on_disconnect(uin)
 
             redis = await _get_redis()
@@ -1077,6 +1013,30 @@ async def _handle_client_message(
             owner_only = bool(
                 await db.scalar(_sel(_AR.owner_only_speaking).where(_AR.id == room_id))
             )
+            # Card gate (item 22) — a room roster is a member list, and iOS
+            # draws each row as a link to that person's card. This packet is
+            # addressed to ONE person (the entrant), so the verdict is a real
+            # per-viewer answer here, unlike the fan-out below.
+            #
+            # Same shape as the group roster: only "contacts" needs the graph,
+            # so the query runs only when the room holds somebody on it, once
+            # for the whole roster, over the entrant's own contact edges.
+            card_contacts: set[int] = set()
+            gated = [
+                u.uin for u in users
+                if (u.profile_card_policy or "everyone") == "contacts" and u.uin != uin
+            ]
+            if gated:
+                card_contacts = set(
+                    (
+                        await db.scalars(
+                            _sel(Contact.contact_uin).where(
+                                Contact.owner_uin == uin,
+                                Contact.contact_uin.in_(gated),
+                            )
+                        )
+                    ).all()
+                )
         # Avatars ride along on the roster, gated by room membership —
         # the same relationship group rosters already treat as enough
         # (`GroupMemberOut`). Nothing extra is fetched: these columns
@@ -1088,6 +1048,9 @@ async def _handle_client_message(
                 "muted_by_owner": u.uin in muted,
                 "avatar_media_id": u.avatar_media_id,
                 "avatar_media_key": u.avatar_media_key,
+                "profile_openable": card_openable_for_viewer(
+                    u, viewer_uin=uin, is_contact=u.uin in card_contacts
+                ),
             }
             for u in users
         ]
@@ -1117,6 +1080,13 @@ async def _handle_client_message(
         peers = [u for u in roster_uins if u != uin]
         if peers and result == 1:
             entrant_muted = uin in muted
+            # ⚠ No `profile_openable` here, deliberately. One packet goes to
+            # every peer in the room, so there is no single viewer to answer
+            # for; a verdict computed for one of them would be a lie told to
+            # the rest. Absent means "unknown" to every client helper and
+            # falls open, which is the pre-item-22 behaviour, and the entrant's
+            # own `room_roster` (and `/users/{uin}/info` behind the tap) carry
+            # the real answer. Same rule as the group broadcasts.
             await manager.broadcast(peers, {
                 "type": "room_member_entered",
                 "room_id": room_id,

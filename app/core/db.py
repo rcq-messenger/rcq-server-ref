@@ -16,6 +16,27 @@ class Base(DeclarativeBase):
     pass
 
 
+# The two tables the polls removal (2026-08-23) left physically behind, mapped
+# to the column in each that names a person. Their MODELS are gone, so nothing
+# can reach these rows through the ORM, and an account burn has to clear them
+# by raw SQL or not at all. See the block in `init_db` for why the tables are
+# still here and why the burn could not wait for the manual DROP.
+_LEGACY_POLL_TABLES: dict[str, str] = {
+    "poll_votes": "voter_uin",
+    "polls": "creator_uin",
+}
+
+# Which of the above this island ACTUALLY has, decided once at boot by `init_db`
+# and read by `services/uin_rows.purge_uin_rows`. Empty on any island created
+# from this release on, and empty again the moment an operator runs the DROP.
+#
+# ⚠ It has to be settled up front rather than discovered on the burn: a
+# statement against a table that does not exist aborts the surrounding
+# transaction on Postgres, and the surrounding transaction there is somebody's
+# account deletion.
+LEGACY_POLL_TABLES: dict[str, str] = {}
+
+
 # Managed Postgres has a hard, small connection cap (DigitalOcean's
 # smallest plan tops out at 25 total, 3 reserved for the superuser, and
 # DO's own monitoring eats several more). SQLAlchemy's default pool
@@ -118,6 +139,13 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # Mirrors the other *_visibility columns; default "everyone"
     # keeps existing accounts unchanged.
     ("profile_visibility", "TEXT DEFAULT 'everyone'"),
+    # Who may OPEN the card at all (founder item 22) — the tri-state that
+    # decides whether a name in a member list, a reactions sheet or over a
+    # photo is a link. Distinct from `profile_visibility` above, which only
+    # blanks the optional fields and still lets an empty card open. Default
+    # "everyone" so an existing account is unchanged by the ALTER and so a
+    # fresh one matches the value the shipped clients seed their picker with.
+    ("profile_card_policy", "TEXT DEFAULT 'everyone'"),
     # Per-user push toggles + muted-uin list. NULL = use code-side
     # defaults (`_pref` in apns.py); writes flow through PUT
     # /users/me/push-preferences. JSON gets cross-dialect support
@@ -131,16 +159,9 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # row means "no picture", which is exactly the old behaviour.
     ("avatar_media_id", "VARCHAR(64)"),
     ("avatar_media_key", "VARCHAR(96)"),
-    # When TRUE, the user's chosen `status` (online/away/dnd) is
-    # broadcast to contacts even when their WebSocket has been gone
-    # for longer than PRESENCE_FRESHNESS_SECONDS. Lets users keep
-    # showing as "around" without their app actually running. Default
-    # FALSE preserves the historical "killed app = offline" semantics.
-    ("presence_persistent", "BOOLEAN DEFAULT FALSE"),
-    # Optional TTL cap (minutes) for presence_persistent. NULL/0 =
-    # forever (legacy persistent behaviour). N>0 = appear "visible"
-    # for N minutes past last_seen, then fall back to offline.
-    ("presence_ttl_minutes", "INTEGER"),
+    # (`presence_persistent` and `presence_ttl_minutes` left this list on
+    # 2026-08-23 with the feature, see models/user.py. They are queued for the
+    # physical DROP in `_UNMAPPED_DEAD_COLUMNS` below.)
     # Hall of Fame (founder-curated wall of notable contributors). The user
     # opts IN from their client; the founder separately APPROVES from the
     # admin console. Both must be true to appear on the public /hof wall.
@@ -249,6 +270,14 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
     # reporter can read back, through GET /reports/mine.
     ("reply_text", "TEXT DEFAULT ''"),
     ("replied_at", "TIMESTAMPTZ"),
+    # Soft delete on the REPORTER's side (see Report.hidden_at). NULL on every
+    # existing row = still visible, which is what they all are today. The row
+    # has to survive the user's delete because the Hall of Fame counts these
+    # rows live, and a hard DELETE was a way to erase your own dismissed
+    # reports and lift your standing on the wall.
+    ("hidden_at", "TIMESTAMPTZ"),
+    # When the reporter last rewrote their own text. NULL = never edited.
+    ("edited_at", "TIMESTAMPTZ"),
 ]
 
 # Additive on `invites` — an optional reserved UIN so an invite can grant a
@@ -309,7 +338,7 @@ _DEVICE_TOKEN_COLUMNS: list[tuple[str, str]] = [
 ]
 
 async def init_db() -> None:
-    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, poll, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry, mailbox_seq, group_log, vault  # noqa: F401  (register tables)
+    from app.models import user, contact, message, group, device_token, prekey, device, audio_room, report, news, invite, queue_cursor, federation, capability, broker, access_token, server_setting, uin_epoch, owned_uin, relay_inquiry, mailbox_seq, group_log, vault  # noqa: F401  (register tables)
 
     dialect = engine.dialect.name  # 'postgresql' | 'sqlite' | ...
 
@@ -691,7 +720,82 @@ async def init_db() -> None:
             except Exception:
                 pass
 
-    # ── Columns the ORM stopped mapping on 2026-08-22 ──────────────────────
+    # ── Polls, removed 2026-08-23: the tables are deliberately NOT dropped ──
+    #
+    # `polls` and `poll_votes` lost their models in this release (why the
+    # feature went at all is in routers/polls.py), so `create_all` stops
+    # building them and an island created from here on never has them. An
+    # island that already does KEEPS ITS ROWS for now, and that is a decision:
+    #
+    # * A drop from a list in code happens on a RESTART, before anybody has
+    #   looked at anything, and cannot be undone. That is the shape that
+    #   silently destroyed `owned_uins`. The 22.08 cut above could afford it
+    #   because every feature in it was gated by a capability flag the clients
+    #   already read, so their traffic was at zero before the drop ran. Polls
+    #   have no such gate: every shipped build still has the composer and still
+    #   calls the endpoints, which is why routers/polls.py is a 410 tombstone
+    #   rather than nothing. This release is the FIRST moment anybody learns
+    #   polls are gone, and it is the wrong moment to also make it irreversible
+    #   on two production islands at once.
+    # * Waiting costs nothing that is still growing. Nothing in the application
+    #   can read or write these two tables any more: no model, no query, no
+    #   sweep, no burn. The only reader left is somebody at a psql prompt, and
+    #   that is the same person who runs the DROP.
+    #
+    # ⚠ THE DROP IS WORK STILL OWED, not a nicety. Until it runs, `poll_votes`
+    # holds the full ballot list of every poll ever created on this island, the
+    # anonymous ones included (anonymity was only ever a filter in the response
+    # builder). Run this on prod and on is2 once the `/polls/{rest:path}` and
+    # `/groups/{group_id}/polls` rows in the admin request table have sat at
+    # zero long enough to believe the field has updated:
+    #
+    #     DROP TABLE IF EXISTS poll_votes;
+    #     DROP TABLE IF EXISTS polls;
+    #
+    # Children first, because `poll_votes.poll_id` still carries its physical
+    # FK. On Postgres `DROP TABLE IF EXISTS polls CASCADE;` alone does both;
+    # the two-statement form is the one a SQLite self-hoster can also run.
+    #
+    # ⚠⚠ WHAT COULD NOT WAIT FOR THAT: erasure. Losing the models also lost both
+    # entries in `services/uin_rows`, so for one release `DELETE /auth/account`
+    # stopped reaching `poll_votes.voter_uin` and `polls.creator_uin` and a
+    # burned account stayed named in them. A deletion promise that quietly does
+    # nothing is not a debt an operator can be asked to carry for a few weeks,
+    # least of all in the release that justified itself as metadata
+    # minimisation, so the burn reaches these two by raw SQL instead. That needs
+    # to know whether the tables are actually here, and it must never be the
+    # thing that finds out: a failing statement inside the burn's transaction
+    # aborts the whole burn on Postgres. So the probe below is also the
+    # detection, once, at boot, and it records what it found in
+    # LEGACY_POLL_TABLES for uin_rows.purge_uin_rows to read.
+    #
+    # Count what is left and say so on every boot, so the debt lives in the
+    # operator's log rather than in a comment nobody re-reads. It goes quiet by
+    # itself the moment the tables are gone.
+    LEGACY_POLL_TABLES.clear()
+    for _dead_table, _uin_column in _LEGACY_POLL_TABLES.items():
+        left = None
+        async with engine.begin() as conn:
+            try:
+                left = (await conn.execute(
+                    text(f"SELECT count(*) FROM {_dead_table}")
+                )).scalar_one()
+            except Exception:
+                # Already dropped, or this island never had the feature. Stays
+                # out of LEGACY_POLL_TABLES, so nothing tries to delete from it.
+                continue
+        LEGACY_POLL_TABLES[_dead_table] = _uin_column
+        if left:
+            log.warning(
+                "[db] %s still holds %d row(s) from the polls feature removed "
+                "on 2026-08-23. Nothing reads them, and an account burn clears "
+                "the rows that name it, but the table itself is dropped by "
+                "hand: DROP TABLE IF EXISTS poll_votes; "
+                "DROP TABLE IF EXISTS polls;",
+                _dead_table, left,
+            )
+
+    # ── Columns the ORM stopped mapping on 2026-08-22 and 2026-08-23 ───────
     #
     # Dead metadata, each verified to have no reader before it was unmapped.
     # What happens to the physical column now DEPENDS ON THE DIALECT, and the
@@ -707,26 +811,48 @@ async def init_db() -> None:
     # DROP is queued for the release AFTER this one:
     #
     #   users.trade_policy, users.active_days, users.last_active_day
+    #   users.presence_persistent, users.presence_ttl_minutes
     #   groups.entry_price_tokens, groups.pinned_by
     #   group_members.joined_at
     #   contacts.created_at
     #   user_capabilities.updated_at
     #   audio_room_memberships.joined_at
     #
+    # The presence pair joined on 2026-08-23 and the same reasoning is what
+    # keeps it here rather than in the drop-now list: the flagship runs
+    # `--workers 4` and a deploy restarts them one by one, so for a few seconds
+    # a worker still mapping `presence_persistent` shares the database with the
+    # new schema. Every ORM read of `users` names its columns explicitly, so
+    # the drop does not just lose a field, it makes every profile fetch, every
+    # roster read and every socket connect on the old worker fail on "column
+    # users.presence_persistent does not exist". The same goes for a rollback,
+    # which is the one moment we least want the previous release to be broken.
+    # A column nothing reads costs a dump a few bytes per row for one release;
+    # that is the cheaper half of the trade.
+    #
     # ⚠⚠ SQLITE (the default `DATABASE_URL`, so a real self-host shape): the
     # column must GO NOW, because none of that safety net exists. SQLite cannot
     # ALTER a column's NOT NULL away, so the self-heal skips it entirely, and
-    # four of these columns are NOT NULL with no default on any island whose
+    # five of these columns are NOT NULL with no default on any island whose
     # tables `create_all` built. Leaving them unmapped there would mean the
-    # next added contact, the next group join and the next capability ping all
-    # die on a NOT NULL violation. Dropping the column removes the constraint
-    # with it. SQLite has had DROP COLUMN since 3.35 (2021); an island older
-    # than that gets a loud line rather than a silent breakage, because that is
-    # the one case where the operator has to act.
+    # next registration, the next added contact, the next group join and the
+    # next capability ping all die on a NOT NULL violation (the count went from
+    # four to five on 2026-08-23 with `users.presence_persistent`, which is why
+    # it is on this list and not only in the queue above). Dropping the column
+    # removes the constraint with it. SQLite has had DROP COLUMN since 3.35
+    # (2021); an island older than that gets a loud line rather than a silent
+    # breakage, because that is the one case where the operator has to act.
     _UNMAPPED_DEAD_COLUMNS: list[tuple[str, str]] = [
         ("users", "trade_policy"),
         ("users", "active_days"),
         ("users", "last_active_day"),
+        # `presence_persistent` is one of the NOT NULL ones on a create_all
+        # island (the model had it as a plain `Mapped[bool]`), so on SQLite it
+        # is not a tidiness drop: leave it and the next /auth/register dies on
+        # a NOT NULL violation. On Postgres the self-heal above drops the
+        # constraint instead, which is why the column can wait a release there.
+        ("users", "presence_persistent"),
+        ("users", "presence_ttl_minutes"),
         ("groups", "entry_price_tokens"),
         ("groups", "pinned_by"),
         ("group_members", "joined_at"),

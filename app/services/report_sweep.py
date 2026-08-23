@@ -32,7 +32,9 @@ Hence two different terminal states, by what the row is:
   this context and rejects it for every other, so the skeleton is an effort tally,
   not a graph about anyone. Everything legible goes: the reporter's free text,
   the operator's notes, the reply, the conversation turns, and the attachment
-  keys.
+  keys. The one thing carried over from the text is the `[CRASH]` prefix, which
+  is not text but the flag that keeps an auto crash dump out of the tally, see
+  REDACTED_REASON_CRASH.
 
 Either way the media the attachments pointed at is reaped in the same pass.
 `media_sweep._referenced_ids` protects any blob a report still names, so
@@ -40,10 +42,14 @@ clearing the JSON without deleting the file would have left the blob pinned and
 unreferenced, ageing out only on the 30-day mtime rule, which for a screenshot
 uploaded years into a long-running ticket is not the same thing at all.
 
-Horizon measured from RESOLUTION, never from filing. An open report is the
-moderation queue and is not swept at any age: an untriaged complaint that
-deletes itself is a complaint that was never handled, and the queue being
-neglected is not a reason to destroy the evidence. Evidence FILES already have
+Horizon measured from RESOLUTION or from WITHDRAWAL, never from filing. An open
+report is the moderation queue and is not swept at any age: an untriaged
+complaint that deletes itself is a complaint that was never handled, and the
+queue being neglected is not a reason to destroy the evidence. The one open row
+that IS swept is one the reporter withdrew (`hidden_at`, see the WHERE in
+sweep_once): nobody is waiting on that one, the reporter cannot read it or write
+to it any more, and it is the only shape that would otherwise sit here with its
+free text forever. Evidence FILES already have
 their own absolute backstop in `services/evidence_sweep` (30 days regardless of
 status), which is the part that genuinely must not wait for a human.
 
@@ -67,7 +73,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 
 from app.core.db import SessionLocal
 from app.models.report import Report
@@ -98,9 +104,37 @@ MEDIA_ROOT = Path(os.environ.get("RCQ_MEDIA_DIR", "./media/uploads"))
 # client already renders `reason` as plain text with no special cases.
 REDACTED_REASON = "(this closed report was cleared by the island's retention policy)"
 
+# ⚠⚠ The crash variant exists because `reason` is not only text, it is also a
+# FLAG. `hof_stats` decides whether a bug-bounty row counts toward a
+# contributor's tally by testing `reason` for the [CRASH] marker, and an auto
+# crash dump is not a contributor's effort. Redacting a crash row to the plain
+# marker-free string therefore did not just clear text: 90 days after the
+# founder closed it, every swept crash dump silently JOINED the filer's Hall of
+# Fame count, and anyone whose client crashes a lot climbed the wall for it. So
+# the marker survives redaction while everything legible goes.
+REDACTED_REASON_CRASH = f"[CRASH] {REDACTED_REASON}"
+
+# Both markers are the "already redacted" predicate, see the WHERE below.
+_REDACTED_REASONS = (REDACTED_REASON, REDACTED_REASON_CRASH)
+
+# Auto-submitted crash dumps. Mirrors CRASH_MARKER in `routers/admin`,
+# `routers/reports` and `_CRASH_MARKER` in `hof_stats`. Keep them in sync.
+_CRASH_MARKER = "[CRASH]"
+
 # The context that feeds the Hall of Fame. Mirrors `hof_stats` and
 # `reports.create_report`. Keep the three in sync.
 _BUG_CONTEXT = "bug_bounty"
+
+# ⚠ `hidden_at` does not SHORTEN anything. A reporter hiding a report from their
+# own list (DELETE /reports/mine/{id}) is not an early-deletion request: the row
+# is still the operator's record and still the Hall of Fame's tally, and a
+# hidden report that the operator later closes is swept on exactly the same
+# 90 days from resolution as a visible one. What it does do is START a clock for
+# the rows that would otherwise have none, which is every report withdrawn while
+# still open (see sweep_once). Nor does this sweep defeat the soft delete, which
+# is the other direction of the same question: abuse rows are deleted outright
+# but never fed the wall, and bug-bounty rows, the ones that do, are redacted IN
+# PLACE and keep their tally forever.
 
 
 def _unlink_attachment_blobs(attachments: list | None) -> int:
@@ -133,31 +167,70 @@ async def sweep_once() -> tuple[int, int, int]:
     """One pass. Returns (deleted, redacted, blobs_unlinked)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=RESOLVED_MAX_AGE_DAYS)
     deleted = redacted = blobs = 0
+    # Oldest first, so a backlog bigger than MAX_PER_CYCLE drains in age order
+    # instead of whatever the planner feels like. Two things can start a row's
+    # clock (see the WHERE); this prefers the resolution one, which is the clock
+    # almost every row is on. A row that was withdrawn and only closed later is
+    # selected on the earlier of the two and ordered by the later, which costs
+    # nothing: this is a batch order, not the horizon itself.
+    started = func.coalesce(Report.resolved_at, Report.hidden_at)
     async with SessionLocal() as db:
         rows = (
             await db.scalars(
                 select(Report)
                 .where(
-                    # Terminal state only. `status` leaves "open" exactly when
-                    # `resolved_at` is stamped (admin.resolve_report), so a row
-                    # matching this has both.
-                    Report.status != "open",
-                    Report.resolved_at.is_not(None),
-                    Report.resolved_at < cutoff,
+                    or_(
+                        # Terminal state. `status` leaves "open" exactly when
+                        # `resolved_at` is stamped (admin.resolve_report), so a
+                        # row matching this has both.
+                        and_(
+                            Report.status != "open",
+                            Report.resolved_at.is_not(None),
+                            Report.resolved_at < cutoff,
+                        ),
+                        # WITHDRAWN, which is the second clock and the reason
+                        # this is an OR rather than one clause. A reporter who
+                        # drops a still-open report (DELETE /reports/mine/{id})
+                        # used to hard-delete the row; it is a soft delete now,
+                        # for the Hall of Fame reasons in the model. Without
+                        # this branch that made the free text PERMANENT: the
+                        # row keeps `status='open'` and a NULL `resolved_at`
+                        # forever unless an operator happens to close it, which
+                        # is not the normal fate of the long tail of a queue,
+                        # and the reporter cannot reach it either (`hidden_at`
+                        # hides it from GET /reports/mine and 404s both write
+                        # paths), so they cannot even ask for it to be closed.
+                        # A report nobody can read and nothing can reap is the
+                        # exact shape this module exists to stop.
+                        #
+                        # Withdrawing is not the same event as resolving, so it
+                        # does not shorten the horizon: same 90 days, measured
+                        # from the drop. And a still-open row here is always
+                        # self-targeted (`delete_my_report` refuses to hide an
+                        # open report ABOUT somebody else), i.e. bug bounty, so
+                        # it takes the REDACT path below and the wall's tally
+                        # survives untouched.
+                        and_(
+                            Report.hidden_at.is_not(None),
+                            Report.hidden_at < cutoff,
+                        ),
+                    ),
                     # ⚠⚠ AND NOT ALREADY DONE. The abuse path deletes its row so
                     # it can never match twice, but the bug-bounty path REDACTS
                     # IN PLACE and the row keeps satisfying every clause above
                     # forever. Without this the pass re-selects the same rows
                     # every hour: harmless noise at six rows, and a silent
                     # failure of the whole guarantee once there are more than
-                    # MAX_PER_CYCLE of them, because `order_by(resolved_at asc)
+                    # MAX_PER_CYCLE of them, because `order_by(started asc)
                     # limit N` would then return the same N oldest already-done
                     # rows on every pass and never reach a newly expired one.
                     # The marker in `reason` IS the redacted state, so it is
-                    # also the predicate.
-                    Report.reason != REDACTED_REASON,
+                    # also the predicate. Both variants, or every redacted
+                    # CRASH row (which keeps its [CRASH] prefix, see
+                    # REDACTED_REASON_CRASH) matches again on the next pass.
+                    Report.reason.notin_(_REDACTED_REASONS),
                 )
-                .order_by(Report.resolved_at.asc())
+                .order_by(started.asc())
                 .limit(MAX_PER_CYCLE)
             )
         ).all()
@@ -189,14 +262,31 @@ async def sweep_once() -> tuple[int, int, int]:
                 await db.delete(r)
                 deleted += 1
                 continue
-            # Bug bounty: keep the tally, drop everything legible.
-            r.reason = REDACTED_REASON
+            # Bug bounty: keep the tally, drop everything legible. The [CRASH]
+            # prefix is not legible text, it is the flag that keeps this row
+            # OUT of the tally, so it is carried over.
+            r.reason = (
+                REDACTED_REASON_CRASH
+                if _CRASH_MARKER in (r.reason or "")
+                else REDACTED_REASON
+            )
             r.resolution_notes = ""
             r.resolution_action = ""
             r.reply_text = ""
             r.replied_at = None
             r.attachments = None
             r.message_id = None
+            # The edit stamp goes with the text it was a trail for. What
+            # survives here is meant to be an effort tally and nothing else, and
+            # "this person rewrote report #412 at 14:07 on a Tuesday" is a
+            # behavioural fact about them that no reader needs once the two
+            # drafts it distinguished are both gone.
+            r.edited_at = None
+            # ⚠ `hidden_at` deliberately STAYS, and it is not the same kind of
+            # stamp. It is the flag that keeps this row off `GET /reports/mine`,
+            # for a row this pass keeps forever; clearing it would hand the
+            # reporter back a report they dropped, now unreadable, which is a
+            # worse answer than the timestamp is a leak.
             # `evidence_path` / `evidence_mime` are already cleared by
             # services/evidence_sweep long before this horizon; clear them
             # again rather than assume the ordering of two independent loops.
