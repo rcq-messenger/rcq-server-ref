@@ -91,8 +91,12 @@ with a reason; the nine that are accounted for elsewhere:
 * `invites.uin` and `owned_uins.uin` are numbers being held or promised, not
   rows belonging to the burning account; see the notes at their entries.
 * `gossip_records` has no uin column at all. It is keyed by the global signing
-  key, which is why `purge_uin_rows` structurally cannot reach it, and it is the
-  one item in section 2 of the metadata map still open.
+  key, which is why `purge_uin_rows` structurally cannot reach it. It is no
+  longer open: the burn path calls `purge_gossip_mirror` below with the
+  burning account's `users.signing_key`, which IS that key, and everything the
+  burn path cannot see (mirrors of identities living on other islands) ages
+  out on demand in `services/gossip_sweep`. The two halves are written up
+  there, including why a MIGRATION must not take this road.
 """
 
 from __future__ import annotations
@@ -105,7 +109,7 @@ from app.core.db import LEGACY_POLL_TABLES
 from app.models.audio_room import AudioRoom, AudioRoomMembership
 from app.models.capability import UserCapability
 from app.models.contact import Contact, ContactRequest, ContactVaultDevice
-from app.models.federation import HomeIslandRecord
+from app.models.federation import GossipRecord, HomeIslandRecord
 from app.models.group_log import GroupLog, GroupLogCursor, GroupLogReader
 from app.models.group import (
     Group,
@@ -211,6 +215,32 @@ async def rekey_uin_rows(db: AsyncSession, old_uin: int, new_uin: int) -> None:
         )
     for model, column in DROP_ON_REKEY:
         await db.execute(delete(model).where(column == old_uin))
+
+
+async def purge_gossip_mirror(db: AsyncSession, signing_key: str | None) -> int:
+    """Drop this island's gossip MIRROR of a departing identity. Returns rows hit.
+
+    Separate from `purge_uin_rows` on purpose, and taking a KEY rather than a
+    number, because that is the whole shape of the problem: `gossip_records` is
+    keyed by the global Ed25519 `sk`, so no amount of walking uin columns
+    reaches it. The burn path has the key in hand (`users.signing_key` on the
+    row it is about to delete) and is the only caller.
+
+    ⚠ NOT called from the migration path, and that is not an oversight.
+    `_perform_migration` copies `signing_key` verbatim onto the new user row:
+    the identity survives the number change, its record is still true, and its
+    contacts on other islands still resolve against this mirror. Deleting it
+    there would break a live peer's routing to tidy up a number.
+
+    ⚠ Best-effort by design. This island can only reach its OWN copy of the
+    mirror. The same record may sit on any island a contact of theirs uses, and
+    nothing here can reach those; the demand horizon in
+    `services/gossip_sweep` is what eventually clears them.
+    """
+    if not signing_key:
+        return 0
+    res = await db.execute(delete(GossipRecord).where(GossipRecord.sk == signing_key))
+    return res.rowcount or 0
 
 
 async def purge_uin_rows(db: AsyncSession, uin: int) -> None:

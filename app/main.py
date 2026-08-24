@@ -206,6 +206,7 @@ async def lifespan(_: FastAPI):
     # the four workers does the work in any cycle.
     from app.services.credential_sweep import credential_sweep_loop
     from app.services.device_sweep import device_sweep_loop
+    from app.services.gossip_sweep import gossip_sweep_loop
     from app.services.prekey_sweep import prekey_sweep_loop
     from app.services.presence_sweep import presence_sweep_loop
     from app.services.report_sweep import report_sweep_loop
@@ -227,6 +228,12 @@ async def lifespan(_: FastAPI):
         asyncio.create_task(credential_sweep_loop()),
         # Ghosts in the cluster-wide online set, which had no TTL at all.
         asyncio.create_task(presence_sweep_loop()),
+        # Federation gossip mirrors nobody resolves any more. The last of the
+        # map's section-2 items, and the only one that needed a design rather
+        # than a horizon: the row is keyed by a signing key, so the burn path
+        # could not see it, and it is a mirror other islands read, so a plain
+        # age cutoff would break the fallback it exists to serve.
+        asyncio.create_task(gossip_sweep_loop()),
     ]
     try:
         yield

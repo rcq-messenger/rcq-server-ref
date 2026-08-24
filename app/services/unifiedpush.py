@@ -582,10 +582,17 @@ async def send_call_to_user(
     uin: int, *, payload: dict[str, Any], skip_devices: frozenset[str] = frozenset()
 ) -> int:
     """Wake-for-call fan-out to Android UnifiedPush devices. `payload` is the
-    flat call dict (call_id, from_uin, nickname, media, sdp) — the woken
-    receiver shows the full-screen incoming-call UI. Mirrors
-    apns.send_voip_to_user; a `type` discriminator lets the receiver tell a
-    call wake from a message wake. No-op when the user has no endpoints.
+    flat call dict (call_id, from_uin, media, sdp) — the woken receiver shows
+    the full-screen incoming-call UI. Mirrors apns.send_voip_to_user; a `type`
+    discriminator lets the receiver tell a call wake from a message wake.
+    No-op when the user has no endpoints.
+
+    ⚠ NO `nickname`, and do not add one back. It was in this payload until
+    2026-08-24, and this road is not Apple's: it is whatever distributor the
+    callee installed, and for our own push.rcq.app it is a Cloudflare edge
+    that terminates TLS. Either way it was learning who was calling whom, by
+    name. `Push.showIncomingCall` resolves the name from the account's own
+    roster off `from_uin` and `to_uin`. See the ⚠ block in `apns`'s header.
 
     `skip_devices` skips installs by device id — the device that ANSWERED,
     when this push is the answered-elsewhere un-ring (the fan-out already

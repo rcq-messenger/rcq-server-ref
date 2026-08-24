@@ -47,7 +47,7 @@ from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
 from app.services.queue_drain import account_watermark
 from app.services.uin import allocate_uin, uin_is_taken
-from app.services.uin_rows import purge_uin_rows
+from app.services.uin_rows import purge_gossip_mirror, purge_uin_rows
 
 log = logging.getLogger(__name__)
 
@@ -921,6 +921,16 @@ async def delete_account(
     # here, along with several per-feature tables that have since been
     # deleted outright).
     await purge_uin_rows(db, uin)
+    # ⚠ The one row `purge_uin_rows` structurally cannot reach, and it needs
+    # the KEY rather than the number. `gossip_records` is this island's MIRROR
+    # of some identity's signed home-island record, keyed by the global Ed25519
+    # `sk`; anybody may write one, and for a burned account it kept serving
+    # "this identity lives at these islands under these numbers" forever. The
+    # key is `user.signing_key` on the row about to be deleted, so it has to be
+    # read HERE, before `db.delete(user)` below. Mirrors of the same record on
+    # OTHER islands are out of reach from here; `services/gossip_sweep` ages
+    # those out on demand.
+    await purge_gossip_mirror(db, user.signing_key)
     await db.execute(delete(DeviceToken).where(DeviceToken.uin == uin))
 
     # The number goes back into circulation, so retire every token minted for
