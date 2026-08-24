@@ -92,7 +92,17 @@ async def admin_console() -> HTMLResponse:
     with zero extra hosting."""
     from app.admin_console import ADMIN_CONSOLE_HTML
 
-    return HTMLResponse(ADMIN_CONSOLE_HTML)
+    # ⚠ no-store, and it is not paranoia. The page IS the app: its whole client
+    # is inlined in this HTML, so a browser holding yesterday's copy runs
+    # yesterday's logic against today's API and the operator has no way to see
+    # that. It cost a real afternoon: the console was flattening a transparent
+    # island logo onto white, the fix shipped, the operator re-uploaded, and
+    # the cached page produced the identical flattened JPEG down to the byte,
+    # so even the version digest did not move and the upload looked ignored.
+    return HTMLResponse(
+        ADMIN_CONSOLE_HTML,
+        headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 # ── operator settings (Features tab) ────────────────────────────────
