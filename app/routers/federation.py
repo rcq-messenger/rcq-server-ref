@@ -15,6 +15,7 @@ and is deliberately not the trust root.
 import base64
 import binascii
 import json
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -34,6 +35,35 @@ router = APIRouter(prefix="/federation", tags=["federation"])
 # The signed document is small: a key, a short list of (host, uin) homes, a
 # timestamp, a signature. Anything larger is malformed or abusive.
 _MAX_DOC_BYTES = 8 * 1024
+
+# How stale `gossip_records.touched_at` is allowed to get before a read
+# re-stamps it. The column is what `services/gossip_sweep` measures, so it has
+# to move on use; an UPDATE per read would be a write on a read path, so it
+# moves at most once an hour per row. The same shape `unifiedpush` uses for
+# `push_last_ok` ("only when it CHANGES, to keep the write rate near zero"),
+# and this endpoint is measured in single digits per WEEK on the flagship.
+_TOUCH_EVERY = timedelta(hours=1)
+
+
+def _touch(row: GossipRecord) -> bool:
+    """Stamp this row as used, at most once per `_TOUCH_EVERY`.
+
+    Returns whether it changed anything, so the caller can skip a commit it
+    does not need. A NULL `touched_at` is always stamped: it means the row
+    predates the tracking, and leaving it NULL keeps it in the sweep's
+    stamp-instead-of-delete branch forever.
+    """
+    now = datetime.now(timezone.utc)
+    prev = row.touched_at
+    if prev is not None:
+        # Rows written before the column existed can also come back naive from
+        # SQLite, where TIMESTAMP WITH TIME ZONE is a hint and not a type.
+        if prev.tzinfo is None:
+            prev = prev.replace(tzinfo=timezone.utc)
+        if now - prev < _TOUCH_EVERY:
+            return False
+    row.touched_at = now
+    return True
 
 
 def _front_alias_in_homes(homes: list) -> str | None:
@@ -251,8 +281,18 @@ async def put_gossip_record(
             raise HTTPException(status.HTTP_409_CONFLICT, "stale ts")
         existing.doc = raw
         existing.ts = ts
+        # ⚠ Explicit, not left to `onupdate`. A client re-mirrors on every
+        # resolve, and most of those carry a document byte-identical to the
+        # stored one: SQLAlchemy then sees no net change, emits no UPDATE, and
+        # `onupdate` never fires. The row would look untouched since the day it
+        # was first mirrored, which is exactly the reading the sweep must not
+        # get. `_touch` is throttled, so a client re-resolving every ten
+        # minutes still costs at most one write an hour.
+        _touch(existing)
     else:
-        db.add(GossipRecord(sk=sk, doc=raw, ts=ts))
+        db.add(GossipRecord(
+            sk=sk, doc=raw, ts=ts, touched_at=datetime.now(timezone.utc),
+        ))
     await db.commit()
     return {"ok": True, "ts": ts}
 
@@ -284,6 +324,13 @@ async def get_gossip_record(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no record")
+    # A read is what keeps a row alive. This endpoint is the FALLBACK road: a
+    # client only comes here when the peer's own island did not answer, which
+    # is the one situation the mirror was built for and the one situation in
+    # which nothing re-mirrors the record. If reads did not count, the sweep
+    # would age out precisely the rows that are doing their job.
+    if _touch(row):
+        await db.commit()
     return json.loads(row.doc)
 
 

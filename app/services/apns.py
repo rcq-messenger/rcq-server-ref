@@ -22,12 +22,34 @@ constant below for every push of every kind, and the non-sealed kinds
 (contact request, accepted request) no longer title the banner with the
 SENDER'S NICKNAME either.
 
+⚠ The CALL path was not in this header at all until 2026-08-24, and it
+was the worse leak of the two. `send_voip_to_user` (and its Android
+twin `unifiedpush.send_call_to_user`) carried a flat payload built in
+`routers/ws.py`, and that payload had the CALLER'S `nickname` in it
+beside `from_uin`. A call to an offline device therefore told Apple, or
+the callee's UnifiedPush distributor, WHO WAS CALLING WHOM AND WHEN, by
+name: a named edge of the social graph rather than a group's title. It
+is gone, the same way and for the same reason: `from_uin` is the
+minimum a client needs, and the client resolves the name out of its own
+roster (`NicknameCache` in the iOS PushKit handler, `PushEnvelope` on
+Android) before it rings. An install too old to do that shows the
+number instead of the name for as long as it stays un-updated.
+
 What a third party on this path still sees, stated rather than implied:
 `to_uin` (the recipient, needed to pick the local account before any
 decrypt can be tried), `group_id` (the mute and mentions-only gates run
 before the decrypt and key on it), `envType`, and the `thread-id`. A
 group id is not a name but the membership table turns it into one, so
 this is a real remainder and it closes when group identity is sealed.
+
+On the call road specifically what remains is `to_uin`, `from_uin`, the
+call id, audio-vs-video and the SDP. `from_uin` is the load-bearing
+one: it names the other end of the call. It cannot be dropped without
+the callee losing the ability to answer, and it is already sealed on
+the road that CAN hide it, the cross-island §5d wake in
+`routers/messages._wake_for_sealed_call`, which carries a ciphertext
+and no identity of any kind. Sealing the same-island call wake is the
+same work as sealing the same-island message wake and belongs with it.
 
 `send_to_user(uin, ...)` is the public entrypoint. It's a no-op when
 APNs config isn't populated (dev environments without a .p8 key).
@@ -625,8 +647,13 @@ async def send_voip_to_user(
     only — regular APNs tokens won't accept a VoIP push.
 
     The `payload` should be a flat dict with the call info the iOS
-    handler needs (call_id, from_uin, nickname, media, sdp). VoIP push
-    payloads max out at 5KB — full SDPs are ~1.5KB so we fit comfortably.
+    handler needs (call_id, from_uin, media, sdp). VoIP push payloads max
+    out at 5KB — full SDPs are ~1.5KB so we fit comfortably.
+
+    ⚠ NO `nickname` in it, and do not add one back. It was there until
+    2026-08-24 and it put the caller's NAME in front of Apple on every
+    call to an offline device (see the ⚠ in the module header). The iOS
+    handler reads the name out of `NicknameCache` keyed on `from_uin`.
 
     `except_device` skips one install — the device that ANSWERED, when this
     push is the answered-elsewhere un-ring. ⚠ A token row with no device_id

@@ -822,13 +822,50 @@ async def _handle_client_message(
         # iOS-side `VoIPPushService.didReceiveIncomingPush`, which calls
         # CallKit's `reportNewIncomingCall` synchronously.
         if not delivered and kind == "call_offer":
-            async with SessionLocal() as db:
-                caller = await db.get(User, uin)
-                caller_nick = caller.nickname if caller else str(uin)
+            # ⚠ NO `nickname`. It used to be read off the caller's User row and
+            # put in this payload, which then went to Apple (PushKit) and, for
+            # Android, to whatever UnifiedPush distributor the callee runs; for
+            # our own push.rcq.app that is a Cloudflare-terminated TLS hop. So
+            # a call to an offline device handed a third party the CALLER'S
+            # NUMBER AND NAME beside the callee's number and the time: a named
+            # edge of the social graph, strictly more than the group name that
+            # was taken out of message pushes on 2026-08-22 (see the header of
+            # services/apns.py).
+            #
+            # `from_uin` stays because the callee cannot answer without knowing
+            # who to answer, and it is already in the same payload as the
+            # callee's own routing. That number is the minimum a client needs
+            # to look the name up in its own roster, which is exactly what the
+            # group-name removal did with `group_id`: iOS reads NicknameCache
+            # in the PushKit handler, Android resolves through PushEnvelope
+            # before it raises the ring.
+            #
+            # Removing the field also removes a `SessionLocal()` + `User` read
+            # from the offer path, which ran on every call to an offline
+            # device purely to fetch a string we should not have been sending.
+            #
+            # ⚠⚠ DO NOT DEPLOY THIS AHEAD OF THE CLIENTS. Both halves of the
+            # move exist, and neither is in anybody's hands yet: the iOS
+            # NicknameCache lookup is UNCOMMITTED in `RCQ/iOS`, on top of a
+            # backlog of unbuilt commits, and the Android lookup ships in
+            # 0.147. Every build older than those reads this payload for a
+            # name and finds none. Android falls back to "#<uin>", which is
+            # merely poor; the shipped iOS build falls back to the literal
+            # "Stranger" and hands it to CallKit as `localizedCallerName`,
+            # full screen on the lock screen, for the whole ring. It never
+            # repairs itself either: `CallService.handleVoIPIncoming` resolves
+            # the contact into the in-app `Call` only and never calls
+            # `provider.reportCall(with:updated:)`, so nothing corrects the
+            # CallKit entry when the socket offer lands a second later.
+            #
+            # So this one field is gated on an iOS RELEASE, not on an iOS
+            # commit: ship a build carrying the NicknameCache lookup first,
+            # then deploy. The privacy win is worth waiting a release for; a
+            # stranger's name on the lock screen for every call to a phone
+            # that happened to be asleep is not the way to buy it.
             voip_payload = {
                 "call_id": call_id,
                 "from_uin": uin,
-                "nickname": caller_nick,
                 "media": msg.get("media", "video"),
                 "sdp": msg.get("sdp", ""),
             }

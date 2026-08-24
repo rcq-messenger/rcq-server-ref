@@ -70,7 +70,33 @@ class GossipRecord(Base):
     # The full §2.3 signed object verbatim, exactly as the owner signed it.
     doc: Mapped[str] = mapped_column(Text, nullable=False)
     # Extracted issued-at for anti-rollback without re-parsing `doc`.
+    #
+    # ⚠ This is the OWNER'S clock, and it is not a liveness signal. It moves
+    # only when the owner republishes AND somebody re-mirrors the result here;
+    # an identity that never changes homes and whose island has gone dark has a
+    # frozen `ts` and a perfectly useful record. Ageing rows out on `ts` would
+    # therefore delete exactly the rows this mirror exists to hold. See
+    # `services/gossip_sweep.py` for what the sweep measures instead.
     ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    # Last time anybody on this island MIRRORED or RESOLVED this row: the
+    # demand signal the sweep runs on. Distinct from `updated_at` for two
+    # reasons. A re-`PUT` of a byte-identical document changes no column, so
+    # SQLAlchemy emits no UPDATE and `onupdate` never fires; and a `GET` is
+    # the strongest evidence a row is doing its job while changing nothing
+    # about the document at all.
+    #
+    # Nullable because rows written before this column existed have no honest
+    # value for it: their `updated_at` is the FIRST mirror, not the last touch,
+    # and measuring a horizon against a first-write clock deletes rows early.
+    # That is the precise mistake the prekey sweep made and had to fix in
+    # `2026.08.22.12`. The sweep STAMPS a NULL instead of deleting it, so every
+    # row that predates the tracking gets a full horizon from the day it ships.
+    touched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
     )

@@ -186,10 +186,12 @@ async def _wake_for_sealed_call(to_uin: int, payload: str) -> int:
       What it still does NOT learn: WHO is calling, on which island they live,
       the call id, whether it is audio or video, or the SDP. All of that lives
       inside the sealed envelope, which the island cannot open — so this
-      function must never invent any of it. In particular there is NO caller
-      nickname here: the same-island VoIP payload carries one because that
-      island knows the caller, and this one genuinely does not. The client
-      renders "Incoming call" until it decrypts the envelope itself.
+      function must never invent any of it. There is no caller nickname
+      here, and since 2026-08-24 there is none on the same-island road
+      either: that island DOES know the caller, which is exactly why it must
+      not tell Apple or the distributor (see the ⚠ block in the header of
+      services/apns.py). The client renders "Incoming call" until it decrypts
+      the envelope, or resolves the name from its own roster.
 
       Accepted because a censor watching the wire can already infer a call
       from packet timing and size, and a call that does not ring is not a

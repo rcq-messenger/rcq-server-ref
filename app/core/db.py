@@ -212,6 +212,15 @@ _CONTACT_REQUEST_COLUMNS: list[tuple[str, str]] = [
     ("resolved_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
+# Additive on `gossip_records`: the demand clock the gossip sweep runs on.
+# Deliberately NULL on every pre-existing row rather than backfilled to now by
+# the ALTER: the sweep stamps them on its first pass, which is the same thing
+# but visible in the log line, and NULL is the only honest value for "we have
+# never seen anyone touch this". See models/federation.GossipRecord.
+_GOSSIP_RECORD_COLUMNS: list[tuple[str, str]] = [
+    ("touched_at", "TIMESTAMP WITH TIME ZONE"),
+]
+
 # Additive on `groups`. Pre-existing rows default to free + everyone-
 # can-post, matching pre-feature behaviour. Avatar columns nullable —
 # legacy groups keep rendering the generic placeholder.
@@ -380,6 +389,7 @@ async def init_db() -> None:
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
         ("broker_relays", _BROKER_RELAY_COLUMNS),
         ("contact_requests", _CONTACT_REQUEST_COLUMNS),
+        ("gossip_records", _GOSSIP_RECORD_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:

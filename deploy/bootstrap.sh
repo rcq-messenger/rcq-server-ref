@@ -13,7 +13,9 @@
 #   - UFW firewall (22/80/443 only — TURN ports added when coturn lands)
 #   - Dedicated `rcq` system user owning /opt/rcq and /var/log/rcq
 #   - Auto-generated DB password and JWT secret written to /opt/rcq/.env
-#   - Nightly pg_dump kept locally for 7 days under /var/backups/rcq
+#   - Nightly pg_dump, SEALED to an age recipient key, 7 days under
+#     /var/backups/rcq. No key on the box means no dump at all (see the
+#     backup section near the end for why, and for how to install one)
 #
 # After this finishes:
 #   - From your Mac: `bash deploy/deploy.sh <droplet-ip>` to push the backend code.
@@ -33,7 +35,7 @@ apt-get update -y
 apt-get upgrade -y
 apt-get install -y \
     python3.12 python3.12-venv python3-pip \
-    git curl rsync ufw ca-certificates \
+    git curl rsync ufw ca-certificates age \
     postgresql postgresql-contrib \
     debian-keyring debian-archive-keyring apt-transport-https gnupg
 
@@ -112,8 +114,18 @@ echo "==> rcq system user"
 if ! id -u rcq >/dev/null 2>&1; then
     useradd --system --create-home --home-dir /opt/rcq --shell /bin/bash rcq
 fi
-mkdir -p /opt/rcq /opt/rcq/app /opt/rcq/media /var/log/rcq /var/backups/rcq
-chown -R rcq:rcq /opt/rcq /var/log/rcq /var/backups/rcq
+mkdir -p /opt/rcq /opt/rcq/app /opt/rcq/media /var/log/rcq
+chown -R rcq:rcq /opt/rcq /var/log/rcq
+# The dump runs as `postgres` (that is the role with a passwordless local
+# login), so the directory it writes into belongs to postgres. It used to be
+# created as rcq:rcq 755 here and written by a postgres cron, which cannot
+# write it at all: the flagship's own nightly dump failed on exactly this for
+# months and nobody noticed, because cron failures go nowhere. 700 because a
+# sealed dump is still a file worth not offering to every account on the box.
+mkdir -p /var/backups/rcq /etc/rcq
+chown postgres:postgres /var/backups/rcq
+chmod 700 /var/backups/rcq
+chmod 755 /etc/rcq
 
 echo "==> PostgreSQL role + database"
 if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='rcq'" | grep -q 1; then
@@ -151,11 +163,114 @@ fi
 echo "==> Python venv"
 sudo -u rcq python3.12 -m venv /opt/rcq/venv
 
-echo "==> Nightly pg_dump (cron at 03:30)"
+echo "==> Nightly database dump (sealed; cron at 03:30)"
+# ⚠⚠ THIS USED TO BE THE HOLE STAGE 0 EXISTED TO CLOSE. The line here was a
+# plaintext `pg_dump rcq | gzip` with seven days of retention on the same disk
+# as the database. That single line turns every deletion the island promises
+# into "+7 days": a burnt account, a swept queue row, a declined contact
+# request, a revoked device all keep living in yesterday's dump. The live hosts
+# had theirs removed on 2026-08-23, but this script is what CREATES a host, so
+# every new island was still being born with it.
+#
+# The rule now: the dump is sealed to an age recipient whose PRIVATE half never
+# touches the island, or it is not taken at all. Not "plaintext as a fallback"
+# (that is the rule `deploy/rcq-update.sh` uses, and it is right there, for a
+# different dump): the pre-update one is a single file written seconds before a
+# risky upgrade and read minutes later by the operator standing over it. This
+# one is a standing seven-day archive nobody watches. A standing archive is
+# worth having only if it is sealed, so an island without a key gets a log line
+# and no file.
+#
+# Deliberately NOT generated here. The whole value of the seal is that the
+# private half lives somewhere this machine cannot reach, and a key this script
+# minted on the island would be a key the island held.
+cat > /usr/local/sbin/rcq-backup.sh <<-'EOBACKUP'
+	#!/usr/bin/env bash
+	# Nightly dump of the RCQ database: sealed, or not taken.
+	#
+	#   age-keygen -o backup.key        # on YOUR machine, and it stays there
+	#   grep 'public key' backup.key    # -> /etc/rcq/backup.pub on the island
+	#
+	# Restore:
+	#   age -d -i backup.key rcq-YYYYMMDD.sql.gz.age | gunzip | psql rcq
+	#
+	# ⚠ pipefail is load-bearing: without it a pg_dump that dies halfway still
+	# leaves `age` exiting 0 over a truncated stream, i.e. a backup file that
+	# looks fine until the day it is needed.
+	set -euo pipefail
+
+	DIR=/var/backups/rcq
+	PUB=/etc/rcq/backup.pub
+	KEEP_DAYS=7
+
+	if ! command -v age >/dev/null 2>&1; then
+	    logger -t rcq-backup "age not installed: no dump taken"
+	    exit 0
+	fi
+	if [[ ! -s "$PUB" ]]; then
+	    logger -t rcq-backup "no recipient key at $PUB: no dump taken (see /etc/rcq/README-backup.txt)"
+	    exit 0
+	fi
+
+	umask 077
+	OUT="$DIR/rcq-$(date -u +%Y%m%d).sql.gz.age"
+	# Written aside and moved into place, so a dump interrupted at 03:31 can
+	# never be mistaken for last night's backup by the retention sweep below.
+	pg_dump rcq | gzip | age -R "$PUB" > "$OUT.part"
+	mv -f "$OUT.part" "$OUT"
+	find "$DIR" -maxdepth 1 -name 'rcq-*.sql.gz.age' -mtime "+$KEEP_DAYS" -delete
+	find "$DIR" -maxdepth 1 -name 'rcq-*.sql.gz.age.part' -mtime +1 -delete
+	logger -t rcq-backup "sealed dump written: $(basename "$OUT")"
+EOBACKUP
+chmod 755 /usr/local/sbin/rcq-backup.sh
+
+cat > /etc/rcq/README-backup.txt <<-'EOREADME'
+	This island takes a nightly database dump at 03:30 UTC, and it takes one
+	only when it can seal it.
+
+	To turn it on, ON YOUR OWN MACHINE (not here):
+
+	    age-keygen -o backup.key
+	    grep 'public key' backup.key
+
+	Copy that one `age1...` line into /etc/rcq/backup.pub on this island and
+	keep backup.key off the island, forever. The next run writes
+	/var/backups/rcq/rcq-YYYYMMDD.sql.gz.age and keeps seven days.
+
+	To restore, on the machine that holds the private half:
+
+	    age -d -i backup.key rcq-YYYYMMDD.sql.gz.age | gunzip | psql rcq
+
+	Exercise that once, on purpose, before you need it. A dump nobody has
+	ever restored is not a backup.
+
+	Without /etc/rcq/backup.pub nothing is written and a line goes to the
+	journal (`journalctl -t rcq-backup`). That is deliberate: a plaintext
+	dump sitting beside the database for a week undoes every deletion this
+	island promises, for a week.
+EOREADME
+chmod 644 /etc/rcq/README-backup.txt
+
 cat > /etc/cron.d/rcq-backup <<-'EOCRON'
-30 3 * * * postgres pg_dump rcq | gzip > /var/backups/rcq/rcq-$(date +\%Y\%m\%d).sql.gz && find /var/backups/rcq -name 'rcq-*.sql.gz' -mtime +7 -delete
+30 3 * * * postgres /usr/local/sbin/rcq-backup.sh
 EOCRON
 chmod 644 /etc/cron.d/rcq-backup
+
+if [[ -s /etc/rcq/backup.pub ]]; then
+    echo "  (recipient key present, dumps will be sealed)"
+else
+    echo "  ⚠ no /etc/rcq/backup.pub, so NO dump will be taken. See /etc/rcq/README-backup.txt"
+fi
+
+# A re-run on a host the OLD bootstrap set up: say what is lying around, and
+# do not quietly delete it. These may be the operator's only copy.
+_plain=$(find /var/backups/rcq -maxdepth 1 -name 'rcq-*.sql.gz' 2>/dev/null | wc -l | tr -d ' ')
+if [[ "${_plain:-0}" != "0" ]]; then
+    echo "  ⚠⚠ $_plain PLAINTEXT dump(s) in /var/backups/rcq from an earlier"
+    echo "     bootstrap. Every deletion this island has made since the oldest"
+    echo "     of them is still readable in there. Seal or shred them:"
+    echo "       gzip -dc f.sql.gz | gzip | age -R /etc/rcq/backup.pub > f.sql.gz.age && shred -u f.sql.gz"
+fi
 
 echo ""
 echo "==> Bootstrap complete."
@@ -163,6 +278,9 @@ echo ""
 echo "Next steps (from your Mac):"
 echo "  1. Make sure DNS A-record api.rcq.app → $(curl -s https://api.ipify.org)"
 echo "  2. Run from project root: bash deploy/deploy.sh $(curl -s https://api.ipify.org)"
+echo "  3. Backups: age-keygen -o backup.key  (keep it on your own machine),"
+echo "     then put its public line in /etc/rcq/backup.pub here. Until you do,"
+echo "     this island takes NO nightly dump. See /etc/rcq/README-backup.txt"
 echo ""
 echo "Saved credentials:"
 echo "  /opt/rcq/.env          — DATABASE_URL, JWT_SECRET (do NOT commit)"
