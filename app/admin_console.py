@@ -904,6 +904,19 @@ function renderLogo(err){
   if ($('logodrop')) $('logodrop').onclick = removeLogo;
 }
 
+/* True when any pixel of the drawn mark is not fully opaque. Read off the
+ * CANVAS rather than guessed from the file type: a PNG is often flat, and a
+ * WEBP or a GIF can carry a cut-out just as well. The source is a data: URI,
+ * so the canvas is never tainted and getImageData is allowed; if a browser
+ * refuses anyway, the answer is "transparent", which only ever costs pixels. */
+function hasAlpha(ctx, w, h){
+  try {
+    const d = ctx.getImageData(0, 0, w, h).data;
+    for (let i = 3; i < d.length; i += 4) if (d[i] < 255) return true;
+    return false;
+  } catch (e) { return true; }
+}
+
 /* Read the file as a data URI, downscaled to LOGO_EDGE.
  * GIF is passed through untouched: a canvas resize keeps only the first frame,
  * and an operator who picked an animated mark would get a still one back with
@@ -925,24 +938,41 @@ function prepareLogo(file, maxBytes){
       const img = new Image();
       img.onerror = () => reject(new Error('That file is not an image the browser can open.'));
       img.onload = () => {
-        const scale = Math.min(1, LOGO_EDGE/Math.max(img.width, img.height));
-        const w = Math.max(1, Math.round(img.width*scale)), h = Math.max(1, Math.round(img.height*scale));
-        const cv = document.createElement('canvas'); cv.width=w; cv.height=h;
-        const ctx = cv.getContext('2d');
-        if (!ctx) return reject(new Error('This browser cannot resize the picture.'));
-        ctx.drawImage(img, 0, 0, w, h);
-        // PNG first: a logo is usually flat colour with transparency, which PNG
-        // keeps and JPEG does not. A photographic mark compresses badly as PNG,
-        // so fall back to JPEG on a white ground if PNG lands over the ceiling.
-        const png = cv.toDataURL('image/png');
-        if (png.length*0.75 <= maxBytes) return resolve(png);
-        ctx.globalCompositeOperation = 'destination-over';
-        ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,w,h);
-        for (const q of [0.9, 0.75, 0.6]) {
-          const jpg = cv.toDataURL('image/jpeg', q);
-          if (jpg.length*0.75 <= maxBytes) return resolve(jpg);
+        // ⚠ A mark WITH transparency is never flattened onto white. The old
+        // order here was PNG at 256, then JPEG on a white ground, and that is
+        // exactly how the flagship's own logo became a white tile: a 256px PNG
+        // of it lands over the ceiling, and the JPEG that replaced it cannot
+        // carry an alpha channel at all. The operator uploaded a cut-out and
+        // got back a slab, with nothing on the screen saying so.
+        //
+        // So a transparent mark pays in PIXELS instead: it steps down the edge
+        // until the PNG fits, because a smaller sharp mark beats a big one on
+        // a white square. Only a mark that is opaque to begin with, where the
+        // white ground changes nothing, may fall back to JPEG.
+        let transparent = null;
+        for (const edge of [LOGO_EDGE, 192, 160, 128, 96, 64]) {
+          const scale = Math.min(1, edge/Math.max(img.width, img.height));
+          const w = Math.max(1, Math.round(img.width*scale)), h = Math.max(1, Math.round(img.height*scale));
+          const cv = document.createElement('canvas'); cv.width=w; cv.height=h;
+          const ctx = cv.getContext('2d');
+          if (!ctx) return reject(new Error('This browser cannot resize the picture.'));
+          ctx.drawImage(img, 0, 0, w, h);
+          if (transparent === null) transparent = hasAlpha(ctx, w, h);
+          const png = cv.toDataURL('image/png');
+          if (png.length*0.75 <= maxBytes) return resolve(png);
+          if (transparent) continue;  // shrink further rather than lose the cut-out
+          // Opaque mark: a photographic one compresses badly as PNG, and the
+          // white ground it gets here is the ground it already had.
+          ctx.globalCompositeOperation = 'destination-over';
+          ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,w,h);
+          for (const q of [0.9, 0.75, 0.6]) {
+            const jpg = cv.toDataURL('image/jpeg', q);
+            if (jpg.length*0.75 <= maxBytes) return resolve(jpg);
+          }
         }
-        reject(new Error('That picture is still over '+fmtBytes(maxBytes)+' after resizing. Try a simpler mark, or one with fewer colours.'));
+        reject(new Error('That picture is still over '+fmtBytes(maxBytes)+' at 64\u00d764'+
+          (transparent ? ', and it has transparency, so it cannot be flattened onto white to shrink it further. ' : '. ')+
+          'Try a simpler mark, or one with fewer colours.'));
       };
       img.src = raw;
     };
