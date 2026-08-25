@@ -649,15 +649,25 @@ class ConnectionManager:
                 pass
         if still_local:
             return
-        # Last LOCAL connection for this UIN dropped. We can't tell
-        # whether other workers still have a session for them — the
-        # SREM is best-effort; in the multi-device-multi-worker case
-        # we may briefly mark a still-connected user as offline.
-        # Acceptable for v1; messages routed to them via pub/sub will
-        # still be delivered if they're online elsewhere.
+        # Last LOCAL connection for this UIN dropped. Whether the ACCOUNT is
+        # still connected is a different question, and there is an answer for
+        # it now: the per-device key is cluster-wide and expiring, refreshed on
+        # every frame from every worker. If it still exists, some device of
+        # this account is still here and the account does not leave the set.
+        #
+        # ⚠ Without this check the SREM was a race with a straight face. A
+        # reconnect that lands on another worker, or a second device, took the
+        # account out of `ws:online_uins` and nothing ever put it back: the
+        # sweeper only ever REMOVES, and the set holds plain uins while the
+        # device keys are hashed, so it cannot map one to the other and
+        # re-add. The account stayed live (its pings kept `last_seen` fresh, so
+        # contacts saw it online) while the operator's online list simply did
+        # not have it. Found 24.08 chasing "why is this person online but not
+        # in the list": 27 live device keys against 17 members in the set.
         try:
             redis = await get_redis()
-            await redis.srem(_ONLINE_KEY, uin)
+            if not await redis.exists(_online_devs_key(uin)):
+                await redis.srem(_ONLINE_KEY, uin)
         except Exception:  # noqa: BLE001
             pass
 
