@@ -33,6 +33,7 @@ import secrets
 import hmac
 import ipaddress
 import json
+import logging
 import re
 import time
 
@@ -57,6 +58,13 @@ _MAX_TS_SKEW = 300              # ts must not be future-dated past this (clock-s
 _MAX_ROWS_PER_KEY = 8          # one operator key can list at most this many relays
 _MAX_TOTAL_ROWS = 1000         # global pool cap (DB-bloat floor)
 _BUCKET_PERIOD = 86400         # ring reshuffles daily
+# Failures before a never-live community row is swept. The canary runs about
+# every 10 minutes, so this is roughly a day: long enough for somebody who
+# registered a relay in the evening and fixes it in the morning, short enough
+# that a wrong (or someone else's) address is not probed forever.
+_DEAD_AFTER_FAILS = 144
+log = logging.getLogger(__name__)
+
 _LIVENESS_WINDOW = 2700        # a community relay is served only if probed-alive within this many seconds (canary runs ~every 10 min)
 # Region-scoped liveness (the FRA canary is single-vantage: it wrongly drops a
 # relay reachable from a censored region but not FRA, and wrongly serves one
@@ -1025,6 +1033,32 @@ async def admin_liveness(body: LivenessReport, db: AsyncSession = Depends(get_db
             row.fail_count = 0
         else:
             row.fail_count = (row.fail_count or 0) + 1
+            # A self-serve row that has NEVER passed a probe is swept once it
+            # has failed for about a day (the canary runs every ~10 min).
+            #
+            # ⚠ Deleted, not disabled, and that is the kinder of the two: a
+            # re-registration recreates the row with the same tag (it is
+            # derived from the operator key and the endpoint) and comes back
+            # ENABLED, while the refresh path above leaves `enabled` alone —
+            # so a row we disabled would stay dark after its owner fixed it
+            # and re-registered, with nobody the wiser.
+            #
+            # Two things this stops. Dead weight: nothing prunes these today,
+            # so the canary would knock on an address that never worked for as
+            # long as the row exists. And a small piece of reach: registration
+            # does not prove the registrant owns the address, so an entry for
+            # SOMEBODY ELSE's IP turns our prober into a knock every ten
+            # minutes. It never reaches users (the liveness gate in /bridges
+            # sees to that), but it should not outlive a day either.
+            if (
+                row.tier == "community"
+                and row.last_ok is None
+                and (row.fail_count or 0) >= _DEAD_AFTER_FAILS
+            ):
+                await db.delete(row)
+                log.warning(
+                    "[broker] swept never-live community relay after %d failures", row.fail_count
+                )
         updated += 1
     await db.commit()
     return {"ok": True, "updated": updated, "ts": now}
