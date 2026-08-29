@@ -44,7 +44,7 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.contact import Contact, ContactRequest
-from app.models.user import User, card_openable_for_viewer, visible_status
+from app.models.user import User, card_openable_for_viewer, visible_status, coarse_last_seen
 from app.services.apns import send_to_user as apns_send, should_push_for
 from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
@@ -167,7 +167,8 @@ async def list_contacts(
         if live_status == "offline":
             vis = (u.last_seen_visibility or "everyone").lower()
             if vis in ("everyone", "contacts") and u.last_seen is not None:
-                last_seen_visible = u.last_seen
+                # A7: the hour, not the minute. See coarse_last_seen.
+                last_seen_visible = coarse_last_seen(u.last_seen)
         out.append(
             ContactRow(
                 uin=u.uin,

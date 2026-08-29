@@ -292,6 +292,36 @@ def _pool_gauge() -> tuple[int | None, int | None]:
         return None, None
 
 
+class _BodyClock:
+    """Outermost ASGI wrapper: clocks how long `receive()` spends waiting for
+    the request BODY's chunks, so the timing middleware below can subtract
+    the client's half of the wire from what it reports as server work. An
+    endpoint with no body never awaits receive, so GETs cost nothing here.
+    Stored on the scope: the Request object the inner middleware sees is a
+    different instance, but the scope dict is the same one."""
+
+    def __init__(self, app):  # noqa: ANN001 - ASGI app
+        self.app = app
+
+    async def __call__(self, scope, receive, send):  # noqa: ANN001
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        waited = {"s": 0.0}
+        scope["rcq_body_wait"] = waited
+
+        async def timed_receive():
+            t0 = time.perf_counter()
+            msg = await receive()
+            waited["s"] += time.perf_counter() - t0
+            return msg
+
+        await self.app(scope, timed_receive, send)
+
+
+app.add_middleware(_BodyClock)
+
+
 @app.middleware("http")
 async def record_metrics(request: Request, call_next):
     """Time every request into the in-memory minute buckets.
@@ -314,9 +344,14 @@ async def record_metrics(request: Request, call_next):
         route = request.scope.get("route")
         path = getattr(route, "path", None) or "(unmatched)"
         in_use, ceiling = _pool_gauge()
+        # The client's half of the clock (waiting for its body chunks),
+        # measured by _BodyClock outside us. Subtracted so the path rows
+        # say what the SERVER did; a stalled upload is counted separately.
+        body_s = float(request.scope.get("rcq_body_wait", {}).get("s", 0.0))
         metrics.record_request(
             path=path,
-            seconds=time.perf_counter() - started,
+            seconds=max(0.0, time.perf_counter() - started - body_s),
+            body_seconds=body_s,
             status_code=status_code,
             uin=getattr(request.state, "uin", None),
             pool_in_use=in_use,
