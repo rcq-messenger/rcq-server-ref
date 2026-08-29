@@ -858,6 +858,20 @@ async def preview_group(
         .join(User, User.uin == GroupMember.uin)
         .where(GroupMember.group_id == group_id)
     )
+    # ⚠⚠ The avatar pair goes to MEMBERS ONLY, and the key is why.
+    # `avatar_media_key` is the cleartext AES key of the blob, and
+    # `GET /media/{id}` has no auth at all, so the pair IS the picture. This
+    # endpoint is optional-auth and, for an OPEN group, entitled to everyone
+    # (the gate above only guards closed rooms) - which handed the avatar of
+    # every open room on the island to an anonymous caller walking sequential
+    # ids. The name, the description and the count stay: a join card has to
+    # say what you are joining. The avatar falls back to the letter tile every
+    # client already draws for the redacted card below.
+    viewer_is_member = _viewer_uin is not None and await db.scalar(
+        select(GroupMember.id).where(
+            GroupMember.group_id == group_id, GroupMember.uin == _viewer_uin
+        )
+    ) is not None
     return GroupPreviewOut(
         id=g.id,
         name=g.name,
@@ -866,8 +880,8 @@ async def preview_group(
         is_closed=g.is_closed,
         owner_uin=g.owner_uin,
         owner_nickname=owner.nickname if owner else None,
-        avatar_media_id=g.avatar_media_id,
-        avatar_media_key=g.avatar_media_key,
+        avatar_media_id=g.avatar_media_id if viewer_is_member else None,
+        avatar_media_key=g.avatar_media_key if viewer_is_member else None,
     )
 
 
@@ -958,8 +972,11 @@ async def search_groups(
             is_closed=g.is_closed,
             owner_uin=g.owner_uin,
             owner_nickname=owner_nick.get(g.owner_uin),
-            avatar_media_id=g.avatar_media_id,
-            avatar_media_key=g.avatar_media_key,
+            # Search returns rooms the caller is NOT in, by construction, so
+            # the avatar pair is never theirs to hold. Same reasoning as the
+            # preview above: the key is the picture, and /media has no auth.
+            avatar_media_id=None,
+            avatar_media_key=None,
         )
         for g in rows
     ]
