@@ -178,6 +178,19 @@ async def lifespan(_: FastAPI):
         await migrate_legacy_account_keys()
     except Exception:  # noqa: BLE001, a key migration must never block boot
         _log.exception("[boot] legacy per-account key migration failed")
+    # Teach the transport classifier which addresses are broker relays, so a
+    # request from one is not filed as `direct` (the panel and the hourly log
+    # disagreed by exactly this traffic). Best-effort: an island with no
+    # broker rows just gets an empty set, which is what it had before.
+    try:
+        from app.core.db import SessionLocal
+        from app.routers.broker import refresh_broker_transport_set
+
+        async with SessionLocal() as _db:
+            n = await refresh_broker_transport_set(_db)
+        _log.info("[boot] transport knows %d broker relay address(es)", n)
+    except Exception:  # noqa: BLE001 - never block boot on a counter
+        _log.exception("[boot] broker transport set unavailable")
     expire_task = asyncio.create_task(random_chat.expire_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.

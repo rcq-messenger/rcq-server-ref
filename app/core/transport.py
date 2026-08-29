@@ -95,6 +95,27 @@ def fleet_endpoints() -> frozenset[str]:
     return frozenset(out)
 
 
+# Broker-distributed relays live in the DATABASE, not in relays.yaml, so the
+# yaml set above cannot see them: one of them carried real traffic while the
+# panel filed it under "direct" (2026-08-18, 164.92.217.91). The log parser
+# learned to read them from the descriptors; this — the live counter every
+# request goes through — never did, so the panel and the hourly log disagreed
+# by exactly the traffic of those machines.
+#
+# A set rather than a query, because `classify` runs inside the request path
+# and must not touch the database. Refreshed by the broker itself at the
+# moments it is already holding those rows: boot, a registration, a liveness
+# report. Empty until the first refresh, which is the same best-effort
+# contract the yaml has.
+_broker_addresses: frozenset[str] = frozenset()
+
+
+def set_broker_addresses(addresses: set[str]) -> None:
+    """Publish the broker pool's host addresses to [classify]."""
+    global _broker_addresses
+    _broker_addresses = frozenset(a for a in addresses if a)
+
+
 def classify(ip: str | None) -> str:
     """`direct` | `front` | `relay` for one client address.
 
@@ -103,7 +124,7 @@ def classify(ip: str | None) -> str:
     """
     if not ip:
         return "direct"
-    if ip in _relay_addresses():
+    if ip in _relay_addresses() or ip in _broker_addresses:
         return "relay"
     try:
         addr = ipaddress.ip_address(ip)

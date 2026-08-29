@@ -47,7 +47,7 @@ from app.core.db import get_db
 from app.core.rate_limit import _client_ip, rate_limit
 from app.core.redis import get_redis
 from app.core.security import require_admin
-from app.core.transport import fleet_endpoints
+from app.core.transport import fleet_endpoints, set_broker_addresses
 from app.models.broker import BrokerRelay, RelayTenant
 from app.services.geoip import country_of
 
@@ -1061,7 +1061,29 @@ async def admin_liveness(body: LivenessReport, db: AsyncSession = Depends(get_db
                 )
         updated += 1
     await db.commit()
+    # The canary is the one caller that touches these rows on a schedule, so
+    # it is also the cheapest place to keep the classifier's set current.
+    await refresh_broker_transport_set(db)
     return {"ok": True, "updated": updated, "ts": now}
+
+
+async def refresh_broker_transport_set(db: AsyncSession) -> int:
+    """Hand the broker pool's addresses to the transport classifier.
+
+    Called where the rows are already in hand: at boot and after every
+    liveness report. Without it a request arriving from one of these
+    machines counts as `direct`, and the relay share in the panel reads
+    lower than the hourly log parser's - by exactly this traffic.
+    """
+    rows = (await db.execute(select(BrokerRelay.descriptor))).scalars().all()
+    hosts: set[str] = set()
+    for desc in rows:
+        if isinstance(desc, dict):
+            server = desc.get("server")
+            if isinstance(server, str) and server:
+                hosts.add(server)
+    set_broker_addresses(hosts)
+    return len(hosts)
 
 
 @router.delete("/admin/{tag}", dependencies=[Depends(require_admin)])
