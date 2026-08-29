@@ -105,6 +105,16 @@ class Bucket:
     # AT the wall. A minute of these with no 5xx means the pool is fully used
     # and nobody timed out; the same minute with 5xx is starvation.
     pool_at_ceiling: int = 0
+    # Requests whose CLIENT was the slow half: time spent waiting for the
+    # request body's chunks to arrive. A phone that dies mid-upload holds
+    # the socket until TCP gives up (~16 min), and before this split that
+    # whole wait landed in `seconds`/`worst` and read as server work - the
+    # 993 000 ms "outliers" on POST /users/me/capabilities were exactly
+    # this. The path rows now carry work time only; the abandoned uploads
+    # are counted here instead of scaring the operator from the top of
+    # "where the time goes".
+    slow_bodies: int = 0
+    slow_body_worst: float = 0.0
 
 
 _buckets: dict[int, Bucket] = {}
@@ -134,8 +144,15 @@ def record_request(
     pool_in_use: int | None = None,
     pool_ceiling: int | None = None,
     transport: str | None = None,
+    body_seconds: float = 0.0,
 ) -> None:
     b = _bucket()
+    # The client's half of the clock never reaches the path rows. 5s is
+    # generous for any healthy uplink sending our biggest body.
+    if body_seconds > 5.0:
+        b.slow_bodies += 1
+        if body_seconds > b.slow_body_worst:
+            b.slow_body_worst = body_seconds
     b.calls[path] += 1
     if transport:
         b.transport[transport] += 1
@@ -235,9 +252,15 @@ def snapshot(minutes: int = 60, top_paths: int = 12) -> dict:
         for kind, n in b.transport.items():
             transport[kind] += n
 
+    slow_bodies = sum(b.slow_bodies for b in wanted if b is not None)
+    slow_body_worst = max((b.slow_body_worst for b in wanted if b is not None), default=0.0)
     return {
         "minutes": minutes,
         "series": series,
         "paths": paths,
         "transport": dict(transport),
+        # Clients that stalled while SENDING their body (died mid-upload,
+        # or a dying uplink). Their wait is excluded from the path rows.
+        "slow_bodies": slow_bodies,
+        "slow_body_worst_ms": round(1000 * slow_body_worst, 1),
     }

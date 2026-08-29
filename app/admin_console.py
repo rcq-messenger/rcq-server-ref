@@ -219,7 +219,8 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       </div>
       <div class="card pad" style="margin-top:16px">
         <h3>Where the time goes</h3>
-        <p class="sub">Sorted by total time spent, not by how often it is called: the endpoint worth fixing is the one the server spends its life in. &ldquo;Worst&rdquo; is the slowest single call, which an average hides. <b>Wall clock:</b> on a POST this includes the time the client took to send its body, so a sender on a bad link can make an endpoint look slow when the server did nothing. Trust the GETs.</p>
+        <p class="sub">Sorted by total time spent, not by how often it is called: the endpoint worth fixing is the one the server spends its life in. &ldquo;Worst&rdquo; is the slowest single call, which an average hides. The clock counts <b>server work only</b>: the time a client spends sending its request body is measured separately, so a phone dying mid-upload no longer paints an endpoint red.</p>
+        <p class="sub" id="inst-slowbodies" style="display:none"></p>
         <table><thead><tr><th>Path</th><th style="text-align:right">Calls/min</th><th style="text-align:right">Typical</th><th style="text-align:right">Worst</th><th style="text-align:right">5xx</th></tr></thead>
           <tbody id="inst-paths"></tbody></table>
       </div>
@@ -472,6 +473,12 @@ async function loadInstruments() {
       $('inst-chart-x').innerHTML = `<span>${fmt(series[0].minute)}</span><span>${fmt(series[series.length-1].minute)}</span>`;
     }
 
+    const sb = m.slow_bodies || 0;
+    const sbEl = $('inst-slowbodies');
+    if (sb > 0) {
+      sbEl.style.display = '';
+      sbEl.innerHTML = `<b>Stalled uploads:</b> ${sb} request(s) whose client took over 5s to deliver its body (worst ${Math.round((m.slow_body_worst_ms||0)/1000)}s). Their wait is excluded from the rows above; the server did no work while waiting.`;
+    } else { sbEl.style.display = 'none'; }
     const rows = m.paths || [];
     $('inst-paths').innerHTML = rows.length ? rows.map(p=>`<tr>
       <td class="mono">${p.path}</td>

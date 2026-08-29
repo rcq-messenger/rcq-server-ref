@@ -314,6 +314,25 @@ def _as_aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+def coarse_last_seen(last_seen: datetime | None) -> datetime | None:
+    """`last_seen` floored to the hour, for serving to OTHER users (A7).
+
+    The stored value stays exact because it doubles as the presence
+    heartbeat (`presence_is_fresh`, 60s window) - flooring the column would
+    mark every live socket offline. What other people learn is a different
+    question: a minute-precise "was here at 14:47" is an activity pattern,
+    and nobody needs it to decide whether to write. Live "online" still
+    shows exactly (it is the status field, not this timestamp), and the
+    clients' own buckets ("recently", "today") sit on top unchanged.
+
+    The owner keeps their exact value; the admin console keeps it too -
+    those are the operator's instruments, not another user's view."""
+    if last_seen is None:
+        return None
+    d = _as_aware(last_seen)
+    return d.replace(minute=0, second=0, microsecond=0)
+
+
 def presence_is_fresh(last_seen: datetime | None) -> bool:
     """True if `last_seen` is recent enough to count as a live connection."""
     if last_seen is None:

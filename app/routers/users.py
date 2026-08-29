@@ -19,7 +19,7 @@ from app.core.rate_limit import enforce_cost_budget, rate_limit
 from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
-from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status
+from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen
 from app.services.connection_manager import manager
 from app.services.contact_source import mark_vault_device, unmark_vault_device
 
@@ -302,14 +302,15 @@ class PublicUser(BaseModel):
 def _last_seen_for_viewer(u: User, *, viewer_uin: int, is_contact: bool) -> datetime | None:
     """Apply the target user's `last_seen_visibility` rule against
     the viewer. Owner always sees their own timestamp regardless of
-    the setting — the rule is only about *outsiders*."""
+    the setting — the rule is only about *outsiders*, and an outsider
+    gets the HOUR, not the minute (A7, coarse_last_seen)."""
     if viewer_uin == u.uin:
         return u.last_seen
     visibility = u.last_seen_visibility or "everyone"
     if visibility == "everyone":
-        return u.last_seen
+        return coarse_last_seen(u.last_seen)
     if visibility == "contacts" and is_contact:
-        return u.last_seen
+        return coarse_last_seen(u.last_seen)
     return None
 
 
