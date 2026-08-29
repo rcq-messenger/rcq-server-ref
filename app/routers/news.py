@@ -233,6 +233,13 @@ async def create_news_post(
     db.add(post)
     await db.commit()
     await db.refresh(post)
+    # Realtime nudge (megalist A4): a fresh post used to become visible only
+    # on the next poll or app boot. Every connected client now hears about it
+    # the second it is published; shipped builds ignore the unknown frame and
+    # keep polling, updated ones refetch /news on it. The id doubles as the
+    # badge driver so a client can bump its unread dot without the refetch.
+    from app.services.connection_manager import manager
+    await manager.broadcast_all({"type": "news_posted", "id": post.id})
     return NewsPostOut(
         id=post.id,
         body=post.body,
