@@ -27,6 +27,7 @@ does not exist, which is the end state.
 """
 
 import os
+import base64
 import secrets
 from datetime import datetime, timezone
 
@@ -71,6 +72,12 @@ class GroupOut(BaseModel):
     # Voluntary catalog: the owner chose to list this room publicly, which is
     # the only reason search may match it (stage 6, founder decision 30.08).
     in_catalog: bool = False
+    # Sealed room identity (stage 6 phase 2, docs/group-state-seal-design.md):
+    # an opaque blob the members encrypt under the room state key, and its
+    # strictly-increasing version. The island stores bytes and does version
+    # arithmetic; it cannot read either.
+    state_blob: str | None = None
+    state_ver: int = 0
     # Owner/admin-set free-text description. NULL when unset.
     description: str | None = None
     owner_uin: int
@@ -684,6 +691,8 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
         id=g.id,
         name=g.name,
         in_catalog=g.in_catalog,
+        state_blob=base64.b64encode(g.state_blob).decode() if g.state_blob else None,
+        state_ver=g.state_ver or 0,
         description=g.description,
         owner_uin=g.owner_uin,
         avatar_seed=g.avatar_seed,
@@ -1358,6 +1367,63 @@ class MemberPermsIn(BaseModel):
     # Any subset of {delete, members, info}. Empty list = demote back to a
     # plain member. Unknown entries are rejected.
     permissions: list[str]
+
+
+class GroupStateIn(BaseModel):
+    """One write of the sealed room identity. The blob is opaque to the
+    island by construction; the version is the whole concurrency story."""
+    state_blob: str = Field(min_length=1)
+    state_ver: int = Field(ge=1)
+
+
+# Deflate-then-AEAD of a sub-kilobyte JSON: 64 KB is forty times the largest
+# real room's blob and still nothing next to one avatar. A cap because an
+# unreadable column must not become a free blob store.
+_STATE_BLOB_CAP = 64 * 1024
+
+
+@router.patch("/{group_id}/state", response_model=GroupOut)
+async def patch_group_state(
+    group_id: int,
+    body: GroupStateIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> GroupOut:
+    """Write the sealed room identity (stage 6 phase 2).
+
+    Single writer with a strictly increasing version: `state_ver` must be
+    exactly the stored version plus one, else 409 carrying the current
+    version - the vault's #605 rule at room scale. The loser of a race
+    re-reads, re-applies its change to the fresh plaintext, and retries;
+    nothing is merged on the island because the island cannot read what it
+    would be merging.
+    """
+    me = await _ensure_member(db, group_id, uin)
+    g = await _load_group(db, group_id)
+    if not _member_can(g, me, "info"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
+    try:
+        blob = base64.b64decode(body.state_blob, validate=True)
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "state_blob is not base64")
+    if not blob or len(blob) > _STATE_BLOB_CAP:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "state_blob size out of bounds")
+    current = g.state_ver or 0
+    if body.state_ver != current + 1:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"stale state_ver: island holds {current}",
+        )
+    g.state_blob = blob
+    g.state_ver = body.state_ver
+    await db.commit()
+    await db.refresh(g)
+    members = await _members_with_users(db, g.id, viewer_uin=uin)
+    payload = _serialize(g, members)
+    # The same live push a rename gets: every open client re-reads the group
+    # and, holding the key, re-renders the new name without a restart.
+    await _broadcast_membership(g.id, members, payload)
+    return payload
 
 
 @router.post("/{group_id}/members/{member_uin}/permissions", response_model=GroupOut)
