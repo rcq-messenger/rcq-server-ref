@@ -186,8 +186,12 @@ class AddMemberIn(BaseModel):
     uin: int
 
 
-# The slowmode picker every client shows: off, 5s, 10s, 30s, 1min.
-_SLOWMODE_STEPS = {0, 5, 10, 30, 60}
+# The slowmode picker every client shows: off, 5s, 10s, 30s, 1min, 5min, 1h.
+# 300 and 3600 joined on 29.08: Android 0.151 shipped them in its picker while
+# this set still ended at 60, so the two big steps 422'd silently (#809). The
+# set grows, never shrinks - a client with the shorter menu simply renders the
+# stored number as seconds.
+_SLOWMODE_STEPS = {0, 5, 10, 30, 60, 300, 3600}
 
 
 class GroupPatchIn(BaseModel):
