@@ -433,7 +433,27 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
         await _on_connect(uin)
         while True:
             msg = await ws.receive_json()
-            await _handle_client_message(uin, msg, device_id)
+            bounce = await _handle_client_message(uin, msg, device_id)
+            if bounce and not _may_bounce(uin, device_id):
+                # Healed again inside the brake window: delivery is live
+                # either way, only the backlog drain is deferred. See
+                # _may_bounce for why a repeat bounce is the dangerous half.
+                bounce = False
+            if bounce:
+                # This frame healed a ghost (see touch_device): while the
+                # account was outside the online set, delivery routed around
+                # it and its queue silently accumulated. Shipped clients only
+                # drain `/messages/queue` on boot and on socket OPEN — so the
+                # one move that gets the backlog onto their screen without a
+                # client release is a soft close: the ordinary backoff redials
+                # in ~1s and the open-drain does the rest. 1012 (service
+                # restart) on purpose — not 4000 (would sit out the 30-60s
+                # superseded pause) and not 4401 (would tear the session down).
+                try:
+                    await ws.close(code=1012, reason="resync")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -457,6 +477,35 @@ async def ws_endpoint(ws: WebSocket, uin: int, token: str = Query(...)) -> None:
         metrics.record_socket(opened=False)
         await manager.disconnect(uin, ws)
         await _on_disconnect(uin)
+
+
+# Bounce brake for the ghost heal below. A heal means delivery had routed
+# around a live account; the bounce exists only to make shipped clients drain
+# the backlog. Healing is always safe to repeat — bouncing is NOT: the iOS
+# client silently arms its sing-box tunnel at four young sessions in a row,
+# and the web client escalates to the CF front on three dead-young sockets,
+# so a pathology that re-ghosts an account after every reconnect must not be
+# allowed to bounce it in lockstep. One bounce per (uin, device) per window
+# PER WORKER (in-process on purpose: worst case across 4 workers is four
+# bounces per window, still minutes apart — far above every client's
+# escalation cadence). Between brakes the account still heals on every frame,
+# so live delivery is restored either way; only the backlog drain waits for
+# the next natural reconnect.
+_RESYNC_BOUNCE_WINDOW_S = 600.0
+_resync_bounced_at: dict[tuple[int, str], float] = {}
+
+
+def _may_bounce(uin: int, device_id: str) -> bool:
+    now = time.monotonic()
+    if len(_resync_bounced_at) > 4096:  # lazy prune, bound the dict
+        for k, t in list(_resync_bounced_at.items()):
+            if now - t > _RESYNC_BOUNCE_WINDOW_S:
+                _resync_bounced_at.pop(k, None)
+    last = _resync_bounced_at.get((uin, device_id))
+    if last is not None and now - last < _RESYNC_BOUNCE_WINDOW_S:
+        return False
+    _resync_bounced_at[(uin, device_id)] = now
+    return True
 
 
 # Presence debounce: brief WS drops (iOS network switch, idle timeout)
@@ -622,18 +671,33 @@ async def _debounced_offline(uin: int) -> None:
 
 async def _handle_client_message(
     uin: int, msg: dict, device_id: str = "primary"
-) -> None:
+) -> bool:
     """The WS channel is mostly server→client (presence + delivery). Clients send most
     things over HTTP. We accept a tiny client-initiated set: ping, typing relays,
     call signalling (offer / answer / ICE / end) and audio-room signalling.
 
     Unknown frames fall through and are ignored, which is what shipped clients
-    still sending `hood_subscribe` now get (the Hood was deleted 2026-08-22)."""
+    still sending `hood_subscribe` now get (the Hood was deleted 2026-08-22).
+
+    Returns True when the caller should BOUNCE this socket: the frame just
+    healed a ghost (see ConnectionManager.touch_device) — the account was
+    routed around for some unknown stretch, so its queue may hold messages
+    the client has no reason to fetch. Every shipped client drains
+    `/messages/queue` on socket open, so a soft close is the one lever that
+    makes them recover TODAY, without a client release: reconnect lands in
+    ~1s on the ordinary backoff and the drain brings the backlog in."""
     kind = msg.get("type")
     # Any frame proves this DEVICE is still here, which is what the per-device
-    # push decision reads. Cheap (one SADD + EXPIRE) and it keeps the online
-    # marker's TTL short enough that a dead worker's leftovers age out.
-    await manager.touch_device(uin, device_id)
+    # push decision reads. Cheap (one pipelined SADD·EXPIRE·SADD) and it keeps
+    # the online marker's TTL short enough that a dead worker's leftovers age
+    # out. The third command re-asserts the ACCOUNT set — the self-heal for
+    # ghosts («звук есть, сообщения нет», #732 #754 #756 #759 #761).
+    healed = await manager.touch_device(uin, device_id)
+    if healed:
+        # Identity-free, same policy as the delivery lines. The count is the
+        # instrument here: this line at a steady clip means something is still
+        # de-listing live accounts and the heal is doing the catching.
+        _log.warning("[ws] ghost healed: live socket found outside the online set, bouncing for drain")
     if kind == "ping":
         await manager.send(uin, {"type": "pong", "t": datetime.now(timezone.utc).isoformat()})
         # Heartbeat. Online-state is DERIVED from `last_seen` freshness, so
@@ -647,12 +711,12 @@ async def _handle_client_message(
                 .values(last_seen=datetime.now(timezone.utc))
             )
             await db.commit()
-        return
+        return healed
     if kind == "typing":
         target = int(msg.get("to_uin", 0))
         if target:
             await manager.send(target, {"type": "typing", "from_uin": uin, "active": bool(msg.get("active", True))})
-        return
+        return healed
     # Call signalling — server is a dumb relay for SDP / ICE / hangups,
     # PLUS a single-call guard. Two parties can never be in two calls at
     # once because we register both endpoints on call_offer and refuse
@@ -679,7 +743,7 @@ async def _handle_client_message(
     }:
         target = int(msg.get("to_uin", 0))
         if not target:
-            return
+            return healed
         call_id = str(msg.get("call_id", ""))
 
         # Concurrency guard fires only on call_offer. Answer/ICE/end can't
@@ -697,7 +761,7 @@ async def _handle_client_message(
                     "call_id": call_id,
                     "reason": "unavailable",
                 })
-                return
+                return healed
             registered = await _register_call(call_id, uin, target)
             if registered:
                 from app.services.activity_rollup import bump_bg as activity_bump
@@ -712,7 +776,7 @@ async def _handle_client_message(
                     "call_id": call_id,
                     "reason": "busy",
                 })
-                return
+                return healed
 
         relay: dict = {"type": kind, "from_uin": uin}
         for key in ("call_id", "sdp", "candidate", "media", "reason"):
@@ -759,7 +823,7 @@ async def _handle_client_message(
         if kind == "call_end" and str(msg.get("reason", "")) in {"no_answer", "declined", "expired"}:
             mark = await _answered_mark(call_id)
             if mark is not None and mark[0] == uin:
-                return
+                return healed
 
         delivered = await manager.send(target, relay)
 
@@ -937,7 +1001,7 @@ async def _handle_client_message(
             # Android: dismiss a ringing full-screen call UI that the offer-wake
             # raised but the WS relay couldn't reach (woke too late).
             await up_call(target, payload=voip_payload)
-        return
+        return healed
 
     # ── Audio Rooms ──
     # `room_enter` puts the UIN into an in-memory roster and tells
@@ -951,7 +1015,7 @@ async def _handle_client_message(
     if kind == "room_enter":
         room_id = int(msg.get("room_id", 0))
         if not room_id:
-            return
+            return healed
         # Single-busy: an ongoing 1:1 call blocks room entry, and an
         # ongoing room blocks a 1:1 call (handled in `_register_call`).
         # A stale pin pointing at THIS room is NOT busy — it's the
@@ -963,7 +1027,7 @@ async def _handle_client_message(
                 "room_id": room_id,
                 "reason": "busy",
             })
-            return
+            return healed
         async with SessionLocal() as db:
             from app.routers.audio_rooms import (
                 MAX_ROOM_PARTICIPANTS,
@@ -978,14 +1042,14 @@ async def _handle_client_message(
                     "room_id": room_id,
                     "reason": "no_such_room",
                 })
-                return
+                return healed
             if not await is_room_member(db, room_id, uin):
                 await manager.send(uin, {
                     "type": "room_enter_rejected",
                     "room_id": room_id,
                     "reason": "not_member",
                 })
-                return
+                return healed
             # The whole row, not just the nickname: `room_member_entered`
             # carries the avatar too, and this lookup was already a row read.
             entrant = await db.get(User, uin)
@@ -1026,7 +1090,7 @@ async def _handle_client_message(
                 "room_id": room_id,
                 "reason": "full",
             })
-            return
+            return healed
         # result == 0 (already in) OR 1 (added) — both fine; load roster.
         roster_members = await redis.smembers(_room_members_key(room_id))
         roster_uins = sorted(int(m) for m in roster_members if isinstance(m, str) and m.isdigit())
@@ -1135,12 +1199,12 @@ async def _handle_client_message(
                     "avatar_media_key": entrant_avatar_key,
                 },
             })
-        return
+        return healed
 
     if kind == "room_leave":
         room_id = int(msg.get("room_id", 0))
         if not room_id:
-            return
+            return healed
         redis = await _get_redis()
         # Idempotent leave — only fire room_member_left if the user
         # was actually present.
@@ -1153,13 +1217,13 @@ async def _handle_client_message(
                     "room_id": room_id,
                     "uin": uin,
                 })
-        return
+        return healed
 
     if kind in {"room_offer", "room_answer", "room_ice"}:
         room_id = int(msg.get("room_id", 0))
         target = int(msg.get("to_uin", 0))
         if not room_id or not target:
-            return
+            return healed
         # Both endpoints must be in this room or the relay is a no-op.
         redis = await _get_redis()
         pipe = redis.pipeline(transaction=False)
@@ -1167,7 +1231,7 @@ async def _handle_client_message(
         pipe.sismember(_room_members_key(room_id), str(target))
         sender_in, target_in = await pipe.execute()
         if not sender_in or not target_in:
-            return
+            return healed
         relay: dict = {
             "type": kind,
             "room_id": room_id,
@@ -1177,7 +1241,7 @@ async def _handle_client_message(
             if k in msg:
                 relay[k] = msg[k]
         await manager.send(target, relay)
-        return
+        return healed
 
     if kind == "room_speaking":
         # Lightweight visual indicator: client emits when local mic
@@ -1187,12 +1251,12 @@ async def _handle_client_message(
         room_id = int(msg.get("room_id", 0))
         speaking = bool(msg.get("speaking", False))
         if not room_id:
-            return
+            return healed
         redis = await _get_redis()
         members = await redis.smembers(_room_members_key(room_id))
         member_uins = {int(m) for m in members if isinstance(m, str) and m.isdigit()}
         if uin not in member_uins:
-            return
+            return healed
         peers = [u for u in member_uins if u != uin]
         if peers:
             await manager.broadcast(peers, {
@@ -1201,4 +1265,8 @@ async def _handle_client_message(
                 "uin": uin,
                 "speaking": speaking,
             })
-        return
+        return healed
+
+    # Unknown frame kinds fall through here (ignored by design, see the
+    # docstring) — the heal verdict still has to reach the receive loop.
+    return healed

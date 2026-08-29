@@ -66,7 +66,7 @@ class Group(Base):
     # the X3DH dance with each member completes. The pin is meta-info
     # (group rules), not user message content, so the relaxation is
     # scoped to a single column.
-    pinned_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    pinned_text: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # (`pinned_by` was unmapped on 2026-08-22. It named the admin who set the
     # current pin, was served on the wire, and no client ever rendered it: iOS

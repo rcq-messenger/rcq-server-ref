@@ -693,16 +693,50 @@ class ConnectionManager:
                 self._device_of.get(ws, "primary") for ws in self._conns.get(uin, ())
             }
 
-    async def touch_device(self, uin: int, device_id: str) -> None:
+    async def touch_device(self, uin: int, device_id: str) -> bool:
         """Keep a live device's online marker from expiring. Called on every
         client frame (iOS pings ~25s), which is what makes the TTL safe to keep
-        short enough that a dead worker's leftovers age out quickly."""
+        short enough that a dead worker's leftovers age out quickly.
+
+        Returns True when the account had to be RE-ADDED to `_ONLINE_KEY`,
+        i.e. this frame just proved the account is connected while the set said
+        it was not — a GHOST. Two ways an account still gets ghosted after the
+        2026-08-25 disconnect fix, both measured against the reports of
+        26-28.08 («звук есть, сообщения нет до перезахода», #732 #754 #756
+        #759 #761):
+
+        1. A redial's natural teardown racing its own supersede: the client
+           cancels the old socket and dials the new one at once; the new
+           register lands on worker B (sadd devs + online), and the old
+           socket's death reaches worker A BEFORE the supersede envelope does,
+           so A's `disconnect` still holds the device mapping, srems the
+           device entry B just wrote, finds the key empty and srems the
+           account too. B's socket is alive; nothing re-adds the account.
+
+        2. Doze: the app-level ping timer pauses while the TCP socket stays
+           parked, the device key expires after 180s, `presence_sweep` prunes
+           the account (correctly — it was unreachable), and when the phone
+           wakes the pings resume on the SAME socket. No reconnect ever
+           happens, so nothing re-adds the account.
+
+        In both states delivery routes around the user forever: fan-out and
+        1:1 skip them (queued + push at best, silence at worst) while their
+        socket answers pings, so the client never redials and never drains.
+        The frame in hand is proof of life, so the account set is re-asserted
+        HERE, on every frame — sweeper and disconnect only ever remove, and
+        this is the only spot that can safely put back. The caller uses the
+        return to bounce the socket so shipped clients reconnect and drain
+        the backlog that accrued while they were ghosts (see ws.py)."""
         try:
             redis = await get_redis()
-            await redis.sadd(_online_devs_key(uin), device_id)
-            await redis.expire(_online_devs_key(uin), _ONLINE_DEVS_TTL)
+            async with redis.pipeline(transaction=False) as pipe:
+                pipe.sadd(_online_devs_key(uin), device_id)
+                pipe.expire(_online_devs_key(uin), _ONLINE_DEVS_TTL)
+                pipe.sadd(_ONLINE_KEY, uin)
+                results = await pipe.execute()
+            return bool(results[2])
         except Exception:  # noqa: BLE001
-            pass
+            return False
 
     async def is_online(self, uin: int) -> bool:
         """Cross-worker online check via Redis SET. Async now (was

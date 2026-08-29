@@ -217,7 +217,7 @@ class GroupPatchIn(BaseModel):
         return v
     # Pinned announcement. Empty string clears the pin; None = leave
     # untouched. Plaintext, owner/admin-editable. See model docstring.
-    pinned_text: str | None = Field(default=None, max_length=500)
+    pinned_text: str | None = Field(default=None, max_length=4096)
     # Avatar swap. To clear, send empty strings — None means "leave
     # untouched" so a partial PATCH that only flips post_policy
     # doesn't accidentally wipe the avatar.
