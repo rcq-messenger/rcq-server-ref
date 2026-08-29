@@ -68,6 +68,9 @@ router = APIRouter(prefix="/groups", tags=["groups"])
 class GroupOut(BaseModel):
     id: int
     name: str
+    # Voluntary catalog: the owner chose to list this room publicly, which is
+    # the only reason search may match it (stage 6, founder decision 30.08).
+    in_catalog: bool = False
     # Owner/admin-set free-text description. NULL when unset.
     description: str | None = None
     owner_uin: int
@@ -212,6 +215,10 @@ class GroupPatchIn(BaseModel):
     # Slowmode step, seconds. Fixed menu of steps rather than a free
     # integer so every client renders the same picker.
     slowmode_sec: int | None = None
+    # Voluntary catalog listing. Publishing a room's name is group metadata
+    # in the same sense as the name itself, so it shares the admin-or-owner
+    # gate ("info") rather than the owner-only one.
+    in_catalog: bool | None = None
 
     @field_validator("slowmode_sec")
     @classmethod
@@ -676,6 +683,7 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
     return GroupOut(
         id=g.id,
         name=g.name,
+        in_catalog=g.in_catalog,
         description=g.description,
         owner_uin=g.owner_uin,
         avatar_seed=g.avatar_seed,
@@ -921,7 +929,18 @@ async def search_groups(
     # Exact-id lookup keeps working for closed groups: that path is how a
     # share link resolves, and there the LINK is the capability (same rule as
     # `/{group_id}/preview` below).
-    clauses = [and_(Group.name.ilike(f"%{needle}%"), Group.is_closed.is_(False))]
+    # Catalog rows only (stage 6): a room is searchable by name because its
+    # owner published it, and for no other reason. The exact-id clause below
+    # stays unfiltered - there the LINK is the capability, same rule as
+    # preview. Existing open rooms were seeded in_catalog=TRUE on rollout, so
+    # nothing the island's users could already find went dark.
+    clauses = [
+        and_(
+            Group.name.ilike(f"%{needle}%"),
+            Group.is_closed.is_(False),
+            Group.in_catalog.is_(True),
+        )
+    ]
     if needle.isdigit():
         try:
             clauses.append(Group.id == int(needle))
@@ -1266,6 +1285,10 @@ async def patch_group(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
         cleaned = body.description.strip()
         g.description = cleaned or None
+    if body.in_catalog is not None:
+        if not _member_can(g, me, "info"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
+        g.in_catalog = body.in_catalog
     if body.post_policy is not None:
         if g.owner_uin != uin:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text
+from sqlalchemy import LargeBinary, BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -57,6 +57,15 @@ class Group(Base):
     # (0 = off). Unlike the two flags above this one IS server-enforced for
     # authenticated senders on /messages/group-sealed — see messages.py.
     slowmode_sec: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Voluntary catalog (stage 6): True only when the owner/admins chose to
+    # publish this room. Search matches catalog rows only; for everything
+    # else the island is not in the business of knowing what a room is.
+    in_catalog: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Sealed room identity (stage 6, phase 2): deflate-then-AEAD under a room
+    # key distributed over the sealed channel. Single writer, strictly
+    # increasing version, 409 on stale - the vault's #605 rule at room scale.
+    state_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    state_ver: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     # Pinned plaintext announcement, owner/admin-editable. Surfaced as
     # a sticky header above the message list in ChatView so new joiners
     # who can't see the encrypted history at least see the rules /

@@ -247,6 +247,15 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     ("links_allowed", "BOOLEAN DEFAULT TRUE"),
     ("files_allowed", "BOOLEAN DEFAULT TRUE"),
     ("slowmode_sec", "INTEGER DEFAULT 0"),
+    # Voluntary catalog (metadata stage 6, founder decision 30.08): the name
+    # and description are PUBLIC LISTING fields, held openly only because the
+    # owner chose to publish the room. Search returns catalog rows only.
+    # Unlisted rooms will keep their identity in state_blob (sealed, room-key
+    # under the skdm channel) once clients learn to write it; the columns are
+    # added now so the schema is ready and the toggle can ship first.
+    ("in_catalog", "BOOLEAN DEFAULT FALSE"),
+    ("state_blob", "BYTEA"),
+    ("state_ver", "BIGINT DEFAULT 0"),
 ]
 
 # Additive on `group_members` — granular moderator capabilities the owner
