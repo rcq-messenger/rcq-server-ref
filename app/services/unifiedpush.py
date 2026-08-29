@@ -135,6 +135,29 @@ _RELAY_HOSTS = frozenset(
 )
 
 
+# Fast-fail for DEAD subscriptions on the blocked host (megalist H5). 618 of
+# 1096 Android endpoints still point at ntfy.sh, most of them long-dead
+# registrations from before the relay era; each one used to burn up to three
+# attempts x 8s of an inflight slot on every fan-out, which is exactly the
+# semaphore a big group's push burst starves on. An endpoint on a relayed
+# host whose last recorded success is old (or absent) gets ONE attempt with a
+# short timeout instead: a subscriber that is actually alive answers the
+# relay in well under a second, and the first 2xx re-stamps push_last_ok,
+# which lifts the endpoint back to full service by itself.
+_STALE_AFTER = timedelta(days=7)
+_QUICK_TIMEOUT = 2.5
+
+
+def _quick_lane(endpoint: str, last_ok: datetime | None) -> bool:
+    try:
+        host = (urlparse(endpoint).hostname or "").lower()
+    except ValueError:
+        return False
+    if host not in _RELAY_HOSTS:
+        return False
+    return last_ok is None or (datetime.now(timezone.utc) - last_ok) > _STALE_AFTER
+
+
 def _endpoint_label(endpoint: str) -> str:
     """A safe name for one push endpoint in a log line.
 
@@ -255,7 +278,7 @@ async def _endpoints_for(uin: int) -> list[EndpointRow]:
     return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
-async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
+async def _post_once(endpoint: str, body: bytes, ttl: int, quick: bool = False) -> tuple[str, str]:
     """POST one payload to one UnifiedPush endpoint. Returns
     (outcome, detail) where outcome is "ok" | "retry" | "drop" | "fail".
     Pure network — no DB.
@@ -286,7 +309,12 @@ async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
         headers["X-Relay-Target"] = endpoint
         headers["X-Relay-Key"] = _RELAY_KEY
     try:
-        resp = await client.post(url, content=body, headers=headers)
+        if quick:
+            # The quick lane's whole point is not to hold an inflight slot
+            # for the full 8s on a host that mostly does not answer.
+            resp = await client.post(url, content=body, headers=headers, timeout=_QUICK_TIMEOUT)
+        else:
+            resp = await client.post(url, content=body, headers=headers)
     except (httpx.HTTPError, asyncio.TimeoutError) as exc:
         return "retry", type(exc).__name__
     if 200 <= resp.status_code < 300:
@@ -298,20 +326,21 @@ async def _post_once(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
     return "fail", str(resp.status_code)
 
 
-async def _deliver(endpoint: str, body: bytes, ttl: int) -> tuple[str, str]:
-    """One endpoint, up to len(_RETRY_DELAYS)+1 attempts. Returns the final
-    (outcome, detail). Jitter keeps a fan-out's retries from re-bursting in
-    lockstep — which for a shared-NAT ntfy visitor is what drained the bucket
-    in the first place."""
+async def _deliver(endpoint: str, body: bytes, ttl: int, quick: bool = False) -> tuple[str, str]:
+    """One endpoint, up to len(_RETRY_DELAYS)+1 attempts (exactly one on the
+    quick lane, see _quick_lane). Returns the final (outcome, detail). Jitter
+    keeps a fan-out's retries from re-bursting in lockstep — which for a
+    shared-NAT ntfy visitor is what drained the bucket in the first place."""
     outcome, detail = "fail", "unsent"
-    for attempt, delay in enumerate((0.0, *_RETRY_DELAYS)):
+    schedule = (0.0,) if quick else (0.0, *_RETRY_DELAYS)
+    for attempt, delay in enumerate(schedule):
         if delay:
             await asyncio.sleep(delay * (0.75 + random.random() * 0.5))
         async with _semaphore():
-            outcome, detail = await _post_once(endpoint, body, ttl)
+            outcome, detail = await _post_once(endpoint, body, ttl, quick=quick)
         if outcome != "retry":
             return outcome, detail
-        if attempt < len(_RETRY_DELAYS):
+        if attempt < len(schedule) - 1:
             log.info("[up] %s for %s, retry %d", detail, _endpoint_label(endpoint), attempt + 1)
     return outcome, detail
 
@@ -448,8 +477,15 @@ async def _fan_out(
     if not endpoints:
         return
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    quick_lanes = [_quick_lane(e, last_ok) for _, e, _, _, last_ok in endpoints]
+    if (quick_n := sum(quick_lanes)):
+        log.info("[up] %s uin=%s quick-lane for %d stale relayed endpoint(s)",
+                 what, log_identity(uin), quick_n)
     results = await asyncio.gather(
-        *(_deliver(endpoint, body, ttl) for _, endpoint, _, _, _ in endpoints),
+        *(
+            _deliver(endpoint, body, ttl, quick=quick)
+            for (_, endpoint, _, _, _), quick in zip(endpoints, quick_lanes)
+        ),
         return_exceptions=True,
     )
     ok_ids: list[int] = []
