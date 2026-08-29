@@ -237,7 +237,7 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     # Sticky group announcement. Plaintext on the server (see model
     # comment) so brand-new joiners can see rules / welcome without
     # waiting for X3DH to complete with every existing member.
-    ("pinned_text", "VARCHAR(500)"),
+    ("pinned_text", "VARCHAR(4096)"),
     ("pinned_at", "TIMESTAMP WITH TIME ZONE"),
     # Unguessable half of a share link (see the model comment). Backfilled
     # for existing rows by `_backfill_group_share_tokens` below.
@@ -438,6 +438,23 @@ async def init_db() -> None:
                         ))
                     except Exception:
                         pass
+
+    # Widened columns (Postgres). `ADD COLUMN IF NOT EXISTS` skips a column
+    # that already exists, so an install that predates a width bump keeps the
+    # old cap forever unless it is re-asserted here. Widening is metadata-only
+    # in PG (no table rewrite, no lock worth naming) and idempotent. SQLite
+    # never enforced VARCHAR length in the first place, so it needs nothing.
+    # The one entry so far: the group pin, 500 -> 4096 (megalist A6 - the
+    # 500 cap was making clients silently 422 on real announcements).
+    if dialect == "postgresql":
+        for table, col, new_type in [("groups", "pinned_text", "VARCHAR(4096)")]:
+            async with engine.begin() as conn:
+                try:
+                    await conn.execute(text(
+                        f"ALTER TABLE {table} ALTER COLUMN {col} TYPE {new_type}"
+                    ))
+                except Exception:
+                    pass
 
     # Backfill share tokens for groups created before the column existed, so
     # every group has an unguessable half to its share link. Done here (rather
