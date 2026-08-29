@@ -169,6 +169,49 @@ async def _next_group_seq(db: AsyncSession, group_id: int) -> int:
     return int((await db.execute(sql, {"g": group_id})).scalar_one())
 
 
+async def _next_group_seqs(db: AsyncSession, group_id: int, count: int) -> range:
+    """Allocate `count` consecutive room sequences in ONE round-trip.
+
+    Same durable counter and same guarantees as `_next_group_seq` above
+    (never MAX()-derived, awarded inside the post's transaction); the only
+    difference is that the whole block is claimed by a single statement
+    instead of one statement per row.
+
+    ⚠ This is not a micro-optimisation, it is the fix for an island-wide
+    stall measured on prod 2026-08-25. The sealed group path used to award a
+    seq per addressed log row INSIDE its per-recipient loop, so one post to
+    the flagship group (152 log readers that day) spent ~150 sequential
+    round-trips inside a single open transaction. The managed database pools
+    in TRANSACTION mode with 15 server connections for the whole island, so a
+    dozen concurrent group posts pinned 13 of those 15 as `idle in
+    transaction` while executing almost nothing (1 active query in 94% of
+    samples). Everything else on the island then queued inside PgBouncer,
+    where none of our instruments can see it: /contacts, /vault and
+    /server/info all peaked at ~11s together while the CPU sat at 0.2, and
+    /messages/group-sealed itself ran p95 28.6s against a p50 of 0.61s, which
+    is past the clients' own 30s timeout.
+
+    Returns the awarded block, lowest first, for the caller to zip onto its
+    rows. An empty block for `count <= 0` so the caller needs no special case.
+    """
+    if count <= 0:
+        return range(0)
+    if engine.dialect.name == "postgresql":
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, :n) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = group_seq.next_seq + :n "
+            "RETURNING next_seq"
+        )
+    else:
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, :n) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = next_seq + :n "
+            "RETURNING next_seq"
+        )
+    last = int((await db.execute(sql, {"g": group_id, "n": count})).scalar_one())
+    return range(last - count + 1, last + 1)
+
+
 _CALL_WAKE_ENV_MAX = 3500
 
 
@@ -561,6 +604,7 @@ def _keep_for(
     queueable: set[int],
     cls: int,
     wake: Iterable[int],
+    envelope_type: str,
 ) -> set[int]:
     """Who this group envelope is actually stored for.
 
@@ -591,8 +635,29 @@ def _keep_for(
     path maps envelope_type when a client does not send `cls`). The group
     dormant sweep applies the same rule to STORED rows, falling back to
     envelope_type for the legacy rows that carry NULL there.
+
+    3. **And then it was too generous, in exactly one direction.** The
+       keep-for-everyone rule above is about KEY MATERIAL: an `skdm` is the
+       chain key, and a member who never receives it cannot read a single
+       later broadcast. A `sknack` is the opposite, it is the QUESTION ("who
+       holds key id X?"), and it is worthless the moment it is stale: the
+       asking client re-fires per key id every ten minutes and again after a
+       restart, so an hour-old copy will never be the one that recovers
+       anybody. Both landed in cls 2 together, so one recovery request in the
+       flagship group wrote a row for all ~930 members. Measured on prod
+       2026-08-25, five real posts produced 552 fan-outs and 152 286 queue
+       rows in a single hour, and 336k of the table's 556k rows were this
+       housekeeping rather than anything a person wrote. A `sknack` now
+       follows the normal rule: live to whoever is connected, stored only for
+       members who are actually around. That is also what a LEGACY sknack
+       (cls NULL) already did on the read side, so the two sides now agree.
+
+       ⚠ `sknack` stays cls 2 everywhere ELSE, and it has to. cls 1 is what
+       drives the push fan-out, so demoting the class itself would send every
+       member a "New group message" banner for a key-recovery question.
+       Only the keep decision changes.
     """
-    if cls == 2:
+    if cls == 2 and envelope_type != "sknack":
         return set(recipients)
     return set(queueable) | set(wake)
 
@@ -855,22 +920,32 @@ async def send_group_sealed(
     # the dormancy machinery existed to bound the per-member table, and a room
     # log has one retention window for the whole room instead.
     readers = await _group_log_readers(db, (e.to_uin for e in entries))
-    log_rows = []
-    for e in entries:
-        if e.to_uin in readers:
-            log_rows.append({
-                "group_id": body.group_id,
-                "seq": await _next_group_seq(db, body.group_id),
-                "to_uin": e.to_uin,
-                "envelope_type": body.envelope_type,
-                "cls": cls,
-                "payload": e.payload,
-                "received_at": now,
-            })
+    addressed = [e for e in entries if e.to_uin in readers]
+    # One statement for the whole block of seqs instead of one per row. See
+    # `_next_group_seqs` for why the loop that used to sit here was the thing
+    # that stalled the island every time somebody posted in the big group.
+    log_rows = [
+        {
+            "group_id": body.group_id,
+            "seq": seq,
+            "to_uin": e.to_uin,
+            "envelope_type": body.envelope_type,
+            "cls": cls,
+            "payload": e.payload,
+            "received_at": now,
+        }
+        for e, seq in zip(
+            addressed, await _next_group_seqs(db, body.group_id, len(addressed))
+        )
+    ]
     if log_rows:
         await db.execute(insert(GroupLog), log_rows)
     keep = _keep_for(
-        (e.to_uin for e in entries if e.to_uin not in readers), queueable, cls, wake
+        (e.to_uin for e in entries if e.to_uin not in readers),
+        queueable,
+        cls,
+        wake,
+        body.envelope_type,
     )
     rows = [
         {
@@ -1086,7 +1161,10 @@ async def send_group_broadcast(
         wake = await group_push_targets(
             db, [uin for uin in offline_recipients if uin != caller], group_id
         )
-    keep = _keep_for((u for u in recipients if u not in readers), queueable, cls, wake)
+    # The stored row rides as "gmsg" here, not as the declared inner type, so
+    # that is what the keep rule is asked about. A broadcast never carries
+    # key-distribution material anyway.
+    keep = _keep_for((u for u in recipients if u not in readers), queueable, cls, wake, "gmsg")
     rows = [
         {
             "to_uin": uin,
