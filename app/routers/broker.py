@@ -1077,11 +1077,17 @@ async def refresh_broker_transport_set(db: AsyncSession) -> int:
     """
     rows = (await db.execute(select(BrokerRelay.descriptor))).scalars().all()
     hosts: set[str] = set()
-    for desc in rows:
-        if isinstance(desc, dict):
-            server = desc.get("server")
-            if isinstance(server, str) and server:
-                hosts.add(server)
+    for raw in rows:
+        # The column is the signed descriptor VERBATIM, as text: it has to stay
+        # byte-identical for the signature to verify, so it is never a dict
+        # here however much it looks like one.
+        try:
+            desc = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            continue
+        server = desc.get("server") if isinstance(desc, dict) else None
+        if isinstance(server, str) and server:
+            hosts.add(server)
     set_broker_addresses(hosts)
     return len(hosts)
 
