@@ -1600,6 +1600,12 @@ async def fetch_queue(
         max_group = max((r.id for r in rows_group), default=after_group)
         await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
         await db.commit()
+    else:
+        # Every value is already copied into pydantic rows; a backlogged
+        # mailbox on a slow phone otherwise parks this pooled connection
+        # 'idle in transaction' for the entire transfer (11s captured by
+        # the 30.08 spike sampler — same shape as get_group).
+        await db.rollback()
     return out
 
 
