@@ -191,6 +191,10 @@ async def list_contacts(
                 ),
             )
         )
+    # Same early release as GET /groups/{id}: the roster of a large account
+    # streams for seconds to a slow phone, and the session (and its pooled
+    # connection) is otherwise held until the last byte. `out` is built.
+    await db.rollback()
     return out
 
 
