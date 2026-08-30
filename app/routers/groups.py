@@ -31,7 +31,7 @@ import base64
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1032,7 +1032,9 @@ async def get_group(
     group_id: int,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
-) -> GroupOut:
+    # ⚠ Returns a pre-serialized Response, NOT a GroupOut — see the comment on
+    # the return. `response_model` is kept for the OpenAPI schema only.
+) -> Response:
     await _ensure_member(db, group_id, uin)
     g = await _load_group(db, group_id)
     # The member-list screen loads from here, so this is the roster that has
@@ -1048,7 +1050,17 @@ async def get_group(
     # Every read is done and `out` holds plain values, so nothing after
     # this line touches the session.
     await db.rollback()
-    return out
+    # Serialize HERE rather than handing FastAPI the model. Given a pydantic
+    # instance with a `response_model`, FastAPI re-validates the whole object
+    # and then walks it again through `jsonable_encoder` — on the flagship
+    # roster that is 113ms of pure CPU (measured on prod, 2200 members), and
+    # because the event loop is single-threaded per worker it is 113ms during
+    # which that worker answers NOBODY. It is the one endpoint here that does
+    # enough CPU work to be felt by unrelated requests, which is what the
+    # multi-second `worst` on cheap endpoints like /users/me/push-token was.
+    # `model_dump_json` alone is 9ms and byte-identical (verified on prod).
+    # Returning a Response makes FastAPI skip the duplicate pass entirely.
+    return Response(content=out.model_dump_json(), media_type="application/json")
 
 
 @router.post(

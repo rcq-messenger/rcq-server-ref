@@ -35,8 +35,8 @@ vault list. Marked at the call site.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from pydantic import BaseModel, TypeAdapter
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,6 +100,11 @@ class ContactRow(BaseModel):
     avatar_media_key: str | None = None
 
 
+# One-pass serializer for the roster list (see GET /contacts): built once at
+# import so the hot path does not rebuild the adapter per request.
+_CONTACT_ROWS = TypeAdapter(list[ContactRow])
+
+
 class RequestRow(BaseModel):
     id: int
     from_uin: int
@@ -127,7 +132,9 @@ class RespondIn(BaseModel):
 async def list_contacts(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
-) -> list[ContactRow]:
+    # ⚠ Returns a pre-serialized Response, NOT a list — see the return.
+    # `response_model` is kept for the OpenAPI schema only.
+) -> Response:
     """Every row the island still holds for this account.
 
     Unchanged by stage 4 so far and deliberately so: an account that has
@@ -195,7 +202,15 @@ async def list_contacts(
     # streams for seconds to a slow phone, and the session (and its pooled
     # connection) is otherwise held until the last byte. `out` is built.
     await db.rollback()
-    return out
+    # And the same reason as GET /groups/{id} for serializing here: handed a
+    # list of models under a `response_model`, FastAPI re-validates every row
+    # and re-walks it through `jsonable_encoder`. This is the most-called
+    # endpoint on the island, so the duplicated pass is paid ~20 times a
+    # minute for nothing. TypeAdapter gives the identical bytes in one pass.
+    return Response(
+        content=_CONTACT_ROWS.dump_json(out).decode(),
+        media_type="application/json",
+    )
 
 
 @router.post(
