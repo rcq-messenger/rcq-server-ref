@@ -1038,7 +1038,17 @@ async def get_group(
     # The member-list screen loads from here, so this is the roster that has
     # to carry `profile_openable`.
     members = await _members_with_users(db, g.id, viewer_uin=uin)
-    return _serialize(g, members)
+    out = _serialize(g, members)
+    # ⚠ End the read transaction BEFORE returning. FastAPI closes a
+    # yield-dependency's session only after the LAST BYTE of the response
+    # has left, and the flagship room's roster is megabytes that a phone
+    # drains for seconds - so this endpoint pinned a pooled connection
+    # 'idle in transaction' through the whole transfer (typical 4s on the
+    # 31.08 instruments; the same shape as the 25.08 island-wide stall).
+    # Every read is done and `out` holds plain values, so nothing after
+    # this line touches the session.
+    await db.rollback()
+    return out
 
 
 @router.post(
