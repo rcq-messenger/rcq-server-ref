@@ -44,7 +44,7 @@ from app.models.contact import Contact
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.group_log import GroupLog, GroupLogCursor, GroupSeq
 from app.services.group_log import seed_cursors_on_join
-from app.models.user import User, card_openable_for_viewer
+from app.models.user import User, card_openable_fields
 from app.services.connection_manager import manager
 
 # Hard-enforce the closed-group share token (404 for a tokenless preview)
@@ -279,9 +279,27 @@ async def _members_with_users(
     anybody else, and clients treat the absent field as "unknown, draw the
     link" — which is what they did before item 22 existed.
     """
+    # ⚠ COLUMNS, not entities. `select(GroupMember, User)` hydrates two ORM
+    # objects per member with an identity map behind them: on the flagship
+    # roster that is 287ms against 58ms for the same rows read as columns
+    # (measured on prod, 2200 members). Nothing below needs a live instance —
+    # every field used is listed right here, and the one policy verdict goes
+    # through `card_openable_fields` so it cannot drift from the User method.
     rows = (
         await db.execute(
-            select(GroupMember, User)
+            select(
+                GroupMember.uin,
+                GroupMember.role,
+                GroupMember.permissions,
+                User.nickname,
+                User.status,
+                User.identity_key,
+                User.signing_key,
+                User.signal_identity_key,
+                User.avatar_media_id,
+                User.avatar_media_key,
+                User.profile_card_policy,
+            )
             .join(User, User.uin == GroupMember.uin)
             .where(GroupMember.group_id == group_id)
         )
@@ -292,7 +310,7 @@ async def _members_with_users(
         (
             await db.execute(
                 select(UserCapability.uin).where(
-                    UserCapability.uin.in_([m.uin for m, _ in rows]),
+                    UserCapability.uin.in_([r.uin for r in rows]),
                     UserCapability.sender_keys.is_(True),
                 )
             )
@@ -313,7 +331,7 @@ async def _members_with_users(
     # zones. Small groups keep the dots: there the roster is people you know,
     # and knowing who is around is the point.
     online = (
-        await manager.online_subset(u.uin for _, u in rows)
+        await manager.online_subset(r.uin for r in rows)
         if len(rows) <= PRESENCE_ROSTER_LIMIT
         else set()
     )
@@ -332,8 +350,8 @@ async def _members_with_users(
     contact_set: set[int] = set()
     if viewer_uin is not None:
         gated = [
-            u.uin for _, u in rows
-            if (u.profile_card_policy or "everyone") == "contacts" and u.uin != viewer_uin
+            r.uin for r in rows
+            if (r.profile_card_policy or "everyone") == "contacts" and r.uin != viewer_uin
         ]
         if gated:
             contact_set = set(
@@ -347,28 +365,29 @@ async def _members_with_users(
                 ).all()
             )
     out: list[GroupMemberOut] = []
-    for m, u in rows:
+    for r in rows:
         # Live presence: only show as their saved status if they currently have
         # a live WebSocket; otherwise force offline. Fake demo users skip this
         # Invisible always reads as offline so it stays hidden from group-mates.
-        raw_status = u.status if u.uin in online else "offline"
+        raw_status = r.status if r.uin in online else "offline"
         visible = "offline" if raw_status == "invisible" else raw_status
         out.append(GroupMemberOut(
-            uin=m.uin,
-            nickname=u.nickname,
-            avatar_media_id=u.avatar_media_id,
-            avatar_media_key=u.avatar_media_key,
-            role=m.role,
-            permissions=_perm_list(m.permissions),
+            uin=r.uin,
+            nickname=r.nickname,
+            avatar_media_id=r.avatar_media_id,
+            avatar_media_key=r.avatar_media_key,
+            role=r.role,
+            permissions=_perm_list(r.permissions),
             status=visible,
-            identity_key=u.identity_key,
-            signing_key=u.signing_key,
-            signal_identity_key=u.signal_identity_key,
-            sender_keys=m.uin in capable,
+            identity_key=r.identity_key,
+            signing_key=r.signing_key,
+            signal_identity_key=r.signal_identity_key,
+            sender_keys=r.uin in capable,
             profile_openable=(
                 None if viewer_uin is None
-                else card_openable_for_viewer(
-                    u, viewer_uin=viewer_uin, is_contact=u.uin in contact_set
+                else card_openable_fields(
+                    r.uin, r.profile_card_policy,
+                    viewer_uin=viewer_uin, is_contact=r.uin in contact_set,
                 )
             ),
         ))
