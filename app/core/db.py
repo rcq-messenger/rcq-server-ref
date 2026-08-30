@@ -254,6 +254,7 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     # under the skdm channel) once clients learn to write it; the columns are
     # added now so the schema is ready and the toggle can ship first.
     ("in_catalog", "BOOLEAN DEFAULT FALSE"),
+    ("min_account_age_hours", "INTEGER DEFAULT 0"),
     ("state_blob", "BYTEA"),
     ("state_ver", "BIGINT DEFAULT 0"),
 ]

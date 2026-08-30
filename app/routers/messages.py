@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import math
 import logging
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
@@ -752,6 +753,57 @@ async def _enforce_group_slowmode(
             await redis.set(_slowmode_free_key(other, g.id, caller), "1", ex=_SLOWMODE_PAIR_GRACE_SEC)
 
 
+async def _enforce_account_age_gate(
+    db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str
+) -> None:
+    """Anti-spam age floor (#803): a room may require an account to be older
+    than `g.min_account_age_hours` before it can POST a message. Registration
+    here takes five seconds, so a ban list only breeds throwaway accounts;
+    an age floor makes every throwaway wait it out, which is the one currency
+    a spammer does not print.
+
+    Same phase-1 trust shape as owner_only and slowmode: an anonymous poster
+    stays on the client-side gate (sealed sender hides who they are), and the
+    owner, an admin and any member holding a granted cap are exempt, matching
+    the composer. A caller with no local User row is a cross-island guest:
+    their age lives on their home island where we cannot read it, so phase 1
+    lets them through rather than muting every guest.
+    """
+    if envelope_type != "message" or g is None or (g.min_account_age_hours or 0) <= 0:
+        return
+    if caller is None or caller == g.owner_uin:
+        return
+    row = (
+        await db.execute(
+            select(GroupMember.role, GroupMember.permissions).where(
+                GroupMember.group_id == g.id, GroupMember.uin == caller
+            )
+        )
+    ).first()
+    if row is None:
+        return  # not a member; the membership check below is the gate
+    role, perms = row
+    if role == "admin" or bool((perms or "").strip()):
+        return
+    u = await db.get(User, caller)
+    created = getattr(u, "created_at", None)
+    if created is None:
+        return
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
+    need = float(g.min_account_age_hours)
+    if age_h >= need:
+        return
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "account_too_young",
+            "hours_left": max(1, math.ceil(need - age_h)),
+        },
+    )
+
+
 class GroupRecipientPayload(BaseModel):
     to_uin: int
     payload: str
@@ -811,6 +863,18 @@ async def send_group_sealed(
     # from a shipped client. The reader below it was the push block titling
     # its banner with `g.name`, which is gone; `_enforce_group_slowmode` runs
     # unconditionally and takes `g` too, so the hazard is unchanged.
+    # A sender-key recovery ask (`sknack`) fans ONE sealed payload to EVERY
+    # capable member, so a client stuck in an ask loop is an island-wide
+    # problem, not its own: measured 30.08, one install asked a 971-member
+    # room every ten minutes around the clock (366 posts in 12h), each post
+    # parsing ~1MB of payloads, bulk-inserting ~950 queue rows and holding a
+    # pool connection for over a second - the "everything worst 4-7s" spikes
+    # on the instruments were exactly these. Real recovery is a handful of
+    # asks; ten an hour is generous. The client's send is best-effort and
+    # swallows the 429, so an old looping install degrades to ~silent.
+    if body.envelope_type == "sknack":
+        ident = f"uin:{caller}" if caller is not None else f"ip:{request.client.host if request.client else 'unknown'}"
+        await enforce_rate_limit(ident, "messages_sknack", 10, 3600)
     g = await db.get(Group, body.group_id)
     if body.envelope_type == "message":
         if g is not None and g.post_policy == "owner_only" and caller is not None and caller != g.owner_uin:
@@ -838,6 +902,7 @@ async def send_group_sealed(
     queueable = _queueable(member_rows)
 
     await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="sealed")
+    await _enforce_account_age_gate(db, g, caller, body.envelope_type)
 
     now = datetime.now(timezone.utc)
     # Stage 2a: the class the server branches on (push + keep), derived from the
@@ -1074,6 +1139,7 @@ async def send_group_broadcast(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
 
     await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="broadcast")
+    await _enforce_account_age_gate(db, g, caller, body.envelope_type)
 
     recipient_rows = (
         await db.execute(

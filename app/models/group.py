@@ -61,6 +61,12 @@ class Group(Base):
     # publish this room. Search matches catalog rows only; for everything
     # else the island is not in the business of knowing what a room is.
     in_catalog: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Anti-spam age floor (#803): an account younger than this many hours
+    # may read but not POST (0 = off). Registration takes five seconds, so
+    # a ban list only breeds throwaways; the floor makes each throwaway
+    # wait it out. Server-enforced for authenticated senders on both group
+    # send paths - see messages.py `_enforce_account_age_gate`.
+    min_account_age_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Sealed room identity (stage 6, phase 2): deflate-then-AEAD under a room
     # key distributed over the sealed channel. Single writer, strictly
     # increasing version, 409 on stale - the vault's #605 rule at room scale.
