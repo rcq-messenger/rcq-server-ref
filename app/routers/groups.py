@@ -100,6 +100,9 @@ class GroupOut(BaseModel):
     # Slowmode step in seconds (0 = off). Server-enforced for
     # authenticated senders; moderators and the owner are exempt.
     slowmode_sec: int = 0
+    # Anti-spam age floor in hours (0 = off): an account younger than this
+    # may read but not post. Same enforcement shape as slowmode.
+    min_account_age_hours: int = 0
     # Pinned plaintext announcement, owner/admin-editable. NULL when
     # unset. Rendered as a sticky banner above the message list so a
     # brand-new joiner (who can't see encrypted history) at least sees
@@ -202,6 +205,8 @@ class AddMemberIn(BaseModel):
 # set grows, never shrinks - a client with the shorter menu simply renders the
 # stored number as seconds.
 _SLOWMODE_STEPS = {0, 5, 10, 30, 60, 300, 3600}
+# Off, 1h, 6h, day, 3 days, week, 30 days.
+_AGE_GATE_STEPS = {0, 1, 6, 24, 72, 168, 720}
 
 
 class GroupPatchIn(BaseModel):
@@ -227,11 +232,22 @@ class GroupPatchIn(BaseModel):
     # gate ("info") rather than the owner-only one.
     in_catalog: bool | None = None
 
+    # Anti-spam age floor, hours. Fixed menu of steps, same reasoning as
+    # slowmode: every client renders the same picker.
+    min_account_age_hours: int | None = None
+
     @field_validator("slowmode_sec")
     @classmethod
     def _slowmode_step(cls, v: int | None) -> int | None:
         if v is not None and v not in _SLOWMODE_STEPS:
             raise ValueError(f"slowmode_sec must be one of {sorted(_SLOWMODE_STEPS)}")
+        return v
+
+    @field_validator("min_account_age_hours")
+    @classmethod
+    def _age_gate_step(cls, v: int | None) -> int | None:
+        if v is not None and v not in _AGE_GATE_STEPS:
+            raise ValueError(f"min_account_age_hours must be one of {sorted(_AGE_GATE_STEPS)}")
         return v
     # Pinned announcement. Empty string clears the pin; None = leave
     # untouched. Plaintext, owner/admin-editable. See model docstring.
@@ -702,6 +718,7 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
         links_allowed=g.links_allowed,
         files_allowed=g.files_allowed,
         slowmode_sec=g.slowmode_sec,
+        min_account_age_hours=g.min_account_age_hours or 0,
         pinned_text=g.pinned_text,
         pinned_at=g.pinned_at,
         avatar_media_id=g.avatar_media_id,
@@ -1320,6 +1337,11 @@ async def patch_group(
         if g.owner_uin != uin:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
         g.files_allowed = body.files_allowed
+    if body.min_account_age_hours is not None:
+        # The age floor is a rule of the room, like slowmode: owner-only.
+        if g.owner_uin != uin:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
+        g.min_account_age_hours = body.min_account_age_hours
     if body.slowmode_sec is not None:
         if g.owner_uin != uin:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
