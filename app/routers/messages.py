@@ -875,6 +875,13 @@ async def send_group_sealed(
     if body.envelope_type == "sknack":
         ident = f"uin:{caller}" if caller is not None else f"ip:{request.client.host if request.client else 'unknown'}"
         await enforce_rate_limit(ident, "messages_sknack", 10, 3600)
+        # And per ROOM: the measured storm was one install asking one room
+        # about its ~5 dead kids every window, which rode the account budget
+        # at exactly 10/hour - still ~10k deposits a day. Two asks per room
+        # per hour answers every recoverable kid (a live owner answers the
+        # first ask); only the dead ones are slowed, and dead is what they
+        # are.
+        await enforce_rate_limit(f"{ident}:g{body.group_id}", "messages_sknack_room", 2, 3600)
     g = await db.get(Group, body.group_id)
     if body.envelope_type == "message":
         if g is not None and g.post_policy == "owner_only" and caller is not None and caller != g.owner_uin:
