@@ -921,16 +921,30 @@ async def update_me(
         else:
             data["hof_avatar"] = _validate_hof_avatar(raw)
     if "avatar_media_id" in data or "avatar_media_key" in data:
-        # The pair only makes sense whole: an id without a key is a blob
-        # nobody can open, and a key without an id points at nothing. Sending
-        # both blank is how a client removes the picture.
+        # The pair used to have to arrive whole. It no longer does, and the
+        # asymmetry is the profile-key migration (docs/profile-key-design.md):
+        #
+        #   * id WITHOUT key is the NEW shape. The blob is sealed under the
+        #     owner's profile key, which their contacts receive over E2E and
+        #     this island never sees. We store the id, serve the id, and cannot
+        #     open the picture - which is the whole point, because today we can:
+        #     the key sits in this row next to the uin and the nickname, and a
+        #     seized island decrypts every face it holds.
+        #   * id WITH key is the OLD shape, still accepted so that clients
+        #     which predate the migration keep working. Phase 3 nulls these.
+        #   * key WITHOUT id is still nonsense and still refused.
+        #
+        # Clearing both is still how a client removes the picture.
         new_id = (data.get("avatar_media_id") or "").strip() or None
         new_key = (data.get("avatar_media_key") or "").strip() or None
-        if (new_id is None) != (new_key is None):
+        if new_id is None and new_key is not None:
             raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "avatar_media_id and avatar_media_key go together"
+                status.HTTP_400_BAD_REQUEST, "avatar_media_key without avatar_media_id"
             )
         data["avatar_media_id"] = new_id
+        # An id arriving alone REPLACES whatever key we held: the new blob is
+        # sealed under a key we were not given, so keeping the old one would
+        # leave a key that opens nothing pointing at a picture it cannot.
         data["avatar_media_key"] = new_key
     # (The `presence_ttl_minutes` allow-list check stood here until 2026-08-23.
     # It guarded a column that no longer exists; the key cannot reach `data` at
