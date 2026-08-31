@@ -756,11 +756,23 @@ async def _enforce_group_slowmode(
 async def _enforce_account_age_gate(
     db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str
 ) -> None:
-    """Anti-spam age floor (#803): a room may require an account to be older
-    than `g.min_account_age_hours` before it can POST a message. Registration
-    here takes five seconds, so a ban list only breeds throwaway accounts;
-    an age floor makes every throwaway wait it out, which is the one currency
-    a spammer does not print.
+    """Anti-spam floor (#803, #833): a room may require a member to have waited
+    `g.min_account_age_hours` before it can POST a message. Registration here
+    takes five seconds, so a ban list only breeds throwaway accounts; a wait
+    makes every throwaway sit it out, which is the one currency a spammer does
+    not print.
+
+    ⚠ It counts from JOINING THE ROOM when that is known, and from account
+    creation otherwise. #833 is why: counting from registration is beaten by
+    ageing one account — spam, get kicked, walk back in and carry on, because
+    the account is still old. Counted from joining, a kick costs the wait
+    again. Never weaker than the old rule either way: you cannot join a room
+    before you exist, so joined_at >= created_at.
+
+    `joined_at` is NULL for anyone who joined before the room armed its floor,
+    and deliberately so — it is stamped only for armed rooms and only to the
+    day (see `_armed_join_stamp`). Those members fall back to account age,
+    which is exactly the pre-#833 behaviour.
 
     Same phase-1 trust shape as owner_only and slowmode: an anonymous poster
     stays on the client-side gate (sealed sender hides who they are), and the
@@ -775,23 +787,25 @@ async def _enforce_account_age_gate(
         return
     row = (
         await db.execute(
-            select(GroupMember.role, GroupMember.permissions).where(
-                GroupMember.group_id == g.id, GroupMember.uin == caller
-            )
+            select(
+                GroupMember.role, GroupMember.permissions, GroupMember.joined_at
+            ).where(GroupMember.group_id == g.id, GroupMember.uin == caller)
         )
     ).first()
     if row is None:
         return  # not a member; the membership check below is the gate
-    role, perms = row
+    role, perms, joined = row
     if role == "admin" or bool((perms or "").strip()):
         return
-    u = await db.get(User, caller)
-    created = getattr(u, "created_at", None)
-    if created is None:
+    since = joined
+    if since is None:
+        u = await db.get(User, caller)
+        since = getattr(u, "created_at", None)
+    if since is None:
         return
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - since).total_seconds() / 3600.0
     need = float(g.min_account_age_hours)
     if age_h >= need:
         return
