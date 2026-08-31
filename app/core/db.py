@@ -845,15 +845,31 @@ async def init_db() -> None:
     # previous release finds its columns still present. Dropping in the same
     # release that unmaps would also leave a window during the restart where an
     # old worker inserts a column the new schema no longer has. So the physical
-    # DROP is queued for the release AFTER this one:
+    # DROP is queued for the release AFTER this one.
     #
-    #   users.trade_policy, users.active_days, users.last_active_day
-    #   users.presence_persistent, users.presence_ttl_minutes
-    #   groups.entry_price_tokens, groups.pinned_by
-    #   group_members.joined_at
-    #   contacts.created_at
-    #   user_capabilities.updated_at
-    #   audio_room_memberships.joined_at
+    # ✅ The 22-23.08 batch was DROPPED on both islands on 31.08, a week and
+    # several releases later, which is what "the release after" was waiting
+    # for: users.trade_policy, users.active_days, users.last_active_day,
+    # users.presence_persistent, users.presence_ttl_minutes,
+    # groups.entry_price_tokens, groups.pinned_by, contacts.created_at,
+    # user_capabilities.updated_at, audio_room_memberships.joined_at.
+    # Unmapping stops the writing; only the DROP stops the KEEPING, and the
+    # 31.08 seizure audit found 1502 dated friendships and 2597 activity
+    # counters still sitting there long after the code forgot them. If you
+    # unmap something, put it here AND come back for it.
+    #
+    # ⚠⚠ After any DROP, terminate every pooled backend through the DIRECT
+    # port: DDL poisons PgBouncer's plans exactly like pg_dump does
+    # ([[project_rcq_pgdump_pool_poisoning_2026_08_24]]). The pooled URL names
+    # the database "rcq-pool", which exists only on 25061 - on 25060 it is
+    # "rcq", so swap BOTH the port and the name or the terminate silently
+    # connects nowhere.
+    #
+    # Still queued (nothing today):
+    #
+    #   (empty - group_members.joined_at came BACK on 31.08 for the anti-spam
+    #    floor, stamped only for armed rooms and floored to the day, so it is
+    #    no longer a drop candidate. See models/group.py.)
     #
     # The presence pair joined on 2026-08-23 and the same reasoning is what
     # keeps it here rather than in the drop-now list: the flagship runs
