@@ -266,6 +266,21 @@ async def _load_group(db: AsyncSession, group_id: int) -> Group:
     return g
 
 
+def _armed_join_stamp(g: Group | None) -> datetime | None:
+    """When a new member joined, but ONLY for a room whose anti-spam floor is
+    armed, and only to the day (#833, founder 31.08).
+
+    Both halves are the privacy budget: a room nobody armed records nothing,
+    and an armed one records "joined on the 27th" rather than the minute a
+    relationship began. Floored rather than rounded, so the wait can end up to
+    a day short of nominal but never longer than the owner asked for.
+    """
+    if g is None or (g.min_account_age_hours or 0) <= 0:
+        return None
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 async def _members_with_users(
     db: AsyncSession, group_id: int, *, viewer_uin: int | None = None
 ) -> list[GroupMemberOut]:
@@ -1121,7 +1136,9 @@ async def join_group(
             detail={"code": "group_closed"},
         )
 
-    db.add(GroupMember(group_id=group_id, uin=uin, role="member"))
+    db.add(GroupMember(
+        group_id=group_id, uin=uin, role="member", joined_at=_armed_join_stamp(g),
+    ))
     await db.flush()
     await seed_cursors_on_join(db, group_id, uin)
     await db.commit()
@@ -1176,7 +1193,10 @@ async def add_member(
         )
     )
     if existing is None:
-        db.add(GroupMember(group_id=group_id, uin=body.uin, role="member"))
+        db.add(GroupMember(
+            group_id=group_id, uin=body.uin, role="member",
+            joined_at=_armed_join_stamp(g),
+        ))
         await db.flush()
         await seed_cursors_on_join(db, group_id, body.uin)
         await db.commit()

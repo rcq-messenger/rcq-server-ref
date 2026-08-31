@@ -119,11 +119,23 @@ class GroupMember(Base):
     # non-owner members. Enforcement of `delete` is client-side (sealed sender),
     # `members`/`info` are enforced here. See routers/groups.py.
     permissions: Mapped[str] = mapped_column(String(128), default="", server_default="")
-    # (`joined_at` was unmapped on 2026-08-22. Its one reader picked the oldest
-    # member on owner succession, and `id` is monotonic on the same insert
-    # order, so ORDER BY id returns the same person. What it cost to keep was a
-    # per-person join timeline of every room: exactly when each relationship
-    # started, for every member of every group on the island.)
+    # ⚠ `joined_at` was unmapped on 2026-08-22 because keeping it meant keeping
+    # a per-person join timeline of every room: exactly when each relationship
+    # started, for every member of every group on the island. Its one reader
+    # (oldest member on owner succession) does the same job with ORDER BY id.
+    #
+    # It is back for ONE job, under two rules that keep the old reason honest
+    # (#833, founder 31.08):
+    #   * written ONLY when the room has the anti-spam floor switched on, so
+    #     rooms nobody armed still record nothing at all, and
+    #   * floored to the DAY, so what is stored is "joined on the 27th", not
+    #     the minute a relationship began.
+    # Without it the floor counts from account creation, which a spammer beats
+    # by ageing one account: spam, get kicked, walk back in, carry on. Counted
+    # from joining, a kick costs them the wait again. NULL = joined before the
+    # room armed the floor (or before this existed): the gate then falls back
+    # to account age, which is never weaker than before.
+    joined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
 
 
 class OfflineGroupMessage(Base):
