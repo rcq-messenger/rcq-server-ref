@@ -827,6 +827,34 @@ async def _handle_client_message(
 
         delivered = await manager.send(target, relay)
 
+        # ⚠⚠ `manager.send` answers from `ws:online_uins`, and its own docstring
+        # is careful about what that means: the account was in the online SET at
+        # publish time, not that any socket received this. That set has no TTL.
+        # It is maintained by a SADD on connect and an SREM on disconnect, and
+        # the only thing that prunes a worker which died between the two is
+        # `presence_sweep`, every five minutes — so it can keep saying "online"
+        # for something like eight minutes after the last socket of the account
+        # went away.
+        #
+        # For a MESSAGE that costs nothing: the row is queued, the drain picks
+        # it up, and a stale "online" only means a push was skipped. A CALL has
+        # no queue and no drain. Every fallback below this line — the VoIP push,
+        # the UnifiedPush wake, `call_unreachable` — is gated on `delivered`
+        # being false, so a ghost in that set turns a call into pure silence:
+        # nothing rings, nothing is pushed, and the caller hears a ringback the
+        # island has no basis for. That is exactly the shape of report #805,
+        # where the phone rang and the desktop showed nothing.
+        #
+        # `online_devices` is the honest signal for this question: it is backed
+        # by a per-account key with a 180s TTL that every client frame refreshes,
+        # so it exists only while some device of the account has actually been
+        # heard from. Asked only for calls, and only to DOWNGRADE a delivered
+        # that the set claims: the cost of being wrong this way is a redundant
+        # push, which is the direction the push paths already choose.
+        if delivered and kind in ("call_offer", "call_answer"):
+            if not await manager.online_devices(target):
+                delivered = False
+
         # Start the grace the moment an answer is on its way, not when the next
         # candidate shows up — by then the race is already lost.
         if kind == "call_answer":
@@ -979,6 +1007,29 @@ async def _handle_client_message(
                         "call_id": call_id,
                     },
                 )
+
+        # The answer had nowhere to go. Of the whole call vocabulary this is the
+        # only event with NO fallback at all: an offer that misses gets a VoIP
+        # push, a UnifiedPush wake and, failing both, `call_unreachable`; an end
+        # that misses gets its own push below. An answer that misses used to be
+        # dropped in silence, and silence here is the worse half of report #805
+        # — the person who ACCEPTED is now sitting in a connected call, camera
+        # on, talking to nobody, because their side has no way to learn the
+        # caller stopped existing. Waking the caller is pointless (a call they
+        # abandoned), so this is not a push: it is one frame back to the person
+        # holding the phone, saying the other side is gone. Additive like
+        # `call_unreachable` and `call_offline`: a client that does not know the
+        # event ignores it and keeps today's behaviour.
+        if not delivered and kind == "call_answer":
+            await manager.send(
+                uin,
+                {
+                    "type": "call_end",
+                    "from_uin": target,
+                    "call_id": call_id,
+                    "reason": "caller_gone",
+                },
+            )
 
         # call_end fallback. If the recipient's WS wasn't connected
         # (their device just woke from the offer push but hasn't
