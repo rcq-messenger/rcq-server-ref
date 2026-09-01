@@ -68,6 +68,20 @@ log = logging.getLogger(__name__)
 _CRITICAL_TYPES = {"skdm", "sknack"}
 _EPHEMERAL_TYPES = {"typing", "read", "visit", "presence", "nudge", "bounce"}
 
+# ⚠⚠ A self-carbon is content that must NOT be pushed, which no class expressed.
+# A carbon is a copy of a message the user themself just sent, mirrored to their
+# own other devices, so waking their phone for it is a notification about their
+# own typing. It fell to cls 1 through the default below and was pushed on every
+# send, and the only reason nobody saw a banner is that all three clients filter
+# the type on their side after the push has already crossed APNs and the
+# UnifiedPush host. Every client's comment claims the island filters this; it
+# never did, and the set they name has not existed here for months.
+#
+# It cannot simply join _EPHEMERAL_TYPES: cls 0 changes retention too, and a
+# carbon has to survive until the other device drains it. So it stays content
+# for storage and is refused a push explicitly at the branch.
+_NEVER_PUSH_TYPES = {"carbon"}
+
 # ⚠ "call" stays a content-class row, never a legible "call" kind. A call
 # deposit is already coerced to frame type "message" on the live socket (see the
 # comment in `send_sealed`), and the RINGING wake is now driven by the `ring`
@@ -532,6 +546,10 @@ async def send_sealed(
         # still delivers the envelope if the wake is late or lost.
         if not delivered:
             pushed = await _wake_for_sealed_call(body.to_uin, body.payload)
+    elif cls == 1 and body.envelope_type in _NEVER_PUSH_TYPES:
+        # Stored and delivered like any content row, never woken for. See
+        # _NEVER_PUSH_TYPES.
+        pass
     elif cls == 1:
         online_devices = frozenset(await manager.online_devices(body.to_uin))
         if not delivered or online_devices:
