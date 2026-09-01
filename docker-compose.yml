@@ -75,6 +75,10 @@ services:
       - media:/app/media
       - news_media:/app/news_media
       - evidence:/app/evidence
+      # `.rcq` site bundles. Public bytes, unlike everything else here, and
+      # the only content on the island the operator can read - which is why
+      # they live in a volume of their own rather than beside the media.
+      - sites:/app/sites
       # APNs push notifications (optional). Drop your Apple `.p8` key at
       # ./apns.p8 next to docker-compose.yml and uncomment the mount
       # below, then set APNS_KEY_PATH=/keys/apns.p8 plus APNS_KEY_ID +
@@ -153,3 +157,4 @@ volumes:
   media:
   news_media:
   evidence:
+  sites:
