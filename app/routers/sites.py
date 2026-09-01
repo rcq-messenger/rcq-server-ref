@@ -57,6 +57,11 @@ MAX_FILES = 64
 #: aloud and typed by hand.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
+#: Names this router already answers to. A site called `mine` would be
+#: published happily and then never open, because the route above it wins -
+#: so it is refused at the door instead of becoming a support question.
+_ROUTE_NAMES = {"mine", "available"}
+
 #: What a bundle may contain. No fonts (an outside font is a fingerprint), no
 #: scripts (there is no JS at all), no video (the traffic is somebody else's
 #: relay). Everything is served with the type this table says, never with a
@@ -112,6 +117,28 @@ class AvailabilityOut(BaseModel):
     reason: str | None = None
 
 
+@router.get("/mine", response_model=list[SiteOut])
+async def my_sites(
+    me: int = Depends(current_uin), db: AsyncSession = Depends(get_db)
+) -> list[SiteOut]:
+    """What this account has published here.
+
+    ⚠ Its own route rather than a filter on the catalogue: the catalogue holds
+    the sites that ASKED to be in it, and a person must be able to see their
+    own site whether or not they asked. Declared before `/{name}` so a site
+    can never be called `mine` and shadow it - the name regex allows it, and
+    the first matching route wins.
+    """
+    rows = (
+        await db.execute(select(Site).where(Site.owner_uin == me).order_by(Site.name))
+    ).scalars().all()
+    return [
+        SiteOut(name=s.name, owner_uin=s.owner_uin, version=s.version, title=s.title,
+                size_bytes=s.size_bytes, listed=s.listed, frozen=s.frozen, updated_at=s.updated_at)
+        for s in rows
+    ]
+
+
 @router.get("/available/{name}", response_model=AvailabilityOut,
             dependencies=[Depends(rate_limit("site_available", 30, 60))])
 async def availability(name: str, db: AsyncSession = Depends(get_db)) -> AvailabilityOut:
@@ -123,7 +150,7 @@ async def availability(name: str, db: AsyncSession = Depends(get_db)) -> Availab
     away. This answers one name at a time, rate-limited, like the UIN check.
     """
     lower = name.strip().lower()
-    if not _NAME_RE.match(lower):
+    if not _NAME_RE.match(lower) or lower in _ROUTE_NAMES:
         return AvailabilityOut(name=lower, available=False, reason="invalid")
     row = await db.get(Site, lower)
     return AvailabilityOut(name=lower, available=row is None, reason="taken" if row else None)
@@ -211,7 +238,7 @@ async def put_site(
     swapped, so a reader never sees half a version and a rollback is a rename.
     """
     lower = name.strip().lower()
-    if not _NAME_RE.match(lower):
+    if not _NAME_RE.match(lower) or lower in _ROUTE_NAMES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_name"})
     # ⚠ A name of digits only belongs to the holder of that number. `123456.rcq`
     # is indistinguishable from "the official page of #123456", and that is the
