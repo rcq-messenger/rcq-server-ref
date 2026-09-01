@@ -45,6 +45,18 @@ hosted-key tooling), keep an eye on releases.
   VoIP pushes for inbound calls.
 * **Encrypted media blobs** — opaque bytes by mass; per-blob AES key
   exchanged inside the encrypted envelope.
+* **`.rcq` sites** — your island can host static pages people reach by name
+  (`blog.<your-island>.rcq`) from inside the app: `app/routers/sites.py`,
+  quotas of one site per account / 20 MB / 64 files, and the file type decided
+  by our own table rather than by whatever the uploader claimed. Every bundle
+  is signed by the owner's key with a hash per file, so a reader verifies it
+  and pins the key: your island can refuse to serve a site, it cannot alter
+  one. Reads are UNAUTHENTICATED on purpose - a token would build exactly the
+  "who read what" journal an island should not hold. Set `RCQ_SITES_DIR` to a
+  persistent volume, and see the operator's list at `/admin/sites` (freeze
+  holds a site while a complaint is looked at; unlist only stops advertising
+  it in the catalogue). `python -m app.tools.publish_site` publishes the
+  island's own pages from the command line.
 * **Cross-island federation** — your island joins the wider RCQ network by
   address (`uin@host`): home-island records, multihoming (backup islands),
   gossip key/record sync, and cross-island 1:1, media, groups and calls — all

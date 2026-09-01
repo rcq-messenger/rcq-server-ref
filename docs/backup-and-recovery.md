@@ -16,6 +16,11 @@ Islands never replicate each other and never talk. This document is about an
   stateful thing that matters for identity continuity.
 - **Media directory** (`RCQ_MEDIA_DIR`, default `./media/uploads`): E2E-encrypted
   blobs (`{id}.bin`). Losing it only loses old attachments; identities survive.
+- **Sites directory** (`RCQ_SITES_DIR`, default `./sites`): `.rcq` site
+  bundles. ⚠ The only PUBLIC bytes on the island - back them up like a web
+  root. Losing it loses somebody's pages, and nobody else has a copy: the
+  bundle lives here, not in a client. The rows in Postgres (name, owner, the
+  signed manifest) are useless without the files beside them.
 - Redis is a cache (rate limits, WS routing) — disposable, do not back it up.
 
 ## Minimum backup (every island, including a $6 droplet)
