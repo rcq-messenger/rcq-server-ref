@@ -253,7 +253,17 @@ async def put_site(
     except ValueError:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "bad_manifest"})
 
+    # ⚠ The version inside the signature must be the one this island will
+    # store. A manifest frozen at 1 forever cannot tell a reader they are being
+    # served last week's bundle, and the version is only worth anything if it
+    # is covered by the owner's signature AND matches what is served.
     existing = await db.get(Site, lower)
+    expected_version = (existing.version + 1) if existing is not None else 1
+    if parsed.get("version") != expected_version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "bad_version", "expected": expected_version},
+        )
     if existing is not None and int(existing.owner_uin) != me:
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
     if existing is not None and existing.frozen:
@@ -314,14 +324,14 @@ async def put_site(
     now = datetime.now(timezone.utc)
     if existing is None:
         site = Site(
-            name=lower, owner_uin=me, owner_key=owner_key, version=1,
+            name=lower, owner_uin=me, owner_key=owner_key, version=expected_version,
             manifest=manifest, size_bytes=total, title=title, listed=bool(listed),
             created_at=now, updated_at=now,
         )
         db.add(site)
     else:
         site = existing
-        site.version += 1
+        site.version = expected_version
         site.manifest = manifest
         site.size_bytes = total
         site.title = title

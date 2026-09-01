@@ -119,7 +119,11 @@ async def main() -> None:
         # these the bundle carries goes INTO the signature, because a mark is
         # how a site is recognised in a list and nobody but its owner should
         # get to choose it.
-        for candidate in ("icon.svg", "icon.png", "icon.webp", "favicon.png", "favicon.svg"):
+        # ⚠⚠ Raster only, and it is a network-wide rule rather than this
+        # tool's taste: the mark is drawn by a client's own chrome, outside
+        # the locked frame, so an SVG would reach a native decoder with no
+        # sandbox in front of it (and iOS has no native SVG at all).
+        for candidate in ("icon.png", "icon.webp", "favicon.png"):
             if candidate in files:
                 manifest["icon"] = candidate
                 break
