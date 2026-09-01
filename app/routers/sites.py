@@ -404,3 +404,27 @@ async def admin_freeze(name: str, frozen: bool = True, db: AsyncSession = Depend
     return SiteOut(name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
                    size_bytes=site.size_bytes, listed=site.listed, frozen=site.frozen,
                    updated_at=site.updated_at)
+
+
+@admin_router.post("/{name}/listed", response_model=SiteOut)
+async def admin_listed(name: str, listed: bool, db: AsyncSession = Depends(get_db)) -> SiteOut:
+    """Take a site out of the catalogue, or put it back.
+
+    ⚠ Weaker than a freeze, and that is the point: the site keeps working for
+    anyone who knows its name, it simply stops being advertised on the front
+    page of every browser on this island. An operator answers for what their
+    island recommends; they do not have to take a site down to stop
+    recommending it.
+    """
+    site = await db.get(Site, name.strip().lower())
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "no_site"})
+    if listed and site.frozen:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "frozen"})
+    site.listed = bool(listed)
+    site.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(site)
+    return SiteOut(name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
+                   size_bytes=site.size_bytes, listed=site.listed, frozen=site.frozen,
+                   updated_at=site.updated_at)
