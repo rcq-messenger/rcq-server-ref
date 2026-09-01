@@ -32,8 +32,13 @@ hosted-key tooling), keep an eye on releases.
   The server stores ciphertext, public keys, and group metadata. It
   never holds plaintext message bodies, never sees a sender UIN on a
   1:1 envelope, and never holds media decryption keys.
-* **UIN identity** — 6-9 digit anonymous handles, no phone number, no
-  email. Allocator is a tiny secret-randbelow loop.
+* **UIN identity** — 7-9 digit anonymous handles, no phone number, no
+  email. Allocator is a tiny secret-randbelow loop that skips RESERVED
+  numbers: six digits or fewer, and recognisable shapes (repdigits, ABAB,
+  ladders, four trailing zeros). Those are finite stock and leave only
+  through an operator (`POST /admin/uin/grant`, or an invite minted with the
+  number on it), never out of the allocator or a free claim — see
+  `app/services/uin.is_reserved_uin`.
 * **WebSocket fan-out** — presence, typing, group changes, call and
   audio-room signalling. Cross-worker via Redis pub/sub.
 * **APNs push** — both alert pushes (NSE-decrypted on the device) and
