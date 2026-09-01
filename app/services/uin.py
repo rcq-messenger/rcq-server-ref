@@ -1,3 +1,4 @@
+import re
 import secrets
 from datetime import datetime, timezone
 
@@ -99,6 +100,55 @@ async def uin_is_taken(
     return await db.scalar(reserving) is not None
 
 
+#: Numbers short enough to be worth something on their own. Six digits and
+#: below: 999 three-digit numbers exist in the whole world and never more.
+RESERVED_MAX_LEN = 6
+
+#: The shapes people actually ask for. Kept deliberately small and readable
+#: rather than clever: every extra rule here takes numbers out of circulation
+#: for ordinary users, and a number nobody would pay for is a number somebody
+#: should just be given.
+_PATTERNS = (
+    re.compile(r"^(\d)\1+$"),          # 4444, 777777777
+    re.compile(r"^(\d\d)\1+$"),        # 1212, 505050
+    re.compile(r"^(\d\d\d)\1+$"),      # 123123, 800800800
+    re.compile(r"^0*123456789?$"),     # the ladder up
+    re.compile(r"^9?876543210*$"),     # and down
+    re.compile(r"\d0{4,}$"),           # 120000000
+)
+
+
+def is_reserved_uin(uin: int) -> bool:
+    """Is this number part of the scarce stock rather than ordinary space?
+
+    Scarce means one of two things: SHORT (six digits or fewer — there are 999
+    three-digit numbers in existence and there will never be more) or a
+    PATTERN a person would recognise across a room.
+
+    Why this exists at all. Until 2026-09-01 an island handed these out three
+    ways, all of them blind: the random allocator could mint one, `desired_uin`
+    on an unauthenticated registration could ask for any free number and get
+    it, and `POST /uin/purchase` let a logged-in account claim any free 3-9
+    digit number for nothing and keep its old one in a collection. The result
+    measured on the flagship that morning: 563 of the 999 three-digit numbers
+    taken, 113 of those by accounts active in the last month; 161 more parked
+    in 54 collections, eleven of them on one account. The entire scarce stock
+    was being consumed by whoever asked first, before it was ever offered to
+    anyone.
+
+    Reserving is NOT the same as never giving one out. It means the number
+    leaves through a door somebody is standing at — `POST /admin/uin/grant`,
+    an invite minted with a reserved number, or a settled purchase when there
+    is one — instead of falling out of the allocator.
+    """
+    if uin <= 0:
+        return False
+    s = str(uin)
+    if len(s) <= RESERVED_MAX_LEN:
+        return True
+    return any(p.search(s) for p in _PATTERNS)
+
+
 async def allocate_uin(db: AsyncSession) -> int:
     """Allocate a free UIN in the legacy ICQ range. ICQ used 6–9 digit numbers — we
     follow the same shape so the feel is right.
@@ -108,9 +158,17 @@ async def allocate_uin(db: AsyncSession) -> int:
     every island by construction; the loop almost always ends on its first
     candidate, because the range is ~10^9 wide and no island has a millionth
     of it.
+
+    ⚠ Reserved numbers are skipped, not merely deprioritised. `UIN_MIN` is
+    100_000, so every six-digit number was inside the mint window, and the
+    ladders and repdigits above sit inside it at every length. The retry loop
+    already exists for collisions and absorbs this at no cost: reserved numbers
+    are a vanishing fraction of a 10^9-wide range.
     """
     for _ in range(100):
         candidate = secrets.randbelow(settings.UIN_MAX - settings.UIN_MIN) + settings.UIN_MIN
+        if is_reserved_uin(candidate):
+            continue
         if await uin_is_taken(db, candidate):
             continue
         return candidate

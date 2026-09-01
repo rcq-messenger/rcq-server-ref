@@ -1,10 +1,13 @@
 """UIN shop — pricing + availability for vanity 3-9 digit UINs.
 
-BETA BEHAVIOUR: `/purchase` currently GRANTS a number for free. Testers are
-meant to be able to take whatever number they like while the product is in
-testing, so the price table below is decoration until a real payment path
-exists. The endpoint is gated on `UIN_SHOP_ENABLED` and 404s when it is off,
-so an island only hands out numbers if its operator asked for that.
+BETA BEHAVIOUR: `/purchase` GRANTS a number for free, and since 2026-09-01 it
+only grants an ORDINARY one — short and patterned numbers are reserved stock
+and answer 403 `reserved` here (services/uin.is_reserved_uin). Collections are
+closed with them: a take now always moves the account onto the number, because
+the free-claim-and-keep combination is what put 161 numbers into 54 private
+collections while the shelf everyone else picks from emptied. The endpoint is
+gated on `UIN_SHOP_ENABLED` and 404s when it is off, so an island only hands
+out numbers if its operator asked for that.
 
 Operators can also fulfil a specific number out-of-band via
 `POST /admin/invites`, which reserves it against an invite and is
@@ -45,7 +48,7 @@ from app.core.security import carry_device_id, current_device_id, current_uin, i
 from app.models.owned_uin import OwnedUin
 from app.models.user import User
 from app.routers.migrate import _perform_migration
-from app.services.uin import uin_is_taken
+from app.services.uin import is_reserved_uin, uin_is_taken
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
 
@@ -55,14 +58,14 @@ router = APIRouter(prefix="/uin", tags=["uin_shop"])
 # defense-in-depth gate.
 MIN_LEN = 3
 MAX_LEN = 9
-# How many numbers one account may hold at once. While claiming is free during
-# the beta there is nothing but this stopping one person from sweeping every
-# short number on the island: the scarce ones are exactly the ones a script
-# would take first, and a number sitting in someone's collection is a number no
-# new user can ever have. Ten is generous for a person and useless for a
-# hoarder. Not configurable per-island yet; self-hosters inherit the same cap,
-# which is the safe direction.
-MAX_OWNED_UINS = 10
+# How many numbers one account may hold at once. ⚠⚠ ZERO since 2026-09-01:
+# collections are closed and one identity holds exactly the one number it
+# answers as. Ten was "generous for a person and useless for a hoarder", and
+# the measurement said otherwise: 161 numbers parked across 54 accounts,
+# eleven on one of them, while the short numbers everyone else picks from ran
+# out. The constant stays so the two endpoints that still report a cap can
+# tell a client the truth (`max_owned: 0`) rather than 404 at it.
+MAX_OWNED_UINS = 0
 
 # Price cents keyed by UIN length. Roughly geometric: ~3x per
 # digit drop until the 3-digit trophy tier at the Apple $999 cap.
@@ -130,6 +133,12 @@ async def quote(
     if body.uin == me:
         return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="self")
 
+    # A reserved number is not on sale here, so it must not quote as available:
+    # the picker would offer it, the person would tap, and `/purchase` would
+    # answer 403. Same word both places.
+    if is_reserved_uin(body.uin):
+        return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="reserved")
+
     taken = await uin_is_taken(db, body.uin)
     cents = _PRICES_CENTS[length]
     display = f"${cents / 100:.2f}"
@@ -169,7 +178,12 @@ async def suggestions(
     Availability is a point-in-time snapshot and nothing here reserves a
     number: a suggestion can be registered by someone else a moment
     later. Fulfilment re-checks when the operator mints the invite."""
-    target_lengths = [4, 5, 5, 6, 6, 7, 7, 8]
+    # ⚠ Was [4,5,5,6,6,7,7,8] — the interesting middle, which is now exactly
+    # the reserved stock. Suggesting a number the next endpoint refuses is
+    # worse than suggesting a plainer one, so the carousel starts where the
+    # numbers are actually free; `is_reserved_uin` below is the real gate and
+    # this list only decides what gets tried first.
+    target_lengths = [7, 7, 8, 8, 9, 9]
     out: list[SuggestionOut] = []
     seen: set[int] = set()
     attempts = 0
@@ -183,6 +197,8 @@ async def suggestions(
         if candidate == me or candidate in seen:
             continue
         seen.add(candidate)
+        if is_reserved_uin(candidate):
+            continue
         if await uin_is_taken(db, candidate):
             continue
         cents = _PRICES_CENTS[length]
@@ -357,9 +373,14 @@ async def _take(
     cannot drift between the two."""
     owner = int(user.uin)
     if not switch:
-        db.add(OwnedUin(uin=target, owner_uin=owner, source="purchase"))
-        await db.commit()
-        return PurchaseOut(switched=False, owned=await _owned_uins(db, owner))
+        # ⚠⚠ Collections are closed (2026-09-01). One identity, one number: a
+        # number you are not using is a number nobody can use, and this branch
+        # is how 161 of them ended up parked. Taking a number now means moving
+        # onto it, so the only way to hold two is to be two accounts.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={"code": "collections_closed", "max": 1},
+        )
 
     # Keeping the number they were using is `_perform_migration`'s job now, not
     # this function's. It used to be written here, one commit AFTER the swap:
@@ -409,6 +430,17 @@ async def claim(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
     if body.uin == me:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "self_target"})
+    # ⚠⚠ FROZEN 2026-09-01. This endpoint is what emptied the shelf: it handed
+    # any free short or patterned number to whoever asked, for nothing, and
+    # `switch=false` left the caller's previous number in their collection, so
+    # asking repeatedly built a private hoard. Eleven numbers on one account,
+    # 161 parked across 54, and 450 three-digit numbers on accounts that never
+    # came back. The scarce stock now leaves only through a door somebody is
+    # standing at: `POST /admin/uin/grant`, or an invite minted with the number
+    # on it. Ordinary numbers still move freely — this is about the stock, not
+    # about whether people may change their number.
+    if is_reserved_uin(body.uin):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "reserved"})
     if await uin_is_taken(db, body.uin):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
 
@@ -421,12 +453,17 @@ async def claim(
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
     # Cap the collection. Counted here rather than at activation, because
     # taking is what removes a number from everyone else.
-    held = len(await _owned_uins(db, me))
-    if held >= MAX_OWNED_UINS:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={"code": "too_many_uins", "max": MAX_OWNED_UINS},
-        )
+    #
+    # ⚠ Only for a take that does NOT move the account. With the cap at zero
+    # this would otherwise refuse an ordinary migration too, and changing your
+    # number was never the thing being limited: holding several was.
+    if not body.switch:
+        held = len(await _owned_uins(db, me))
+        if held >= MAX_OWNED_UINS:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"code": "too_many_uins", "max": MAX_OWNED_UINS},
+            )
 
     # The freed number's tokens are retired inside _perform_migration, so the
     # old bearer cannot follow the number to whoever claims it next.
