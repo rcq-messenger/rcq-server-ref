@@ -15,7 +15,7 @@ from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, uin_shop, users, vault, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, sites, uin_shop, users, vault, ws
 from app.routers import random as random_chat
 from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
@@ -417,6 +417,10 @@ app.include_router(polls.router)
 app.include_router(polls.group_polls_router)
 app.include_router(news.public_router)
 app.include_router(news.admin_router)
+# `.rcq` sites (docs/rcq-sites-design.md). Reads are unauthenticated by design:
+# the island must not be able to build a record of who read what.
+app.include_router(sites.router)
+app.include_router(sites.admin_router)
 app.include_router(admin.router)
 app.include_router(migrate.router)
 app.include_router(uin_shop.router)
