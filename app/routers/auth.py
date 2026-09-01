@@ -570,6 +570,21 @@ async def claim_device(
             last_group_id=floor_group,
             updated_at=datetime.now(timezone.utc),
         ))
+        # ⚠⚠ And RETIRE the one it inherited from. The install that was
+        # "primary" is this install, under its own name from now on, so the old
+        # row is an orphan nothing will ever advance again. Left in place it
+        # pins the queue's reap floor: `_reap_below_min` takes the MINIMUM
+        # cursor of the account, so every row above that dead watermark is kept
+        # for every device of the account until the cursor ages out on its own
+        # (7 days superseded, 30 stale). A person who linked a second device on
+        # the 29th was still carrying 78 delivered, acknowledged rows on the 1st
+        # for no reason at all.
+        #
+        # Only the inherited one, and only when it really was inherited: a
+        # linked device that had no "primary" to copy from (the watermark
+        # branch above) must not delete another install's live cursor.
+        if old is not None:
+            await db.delete(old)
         await db.commit()
     return SessionOut(
         token=issue_token(uin, await uin_epoch(uin), body.device_id),
