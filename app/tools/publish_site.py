@@ -115,6 +115,14 @@ async def main() -> None:
         }
         if args.title:
             manifest["title"] = args.title
+        # The site's mark, by convention rather than by a flag: whichever of
+        # these the bundle carries goes INTO the signature, because a mark is
+        # how a site is recognised in a list and nobody but its owner should
+        # get to choose it.
+        for candidate in ("icon.svg", "icon.png", "icon.webp", "favicon.png", "favicon.svg"):
+            if candidate in files:
+                manifest["icon"] = candidate
+                break
         manifest["sig"] = base64.b64encode(key.sign(_canonical(manifest))).decode()
 
         # Written beside the live bundle and swapped, so a reader never sees
