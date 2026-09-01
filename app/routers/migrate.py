@@ -222,28 +222,10 @@ async def _perform_migration(
     # pool; whether the "new number" flow should offer that in the same breath
     # is a founder question, not one to settle by quietly changing this line.
     #
-    # The migration itself is never REFUSED over the cap: this is the one route
-    # whose whole value is being available on demand, no client maps a
-    # `too_many_uins` refusal on it, and the caller is not acquiring anything,
-    # they already had this number. What the cap does bound is how far the
-    # collection may run: a full one is allowed to go ONE over here, and after
-    # that the number a migration leaves behind goes back into the pool like it
-    # always did. Without that ceiling the exemption was unbounded rather than
-    # "one over": there is no cooldown by default and no rate limit on this
-    # route, so a caller could simply loop /account/migrate and accumulate as
-    # many numbers as it had patience for, and since `allocate_uin` now rejects
-    # anything in anybody's collection (services/uin.uin_is_taken), each one is
-    # permanently out of everyone else's reach.
-    #
-    # Counted AFTER the re-key above, so these rows already name `target_uin`.
-    # Imported inside the function because uin_shop imports this module.
-    from app.routers.uin_shop import MAX_OWNED_UINS  # noqa: PLC0415
-
-    held = await db.scalar(
-        select(func.count())
-        .select_from(OwnedUin)
-        .where(OwnedUin.owner_uin == target_uin)
-    )
+    # The number this account is LEAVING. Two things can be true of it: it may
+    # already have an `owned_uins` row (from the era when moving kept it), and
+    # that row may belong to somebody else entirely. Both are handled below;
+    # neither results in a new row any more, because collections are closed.
     stale = await db.get(OwnedUin, old_uin)
     if stale is not None and int(stale.owner_uin) != target_uin:
         # ⚠⚠ SOMEBODY ELSE holds the number this account is answering as. That
@@ -272,17 +254,27 @@ async def _perform_migration(
             "to the pool"
         )
     elif stale is not None:
-        # Already ours (the re-key above moved it), so only the provenance is
-        # out of date. No INSERT, the primary key is taken.
-        stale.source = "migrated"
-    elif (held or 0) > MAX_OWNED_UINS:
-        # Already one over. The number goes back into the allocator pool.
-        log.warning(
-            "[migrate] vacated number returned to the pool: the collection is "
-            "already at %d, past the cap of %d", held, MAX_OWNED_UINS
-        )
+        # Ours (the re-key above moved it), left over from when moving kept the
+        # number. Collections are closed, so it is deleted rather than restamped
+        # — otherwise a pre-existing row would quietly keep the number out of
+        # the pool that every other line here is now putting it back into.
+        await db.delete(stale)
     else:
-        db.add(OwnedUin(uin=old_uin, owner_uin=target_uin, source="migrated"))
+        # ⚠⚠ The vacated number goes back into the POOL (2026-09-01).
+        #
+        # It used to be stamped as an `owned_uins` row for the account that had
+        # just left it, on the §10.1.3 reasoning that only its previous holder
+        # should be able to take it again. In practice that turned every move
+        # into an acquisition: `/uin/purchase` was free during the beta, so the
+        # cheapest way to collect numbers was to keep moving, and 161 of them
+        # ended up parked across 54 collections while the shelf everyone else
+        # picks from emptied. One identity, one number.
+        #
+        # What this costs, honestly: a move is no longer reversible by right.
+        # Change your mind after migrating and the old number may already be
+        # gone. That is the same deal every other user gets, and it is the
+        # reason the number is there for them at all.
+        log.info("[migrate] vacated number returned to the pool")
 
     # Device push tokens belong to the device, not the account. After
     # migration the iOS client re-registers under the new UIN, so we

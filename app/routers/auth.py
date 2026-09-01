@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -46,7 +47,7 @@ from app.routers.groups import (
 from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
 from app.services.queue_drain import account_watermark
-from app.services.uin import allocate_uin, uin_is_taken
+from app.services.uin import allocate_uin, is_reserved_uin, uin_is_taken
 from app.services.uin_rows import purge_gossip_mirror, purge_uin_rows
 
 log = logging.getLogger(__name__)
@@ -157,6 +158,11 @@ class RegisterIn(BaseModel):
     # minted (uin is per-island and is NOT identity — the key is). A redeemed
     # vanity invite still wins over this.
     desired_uin: int | None = None
+    # A signed home-island record (federation §2.3, the same document
+    # `PUT /federation/island-record` carries) proving `desired_uin` is ALREADY
+    # this identity's number somewhere else. Only consulted when the number
+    # asked for is a reserved one — see `_owns_uin_elsewhere`.
+    home_record: dict | None = None
     # Stable per-INSTALL id, minted by the client on first launch. Optional:
     # clients that predate it get "primary" and the old shared behaviour.
     # See `issue_token` for what it buys.
@@ -177,6 +183,55 @@ class RegisterOut(BaseModel):
 class SessionOut(BaseModel):
     token: str
     ws_url: str
+
+
+async def _owns_uin_elsewhere(
+    db: AsyncSession, uin: int, signing_key: str, offered: dict | None
+) -> bool:
+    """Does this identity ALREADY hold `uin` on some other island?
+
+    The one question that separates multihoming from squatting, and it has a
+    real answer because federation records are self-authenticating: the
+    document names `sk` (this identity's Ed25519 signing key) and its `homes`
+    (`host`,`uin`) pairs, and it is signed by the private half of `sk`. Nobody
+    can forge one for a number they do not already answer to.
+
+    Two sources, both verified the same way. The record the CALLER offers, and
+    the one this island already mirrors for that key (`gossip_records`, written
+    by any client that resolved and verified the identity — the write path
+    verifies the signature before storing, see `routers/federation`). The
+    second is what keeps clients that predate `home_record` multihoming onto a
+    reserved number: their contacts have almost certainly mirrored the record
+    here already.
+
+    ⚠ The signature is re-checked here even for the mirrored row. Verification
+    at write time is what makes the table trustworthy today, but this is an
+    authorisation decision about a scarce asset, and it costs one Ed25519
+    verify to not depend on that.
+    """
+    from app.models.federation import GossipRecord
+    from app.routers.federation import _verify_record_sig
+
+    def names_it(doc) -> bool:
+        if not isinstance(doc, dict) or doc.get("sk") != signing_key:
+            return False
+        homes = doc.get("homes")
+        if not isinstance(homes, list):
+            return False
+        if not any(isinstance(h, dict) and h.get("uin") == uin for h in homes):
+            return False
+        return _verify_record_sig(doc)
+
+    if names_it(offered):
+        return True
+    # `doc` is stored as text, and `sk` IS the primary key of the mirror table.
+    raw = await db.scalar(select(GossipRecord.doc).where(GossipRecord.sk == signing_key))
+    if not raw:
+        return False
+    try:
+        return names_it(json.loads(raw))
+    except (ValueError, TypeError):
+        return False
 
 
 class RegisterChallengeIn(BaseModel):
@@ -393,12 +448,29 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # same silent ending. No `except_invite` on this call, deliberately: if the
     # caller's own invite reserved this number the branch above already granted
     # it, so anything still reserving it here is somebody else's promise.
+    #
+    # ⚠⚠ And a RESERVED number (short or patterned — see `is_reserved_uin`) is
+    # not handed out here at all unless the caller already answers to it
+    # somewhere else. This branch was the main way the scarce stock left the
+    # island: `desired_uin` exists for multihoming, but nothing tied it to the
+    # number the caller already has, so asking for #777 worked exactly as well
+    # as asking for your own. Measured 2026-09-01: 563 of 999 three-digit
+    # numbers gone, 450 of them on accounts that never came back.
+    #
+    # Multihoming itself is NOT broken by this: the record that proves prior
+    # tenure is the one federation already defines and this island already
+    # mirrors for most identities. A client that has none falls through to a
+    # fresh number, which is what it got before multihoming existed.
     if (
         uin is None
         and proven
         and body.desired_uin is not None
         and 0 < body.desired_uin <= settings.UIN_MAX
         and not await uin_is_taken(db, body.desired_uin)
+        and (
+            not is_reserved_uin(body.desired_uin)
+            or await _owns_uin_elsewhere(db, body.desired_uin, signing_key, body.home_record)
+        )
     ):
         uin = body.desired_uin
     if uin is None:
