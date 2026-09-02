@@ -66,6 +66,13 @@ class Site(Base):
     #: is not listed still opens by its exact name, which is the point of a
     #: catalogue being a shop window rather than a permission to exist.
     listed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    #: Pinned to the top of the catalogue by the OPERATOR (2026-09-02, founder:
+    #: the network's own page sits in its own section above recents and the
+    #: catalogue in every client). The owner cannot ask for it - a self-service
+    #: flag would be the shop window's front row for sale - and it never
+    #: outlives `listed`: a site that leaves the catalogue, by anyone's hand,
+    #: leaves the top of it too.
+    featured: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     #: Frozen by the operator: reads answer 410 and uploads are refused. Not a
     #: delete - the bytes stay while a complaint is looked at.
     frozen: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

@@ -225,9 +225,11 @@ _GOSSIP_RECORD_COLUMNS: list[tuple[str, str]] = [
 # opt-in on 2026-09-02, and an existing island's rows have to default to the
 # private answer: `create_all` never touches a table that already exists, so
 # without this line the catalogue selects a column that is not there and every
-# read of it is a 500.
+# read of it is a 500. `featured` (same day) is the operator's pin to the top
+# of the catalogue; nothing is featured until an operator says so.
 _SITE_COLUMNS: list[tuple[str, str]] = [
     ("show_owner", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("featured", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
 # Additive on `groups`. Pre-existing rows default to free + everyone-

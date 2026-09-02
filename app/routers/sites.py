@@ -14,6 +14,11 @@ it, because it decides everything in this file:
 * The name is unique on THIS island only. `blog.is2.rcq` is is2's `blog`, and
   `blog` is free on every other island: there is no registry above the
   islands, and there is deliberately no DNS anywhere.
+* The catalogue carries a `featured` flag (2026-09-02, not yet in rcq-spec):
+  the OPERATOR's pin, never the owner's request. Featured sites come first in
+  `GET /sites`, and a client puts them in their own section above recents
+  and the rest of the catalogue - the network's own page `home.rcq` is the
+  case it was made for. Featured never outlives `listed`.
 
 ⚠⚠ This is the first OPEN content we store. Everything else on the island is
 sealed and unreadable to it; these bytes are public by definition, and the
@@ -110,6 +115,9 @@ class SiteOut(BaseModel):
     size_bytes: int
     listed: bool
     show_owner: bool = False
+    #: The operator's pin to the top of the catalogue. Defaulted so a client
+    #: built against an island older than the flag still parses the reply.
+    featured: bool = False
     frozen: bool
     updated_at: datetime
 
@@ -120,6 +128,27 @@ class AvailabilityOut(BaseModel):
     #: "taken" | "invalid" | "reserved" — never who holds it. A name lookup
     #: must not become a directory of who owns what (design §3.6).
     reason: str | None = None
+
+
+class FeaturedIn(BaseModel):
+    featured: bool
+
+
+def _out(s: Site, *, public: bool = False) -> SiteOut:
+    """One place that turns a row into the wire shape.
+
+    ⚠ `public` is the catalogue: the owner is named there only if they asked
+    (`show_owner`). Every other reply goes to the owner or the operator, who
+    both know the number already. Six routes used to build this by hand, and
+    a field added to five of them is a field a client cannot rely on.
+    """
+    return SiteOut(
+        name=s.name,
+        owner_uin=s.owner_uin if (not public or s.show_owner) else None,
+        version=s.version, title=s.title, size_bytes=s.size_bytes,
+        listed=s.listed, show_owner=s.show_owner, featured=s.featured,
+        frozen=s.frozen, updated_at=s.updated_at,
+    )
 
 
 @router.get("/mine", response_model=list[SiteOut])
@@ -137,12 +166,7 @@ async def my_sites(
     rows = (
         await db.execute(select(Site).where(Site.owner_uin == me).order_by(Site.name))
     ).scalars().all()
-    return [
-        SiteOut(name=s.name, owner_uin=s.owner_uin, version=s.version, title=s.title,
-                size_bytes=s.size_bytes, listed=s.listed, show_owner=s.show_owner,
-                frozen=s.frozen, updated_at=s.updated_at)
-        for s in rows
-    ]
+    return [_out(s) for s in rows]
 
 
 @router.get("/available/{name}", response_model=AvailabilityOut,
@@ -344,19 +368,25 @@ async def put_site(
         site.title = title
         site.listed = bool(listed)
         site.show_owner = bool(show_owner)
+        # The operator's pin does not outlive the owner's opt-in: a site that
+        # withdraws from the catalogue leaves the top of it too, and coming
+        # back is a listing, not a promotion. Otherwise an unlist-relist by the
+        # owner would put a site back at the top without an operator's hand.
+        if not site.listed:
+            site.featured = False
         site.updated_at = now
     await db.commit()
     await db.refresh(site)
-    return SiteOut(
-        name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
-        size_bytes=site.size_bytes, listed=site.listed, show_owner=site.show_owner,
-        frozen=site.frozen, updated_at=site.updated_at,
-    )
+    return _out(site)
 
 
 @router.get("", response_model=list[SiteOut])
 async def catalogue(db: AsyncSession = Depends(get_db)) -> list[SiteOut]:
     """The catalogue: only sites that ASKED to be in it.
+
+    Featured sites come first, then everything by freshness. The order is
+    part of the contract, not a courtesy: a client that caps the list, or
+    shows the first screen without scrolling, must still see every pin.
 
     ⚠ Not "every site on the island" - see `availability` for why that list
     does not exist.
@@ -364,16 +394,10 @@ async def catalogue(db: AsyncSession = Depends(get_db)) -> list[SiteOut]:
     rows = (
         await db.execute(
             select(Site).where(Site.listed.is_(True), Site.frozen.is_(False))
-            .order_by(Site.updated_at.desc()).limit(200)
+            .order_by(Site.featured.desc(), Site.updated_at.desc()).limit(200)
         )
     ).scalars().all()
-    return [
-        SiteOut(name=s.name, owner_uin=s.owner_uin if s.show_owner else None,
-                version=s.version, title=s.title, size_bytes=s.size_bytes,
-                listed=s.listed, show_owner=s.show_owner, frozen=s.frozen,
-                updated_at=s.updated_at)
-        for s in rows
-    ]
+    return [_out(s, public=True) for s in rows]
 
 
 @router.delete("/{name}")
@@ -401,12 +425,7 @@ async def delete_site(
 async def admin_list(db: AsyncSession = Depends(get_db)) -> list[SiteOut]:
     """Everything the island hosts, for the person answering for it."""
     rows = (await db.execute(select(Site).order_by(Site.updated_at.desc()))).scalars().all()
-    return [
-        SiteOut(name=s.name, owner_uin=s.owner_uin, version=s.version, title=s.title,
-                size_bytes=s.size_bytes, listed=s.listed, show_owner=s.show_owner,
-                frozen=s.frozen, updated_at=s.updated_at)
-        for s in rows
-    ]
+    return [_out(s) for s in rows]
 
 
 @admin_router.post("/{name}/freeze", response_model=SiteOut)
@@ -420,12 +439,11 @@ async def admin_freeze(name: str, frozen: bool = True, db: AsyncSession = Depend
     site.frozen = bool(frozen)
     if site.frozen:
         site.listed = False
+        site.featured = False
     site.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(site)
-    return SiteOut(name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
-                   size_bytes=site.size_bytes, listed=site.listed, show_owner=site.show_owner,
-                   frozen=site.frozen, updated_at=site.updated_at)
+    return _out(site)
 
 
 @admin_router.post("/{name}/listed", response_model=SiteOut)
@@ -444,9 +462,42 @@ async def admin_listed(name: str, listed: bool, db: AsyncSession = Depends(get_d
     if listed and site.frozen:
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "frozen"})
     site.listed = bool(listed)
+    if not site.listed:
+        site.featured = False
     site.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(site)
-    return SiteOut(name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
-                   size_bytes=site.size_bytes, listed=site.listed, show_owner=site.show_owner,
-                   frozen=site.frozen, updated_at=site.updated_at)
+    return _out(site)
+
+
+@admin_router.post("/{name}/featured", response_model=SiteOut)
+async def admin_featured(name: str, body: FeaturedIn, db: AsyncSession = Depends(get_db)) -> SiteOut:
+    """Pin a site to the top of the catalogue, or take the pin off.
+
+    The operator's power alone: the owner has no way to ask for it, because a
+    self-service flag is the front row of the shop window for sale. Every
+    client shows featured sites in their own section above recents and the
+    catalogue (founder, 2026-09-02, for the network's own page `home.rcq`).
+
+    ⚠ Only a LISTED site can be featured, and the answer to anything else is
+    409 rather than a silent listing: putting an owner's unlisted site into
+    the catalogue is a decision of its own (`/listed`), and a frozen site is
+    out of the catalogue by definition. Unlisting and freezing both take the
+    pin off, so `featured` never says yes on a site the catalogue does not
+    carry.
+    """
+    site = await db.get(Site, name.strip().lower())
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "no_site"})
+    if body.featured and site.frozen:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "frozen"})
+    if body.featured and not site.listed:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_listed"})
+    site.featured = bool(body.featured)
+    # ⚠ Deliberately NOT stamping `updated_at`, unlike freeze and listed. The
+    # catalogue orders the unpinned rows by it, so a pin taken off would leave
+    # the site at the top anyway, by a freshness its content never earned; the
+    # pin is meant to be independent of freshness in both directions.
+    await db.commit()
+    await db.refresh(site)
+    return _out(site)
