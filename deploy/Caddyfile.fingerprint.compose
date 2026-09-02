@@ -34,7 +34,7 @@
 	# is its own error log (upstream refused, TLS), and every such line
 	# carries the request: client IP, and a path that may hold an account
 	# number (/ws/123456789) or a session token (?token=). Mask both, the
-	# same way the maintainers rcq.app config does: an operators error log
+	# same way the maintainers' rcq.app config does: an operator's error log
 	# must not be an address-to-account map, and it must not hold credentials.
 	log default {
 		format filter {
