@@ -468,13 +468,21 @@ p = Path(".env")
 lines = p.read_text().splitlines()
 out = []
 seen = {"ENV": False, "RCQ_DOMAIN": False, "JWT_SECRET": False, "POSTGRES_PASSWORD": False,
-        "RCQ_TLS_MODE": False, "RCQ_CADDYFILE": False}
+        "RCQ_TLS_MODE": False, "RCQ_CADDYFILE": False, "APP_NAME": False}
 for line in lines:
     key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
     if key == "ENV":
         out.append("ENV=prod"); seen["ENV"] = True
     elif key == "RCQ_DOMAIN":
         out.append(f"RCQ_DOMAIN={domain}"); seen["RCQ_DOMAIN"] = True
+    elif key == "APP_NAME":
+        # The island's public name until the operator types one in the admin
+        # console: it is what /server/info answers with and, since
+        # 2026.09.02.5, what an announcement is signed by. The template ships
+        # "RCQ Backend", a developer-facing string that would go out under
+        # every unlabelled post and would be frozen into those rows for good,
+        # so a fresh install names itself after the address its members type.
+        out.append(f"APP_NAME={domain}"); seen["APP_NAME"] = True
     elif key == "JWT_SECRET":
         out.append(f"JWT_SECRET={jwt}"); seen["JWT_SECRET"] = True
     elif key == "POSTGRES_PASSWORD":
@@ -487,6 +495,8 @@ for line in lines:
         out.append(line)
 if not seen["POSTGRES_PASSWORD"]:
     out.append(f"POSTGRES_PASSWORD={pgpw}")
+if not seen["APP_NAME"]:
+    out.append(f"APP_NAME={domain}")
 if fingerprint and not seen["RCQ_TLS_MODE"]:
     out.append("RCQ_TLS_MODE=fingerprint")
 if fingerprint and not seen["RCQ_CADDYFILE"]:
