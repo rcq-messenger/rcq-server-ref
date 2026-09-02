@@ -115,8 +115,10 @@ class SiteOut(BaseModel):
     size_bytes: int
     listed: bool
     show_owner: bool = False
-    #: The operator's pin to the top of the catalogue. Defaulted so a client
-    #: built against an island older than the flag still parses the reply.
+    #: The operator's pin to the top of the catalogue. The default is only the
+    #: column's DEFAULT FALSE mirrored: `_out` always sets it, and a client's
+    #: tolerance for an island too old to send the field lives in that
+    #: client's parser, not in a model that only ever serialises.
     featured: bool = False
     frozen: bool
     updated_at: datetime
@@ -485,6 +487,11 @@ async def admin_featured(name: str, body: FeaturedIn, db: AsyncSession = Depends
     out of the catalogue by definition. Unlisting and freezing both take the
     pin off, so `featured` never says yes on a site the catalogue does not
     carry.
+
+    The flag arrives in a JSON body, as every other admin toggle does
+    (`/admin/users/{uin}/ban` takes `{"suspended"}`, `/admin/hof`
+    `{"approved"}`); `/freeze` and `/listed` next door are the query-string
+    exceptions, kept as they are because two consoles already call them.
     """
     site = await db.get(Site, name.strip().lower())
     if site is None:

@@ -29,6 +29,7 @@ import base64
 import json
 import os
 import shutil
+import sys
 import tempfile
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_site_featured.db"
@@ -203,6 +204,49 @@ async def main() -> int:
               next(s for s in await catalogue(c) if s["name"] == "alpha")["featured"] is True)
         r = await c.post("/admin/sites/alpha/featured", json={}, auth=ADMIN)
         check(f"an empty body is 422, not a silent unfeature ({r.status_code})", r.status_code == 422)
+
+        # The fourth writer of `listed`: the operator's own publish tool, the
+        # path home.rcq actually takes. `--listed` is a plain flag, so a
+        # re-publish that forgets it unlists, and the pin has to go with it
+        # here too, or the row reads featured on a site the catalogue does
+        # not carry and neither console can take the pin off.
+        print("\nThe operator's publish tool (app.tools.publish_site):")
+        from app.tools.publish_site import main as publish_tool
+        pages = tempfile.mkdtemp(prefix="rcq-tool-pages-")
+        with open(os.path.join(pages, "index.html"), "w") as f:
+            f.write("<h1>gamma</h1>")
+        # Beside the pages, not among them: the tool bundles every file in
+        # --dir, and a key is not a type a bundle may carry.
+        keyfile = os.path.join(SITES_TMP, "gamma.key")
+
+        async def tool(*flags):
+            argv = sys.argv
+            sys.argv = ["publish_site", "--name", "gamma", "--dir", pages,
+                        "--uin", str(ALICE), "--key", keyfile, *flags]
+            try:
+                await publish_tool()
+            finally:
+                sys.argv = argv
+
+        async def gamma():
+            r = await c.get("/admin/sites", auth=ADMIN)
+            return next(s for s in r.json() if s["name"] == "gamma")
+
+        await tool("--listed")
+        r = await feature(c, "gamma", True)
+        check(f"a site the tool published can be pinned ({r.status_code})", r.status_code == 200)
+        await tool()
+        g = await gamma()
+        check("a re-publish without --listed unlists AND takes the pin off",
+              g["listed"] is False and g["featured"] is False)
+        await tool("--listed")
+        g = await gamma()
+        check("  ... and a re-publish with --listed is a listing, not a promotion",
+              g["listed"] is True and g["featured"] is False)
+        await feature(c, "gamma", True)
+        await tool("--listed")
+        check("  a re-publish that stays listed keeps the operator's pin", (await gamma())["featured"] is True)
+        shutil.rmtree(pages, ignore_errors=True)
 
     await close_redis()
     shutil.rmtree(SITES_TMP, ignore_errors=True)

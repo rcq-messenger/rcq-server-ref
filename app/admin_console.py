@@ -138,6 +138,19 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .note { background:var(--acc-soft); border:1px solid var(--acc-line); border-radius:12px; padding:14px 16px; font-size:13px; color:var(--fg); line-height:1.6; }
   .note b { color:var(--ink); }
 
+  /* The site viewer: a bundle under review is shown INSIDE the console, in a
+     locked frame, never as a page of its own (see siteRender below). */
+  .viewer { display:none; position:fixed; inset:0; z-index:50; background:rgba(12,13,14,.45); padding:24px; }
+  .viewer.on { display:flex; flex-direction:column; }
+  .viewer .vbox { flex:1; display:flex; flex-direction:column; min-height:0; background:var(--card); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden; }
+  .viewer .vhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 14px; border-bottom:1px solid var(--line); }
+  .viewer .vhead .addr { font-weight:600; color:var(--ink); font-size:13px; }
+  .viewer .vhead .pages { display:flex; gap:4px; flex-wrap:wrap; }
+  .viewer .vhead .pages button.on { border-color:var(--acc); color:var(--acc-dim); }
+  .viewer .vhead .vnote { color:var(--mut); font-size:12px; margin-left:auto; }
+  .viewer iframe { flex:1; width:100%; border:0; background:#fff; }
+  @media (max-width:640px) { .viewer { padding:8px; } .viewer .vhead .vnote { display:none; } }
+
   /* mobile */
   .menubtn { display:none; }
   .scrim { display:none; }            /* never a grid item on desktop */
@@ -163,6 +176,20 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 </head>
 <body>
 <div id="updbar" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:#b45309;color:#fff;padding:10px 16px;font-size:14px;line-height:1.5;text-align:center;white-space:normal;overflow-wrap:anywhere;box-shadow:0 1px 6px rgba(0,0,0,.25)"></div>
+<!-- The site viewer (Sites tab). `sandbox` with nothing allowed: no scripts,
+     no forms, no popups, no origin of ours, and no way to navigate anything.
+     What goes into the frame has already been through siteRender. -->
+<div class="viewer" id="viewer" onclick="if(event.target===this)closeViewer()">
+  <div class="vbox">
+    <div class="vhead">
+      <span class="mono addr" id="v_addr"></span>
+      <span class="pages" id="v_pages"></span>
+      <span class="vnote">Locked frame, same rules as the app's reader: links do nothing, nothing loads from outside.</span>
+      <button class="btn ghost sm" onclick="closeViewer()">Close</button>
+    </div>
+    <iframe id="v_frame" sandbox referrerpolicy="no-referrer" title="Site under review"></iframe>
+  </div>
+</div>
 <div class="layout">
   <aside id="side">
     <div class="brand">
@@ -317,7 +344,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 
     <!-- SITES (.rcq bundles this island hosts) -->
     <section class="view" id="v-sites">
-      <div class="head"><div><h1>Sites</h1><p>The <b>.rcq</b> pages this island hosts — the one kind of content here you can actually read, because it is public by definition. <b>List / Unlist</b> is the shop window: a listed site shows in the catalogue on the front page of every browser on this island, an unlisted one still opens by its exact name. <b>Feature</b> pins a listed site to the top of that catalogue, in its own section above recents — the network's own <span class="mono">home.rcq</span> is what it is for. <b>Freeze</b> is the hold for a complaint: reads answer “frozen”, uploads are refused, nothing is deleted, and it is reversible.</p></div></div>
+      <div class="head"><div><h1>Sites</h1><p>The <b>.rcq</b> pages this island hosts — the one kind of content here you can actually read, because it is public by definition. <b>View</b> shows a site here, in a locked frame and through the same sanitiser as the app's reader: its links do nothing and nothing in it loads from outside, so looking at a site under complaint never tells its author that somebody did. <b>List / Unlist</b> is the shop window: a listed site shows in the catalogue on the front page of every browser on this island, an unlisted one still opens by its exact name. <b>Feature</b> pins a listed site to the top of that catalogue, in its own section above recents — the network's own <span class="mono">home.rcq</span> is what it is for. <b>Freeze</b> is the hold for a complaint: reads answer “frozen”, uploads are refused, nothing is deleted, and it is reversible.</p></div></div>
       <div class="card pad">
         <p class="sub" id="sites-summary" style="margin:0 0 8px"></p>
         <table><thead><tr><th>Site</th><th>Catalogue line</th><th>Owner</th><th>Size</th><th>State</th><th>Updated</th><th></th></tr></thead>
@@ -783,14 +810,21 @@ async function loadSites() {
          listing an owner's unlisted site is a decision of its own (the List
          button), never something Feature does on the side. */
       const canFeature = s.listed && !s.frozen;
+      /* ⚠⚠ The name is TEXT, not a link to the bundle. A raw /sites/... page
+         in the operator's own tab can navigate itself out of the island (a
+         meta refresh, a plain link) whatever headers it was served with, and
+         that hands a third party the operator's address and the moment a
+         human looked at the complaint. View renders it in a locked frame
+         instead (siteRender). */
       return `<tr>
-      <td class="mono"><a href="/sites/${encodeURIComponent(s.name)}/index.html" target="_blank" rel="noopener">${n}.rcq</a></td>
+      <td class="mono">${n}.rcq</td>
       <td>${s.title?escAttr(s.title):'<span style="color:var(--dim)">—</span>'}</td>
       <td class="mono">#${s.owner_uin}</td>
       <td class="mono" style="color:var(--dim)">${fmtBytes(s.size_bytes||0)}</td>
       <td>${state}</td>
       <td class="mono" style="color:var(--dim)">${timeago(s.updated_at)}</td>
       <td style="text-align:right;white-space:nowrap">
+        <button class="btn ghost sm" onclick="openViewer('${n}')">View</button>
         <button class="btn ghost sm" ${s.frozen?'disabled title="A frozen site is out of the catalogue already"':''} onclick="siteListed('${n}',${!s.listed})">${s.listed?'Unlist':'List'}</button>
         <button class="btn ghost sm" ${canFeature?'':'disabled title="Only a site in the catalogue can be featured"'} onclick="siteFeatured('${n}',${!s.featured})">${s.featured?'Unfeature':'Feature'}</button>
         <button class="btn danger sm" onclick="siteFrozen('${n}',${!s.frozen})">${s.frozen?'Unfreeze':'Freeze'}</button>
@@ -800,6 +834,163 @@ async function loadSites() {
 async function siteListed(name, on){ try{ await api('POST','/sites/'+encodeURIComponent(name)+'/listed?listed='+on); loadSites(); }catch(e){ alert(e.message); } }
 async function siteFeatured(name, on){ try{ await api('POST','/sites/'+encodeURIComponent(name)+'/featured',{featured:on}); loadSites(); }catch(e){ alert(e.message); } }
 async function siteFrozen(name, on){ if(on&&!confirm('Freeze '+name+'.rcq? Readers get “frozen”, uploads are refused; nothing is deleted.'))return; try{ await api('POST','/sites/'+encodeURIComponent(name)+'/freeze?frozen='+on); loadSites(); }catch(e){ alert(e.message); } }
+
+/* ---- site viewer ----
+   ⚠⚠ A bundle is never opened raw. The serve route's policy stops scripts,
+   outside images, styles and forms, but no header stops a top-level document
+   from navigating ITSELF: a <meta refresh> or a plain link in a site under
+   complaint would carry the operator's browser, address and the moment a
+   human looked at it, straight to a third party - the one reader a spammer
+   most wants to identify. So the bytes are fetched, put through the same
+   rules as the app's reader (web-chat src/lib/sites.ts, kept in step by
+   hand), and written into a locked frame with no origin, no scripts and
+   nothing left in it that could ask the network for anything.
+   Regexes below carry doubled backslashes: this JS lives in a plain Python
+   string, and one backslash is Python's. */
+const SITE_TAGS = new Set(['html','head','body','title','style','meta',
+  'div','span','p','br','hr','section','article','main','aside','nav',
+  'header','footer','figure','figcaption','blockquote','pre','code','kbd','samp',
+  'h1','h2','h3','h4','h5','h6','ul','ol','li','dl','dt','dd',
+  'table','thead','tbody','tfoot','tr','th','td','caption','colgroup','col',
+  'a','img','strong','b','em','i','u','s','small','sub','sup','mark',
+  'time','abbr','cite','q','ruby','rt','rp','wbr','details','summary']);
+/* Everything not named here goes, which covers on*, href, ping, srcset,
+   formaction, http-equiv and whatever is invented next. */
+const SITE_ATTRS = new Set(['class','id','title','lang','dir','alt','width','height',
+  'colspan','rowspan','headers','scope','span','datetime','cite','open',
+  'start','reversed','value','charset']);
+const SITE_IMAGES = {png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', webp:'image/webp', svg:'image/svg+xml'};
+function siteHas(m, path){ return Object.prototype.hasOwnProperty.call(m.files||{}, path); }
+/* `../a/b.png` against the page's own path, inside the bundle only. */
+function siteResolve(from, ref) {
+  if (/^[a-z]+:/i.test(ref) || ref.startsWith('//') || ref.startsWith('#')) return null;
+  const out = ref.startsWith('/') ? [] : from.split('/').slice(0,-1);
+  for (const seg of ref.replace(/^[/]/,'').split('/')) {
+    if (!seg || seg==='.') continue;
+    if (seg==='..') out.pop(); else out.push(seg);
+  }
+  return out.join('/') || null;
+}
+/* Author CSS stays, minus anything that fetches; same passes, same order as
+   the reader's cleanCss, each one there because a conformance case walked
+   through the previous version. Escapes are DECODED, not deleted: an escaped
+   url( is url( to the browser and invisible to a scanner. */
+function siteCss(css) {
+  return css
+    .replace(/[/][*][^]*?([*][/]|$)/g, '')
+    .replace(/\\\\([0-9a-fA-F]{1,6})[ \\t\\n\\r\\f]?|\\\\(.)/g, (m, hex, ch) => {
+      if (!hex) return ch;
+      const cp = parseInt(hex, 16);
+      return cp > 0x10FFFF ? '' : String.fromCodePoint(cp);
+    })
+    .replace(/<\\s*[/]\\s*style/gi, '')
+    .replace(/@import[^;{]*(;|(?=[{])|$)/gi, '')
+    .replace(/@font-face\\s*[{][^}]*[}]/gi, '')
+    .replace(/(-\\w+-)?image-set\\s*[(][^)]*[)]/gi, 'none')
+    .replace(/url[(]\\s*(?:'\\s*data:|"\\s*data:|data:)[^)]*[)]|url[(][^)]*[)]/gi,
+             (m) => (/url[(]\\s*['"]?\\s*data:/i.test(m) ? m : 'none'));
+}
+async function siteManifest(name) {
+  if (MOCK) return Object.assign({}, MOCK_BUNDLE.manifest, {name});
+  const r = await fetch('/sites/'+encodeURIComponent(name)+'/manifest.json', {credentials:'omit', referrerPolicy:'no-referrer', cache:'reload'});
+  if (r.status===410) throw new Error('frozen');
+  if (!r.ok) throw new Error('missing');
+  return r.json();
+}
+/* One file of the bundle: text, or an image as a data: URI so the frame's
+   policy can stay `img-src data:` and the page never touches the network. */
+async function siteFile(name, m, path, type) {
+  let bytes;
+  if (MOCK) {
+    if (!siteHas(MOCK_BUNDLE, path)) throw new Error('missing');
+    bytes = new TextEncoder().encode(MOCK_BUNDLE.files[path]);
+  } else {
+    const url = '/sites/'+encodeURIComponent(name)+'/'+path.split('/').map(encodeURIComponent).join('/')+'?v='+encodeURIComponent(m.version);
+    const r = await fetch(url, {credentials:'omit', referrerPolicy:'no-referrer', cache:'reload'});
+    if (r.status===410) throw new Error('frozen');
+    if (!r.ok) throw new Error('missing');
+    bytes = new Uint8Array(await r.arrayBuffer());
+  }
+  if (!type) return new TextDecoder().decode(bytes);
+  let bin=''; for (const b of bytes) bin += String.fromCharCode(b);
+  return 'data:'+type+';base64,'+btoa(bin);
+}
+async function siteRender(name, m, path) {
+  const doc = new DOMParser().parseFromString(await siteFile(name, m, path), 'text/html');
+  doc.querySelectorAll('frameset, frame, noframes').forEach(el=>el.remove());
+  /* A stylesheet <link> becomes a <style>, which the walk below then treats
+     like any author style block. */
+  for (const el of Array.from(doc.querySelectorAll('link'))) {
+    const rel = (el.getAttribute('rel')||'').toLowerCase();
+    const href = siteResolve(path, el.getAttribute('href')||'');
+    if (rel!=='stylesheet' || !href || !siteHas(m, href)) { el.remove(); continue; }
+    try { const st = doc.createElement('style'); st.textContent = siteCss(await siteFile(name, m, href)); el.replaceWith(st); }
+    catch(e){ el.remove(); }
+  }
+  /* Removed WITH their children: the text inside a script element is code. */
+  doc.querySelectorAll('script, iframe, object, embed, form, video, audio, source, track, base, svg, math, canvas, template, noscript, portal').forEach(el=>el.remove());
+  const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT); const comments=[];
+  while (walker.nextNode()) comments.push(walker.currentNode);
+  comments.forEach(c=>{ if (c.parentNode) c.parentNode.removeChild(c); });
+  for (const img of Array.from(doc.querySelectorAll('img'))) {
+    const src = siteResolve(path, img.getAttribute('src')||'');
+    const type = src && SITE_IMAGES[(src.split('.').pop()||'').toLowerCase()];
+    if (!src || !type || !siteHas(m, src)) { img.remove(); continue; }
+    try { img.setAttribute('src', await siteFile(name, m, src, type)); } catch(e){ img.remove(); }
+  }
+  /* Every link is inert text once the walk strips href; the title keeps
+     where it pointed, which is what an operator reviewing a complaint
+     actually wants to know. */
+  for (const a of Array.from(doc.querySelectorAll('a'))) a.setAttribute('title', a.getAttribute('href')||'');
+  for (const el of Array.from(doc.querySelectorAll('*'))) {
+    const tag = el.tagName.toLowerCase();
+    if (!SITE_TAGS.has(tag)) { el.replaceWith(...Array.from(el.childNodes)); continue; }
+    for (const attr of Array.from(el.attributes)) {
+      const n = attr.name.toLowerCase();
+      const keep = SITE_ATTRS.has(n)
+        || (tag==='img' && n==='src' && attr.value.startsWith('data:'))
+        || (n==='style' && !/url\\s*[(]|@import/i.test(attr.value));
+      if (!keep) el.removeAttribute(attr.name);
+    }
+    if (tag==='style') el.textContent = siteCss(el.textContent||'');
+  }
+  /* Our own policy last, so it is not one of the attributes just stripped. */
+  const meta = doc.createElement('meta');
+  meta.setAttribute('http-equiv','Content-Security-Policy');
+  meta.setAttribute('content', "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src 'none'");
+  doc.head.prepend(meta);
+  return '<!doctype html>'+doc.documentElement.outerHTML;
+}
+let viewerManifest = null;
+function viewerSay(text) {
+  $('v_frame').srcdoc = '<p style="font:13px -apple-system,sans-serif;color:#9aa1ab;padding:40px;text-align:center">'+escAttr(text)+'</p>';
+}
+async function showSitePage(name, path) {
+  Array.from($('v_pages').children).forEach(b=>b.classList.toggle('on', b.dataset.page===path));
+  viewerSay('Loading '+path+'…');
+  try { $('v_frame').srcdoc = await siteRender(name, viewerManifest, path); }
+  catch(e){ viewerSay(e.message==='frozen' ? 'Frozen: the island does not serve this site while it is held.' : e.message==='missing' ? 'The island has no '+path+' for this site.' : 'Could not reach the island ('+e.message+').'); }
+}
+async function openViewer(name) {
+  $('v_addr').textContent = name+'.rcq';
+  $('v_pages').innerHTML = '';
+  $('viewer').classList.add('on');
+  viewerSay('Loading…');
+  try {
+    viewerManifest = await siteManifest(name);
+    /* index.html first, the rest alphabetically: the page list in our own
+       chrome is the only door between pages, as in the reader. */
+    const pages = Object.keys(viewerManifest.files||{}).filter(f=>f.toLowerCase().endsWith('.html'))
+      .sort((a,b)=> a==='index.html' ? -1 : b==='index.html' ? 1 : a.localeCompare(b));
+    if (pages.length > 1) pages.forEach(p=>{
+      const b = document.createElement('button'); b.className='btn ghost sm'; b.dataset.page=p; b.textContent=p;
+      b.onclick = () => showSitePage(name, p); $('v_pages').appendChild(b);
+    });
+    await showSitePage(name, pages.includes('index.html') ? 'index.html' : pages[0] || 'index.html');
+  } catch(e){ viewerSay(e.message==='frozen' ? 'Frozen: the island does not serve this site while it is held.' : 'Could not load the site ('+e.message+').'); }
+}
+function closeViewer(){ $('viewer').classList.remove('on'); $('v_frame').srcdoc=''; viewerManifest=null; }
+document.addEventListener('keydown', e=>{ if (e.key==='Escape' && $('viewer').classList.contains('on')) closeViewer(); });
 
 /* ---- relays (broker pool — lives under /broker/admin, not /admin) ---- */
 async function rawApi(method, path, body) {
@@ -1090,6 +1281,23 @@ const MOCK_SITES = [
   {name:'drafts', owner_uin:710335446, version:1, title:null, size_bytes:2048, listed:false, show_owner:false, featured:false, frozen:false, updated_at:new Date(Date.now()-86400e3).toISOString()},
   {name:'spam', owner_uin:901003980, version:1, title:'cheap pills', size_bytes:900, listed:false, show_owner:false, featured:false, frozen:true, updated_at:new Date(Date.now()-3*86400e3).toISOString()},
 ];
+/* A deliberately hostile bundle for the design preview: a meta refresh, an
+   outward link, a script, a fetching stylesheet. The viewer must show the
+   prose and none of the rest. (The script tag is split so the HTML parser
+   does not read it as the end of THIS script.) */
+const MOCK_BUNDLE = {
+  manifest: {v:1, version:4, key:'mock', files:{'index.html':'', 'en.html':'', 'style.css':''}},
+  files: {
+    'index.html': '<!doctype html><html><head><meta charset="utf-8"><title>home</title>'
+      + '<meta http-equiv="refresh" content="0;url=https://tracker.example/?home">'
+      + '<link rel="stylesheet" href="style.css"><scr'+'ipt>document.title="pwned"</scr'+'ipt></head>'
+      + '<body><h1>What this network is</h1><p><a href="en.html">English</a> · <a href="zh.html">中文</a> · <a href="https://tracker.example/">a link out</a></p>'
+      + '<p>Messages, calls and pages that stay inside the network. This paragraph is what the operator sees; the redirect, the script and the outward link above are not.</p>'
+      + '<p style="background:url(https://tracker.example/px.png)">An inline style that tried to fetch.</p></body></html>',
+    'en.html': '<!doctype html><html><head><meta charset="utf-8"></head><body><h1>What this network is (EN)</h1><p>The second page of the bundle.</p></body></html>',
+    'style.css': 'body{font-family:-apple-system,sans-serif;max-width:640px;margin:40px auto;color:#1c1e22} h1{color:#16a34a} @import url(https://tracker.example/x.css); body{background-image:url(https://tracker.example/pixel.png)}',
+  },
+};
 function mock(method, path, body) {
   if (path==='/sites') return MOCK_SITES;
   if (path.startsWith('/sites/') && method==='POST') {
