@@ -27,9 +27,12 @@ class NewsPost(Base):
     # JSON array of {media_id, mime, kind}. `kind` ∈ {"image", "video", "gif"}
     # so iOS can route to the right renderer without sniffing bytes.
     attachments: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    # Author label shown to readers — typically "RCQ Team" but
-    # admin can override per-post for guest-author drops.
-    author_label: Mapped[str] = mapped_column(String(64), nullable=False, default="RCQ Team")
+    # Who signed the post, as readers see it. The router fills it at publish
+    # time: the label the operator typed, else the island's own name
+    # (routers/news.py). No static default on purpose: the island's name is
+    # a setting that can change, and a string frozen here would name a team
+    # that a self-hosted island is not part of.
+    author_label: Mapped[str] = mapped_column(String(64), nullable=False)
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

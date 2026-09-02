@@ -24,9 +24,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import require_admin
 from app.models.news import NewsPost
+from app.services import server_settings
 
 public_router = APIRouter(prefix="/news", tags=["news"])
 admin_router = APIRouter(prefix="/admin/news", tags=["news"], dependencies=[Depends(require_admin)])
@@ -228,7 +230,7 @@ async def create_news_post(
     post = NewsPost(
         body=body.body.strip(),
         attachments=attachments_payload or None,
-        author_label=(body.author_label or "RCQ Team").strip() or "RCQ Team",
+        author_label=(body.author_label or "").strip() or await _island_name(),
     )
     db.add(post)
     await db.commit()
@@ -296,6 +298,24 @@ async def delete_news_post(
 
 
 # ── helpers ─────────────────────────────────────────────────────────
+
+
+async def _island_name() -> str:
+    """Who signs a post when the operator typed no author: the island itself.
+
+    The same chain /server/info answers with, so a reader sees the post under
+    the name they already know this island by: the operator's `island_name`
+    override, else the server's own name. Resolved at publish time and written
+    into the row, so an island that renames itself keeps its old posts signed
+    as they were. Never a fixed string here: a self-hosted island is not part
+    of anybody's "team" and must not claim to be.
+
+    ⚠ `author_label` is 64 characters wide and `island_name` is not (the
+    settings registry takes 2048). Cut to fit, because on Postgres the
+    alternative is a 500 on every publish from an island with a long name.
+    """
+    name = str(await server_settings.get("island_name") or "").strip() or settings.APP_NAME
+    return name[:64]
 
 
 def _coerce_attachments(raw) -> list[NewsAttachmentOut]:
