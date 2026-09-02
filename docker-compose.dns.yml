@@ -1,0 +1,26 @@
+# Override that swaps the stock Caddy image for one built with the DNS-01
+# modules (deploy/Dockerfile.caddy-dns): certificates validated through the
+# DNS provider's API instead of an HTTP challenge on port 80. Only needed
+# together with a `tls { dns ... }` block in the Caddyfile; see
+# docs/tls-without-a-ca.md, answer 1.
+#
+# Make it permanent by adding to .env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.dns.yml
+#
+# ⚠ Without that line a plain `docker compose up -d`, and deploy/rcq-update.sh,
+# silently put the stock image back, and the next renewal fails. One-off use:
+#   docker compose -f docker-compose.yml -f docker-compose.dns.yml up -d --build
+
+services:
+  caddy:
+    image: rcq-caddy-dns:local
+    build:
+      context: ./deploy
+      dockerfile: Dockerfile.caddy-dns
+    environment:
+      # Provider credentials the Caddyfile reads as {env.NAME}. Set the one
+      # you use in .env; the others stay empty and unused.
+      CF_API_TOKEN: ${CF_API_TOKEN:-}
+      DESEC_TOKEN: ${DESEC_TOKEN:-}
+      HETZNER_API_TOKEN: ${HETZNER_API_TOKEN:-}

@@ -1,0 +1,25 @@
+# Caddy with the DNS-01 challenge modules, for an island whose port 80 is
+# unreachable or whose HTTP path the certificate authority cannot use
+# (docs/tls-without-a-ca.md, answer 1). docker-compose.dns.yml builds it.
+#
+# Three providers, chosen for a free tier a person can sign up for and an
+# API token that can be scoped to a single zone: Cloudflare, deSEC, Hetzner.
+# Any other module under https://github.com/caddy-dns goes on the list the
+# same way.
+#
+# ⚠ The build fetches Go modules through GOPROXY. Where proxy.golang.org is
+# filtered, build the image on another machine and carry it over with
+# `docker save` / `docker load`, or point the build at a mirror:
+#   docker compose -f docker-compose.yml -f docker-compose.dns.yml build \
+#       --build-arg GOPROXY=https://goproxy.io,direct caddy
+
+FROM caddy:2-builder AS builder
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=$GOPROXY
+RUN xcaddy build \
+    --with github.com/caddy-dns/cloudflare \
+    --with github.com/caddy-dns/desec \
+    --with github.com/caddy-dns/hetzner
+
+FROM caddy:2-alpine
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

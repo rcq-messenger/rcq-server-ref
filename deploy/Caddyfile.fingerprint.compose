@@ -1,0 +1,83 @@
+# Caddyfile for the docker-compose self-host path WITHOUT a certificate
+# authority: the island serves its own ten-year certificate from ./certs and
+# the RCQ apps pin its SHA-256 fingerprint on first connect, or check it
+# against the one the user typed as `address#fingerprint`.
+#
+# install.sh selects this file (RCQ_CADDYFILE in .env) when no domain is
+# given, and issues certs/island.crt + certs/island.key for the host's public
+# IP and any name given. deploy/island-fingerprint.sh prints the fingerprint
+# to hand out. docs/tls-without-a-ca.md is the whole story, including how to
+# move to a certificate authority later.
+#
+# Kept in step with Caddyfile.compose by hand: same protocols, same log
+# masking, same proxy headers. Only where the certificate comes from differs.
+# ⚠ A browser cannot open an island served this way; the web client is out.
+
+{
+	# No certificate authority is involved and Caddy must not go looking for
+	# one: no ACME, and no automatic redirect from :80 either (that redirect
+	# is part of auto_https, which is why :80 gets its own block below).
+	auto_https off
+
+	# HTTP/3 (QUIC) deliberately disabled, same reason as Caddyfile.compose:
+	# QUIC bypasses the SOCKS proxy the circumvention tunnel is built on.
+	servers {
+		protocols h1 h2
+	}
+
+	# Caddy picks the certificate by the name in the client's SNI. A client
+	# that dials a bare IP sends no SNI at all (an IP is not a name), so tell
+	# Caddy which certificate that means: the island's, by its own address.
+	default_sni {$RCQ_DOMAIN}
+
+	# No access log at all on this path, on purpose. What Caddy still writes
+	# is its own error log (upstream refused, TLS), and every such line
+	# carries the request: client IP, and a path that may hold an account
+	# number (/ws/123456789) or a session token (?token=). Mask both, the
+	# same way the maintainers rcq.app config does: an operators error log
+	# must not be an address-to-account map, and it must not hold credentials.
+	log default {
+		format filter {
+			wrap console
+			fields {
+				request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+" "${1}${2}${3}REDACTED"
+				request>remote_ip ip_mask {
+					ipv4 24
+					ipv6 32
+				}
+				request>client_ip ip_mask {
+					ipv4 24
+					ipv6 32
+				}
+			}
+		}
+	}
+}
+
+# A catch-all on 443 rather than a named site: whatever name or IP the client
+# dialled, this is the only certificate there is.
+:443 {
+	tls /certs/island.crt /certs/island.key
+
+	reverse_proxy app:8000 {
+		# Surface the real client IP to FastAPI so rate-limiters and audit
+		# logs don't all collapse to the caddy container's IP.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP       {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options    "nosniff"
+		Referrer-Policy           "no-referrer"
+		-Server
+	}
+}
+
+# Port 80 stays bound so it is not a door left open for something else, and
+# answers nothing: there is no ACME challenge to serve, and nothing to
+# redirect to that a browser could open.
+:80 {
+	respond 404
+}

@@ -10,8 +10,10 @@ enough. This guide is for a real, internet-facing island with HTTPS.
 Prerequisites:
 - A Debian 12 server with a public IP and root (or sudo).
 - A domain or subdomain pointed at that IP with an `A` record
-  (e.g. `island.example.com`). iOS clients require HTTPS, so a real hostname
-  is mandatory; Caddy issues a free Let's Encrypt certificate automatically.
+  (e.g. `island.example.com`); Caddy issues a free Let's Encrypt certificate
+  for it automatically. Without one, or when no certificate authority will
+  issue to you, the island serves its own certificate and the apps pin it:
+  step 7a.
 
 Throughout, replace `island.example.com` with your hostname and choose a strong
 database password where noted.
@@ -138,6 +140,55 @@ On first request Caddy obtains a Let's Encrypt certificate for the domain
 ```bash
 curl -fsS https://island.example.com/health && echo "island is live"
 ```
+
+### 7a. Without a certificate authority (fingerprint mode)
+
+If no authority will issue to you, or the island has no domain, Caddy serves a
+certificate the island made itself and the RCQ apps (Android, iOS, desktop,
+CLI; not a browser) pin its SHA-256 fingerprint. Issue it once, for the address
+users will type (a bare IP is fine; `DNS:island.example.com` in the SAN and as
+the CN for a name):
+
+```bash
+sudo openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /etc/caddy/island.key
+sudo openssl req -new -x509 -key /etc/caddy/island.key -sha256 -days 3650 \
+    -subj "/CN=203.0.113.5" -addext "subjectAltName=IP:203.0.113.5" -out /etc/caddy/island.crt
+sudo chown caddy:caddy /etc/caddy/island.key /etc/caddy/island.crt
+sudo chmod 600 /etc/caddy/island.key
+```
+
+Keep OpenSSL 3's `-x509` defaults (`CA:TRUE` and a subject key identifier) and
+the address in the SAN: the CLI runs on Node and can only be handed a trust
+anchor, and a certificate without them is refused there and nowhere else. Then
+`/etc/caddy/Caddyfile` becomes:
+
+```caddyfile
+{
+	# No authority to ask, and no redirect from :80 (both are auto_https).
+	auto_https off
+	# A client dialling a bare IP sends no SNI; this names the certificate for it.
+	default_sni 203.0.113.5
+}
+
+:443 {
+	tls /etc/caddy/island.crt /etc/caddy/island.key
+	reverse_proxy 127.0.0.1:8000
+}
+
+:80 {
+	respond 404
+}
+```
+
+```bash
+sudo systemctl reload caddy
+openssl x509 -noout -fingerprint -sha256 -in /etc/caddy/island.crt
+```
+
+Hand out `203.0.113.5#<fingerprint>`, the fingerprint lowercased and without
+colons. What users see, how to rotate the certificate, and how to move to a
+certificate authority later without disturbing anyone:
+[tls-without-a-ca.md](tls-without-a-ca.md).
 
 ## 8. Point a client at it
 
