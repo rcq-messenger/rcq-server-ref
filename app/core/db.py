@@ -482,6 +482,33 @@ async def init_db() -> None:
                 except Exception:
                     pass
 
+    # Rows signed under 2026.09.02.3, which cut the island's name to the
+    # column's 64 characters at publish time, in Python, so on SQLite as
+    # well. The widening above does not touch them, and every client drops
+    # the author line only when the label EQUALS the island's name, so on an
+    # island named with more than 64 characters those posts kept reading as
+    # "<name> · <name cut to 64>" after the very upgrade meant to end that.
+    # Exactly the rows carrying the current name's 64-character prefix, and
+    # only when the name is long enough to have been cut; on any other
+    # island no row can match. Keyed on the CURRENT name, so a row cut under
+    # a name the island has since dropped stays (nothing tells it from a
+    # guest label), and a guest label typed as precisely those 64 characters
+    # becomes the island's own signature, which is what a label equal to the
+    # island's name means to every client anyway. After the widening, which
+    # the whole name needs to fit; a failure here must not block boot.
+    try:
+        from app.services.server_settings import island_name
+
+        name = await island_name()
+        if len(name) > 64:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE news_posts SET author_label = :whole WHERE author_label = :cut"),
+                    {"whole": name, "cut": name[:64]},
+                )
+    except Exception:  # noqa: BLE001
+        pass
+
     # Backfill share tokens for groups created before the column existed, so
     # every group has an unguessable half to its share link. Done here (rather
     # than lazily on first share) because the preview gate treats a NULL token
