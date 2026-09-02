@@ -420,8 +420,9 @@ else
         fi
         # The address users type and the certificate is issued for: the
         # name when there is one, else the IP. Never both: the apps key
-        # their trust on the address, and a name can move to a real CA
-        # later without anybody noticing (docs/tls-without-a-ca.md).
+        # their trust on the address, and only a name can move to a real
+        # CA later, at the cost of one banner for the users who typed the
+        # fingerprint and nothing for the rest (docs/tls-without-a-ca.md).
         DOMAIN="${DOMAIN:-$PUBLIC_IP}"
         if [ -n "$PUBLIC_IP" ] && ! is_ip_literal "$DOMAIN" && ! resolves_to "$DOMAIN" "$PUBLIC_IP"; then
             RESOLVED=$(dig +short "$DOMAIN" 2>/dev/null | tail -1 || true)
@@ -557,8 +558,9 @@ if [ "$TLS_MODE_VAL" = "fingerprint" ]; then
         echo "    $DOMAIN_VAL does not point at this host yet. The certificate carries the IP"
         echo "    too, so that is the address that works meanwhile. Once the A-record is live,"
         echo "    hand out $DOMAIN_VAL#$FP instead: only an island added"
-        echo "    by name can move to a certificate authority later without a new fingerprint"
-        echo "    for everybody."
+        echo "    by name can move to a certificate authority later (users who typed the"
+        echo "    fingerprint accept one banner then; nobody else notices). By IP, the address"
+        echo "    itself changes, and everyone adds the island again."
     fi
     echo
     echo "Next steps:"

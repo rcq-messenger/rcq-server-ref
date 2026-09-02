@@ -78,10 +78,15 @@ path removes the first-use gap entirely: the operator hands out the address as
 `host#fingerprint` over a channel the person already trusts, and the app checks
 the island against the typed fingerprint before it trusts anything. What the
 mode does not do, stated plainly: the first contact with an unknown island over
-a hostile network, without a typed fingerprint, can pin an impostor. Even then
-the impostor sees ciphertext and metadata, not messages: sealed sender and
-end-to-end encryption do not depend on TLS. An island that has once been
-validated through a certificate authority on a device cannot be downgraded to a
+a hostile network, without a typed fingerprint, can pin an impostor. What that
+costs is bounded, not nothing. Every conversation whose peer keys the device
+already held stays what it was: sealed sender and end-to-end encryption do not
+depend on TLS, and there the impostor sees ciphertext and metadata, not
+messages. A contact made for the first time THROUGH the impostor is not covered:
+the island serves the peer's key bundle, so an impostor can serve its own and
+read those bodies, exactly as a compromised backend could, and only comparing
+safety numbers out of band catches it. An island that has once been validated
+through a certificate authority on a device cannot be downgraded to a
 private certificate silently; that is a change, with the same red banner. And
 `api.rcq.app`, with everything under `rcq.app`, is never accepted on first use.
 
