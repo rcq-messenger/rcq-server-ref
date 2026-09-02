@@ -301,11 +301,11 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       <div class="card pad">
         <textarea id="n_body" rows="4" placeholder="Write an announcement… (up to 4000 chars)" style="width:100%;box-sizing:border-box;resize:vertical"></textarea>
         <div class="row" style="margin-top:10px">
-          <input id="n_author" placeholder="Author label (optional)" style="flex:1;min-width:150px">
+          <input id="n_author" placeholder="Author (empty = this island's name)" style="flex:1;min-width:150px">
           <input id="n_files" type="file" multiple accept="image/*,video/*" title="Optional image/video attachments" style="flex:1;min-width:150px">
           <button class="btn" onclick="publishNews()">Publish</button>
         </div>
-        <p class="sub" style="margin:10px 0 0">Posts appear in every user's News feed. Attachments are optional (images / video).</p>
+        <p class="sub" style="margin:10px 0 0">Posts appear in every user's News feed, signed with the author you typed, or with this island's name when the field is empty. Attachments are optional (images / video).</p>
         <div class="err" id="n_err"></div>
       </div>
       <div class="card pad">
@@ -1063,10 +1063,10 @@ function mock(method, path, body) {
     {uin:710335446,nickname:'nosferatu',status:'away',last_seen:new Date(Date.now()-300e3).toISOString()},
   ];
   if (path==='/news') {
-    if (method==='POST') return {id:Math.floor(Math.random()*9000), body:(body&&body.body)||'', attachments:(body&&body.attachments)||[], author_label:(body&&body.author_label)||'', published_at:new Date().toISOString()};
+    if (method==='POST') return {id:Math.floor(Math.random()*9000), body:(body&&body.body)||'', attachments:(body&&body.attachments)||[], author_label:(body&&body.author_label)||'Example Island', published_at:new Date().toISOString()};
     return {items:[
       {id:3, body:'Scheduled maintenance tonight 02:00–02:30 UTC. Expect a brief blip.', attachments:[], author_label:'Admin', published_at:new Date(Date.now()-3600e3).toISOString()},
-      {id:2, body:'New build is out — bug fixes and faster chat scrolling.', attachments:[{media_id:'x',mime:'image/png',kind:'image'}], author_label:'', published_at:new Date(Date.now()-86400e3).toISOString()},
+      {id:2, body:'New build is out — bug fixes and faster chat scrolling.', attachments:[{media_id:'x',mime:'image/png',kind:'image'}], author_label:'Example Island', published_at:new Date(Date.now()-86400e3).toISOString()},
     ], latest_id:3};
   }
   if (path.startsWith('/news/') && method==='DELETE') return null;
