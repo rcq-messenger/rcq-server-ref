@@ -22,6 +22,20 @@
 		protocols h1 h2
 	}
 
+	# ── When Let's Encrypt will not issue to you ──────────────────────────
+	# docs/tls-without-a-ca.md, answer 2. A second ACME issuer: Caddy tries
+	# them in the order written, so Let's Encrypt stays first and Buypass
+	# (free, no account credentials, 180-day certificates) takes over the day
+	# the first one refuses. Uncomment both lines when a renewal fails with a
+	# policy or region error rather than a DNS one. Buypass requires the
+	# contact email.
+	#
+	# cert_issuer acme
+	# cert_issuer acme {
+	# 	dir https://api.buypass.com/acme/directory
+	# 	email you@example.com
+	# }
+
 	# No access log at all on this path, on purpose. What Caddy still writes
 	# is its own error log (upstream refused, TLS, ACME), and every such line
 	# carries the request: client IP, and a path that may hold an account
@@ -47,6 +61,16 @@
 }
 
 {$RCQ_DOMAIN} {
+	# ── DNS-01 instead of the HTTP challenge on port 80 ───────────────────
+	# docs/tls-without-a-ca.md, answer 1. For a host whose port 80 is
+	# unreachable, or when the CA's validators cannot reach this host at all
+	# but can read your DNS. Needs the Caddy image built with the DNS module
+	# (docker-compose.dns.yml) and CF_API_TOKEN in .env.
+	#
+	# tls {
+	# 	dns cloudflare {env.CF_API_TOKEN}
+	# }
+
 	reverse_proxy app:8000 {
 		# Surface the real client IP to FastAPI so rate-limiters and audit
 		# logs don't all collapse to the caddy container's IP.

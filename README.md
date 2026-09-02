@@ -15,13 +15,17 @@ source (AGPL-3.0) as the reference implementation and so anyone can run
 their own island. It's still beta — the protocol and features evolve —
 and the *self-hosted* path specifically is the newer surface (fewer
 operators have run it than the flagship). The included
-`docker-compose.yml` covers TLS (Caddy + Let's Encrypt) and APNs setup
+`docker-compose.yml` covers TLS (Caddy + Let's Encrypt, or the island's own
+pinned certificate when no authority will issue to you:
+[`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)) and APNs setup
 is documented in [`docs/apns.md`](docs/apns.md). Open items: a wider
 testing pass on the self-hosted path, and the non-Docker relay
 self-host story — track those in [Issues](../../issues).
 
-If you have a small VPS, a domain you can point at it, and ten
-minutes, the quick-start below stands a working server up. If you'd
+If you have a small VPS and ten minutes, the quick-start below stands a
+working server up. A domain you can point at it is the normal case; an
+island reached by IP alone is a supported one
+([`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)). If you'd
 rather wait for the friction-light path (one-command install,
 hosted-key tooling), keep an eye on releases.
 
@@ -97,10 +101,13 @@ On a fresh Ubuntu / Debian VPS, as root or via sudo:
 curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh | bash
 ```
 
-Asks you for the public domain, sanity-checks DNS, installs Docker
-if missing, generates a random `JWT_SECRET` + `POSTGRES_PASSWORD`,
-writes `.env`, brings the stack up, waits for the Let's Encrypt
-cert, smoke-tests `/health`, prints the next-step instructions.
+Asks whether you have a domain. With one: sanity-checks DNS, installs
+Docker if missing, generates a random `JWT_SECRET` + `POSTGRES_PASSWORD`,
+writes `.env`, brings the stack up, waits for the Let's Encrypt cert,
+smoke-tests `/health`, prints the next-step instructions. Without one:
+the same, except the island issues its own certificate and the script
+ends with the fingerprint and the `address#fingerprint` line your users
+type ([`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)).
 
 If you'd rather inspect first (recommended for any non-throwaway
 box):
@@ -114,14 +121,19 @@ bash install.sh
 Prereqs the script assumes you've already done:
 * You have a VPS or other always-on host.
 * You own a domain (or subdomain) and have pointed an A-record at
-  the host.
+  the host. Optional: without one the island runs in fingerprint
+  mode, reached by IP, and the apps pin its certificate
+  ([`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)); the web
+  client cannot join an island without a certificate authority.
 * Ports 80 + 443 are reachable on the host (Caddy needs both for
-  the ACME HTTP-01 challenge).
+  the ACME HTTP-01 challenge; fingerprint mode needs only 443).
 
 ## Quick start (manual docker-compose)
 
 Prereqs: a VPS with Docker installed, a domain (or subdomain) you can
 point at it, and an open port 80 + 443 (Caddy needs both for ACME).
+No domain, or no certificate authority that will issue to you:
+[`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md).
 
 ```bash
 # 1. DNS: point an A-record at this host. Wait for propagation
@@ -213,7 +225,9 @@ To enable:
    blog, generic SaaS landing, or anything that doesn't look like RCQ.
 
 3. Point the caddy service at the masquerade config and mount the
-   decoy directory (in `docker-compose.yml`):
+   decoy directory (in `docker-compose.yml`; the Caddyfile line can also
+   be `RCQ_CADDYFILE=./deploy/Caddyfile.masquerade.compose` in `.env`,
+   leaving `docker-compose.yml` untouched):
 
    ```yaml
    caddy:
@@ -238,6 +252,22 @@ access tokens** (mint/revoke them in the admin console instead of one shared
 secret), use `deploy/Caddyfile.masquerade-tokens.compose` instead — see
 **[docs/private-island.md](docs/private-island.md)**. Closed islands are
 native-only (iOS/Android/desktop).
+
+## TLS without a certificate authority
+
+Let's Encrypt is a policy, not a protocol: if it stops issuing to your
+address, or you have no domain at all, the island still runs. In order of
+cost: validate over DNS instead of port 80 (`docker-compose.dns.yml`), use
+another ACME authority (a ready-to-uncomment block in
+`deploy/Caddyfile.compose`), or drop the authority entirely and let the
+apps pin the island's own certificate by its SHA-256 fingerprint, the way
+SSH pins a host key. `install.sh` sets the last one up when you answer
+"no" to the domain question, and ends with the line to hand your users:
+`203.0.113.5#ab12…`. Android, iOS, the desktop app and the CLI open such an
+island; a browser cannot. The three answers, what users see, rotation and
+the move to an authority later:
+[`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md). The trust model is
+one paragraph in [SECURITY.md](SECURITY.md#islands-trusted-by-fingerprint).
 
 ## What's intentionally NOT in this repo
 

@@ -65,6 +65,26 @@ faith:
 
 If in doubt, ask first via the contacts above.
 
+## Islands trusted by fingerprint
+
+An island run without a certificate authority (`RCQ_TLS_MODE=fingerprint`,
+[docs/tls-without-a-ca.md](docs/tls-without-a-ca.md)) is identified by the
+SHA-256 fingerprint of the certificate it serves. The apps trust it the way SSH
+trusts a host key: on the first connection they pin whatever the island presents
+and say so once; on every later connection the certificate has to be the same
+one, and a different one is refused, not connected to, until the person compares
+the new fingerprint with what the operator published and accepts it. The careful
+path removes the first-use gap entirely: the operator hands out the address as
+`host#fingerprint` over a channel the person already trusts, and the app checks
+the island against the typed fingerprint before it trusts anything. What the
+mode does not do, stated plainly: the first contact with an unknown island over
+a hostile network, without a typed fingerprint, can pin an impostor. Even then
+the impostor sees ciphertext and metadata, not messages: sealed sender and
+end-to-end encryption do not depend on TLS. An island that has once been
+validated through a certificate authority on a device cannot be downgraded to a
+private certificate silently; that is a change, with the same red banner. And
+`api.rcq.app`, with everything under `rcq.app`, is never accepted on first use.
+
 ## Verifying what you run
 
 This backend is open source — you can read every line and run it yourself. It is

@@ -38,3 +38,8 @@ evidence/
 
 # Apple Push key — never check this in
 *.p8
+
+# The island's own certificate (fingerprint mode). The key IS the island's
+# identity to every user; certs/.gitkeep keeps the directory for the mount.
+certs/*.key
+certs/*.crt

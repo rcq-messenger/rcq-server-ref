@@ -13,13 +13,17 @@
 #      iOS clients require HTTPS (App Transport Security), so RCQ_DOMAIN
 #      must be a real hostname with a public A-record pointing at this
 #      host. Caddy auto-issues a Let's Encrypt cert on first boot.
+#      No domain, or no certificate authority that will issue to you: run
+#      install.sh (it asks), or set RCQ_TLS_MODE=fingerprint + RCQ_CADDYFILE
+#      by hand. docs/tls-without-a-ca.md.
 #   2. (Optional) Drop an APNs `.p8` key at `./apns.p8` next to this file
 #      if you want iOS push notifications. See `docs/apns.md`. Without
 #      the file the server runs fine — users get messages on the next
 #      WebSocket reconnect, just without iOS alert pushes.
 #
 # What you get:
-#   - caddy on :80 + :443, auto-TLS for RCQ_DOMAIN
+#   - caddy on :80 + :443, auto-TLS for RCQ_DOMAIN (or the island's own
+#     pinned certificate from ./certs in fingerprint mode)
 #   - app (FastAPI) on the internal docker network at app:8000
 #   - postgres 16 with a persistent volume
 #   - redis 7 with a persistent volume (AOF on)
@@ -43,7 +47,14 @@ services:
     environment:
       RCQ_DOMAIN: ${RCQ_DOMAIN}
     volumes:
-      - ./deploy/Caddyfile.compose:/etc/caddy/Caddyfile:ro
+      # Which Caddyfile: Let's Encrypt by default; the fingerprint one when
+      # install.sh ran without a domain (RCQ_CADDYFILE in .env); a masquerade
+      # one the same way. docs/tls-without-a-ca.md.
+      - ${RCQ_CADDYFILE:-./deploy/Caddyfile.compose}:/etc/caddy/Caddyfile:ro
+      # The island's own certificate, fingerprint mode. Mounted in every mode
+      # so switching is a .env edit and a restart; in CA mode the directory
+      # is empty (certs/.gitkeep keeps it in the checkout so the mount works).
+      - ./certs:/certs:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
