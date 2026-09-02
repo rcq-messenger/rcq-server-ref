@@ -24,7 +24,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import require_admin
 from app.models.news import NewsPost
@@ -102,6 +101,8 @@ class NewsListOut(BaseModel):
 class CreateNewsIn(BaseModel):
     body: str = Field(..., min_length=1, max_length=MAX_BODY_LEN)
     attachments: list[NewsAttachmentIn] = Field(default_factory=list)
+    # A label typed for one post (a guest author). The island's own name,
+    # the default, is not subject to this cap and is never cut.
     author_label: str | None = Field(default=None, max_length=64)
 
 
@@ -227,10 +228,19 @@ async def create_news_post(
         {"media_id": a.media_id, "mime": a.mime, "kind": _kind_for_mime(a.mime)}
         for a in body.attachments
     ]
+    # Who signs when the operator typed no author: the island itself, by the
+    # name /server/info answers with, so a reader sees the post under the name
+    # they already know this island by. Resolved now and written into the row,
+    # so an island that renames itself keeps its old posts signed as they
+    # were. Never a fixed string: a self-hosted island is not part of
+    # anybody's "team" and must not claim to be. Never cut either: the clients
+    # drop the author line only when the label EQUALS the island's name, so a
+    # name cut to fit a column read as a guest post on every one of them
+    # ("Island · Island…"). The column is as wide as the name (models/news.py).
     post = NewsPost(
         body=body.body.strip(),
         attachments=attachments_payload or None,
-        author_label=(body.author_label or "").strip() or await _island_name(),
+        author_label=(body.author_label or "").strip() or await server_settings.island_name(),
     )
     db.add(post)
     await db.commit()
@@ -298,24 +308,6 @@ async def delete_news_post(
 
 
 # ── helpers ─────────────────────────────────────────────────────────
-
-
-async def _island_name() -> str:
-    """Who signs a post when the operator typed no author: the island itself.
-
-    The same chain /server/info answers with, so a reader sees the post under
-    the name they already know this island by: the operator's `island_name`
-    override, else the server's own name. Resolved at publish time and written
-    into the row, so an island that renames itself keeps its old posts signed
-    as they were. Never a fixed string here: a self-hosted island is not part
-    of anybody's "team" and must not claim to be.
-
-    ⚠ `author_label` is 64 characters wide and `island_name` is not (the
-    settings registry takes 2048). Cut to fit, because on Postgres the
-    alternative is a 500 on every publish from an island with a long name.
-    """
-    name = str(await server_settings.get("island_name") or "").strip() or settings.APP_NAME
-    return name[:64]
 
 
 def _coerce_attachments(raw) -> list[NewsAttachmentOut]:

@@ -17,10 +17,15 @@ island calls itself, resolved at publish time through the same chain
     not rewrite the posts already signed with the old name;
   * clearing the override falls back to the server's own name, the way the
     settings help promises;
-  * ⚠ `author_label` is 64 characters wide and `island_name` takes 2048. A
-    long island name is cut to fit, because on Postgres the alternative is a
-    500 on every publish. SQLite would not have caught this, which is why the
-    length is pinned explicitly.
+  * a whitespace-only override is unset for /server/info AND the signature:
+    one chain, not two;
+  * a long island name is written whole: the name is the signature, and a
+    name cut to fit a column is a label no client recognises as the island's
+    own (they drop the author line only on equality), so every unlabelled
+    post read as a guest post. ⚠ The column is as wide as the setting (2048);
+    the width bump for a Postgres island that created it at 64 is in
+    app/core/db.py's widened-columns list, and SQLite enforces no width, so
+    this test pins only that the router no longer cuts.
 
 In-process ASGI against a throwaway SQLite DB, Redis db 15 for the realtime
 nudge a publish sends (falls back to local fan-out if Redis is down). NOT
@@ -153,19 +158,28 @@ async def main() -> None:
         check("...and so does the signature",
               p_cleared.get("author_label") == "Island Under Test", str(p_cleared.get("author_label")))
         await rename(c, "   ")
+        info = (await c.get("/server/info")).json()
+        check("a whitespace-only island name is unset for /server/info",
+              info.get("name") == "Island Under Test", repr(info.get("name")))
         p_ws = await publish(c, "whitespace island name")
-        check("a whitespace-only island name is treated as unset",
+        check("*** ...and for the signature: the same chain",
               p_ws.get("author_label") == "Island Under Test", str(p_ws.get("author_label")))
 
-        print("\nthe column width")
+        print("\na long island name")
         long_name = "Island " + "x" * 100
         await rename(c, long_name)
+        info = (await c.get("/server/info")).json()
         p_long = await publish(c, "long island name")
         label = p_long.get("author_label") or ""
         check("*** a long island name does not break publishing", bool(p_long),
               "no post came back")
-        check("the signature is cut to the 64 the column holds", len(label) == 64, str(len(label)))
-        check("...and is the head of the island's name", long_name.startswith(label), label)
+        check("*** the signature is the whole name, never cut", label == long_name,
+              f"{len(label)} chars: {label[:40]}…")
+        check("...and exactly what /server/info says", label == info.get("name"))
+        feed = (await c.get("/news")).json()
+        by_id = {it["id"]: it for it in feed.get("items", [])}
+        check("readers get the whole name too",
+              by_id.get(p_long.get("id"), {}).get("author_label") == long_name)
 
     await close_redis()
     print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILED'}")

@@ -464,10 +464,16 @@ async def init_db() -> None:
     # old cap forever unless it is re-asserted here. Widening is metadata-only
     # in PG (no table rewrite, no lock worth naming) and idempotent. SQLite
     # never enforced VARCHAR length in the first place, so it needs nothing.
-    # The one entry so far: the group pin, 500 -> 4096 (megalist A6 - the
-    # 500 cap was making clients silently 422 on real announcements).
+    # Entries: the group pin, 500 -> 4096 (megalist A6 - the 500 cap was
+    # making clients silently 422 on real announcements); the news author
+    # label, 64 -> 2048, the width of the island name it defaults to (a name
+    # cut to 64 was a label no client recognised as the island's own, so every
+    # unlabelled post read as a guest post).
     if dialect == "postgresql":
-        for table, col, new_type in [("groups", "pinned_text", "VARCHAR(4096)")]:
+        for table, col, new_type in [
+            ("groups", "pinned_text", "VARCHAR(4096)"),
+            ("news_posts", "author_label", "VARCHAR(2048)"),
+        ]:
             async with engine.begin() as conn:
                 try:
                     await conn.execute(text(
