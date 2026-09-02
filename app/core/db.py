@@ -476,6 +476,16 @@ async def init_db() -> None:
         ]:
             async with engine.begin() as conn:
                 try:
+                    # ⚠ Widening is metadata-only, but the statement still takes
+                    # ACCESS EXCLUSIVE, and a lock request queues AHEAD of every
+                    # reader behind it. Four workers run this on every boot, so
+                    # one transaction someone left open on `news_posts` would
+                    # otherwise park the whole island's boot behind it and stall
+                    # the readers piling up behind the ALTER. Three seconds is
+                    # far more than a catalogue change needs; giving up is free,
+                    # because the column is already the width it will be and the
+                    # next boot tries again.
+                    await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
                     await conn.execute(text(
                         f"ALTER TABLE {table} ALTER COLUMN {col} TYPE {new_type}"
                     ))

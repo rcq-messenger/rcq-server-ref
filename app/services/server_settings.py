@@ -170,8 +170,11 @@ async def island_name() -> str:
     must see the same name in both places, and two callers each doing
     `override or default` did not (a whitespace-only override passed the
     first and not the second). Rows written before validate() stripped are
-    why the strip is here as well."""
-    return str(await get("island_name") or "").strip() or _env.APP_NAME
+    why the strip is here as well, and the fallback is stripped too: an
+    operator who padded APP_NAME in their compose file meant the name, not
+    the padding, and a signature carrying it would not equal the name every
+    client compares against."""
+    return str(await get("island_name") or "").strip() or _env.APP_NAME.strip()
 
 
 def validate(updates: dict[str, Any]) -> dict[str, str]:
