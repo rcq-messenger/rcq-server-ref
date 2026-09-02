@@ -163,6 +163,17 @@ async def get_bool(key: str) -> bool:
     return bool(await get(key))
 
 
+async def island_name() -> str:
+    """The name this island answers to: the operator's override, else the
+    server's own name. The ONE chain for it: /server/info answers with this,
+    and so does everything that signs as the island (a news post). A reader
+    must see the same name in both places, and two callers each doing
+    `override or default` did not (a whitespace-only override passed the
+    first and not the second). Rows written before validate() stripped are
+    why the strip is here as well."""
+    return str(await get("island_name") or "").strip() or _env.APP_NAME
+
+
 def validate(updates: dict[str, Any]) -> dict[str, str]:
     """Coerce a {key: value} patch to {key: serialized}. Raises ValueError on a
     bad key / type / range / choice so the endpoint can 400 cleanly."""
@@ -186,6 +197,12 @@ def validate(updates: dict[str, Any]) -> dict[str, str]:
         else:
             if not isinstance(value, str):
                 raise ValueError(f"'{key}' must be a string")
+            # Whitespace is not a value. The help text promises that an empty
+            # island name means the server's own, and an operator who saved
+            # three spaces meant empty; stripped once here so no reader has to
+            # know (/server/info once showed the spaces while the news
+            # signature fell back to the default).
+            value = value.strip()
             if spec.choices is not None and value not in spec.choices:
                 raise ValueError(f"'{key}' must be one of {list(spec.choices)}")
             out[key] = value[:2048]

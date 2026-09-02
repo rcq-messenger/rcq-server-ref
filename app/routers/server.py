@@ -182,7 +182,7 @@ class ServerInfo(BaseModel):
 async def server_info() -> ServerInfo:
     eff = await server_settings.effective()
     return ServerInfo(
-        name=eff["island_name"] or settings.APP_NAME,
+        name=await server_settings.island_name(),
         welcome=eff["welcome_text"],
         logo_version=await island_logo.version(),
         capabilities=ServerCapabilities(

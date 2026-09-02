@@ -32,7 +32,12 @@ class NewsPost(Base):
     # (routers/news.py). No static default on purpose: the island's name is
     # a setting that can change, and a string frozen here would name a team
     # that a self-hosted island is not part of.
-    author_label: Mapped[str] = mapped_column(String(64), nullable=False)
+    #
+    # ⚠ As wide as the island name it defaults to (server_settings takes
+    # 2048), and in the widened-columns list in core/db.py for islands that
+    # created it at 64: a name cut to fit was a label no client recognised
+    # as the island's own, and every unlabelled post read as a guest post.
+    author_label: Mapped[str] = mapped_column(String(2048), nullable=False)
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
