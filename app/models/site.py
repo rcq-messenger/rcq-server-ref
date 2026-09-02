@@ -56,6 +56,12 @@ class Site(Base):
     #: One line the catalogue shows. Not the page title: the author writes it
     #: for the list, and it is public.
     title: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    #: Show WHO published this in the public catalogue. Opt-in, and off by
+    #: default (2026-09-02, founder): the island knows the owner because it
+    #: must, but publishing a page is not a decision to publish the number
+    #: that receives your messages. The operator still sees it - they answer
+    #: for what their island hosts - and `/admin/sites` is where that lives.
+    show_owner: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     #: In the catalogue. Opt-in, and the operator's to withdraw: a site that
     #: is not listed still opens by its exact name, which is the point of a
     #: catalogue being a shop window rather than a permission to exist.
