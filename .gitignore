@@ -40,6 +40,8 @@ evidence/
 *.p8
 
 # The island's own certificate (fingerprint mode). The key IS the island's
-# identity to every user; certs/.gitkeep keeps the directory for the mount.
-certs/*.key
-certs/*.crt
+# identity to every user, and a rotation moves the old pair aside under
+# whatever name (island.key.old, a dated copy): everything in certs/ stays
+# out, and only the .gitkeep that holds the directory for the mount is in.
+certs/*
+!certs/.gitkeep
