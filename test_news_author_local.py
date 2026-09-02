@@ -25,7 +25,11 @@ island calls itself, resolved at publish time through the same chain
     post read as a guest post. ⚠ The column is as wide as the setting (2048);
     the width bump for a Postgres island that created it at 64 is in
     app/core/db.py's widened-columns list, and SQLite enforces no width, so
-    this test pins only that the router no longer cuts.
+    this test pins only that the router no longer cuts;
+  * rows signed under 2026.09.02.3, which cut the name to 64, are rewritten
+    to the whole name at the next boot (init_db), keyed on the island's
+    CURRENT name: a guest label of other characters, and a row cut under a
+    name the island has since dropped, stay as they are.
 
 In-process ASGI against a throwaway SQLite DB, Redis db 15 for the realtime
 nudge a publish sends (falls back to local fan-out if Redis is down). NOT
@@ -180,6 +184,47 @@ async def main() -> None:
         by_id = {it["id"]: it for it in feed.get("items", [])}
         check("readers get the whole name too",
               by_id.get(p_long.get("id"), {}).get("author_label") == long_name)
+
+        print("\nrows signed under the release that cut the name")
+        # 2026.09.02.3 wrote name[:64] into the row, in Python, so on SQLite
+        # too. Plant one such row the way it did, beside a guest label of 64
+        # other characters, then run init_db again: that is what the upgrade
+        # does at boot, and the widening alone leaves the rows as they were.
+        from app.core.db import SessionLocal as _SessionLocal
+        from app.models.news import NewsPost as _NewsPost
+
+        async def plant(label: str, body: str) -> int:
+            async with _SessionLocal() as s:
+                row = _NewsPost(body=body, author_label=label)
+                s.add(row)
+                await s.flush()
+                rid = row.id
+                await s.commit()
+            return rid
+
+        cut_id = await plant(long_name[:64], "signed under 2026.09.02.3")
+        guest_id = await plant("g" * 64, "a guest with a 64-character label")
+        await init_db()
+        feed = (await c.get("/news")).json()
+        by_id = {it["id"]: it for it in feed.get("items", [])}
+        check("*** the cut signature is the whole name after the next boot",
+              by_id.get(cut_id, {}).get("author_label") == long_name,
+              str(by_id.get(cut_id, {}).get("author_label"))[:80])
+        check("a guest label of 64 other characters is left alone",
+              by_id.get(guest_id, {}).get("author_label") == "g" * 64)
+        check("a post signed whole is untouched",
+              by_id.get(p_long.get("id"), {}).get("author_label") == long_name)
+        # Keyed on the CURRENT name: a row cut under a name the island has
+        # since dropped is a label nothing can tell from a guest's, and stays.
+        await rename(c, "Ostrov " + "y" * 100)
+        stale_id = await plant(long_name[:64], "cut under the old name")
+        await init_db()
+        feed = (await c.get("/news")).json()
+        by_id = {it["id"]: it for it in feed.get("items", [])}
+        check("a row cut under a name since dropped stays as it is",
+              by_id.get(stale_id, {}).get("author_label") == long_name[:64])
+        check("...and the one fixed under that name keeps the whole old name",
+              by_id.get(cut_id, {}).get("author_label") == long_name)
 
     await close_redis()
     print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILED'}")
