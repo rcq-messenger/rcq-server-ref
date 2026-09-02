@@ -236,9 +236,10 @@ To enable:
    blog, generic SaaS landing, or anything that doesn't look like RCQ.
 
 3. Point the caddy service at the masquerade config and mount the
-   decoy directory (in `docker-compose.yml`; the Caddyfile line can also
-   be `RCQ_CADDYFILE=./deploy/Caddyfile.masquerade.compose` in `.env`,
-   leaving `docker-compose.yml` untouched):
+   decoy directory, both in `docker-compose.yml`. (`RCQ_CADDYFILE=./deploy/Caddyfile.masquerade.compose`
+   in `.env` covers the Caddyfile line alone; the decoy mount has no `.env`
+   switch, and without it every untokened request gets Caddy's bare 404
+   instead of the decoy page, so the compose edit happens either way.)
 
    ```yaml
    caddy:
