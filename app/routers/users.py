@@ -972,6 +972,17 @@ async def update_me(
     )
 
 
+# What a push address may be, and it is the INDEX that decides: `token` is
+# indexed and carries the (uin, token) unique constraint, so the value has to
+# stay inside a btree entry (models/device_token.py). Refused here rather than
+# by the database, because the database's answer is a 500 and a client that
+# retries it on every launch for ever — which is exactly what one person's
+# 344-character UnifiedPush endpoint did from 2026-09-01 until the column was
+# widened. Well above any real endpoint; a value over it is a broken
+# distributor, and it deserves to be told so.
+MAX_PUSH_TOKEN_LEN = 1024
+
+
 class PushTokenIn(BaseModel):
     token: str
     platform: str = "ios"  # "ios" | "ios-voip"
@@ -999,6 +1010,11 @@ async def register_push_token(
     up and never retries)."""
     if not body.token.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty token")
+    if len(body.token) > MAX_PUSH_TOKEN_LEN:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {"code": "token_too_long", "max": MAX_PUSH_TOKEN_LEN, "got": len(body.token)},
+        )
     now = datetime.now(timezone.utc)
     device_id = (body.device_id or "").strip() or None
     # Upsert on the existing (uin, token) constraint either way — an app
