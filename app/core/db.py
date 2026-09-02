@@ -476,6 +476,19 @@ async def init_db() -> None:
         ]:
             async with engine.begin() as conn:
                 try:
+                    # ⚠⚠ A widening that ACTUALLY changes the type poisons the
+                    # connection pool: Postgres invalidates the cached plans of
+                    # every server connection that has read this table, and the
+                    # managed pooler hands those same connections back, so the
+                    # next reader gets InvalidCachedStatementError rather than a
+                    # row. Seen on 2026-09-02 with this very entry: /news, which
+                    # every client polls at boot, answered 500 to roughly one
+                    # request in twelve for five minutes after the deploy, and
+                    # restarting the app did NOT clear it. The cure is to
+                    # terminate the database's backends from a DIRECT (unpooled)
+                    # connection, which forces the pooler to open fresh ones.
+                    # Do that as part of any deploy that changes a column type.
+                    #
                     # ⚠ Widening is metadata-only, but the statement still takes
                     # ACCESS EXCLUSIVE, and a lock request queues AHEAD of every
                     # reader behind it. Four workers run this on every boot, so
