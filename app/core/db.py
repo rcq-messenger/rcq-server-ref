@@ -473,6 +473,11 @@ async def init_db() -> None:
         for table, col, new_type in [
             ("groups", "pinned_text", "VARCHAR(4096)"),
             ("news_posts", "author_label", "VARCHAR(2048)"),
+            # The push address, 255 -> 1024: the column was sized for an APNs
+            # hex token and then quietly became the home of a UnifiedPush
+            # endpoint URL that somebody else's distributor generates. See
+            # models/device_token.py for why 1024 and not more.
+            ("device_tokens", "token", "VARCHAR(1024)"),
         ]:
             async with engine.begin() as conn:
                 try:

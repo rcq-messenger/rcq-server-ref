@@ -27,9 +27,26 @@ class DeviceToken(Base):
         BigInteger, ForeignKey("users.uin", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    # Hex-encoded APNs device token (64 chars for original APNs format,
-    # variable length post-iOS 13). We don't reformat — store what iOS sent.
-    token: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # What to push to. On iOS a hex APNs device token (64 characters in the
+    # original format, variable since iOS 13); on Android the whole
+    # UnifiedPush ENDPOINT URL, because with UnifiedPush there is no gateway
+    # and the URL the distributor handed the app IS the address
+    # (services/unifiedpush.py). We store what the client sent, unaltered.
+    #
+    # ⚠⚠ 255 was the APNs number and it silently became the ceiling for a URL
+    # somebody else generates. Conversations' distributor mints 344-character
+    # endpoints (`up.conversations.im/push/v2.local.<paseto>`), so from
+    # 2026-09-01 one user's registration answered 500 on every launch, 342
+    # times a day, and their push simply did not work: Postgres refused the
+    # row, and nothing on either side could say why.
+    #
+    # 1024 is chosen against the INDEX, not against the URL. This column is
+    # indexed and carries the `(uin, token)` unique constraint, and a btree
+    # entry has a hard ceiling near 2700 bytes; 1024 characters cannot exceed
+    # it even if every one of them takes two bytes. The endpoint is refused
+    # above that at the API boundary (routers/users.py) so the answer is a
+    # 400 that names the problem rather than a 500 the client retries for ever.
+    token: Mapped[str] = mapped_column(String(1024), nullable=False, index=True)
     # "ios" | "ios-voip" — VoIP tokens are a separate registration via
     # PushKit and route to a different endpoint. Distinguished here so the
     # APNs sender knows which kind to use.
