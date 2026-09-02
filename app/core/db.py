@@ -221,6 +221,15 @@ _GOSSIP_RECORD_COLUMNS: list[tuple[str, str]] = [
     ("touched_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
+# Additive on `sites`. ⚠ Naming the owner in the PUBLIC catalogue became
+# opt-in on 2026-09-02, and an existing island's rows have to default to the
+# private answer: `create_all` never touches a table that already exists, so
+# without this line the catalogue selects a column that is not there and every
+# read of it is a 500.
+_SITE_COLUMNS: list[tuple[str, str]] = [
+    ("show_owner", "BOOLEAN NOT NULL DEFAULT FALSE"),
+]
+
 # Additive on `groups`. Pre-existing rows default to free + everyone-
 # can-post, matching pre-feature behaviour. Avatar columns nullable —
 # legacy groups keep rendering the generic placeholder.
@@ -400,6 +409,7 @@ async def init_db() -> None:
         ("broker_relays", _BROKER_RELAY_COLUMNS),
         ("contact_requests", _CONTACT_REQUEST_COLUMNS),
         ("gossip_records", _GOSSIP_RECORD_COLUMNS),
+        ("sites", _SITE_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:

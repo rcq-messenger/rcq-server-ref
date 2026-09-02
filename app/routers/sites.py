@@ -100,11 +100,16 @@ def _safe_rel(path: str) -> str:
 
 class SiteOut(BaseModel):
     name: str
-    owner_uin: int
+    #: ⚠ None in the PUBLIC catalogue unless the owner asked to be named
+    #: (`show_owner`). Publishing a page is not a decision to publish the
+    #: number that receives your messages. `/admin/sites` always carries it:
+    #: the operator answers for what their island hosts.
+    owner_uin: int | None
     version: int
     title: str | None
     size_bytes: int
     listed: bool
+    show_owner: bool = False
     frozen: bool
     updated_at: datetime
 
@@ -134,7 +139,8 @@ async def my_sites(
     ).scalars().all()
     return [
         SiteOut(name=s.name, owner_uin=s.owner_uin, version=s.version, title=s.title,
-                size_bytes=s.size_bytes, listed=s.listed, frozen=s.frozen, updated_at=s.updated_at)
+                size_bytes=s.size_bytes, listed=s.listed, show_owner=s.show_owner,
+                frozen=s.frozen, updated_at=s.updated_at)
         for s in rows
     ]
 
@@ -228,6 +234,7 @@ async def put_site(
     owner_key: str = Form(...),
     title: str | None = Form(None),
     listed: bool = Form(False),
+    show_owner: bool = Form(False),
     files: list[UploadFile] = File(...),
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -326,7 +333,7 @@ async def put_site(
         site = Site(
             name=lower, owner_uin=me, owner_key=owner_key, version=expected_version,
             manifest=manifest, size_bytes=total, title=title, listed=bool(listed),
-            created_at=now, updated_at=now,
+            show_owner=bool(show_owner), created_at=now, updated_at=now,
         )
         db.add(site)
     else:
@@ -336,12 +343,14 @@ async def put_site(
         site.size_bytes = total
         site.title = title
         site.listed = bool(listed)
+        site.show_owner = bool(show_owner)
         site.updated_at = now
     await db.commit()
     await db.refresh(site)
     return SiteOut(
         name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
-        size_bytes=site.size_bytes, listed=site.listed, frozen=site.frozen, updated_at=site.updated_at,
+        size_bytes=site.size_bytes, listed=site.listed, show_owner=site.show_owner,
+        frozen=site.frozen, updated_at=site.updated_at,
     )
 
 
@@ -359,8 +368,10 @@ async def catalogue(db: AsyncSession = Depends(get_db)) -> list[SiteOut]:
         )
     ).scalars().all()
     return [
-        SiteOut(name=s.name, owner_uin=s.owner_uin, version=s.version, title=s.title,
-                size_bytes=s.size_bytes, listed=s.listed, frozen=s.frozen, updated_at=s.updated_at)
+        SiteOut(name=s.name, owner_uin=s.owner_uin if s.show_owner else None,
+                version=s.version, title=s.title, size_bytes=s.size_bytes,
+                listed=s.listed, show_owner=s.show_owner, frozen=s.frozen,
+                updated_at=s.updated_at)
         for s in rows
     ]
 
@@ -392,7 +403,8 @@ async def admin_list(db: AsyncSession = Depends(get_db)) -> list[SiteOut]:
     rows = (await db.execute(select(Site).order_by(Site.updated_at.desc()))).scalars().all()
     return [
         SiteOut(name=s.name, owner_uin=s.owner_uin, version=s.version, title=s.title,
-                size_bytes=s.size_bytes, listed=s.listed, frozen=s.frozen, updated_at=s.updated_at)
+                size_bytes=s.size_bytes, listed=s.listed, show_owner=s.show_owner,
+                frozen=s.frozen, updated_at=s.updated_at)
         for s in rows
     ]
 
@@ -412,8 +424,8 @@ async def admin_freeze(name: str, frozen: bool = True, db: AsyncSession = Depend
     await db.commit()
     await db.refresh(site)
     return SiteOut(name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
-                   size_bytes=site.size_bytes, listed=site.listed, frozen=site.frozen,
-                   updated_at=site.updated_at)
+                   size_bytes=site.size_bytes, listed=site.listed, show_owner=site.show_owner,
+                   frozen=site.frozen, updated_at=site.updated_at)
 
 
 @admin_router.post("/{name}/listed", response_model=SiteOut)
@@ -436,5 +448,5 @@ async def admin_listed(name: str, listed: bool, db: AsyncSession = Depends(get_d
     await db.commit()
     await db.refresh(site)
     return SiteOut(name=site.name, owner_uin=site.owner_uin, version=site.version, title=site.title,
-                   size_bytes=site.size_bytes, listed=site.listed, frozen=site.frozen,
-                   updated_at=site.updated_at)
+                   size_bytes=site.size_bytes, listed=site.listed, show_owner=site.show_owner,
+                   frozen=site.frozen, updated_at=site.updated_at)
