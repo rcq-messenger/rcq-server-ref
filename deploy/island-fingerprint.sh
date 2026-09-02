@@ -21,8 +21,21 @@ env_value() {
     grep -E "^$1=" .env 2>/dev/null | cut -d= -f2- | cut -d, -f1 | tr -d ' ' || true
 }
 
+# An IPv4 dotted quad or an IPv6 literal, brackets or not. Two colons at
+# least for IPv6: `island.example:8443` has one and is a name with a port.
+is_ipv6_literal() {
+    local a="${1#\[}"; a="${a%\]}"
+    [[ "$a" == *:*:* ]] && [[ "$a" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
 is_ip_literal() {
-    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$1" == *:* ]]
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || is_ipv6_literal "$1"
+}
+
+# The address as it goes into a URL, after -connect, and into the line users
+# type: an IPv6 literal in brackets (the apps key their trust on
+# `[2001:db8::1]`, brackets included), everything else as it is.
+url_host() {
+    if is_ipv6_literal "$1" && [[ "$1" != \[* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
 }
 
 # openssl's `sha256 Fingerprint=AB:CD:…` to the canonical form the apps store
@@ -71,7 +84,7 @@ echo "SHA-256 fingerprint, as the apps show it:"
 fingerprint_display "$FP" | sed 's/^/    /'
 echo
 echo "Canonical form:  $FP"
-echo "Give your users: $ADDRESS#$FP"
+echo "Give your users: $(url_host "$ADDRESS")#$FP"
 echo
 
 # What the wire presents, the way a client sees it: SNI for a name, none for
@@ -80,17 +93,17 @@ SNI=()
 is_ip_literal "$ADDRESS" || SNI=(-servername "$ADDRESS")
 T=()
 command -v timeout >/dev/null 2>&1 && T=(timeout 10)
-LIVE=$(${T[@]+"${T[@]}"} openssl s_client -connect "$ADDRESS:443" ${SNI[@]+"${SNI[@]}"} </dev/null 2>/dev/null \
+LIVE=$(${T[@]+"${T[@]}"} openssl s_client -connect "$(url_host "$ADDRESS"):443" ${SNI[@]+"${SNI[@]}"} </dev/null 2>/dev/null \
     | openssl x509 -noout -fingerprint -sha256 2>/dev/null | canonical || true)
 
 if [ -z "$LIVE" ]; then
-    echo "Could not reach https://$ADDRESS from here to compare (not up yet, or this box"
+    echo "Could not reach https://$(url_host "$ADDRESS") from here to compare (not up yet, or this box"
     echo "cannot dial its own public address). Users see whatever the wire presents:"
-    echo "    openssl s_client -connect $ADDRESS:443 </dev/null | openssl x509 -noout -fingerprint -sha256"
+    echo "    openssl s_client -connect $(url_host "$ADDRESS"):443 </dev/null | openssl x509 -noout -fingerprint -sha256"
 elif [ "$LIVE" = "$FP" ]; then
-    echo "Live check: https://$ADDRESS presents this certificate."
+    echo "Live check: https://$(url_host "$ADDRESS") presents this certificate."
 else
-    echo "⚠ Live check: https://$ADDRESS presents a DIFFERENT certificate:"
+    echo "⚠ Live check: https://$(url_host "$ADDRESS") presents a DIFFERENT certificate:"
     echo "    $LIVE"
     echo "  Caddy is still serving the old file. Restart it: docker compose restart caddy"
     exit 1
