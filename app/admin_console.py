@@ -6,8 +6,8 @@ This is the SELF-HOST counterpart to the managed `console.rcq.app` /
 `https://<their-server>/admin/console`, the browser prompts for the
 `ADMIN_USERNAME` / `ADMIN_PASSWORD` they set in `.env`, and they manage
 their own server — UIN reservations (vanity numbers), invites, users,
-reports, stats, and a Server/federation info panel — with zero dependency
-on our infrastructure.
+reports, the `.rcq` sites it hosts, stats, and a Server/federation info
+panel — with zero dependency on our infrastructure.
 
 Vanilla JS, no build step, single file. Calls the existing /admin API; the
 browser replays the Basic credentials it already prompted for. The page is
@@ -103,6 +103,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .btn.danger { background:var(--bg); border:1px solid var(--line); color:var(--red); }
   .btn.danger:hover { background:var(--red-soft); border-color:var(--red); }
   .btn.sm { padding:6px 11px; font-size:12.5px; }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
   /* features tab rows */
   .frow { display:flex; align-items:flex-start; gap:14px; padding:12px 0; border-top:1px solid var(--line-2); }
   .frow.first { border-top:none; padding-top:2px; }
@@ -314,6 +315,16 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       </div>
     </section>
 
+    <!-- SITES (.rcq bundles this island hosts) -->
+    <section class="view" id="v-sites">
+      <div class="head"><div><h1>Sites</h1><p>The <b>.rcq</b> pages this island hosts — the one kind of content here you can actually read, because it is public by definition. <b>List / Unlist</b> is the shop window: a listed site shows in the catalogue on the front page of every browser on this island, an unlisted one still opens by its exact name. <b>Feature</b> pins a listed site to the top of that catalogue, in its own section above recents — the network's own <span class="mono">home.rcq</span> is what it is for. <b>Freeze</b> is the hold for a complaint: reads answer “frozen”, uploads are refused, nothing is deleted, and it is reversible.</p></div></div>
+      <div class="card pad">
+        <p class="sub" id="sites-summary" style="margin:0 0 8px"></p>
+        <table><thead><tr><th>Site</th><th>Catalogue line</th><th>Owner</th><th>Size</th><th>State</th><th>Updated</th><th></th></tr></thead>
+          <tbody id="sites"></tbody></table>
+      </div>
+    </section>
+
     <!-- RELAYS (community circumvention pool) -->
     <section class="view" id="v-relays">
       <div class="head"><div><h1>Relays</h1><p>Advanced — only relevant if someone runs censorship-circumvention relays for <b>your</b> island. This lists relays registered with <b>your own</b> server’s broker (never another island’s). Most operators can ignore this tab; it stays empty until a relay self-registers.</p></div></div>
@@ -371,6 +382,7 @@ const NAV = [
   ['users','Users','M8 11a3 3 0 100-6 3 3 0 000 6zM2 20c0-3 3-5 6-5s6 2 6 5M16 7a3 3 0 110 6'],
   ['reports','Reports','M12 3l9 16H3zM12 10v4M12 17v.5','reports-badge'],
   ['news','News','M4 6h16v12H4zM4 6l8 6 8-6'],
+  ['sites','Sites','M4 5h16v14H4zM4 9h16M8 9v10'],
   ['relays','Relays','M12 20v-7M8.5 13a5 5 0 017 0M6 10.5a9 9 0 0112 0'],
   ['features','Features','M4 6h16M4 12h16M4 18h16M8 6v0M16 12v0M10 18v0'],
   ['server','Server','M4 5h16v5H4zM4 14h16v5H4zM7 7.5h.5M7 16.5h.5'],
@@ -389,6 +401,7 @@ function go(v) {
   if (v==='access') loadAccess();
   if (v==='reports') loadReports();
   if (v==='news') loadNews();
+  if (v==='sites') loadSites();
   if (v==='relays') loadRelays();
   if (v==='features') loadFeatures();
   if (v==='server') loadServer();
@@ -753,6 +766,41 @@ async function publishNews() {
 }
 async function deleteNews(id){ if(!confirm('Delete this announcement?'))return; try{ await api('DELETE','/news/'+id); loadNews(); }catch(e){ alert(e.message); } }
 
+/* ---- sites (.rcq bundles; the only bytes on the island an operator can read) ---- */
+async function loadSites() {
+  try {
+    const rows = (await api('GET','/sites'))||[];
+    const listed = rows.filter(s=>s.listed&&!s.frozen).length;
+    const featured = rows.filter(s=>s.featured).length;
+    $('sites-summary').innerHTML = rows.length
+      ? `<b>${rows.length}</b> hosted · <b>${listed}</b> in the catalogue · <b>${featured}</b> featured` : '';
+    $('sites').innerHTML = rows.length ? rows.map(s=>{
+      const n = escAttr(s.name);
+      const state = s.frozen ? '<span class="pill red">frozen</span>'
+        : s.listed ? '<span class="pill green">in catalogue</span>'+(s.featured?' <span class="pill vanity">featured</span>':'')
+        : '<span class="pill">by name only</span>';
+      /* Feature needs a listed site: the island answers 409 otherwise, and
+         listing an owner's unlisted site is a decision of its own (the List
+         button), never something Feature does on the side. */
+      const canFeature = s.listed && !s.frozen;
+      return `<tr>
+      <td class="mono"><a href="/sites/${encodeURIComponent(s.name)}/index.html" target="_blank" rel="noopener">${n}.rcq</a></td>
+      <td>${s.title?escAttr(s.title):'<span style="color:var(--dim)">—</span>'}</td>
+      <td class="mono">#${s.owner_uin}</td>
+      <td class="mono" style="color:var(--dim)">${fmtBytes(s.size_bytes||0)}</td>
+      <td>${state}</td>
+      <td class="mono" style="color:var(--dim)">${timeago(s.updated_at)}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn ghost sm" ${s.frozen?'disabled title="A frozen site is out of the catalogue already"':''} onclick="siteListed('${n}',${!s.listed})">${s.listed?'Unlist':'List'}</button>
+        <button class="btn ghost sm" ${canFeature?'':'disabled title="Only a site in the catalogue can be featured"'} onclick="siteFeatured('${n}',${!s.featured})">${s.featured?'Unfeature':'Feature'}</button>
+        <button class="btn danger sm" onclick="siteFrozen('${n}',${!s.frozen})">${s.frozen?'Unfreeze':'Freeze'}</button>
+      </td></tr>`;}).join('') : '<tr><td colspan="7" class="empty">Nobody has published a site here yet.</td></tr>';
+  } catch(e){ $('sites').innerHTML='<tr><td colspan="7" class="err">'+e.message+'</td></tr>'; }
+}
+async function siteListed(name, on){ try{ await api('POST','/sites/'+encodeURIComponent(name)+'/listed?listed='+on); loadSites(); }catch(e){ alert(e.message); } }
+async function siteFeatured(name, on){ try{ await api('POST','/sites/'+encodeURIComponent(name)+'/featured',{featured:on}); loadSites(); }catch(e){ alert(e.message); } }
+async function siteFrozen(name, on){ if(on&&!confirm('Freeze '+name+'.rcq? Readers get “frozen”, uploads are refused; nothing is deleted.'))return; try{ await api('POST','/sites/'+encodeURIComponent(name)+'/freeze?frozen='+on); loadSites(); }catch(e){ alert(e.message); } }
+
 /* ---- relays (broker pool — lives under /broker/admin, not /admin) ---- */
 async function rawApi(method, path, body) {
   if (MOCK) return mock(method, path, body);
@@ -1036,7 +1084,25 @@ let MOCK_SETTINGS = [
   {key:'welcome_text',type:'str',group:'branding',label:'Welcome / rules',help:'Optional welcome or rules text shown in the app.',value:'',default:'',overridden:false,min:null,max:null,choices:null},
 ];
 
+const MOCK_SITES = [
+  {name:'home', owner_uin:1000, version:4, title:'What this network is', size_bytes:18432, listed:true, show_owner:true, featured:true, frozen:false, updated_at:new Date(Date.now()-7200e3).toISOString()},
+  {name:'blog', owner_uin:524060806, version:2, title:'dev notes', size_bytes:5120, listed:true, show_owner:false, featured:false, frozen:false, updated_at:new Date(Date.now()-600e3).toISOString()},
+  {name:'drafts', owner_uin:710335446, version:1, title:null, size_bytes:2048, listed:false, show_owner:false, featured:false, frozen:false, updated_at:new Date(Date.now()-86400e3).toISOString()},
+  {name:'spam', owner_uin:901003980, version:1, title:'cheap pills', size_bytes:900, listed:false, show_owner:false, featured:false, frozen:true, updated_at:new Date(Date.now()-3*86400e3).toISOString()},
+];
 function mock(method, path, body) {
+  if (path==='/sites') return MOCK_SITES;
+  if (path.startsWith('/sites/') && method==='POST') {
+    /* No backslashes: this JS lives inside a plain Python string. */
+    const m = path.match(/^[/]sites[/]([^/]+)[/](listed|freeze|featured)(?:[?][a-z]+=(true|false))?$/);
+    const s = m && MOCK_SITES.find(x=>x.name===decodeURIComponent(m[1]));
+    if (!s) throw new Error('no_site');
+    const on = body ? !!body.featured : m[3]==='true';
+    if (m[2]==='freeze') { s.frozen=on; if(on){ s.listed=false; s.featured=false; } }
+    if (m[2]==='listed') { if(on&&s.frozen) throw new Error('frozen'); s.listed=on; if(!on) s.featured=false; }
+    if (m[2]==='featured') { if(on&&s.frozen) throw new Error('frozen'); if(on&&!s.listed) throw new Error('not_listed'); s.featured=on; }
+    return s;
+  }
   if (path==='/settings') {
     if (method==='PATCH' && body) Object.keys(body).forEach(k=>{ const s=MOCK_SETTINGS.find(x=>x.key===k); if(s){ s.value=body[k]; s.overridden=true; } });
     return { settings: MOCK_SETTINGS };
