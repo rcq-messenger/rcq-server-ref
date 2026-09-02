@@ -59,8 +59,9 @@
 #   6. In fingerprint mode prints the fingerprint and the
 #      `address#fingerprint` line to hand to your users FIRST, then waits
 #      up to 60 seconds for Caddy to serve that certificate and for /health
-#      to answer 200 through it. In CA mode waits the same way for the
-#      Let's Encrypt certificate and /health.
+#      to answer 200 through it; an address that answers with a different
+#      certificate is a stop, not a wait. In CA mode waits the same way for
+#      the Let's Encrypt certificate and /health.
 #   7. Prints next-step instructions for wiring an iOS client at it
 #      + ops cheat-sheet (logs / restart / update / APNs).
 #
@@ -137,8 +138,14 @@ is_ipv6_literal() {
     local a="${1#\[}"; a="${a%\]}"
     [[ "$a" == *:*:* ]] && [[ "$a" =~ ^[0-9A-Fa-f:.]+$ ]]
 }
+# The shape, and then whether it is an address at all: `203.0.113.300` has
+# the shape, went into the SAN, and openssl's refusal came back as "OpenSSL
+# 3 is required". python3 is installed before the first call (Required
+# tooling), and ipaddress refuses exactly what openssl refuses.
 is_ip_literal() {
-    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || is_ipv6_literal "$1"
+    local a="${1#\[}"; a="${a%\]}"
+    { [[ "$a" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || is_ipv6_literal "$a"; } \
+        && python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$a" 2>/dev/null
 }
 
 # The address as it goes into a URL, after -connect, and into the line users
@@ -148,10 +155,18 @@ url_host() {
     if is_ipv6_literal "$1" && [[ "$1" != \[* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
 }
 
-# Brackets off, lowercase: one spelling for the SAN, .env and the dig compare.
+# Brackets off, lowercase, and an IPv6 literal compressed: one spelling for
+# the SAN, .env, the dig compare and the line users type. dig prints AAAA
+# records compressed, so `2001:0db8::1` typed as RCQ_ADDRESS never matched
+# the name's record and was handed out as typed, and the apps key their
+# trust on the address as typed: `[2001:0db8::1]` and `[2001:db8::1]` were
+# two islands. Anything ipaddress does not parse (a name, a typo) comes back
+# as it is, for check_island_ip to judge.
 normalise_ip() {
     local a="${1#\[}"; a="${a%\]}"
-    printf '%s' "$a" | tr -d ' ' | tr '[:upper:]' '[:lower:]'
+    a=$(printf '%s' "$a" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+    python3 -c 'import ipaddress, sys; print(ipaddress.ip_address(sys.argv[1]).compressed)' "$a" 2>/dev/null \
+        || printf '%s' "$a"
 }
 
 # RFC 1918, CGNAT (100.64/10), link-local and loopback, and the IPv6 kin
@@ -188,10 +203,15 @@ detect_public_ip() {
 # (the box dials it fine, the health check passes), and the first to notice
 # would be a user with an address that goes nowhere. RCQ_FORCE says the
 # LAN or the VPN is the point. Not a name either: a name goes in RCQ_DOMAIN
-# and lands in the SAN as one.
+# and lands in the SAN as one. And not the unspecified address, which no
+# lookup returns but a hand can type: nothing dials 0.0.0.0, with RCQ_FORCE
+# or without, and openssl issues for it without a word.
 check_island_ip() {
     local ip="$1"
     is_ip_literal "$ip" || fail "Not an IP address: $ip. RCQ_ADDRESS takes this host's public IP; a name goes in RCQ_DOMAIN."
+    case "$ip" in
+        0.0.0.0|::) fail "$ip is the unspecified address: nothing can dial it, so there is nothing to issue for. RCQ_ADDRESS takes this host's public IP." ;;
+    esac
     is_private_ip "$ip" || return 0
     warn "$ip is a private address (RFC 1918, CGNAT, link-local or loopback): nobody outside this network can dial it."
     [ -n "${RCQ_FORCE:-}" ] || fail "Refusing to issue the island's certificate for $ip. Pass the public address as RCQ_ADDRESS=<ip>, or RCQ_FORCE=1 if this island is meant to live on a LAN or a VPN and $ip is what its users dial."
@@ -224,16 +244,23 @@ resolves_to() {
 #
 # (DNS:<name> in the SAN instead of, or as well as, IP:<ip> for a name.)
 issue_island_cert() {
-    local address="$1" ip="$2" san
+    local address="$1" ip="$2" san err
     if is_ip_literal "$address"; then san="IP:$address"; else san="DNS:$address"; fi
     if [ -n "$ip" ] && [ "$ip" != "$address" ]; then san="$san,IP:$ip"; fi
     mkdir -p certs
-    (
+    # openssl's own words on failure, not a fixed hint: they name the value
+    # it refused (`bad ip address ... value=203.0.113.300`), where the hint
+    # sent an operator with a typo in RCQ_ADDRESS off to upgrade OpenSSL.
+    if ! err=$(
         umask 077
-        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out certs/island.key 2>/dev/null
-        openssl req -new -x509 -key certs/island.key -sha256 -days 3650 \
-            -subj "/CN=$address" -addext "subjectAltName=$san" -out certs/island.crt 2>/dev/null
-    ) || fail "openssl could not issue the island certificate (OpenSSL 3 is required for -addext)."
+        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out certs/island.key 2>&1 \
+        && openssl req -new -x509 -key certs/island.key -sha256 -days 3650 \
+            -subj "/CN=$address" -addext "subjectAltName=$san" -out certs/island.crt 2>&1
+    ); then
+        err=$(printf '%s' "$err" | tr '\n' ' ')
+        case "$err" in *[Uu]nknown\ option*) err="$err (the -addext option needs OpenSSL 3)" ;; esac
+        fail "openssl could not issue the island certificate for $san: ${err:-no output}"
+    fi
     chmod 600 certs/island.key certs/island.crt
 }
 
@@ -275,11 +302,26 @@ presented_fingerprint() {
 # app answers /health through it, with curl trusting that file and nothing
 # else. --connect-to keeps the URL, and with it the name check, on the
 # address while the socket goes to $2.
+#
+# Three answers, not two. 0: live. 2: nothing answered at $2, or the app is
+# not up behind it yet; worth another round, and loopback is a fair second
+# try. 1: the wire at $2 presented a DIFFERENT certificate, left in
+# PRESENTED_FP. Waiting never fixes that one: whoever answers there is not
+# this Caddy (RCQ_ADDRESS typed as a neighbour's IP, a port forward that
+# lands elsewhere, something terminating TLS in front), or it is this Caddy
+# still serving an old file. ⚠ Folded into "not yet" it let the loopback
+# probe pass, and the installer called an island live on an address whose
+# wire is somebody else's, right after handing that address out.
+# deploy/island-fingerprint.sh calls the same wire a different certificate
+# and stops; so does the installer now.
+PRESENTED_FP=""
 probe_island() {
     local address="$1" via="$2" fp="$3"
-    [ "$(presented_fingerprint "$address" "$via")" = "$fp" ] || return 1
+    PRESENTED_FP=$(presented_fingerprint "$address" "$via")
+    [ -n "$PRESENTED_FP" ] || return 2
+    [ "$PRESENTED_FP" = "$fp" ] || return 1
     curl -fsS -m 5 --cacert certs/island.crt --connect-to "::$(url_host "$via"):443" \
-        "https://$(url_host "$address")/health" >/dev/null 2>&1
+        "https://$(url_host "$address")/health" >/dev/null 2>&1 || return 2
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -540,15 +582,46 @@ if [ "$TLS_MODE_VAL" = "fingerprint" ]; then
     VIA+=(127.0.0.1)
     SNI_HINT=""
     is_ip_literal "$DOMAIN_VAL" || SNI_HINT=" -servername $DOMAIN_VAL"
-    LIVE_VIA=""
+    LIVE_VIA=""; FOREIGN_VIA=""; FOREIGN_FP=""
     say "Waiting for Caddy to serve the island certificate (up to 60s)…"
     DEADLINE=$((SECONDS + 60))
     while [ "$SECONDS" -lt "$DEADLINE" ]; do
         sleep 5
         for via in "${VIA[@]}"; do
-            if probe_island "$DOMAIN_VAL" "$via" "$FP"; then LIVE_VIA="$via"; break 2; fi
+            probe_island "$DOMAIN_VAL" "$via" "$FP" && rc=0 || rc=$?
+            case "$rc" in
+                0) LIVE_VIA="$via"; break 2 ;;
+                1) FOREIGN_VIA="$via"; FOREIGN_FP="$PRESENTED_FP"; break 2 ;;
+            esac
+            # Nothing answered at $via: the next one, then another round.
         done
     done
+
+    # A different certificate on the wire is a stop, not a wait, and not a
+    # reason to try loopback: the line above must not go out for an address
+    # whose wire is not this island. Users who typed it would be told the
+    # island is intercepted, or pin the wrong host on first use.
+    if [ -n "$FOREIGN_VIA" ]; then
+        echo
+        warn "https://$(url_host "$FOREIGN_VIA") presents a DIFFERENT certificate than certs/island.crt:"
+        echo "    on the wire:  $FOREIGN_FP"
+        echo "    in the file:  $FP"
+        if [ "$FOREIGN_VIA" = 127.0.0.1 ]; then
+            echo "  Caddy on this box is serving another file. It reads certs/ at start, so after a"
+            echo "  re-issue it needs:  docker compose restart caddy   (docker compose logs caddy says"
+            echo "  which files it loaded)."
+        else
+            echo "  Whatever answers at that address is not this island: RCQ_ADDRESS is not this box's"
+            echo "  public IP, or 443 there is forwarded somewhere else, or something in front of the"
+            echo "  box terminates TLS. Do NOT hand out the line above until that address is this"
+            echo "  island. A wrong address: put the right one in RCQ_DOMAIN in .env, remove"
+            echo "  certs/island.crt and certs/island.key, and re-run install.sh (it issues for the"
+            echo "  corrected address, and nobody holds the old line yet). A forward or a front: fix"
+            echo "  it and re-run."
+        fi
+        echo "  $INSTALL_DIR/deploy/island-fingerprint.sh   # the file against the wire, any time"
+        exit 1
+    fi
 
     if [ -n "$LIVE_VIA" ]; then
         echo
@@ -570,7 +643,7 @@ if [ "$TLS_MODE_VAL" = "fingerprint" ]; then
         exit 0
     fi
 
-    warn "Caddy did not present the island certificate in 60s. The fingerprint above is the file's and stays right; what is not proven is that the wire serves it. Diagnostics:"
+    warn "Nothing answered on 443 in 60s, at $(url_host "${VIA[0]}") or over loopback. The fingerprint above is the file's and stays right; what is not proven is that the wire serves it. Diagnostics:"
     echo "  docker compose logs caddy   # did it load /certs/island.crt and /certs/island.key?"
     echo "  docker compose logs app     # app startup errors"
     echo "  openssl s_client -connect $(url_host "${VIA[0]}"):443$SNI_HINT </dev/null | openssl x509 -noout -fingerprint -sha256"

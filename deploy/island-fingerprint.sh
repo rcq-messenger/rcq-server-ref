@@ -105,6 +105,8 @@ elif [ "$LIVE" = "$FP" ]; then
 else
     echo "⚠ Live check: https://$(url_host "$ADDRESS") presents a DIFFERENT certificate:"
     echo "    $LIVE"
-    echo "  Caddy is still serving the old file. Restart it: docker compose restart caddy"
+    echo "  Caddy is still serving an old file (restart it: docker compose restart caddy),"
+    echo "  or whatever answers at that address is not this box at all. Do not hand out the"
+    echo "  line above until the two agree."
     exit 1
 fi
