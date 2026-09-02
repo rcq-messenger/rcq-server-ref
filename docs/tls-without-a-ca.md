@@ -116,13 +116,18 @@ island in this mode.
 
 ### What it is
 
-`install.sh` asks "Do you have a domain name pointing at this host?" and on
-"no" (or with `RCQ_TLS=fingerprint`, with or without `RCQ_DOMAIN`) it:
+`install.sh` asks "Do you have a domain name pointing at this host?" (on a
+terminal; piped from `curl` it cannot ask and wants `RCQ_TLS=fingerprint` said
+in the environment) and on "no" (or with `RCQ_TLS=fingerprint`, with or without
+`RCQ_DOMAIN`) it:
 
 * issues `certs/island.key` (EC P-256) and `certs/island.crt`, self-signed
   for ten years, with the address in the subject alternative names: the
-  public IP, plus the name when you gave one (`RCQ_PUBLIC_IP` overrides the
-  detected IP on a box behind 1:1 NAT or where the lookup is blocked);
+  public IP, plus the name when you gave one. The IP is what a lookup service
+  sees, or `RCQ_ADDRESS` on a box behind 1:1 NAT or where the lookup is
+  blocked; never the box's own interface address, which on 1:1 NAT is a
+  private one. A private address is refused unless `RCQ_FORCE=1` says a LAN
+  or a VPN is the point;
 * writes `RCQ_TLS_MODE=fingerprint`,
   `RCQ_CADDYFILE=./deploy/Caddyfile.fingerprint.compose` and
   `RCQ_DOMAIN=<address>` to `.env`;
@@ -130,12 +135,17 @@ island in this mode.
   proxy and log masking as the normal file, `auto_https off`, the island's
   own certificate on `:443`, and a `:80` that answers 404 so the port is not
   a door left open;
-* checks that the wire presents exactly that certificate, and prints the
-  fingerprint and the line to hand out:
+* prints the fingerprint and the line to hand out, then checks that the wire
+  presents exactly that certificate:
 
   ```
   Give your users: 203.0.113.5#ab12cd34…
   ```
+
+  With a name whose A-record does not point at the host yet, the line carries
+  the IP (the certificate covers it too) and says to hand out the name form
+  once DNS is live. An IPv6 literal is written in brackets, `[2001:db8::1]#…`,
+  the form the apps key their trust on.
 
 The fingerprint is SHA-256 over the certificate, the same number
 `openssl x509 -noout -fingerprint -sha256 -in certs/island.crt` prints, with

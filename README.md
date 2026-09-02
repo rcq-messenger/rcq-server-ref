@@ -95,22 +95,33 @@ hosted-key tooling), keep an eye on releases.
 
 ## One-line install (recommended)
 
-On a fresh Ubuntu / Debian VPS, as root or via sudo:
+On a fresh Ubuntu / Debian VPS, as root (via sudo: `sudo RCQ_DOMAIN=… bash`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh | RCQ_DOMAIN=rcq.example.com bash
 ```
 
-Asks whether you have a domain. With one: sanity-checks DNS, installs
-Docker if missing, generates a random `JWT_SECRET` + `POSTGRES_PASSWORD`,
-writes `.env`, brings the stack up, waits for the Let's Encrypt cert,
-smoke-tests `/health`, prints the next-step instructions. Without one:
-the same, except the island issues its own certificate and the script
-ends with the fingerprint and the `address#fingerprint` line your users
-type ([`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)).
+Without a domain, the island issues its own certificate and the apps pin
+its fingerprint ([`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)):
 
-If you'd rather inspect first (recommended for any non-throwaway
-box):
+```bash
+curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh | RCQ_TLS=fingerprint bash
+```
+
+Piped in like that the script cannot ask anything (bash is reading the
+script itself from stdin, so a question would be answered by the next
+line of the script), which is why the one-liner takes its answer from
+the environment and stops with that hint when neither is given. With a
+domain: sanity-checks DNS, installs Docker if missing, generates a random
+`JWT_SECRET` + `POSTGRES_PASSWORD`, writes `.env`, brings the stack up,
+waits for the Let's Encrypt cert, smoke-tests `/health`, prints the
+next-step instructions. Without one: the same, except the island issues
+its own certificate and the script prints the fingerprint and the
+`address#fingerprint` line your users type, then checks that the wire
+serves it.
+
+To be asked instead, and to inspect first (recommended for any
+non-throwaway box):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rcq-messenger/rcq-server-ref/main/install.sh -o install.sh
