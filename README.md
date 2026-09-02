@@ -59,8 +59,10 @@ hosted-key tooling), keep an eye on releases.
   "who read what" journal an island should not hold. Set `RCQ_SITES_DIR` to a
   persistent volume, and see the operator's list at `/admin/sites` (freeze
   holds a site while a complaint is looked at; unlist only stops advertising
-  it in the catalogue). `python -m app.tools.publish_site` publishes the
-  island's own pages from the command line.
+  it in the catalogue; feature pins a listed site to the top of the
+  catalogue, and that is the operator's call alone - an owner cannot ask for
+  it). `python -m app.tools.publish_site` publishes the island's own pages
+  from the command line.
 * **Cross-island federation** — your island joins the wider RCQ network by
   address (`uin@host`): home-island records, multihoming (backup islands),
   gossip key/record sync, and cross-island 1:1, media, groups and calls — all

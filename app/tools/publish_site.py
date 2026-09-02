@@ -21,6 +21,11 @@ sign, and the file is generated with 0600.
 
 Run it from the backend root in the server's venv (it needs DATABASE_URL and
 the same RCQ_SITES_DIR the app uses).
+
+⚠ `--listed` is not remembered between runs. A re-publish without it takes the
+site out of the catalogue, and the operator's pin (`featured`) goes with it,
+exactly as on any other unlisting; say `--listed` every time for a site that
+belongs on the front page.
 """
 
 import argparse
@@ -160,6 +165,15 @@ async def main() -> None:
             existing.size_bytes = total
             existing.title = args.title
             existing.listed = bool(args.listed)
+            # The operator's pin does not outlive the listing on this path
+            # either. The API, an unlist and a freeze all take it off, and a
+            # re-publish that forgot --listed is the same withdrawal from the
+            # catalogue. Left in place, the row read "featured" on a site the
+            # catalogue does not carry, neither console could take the pin off
+            # (their button needs a listed site), and the next re-listing put
+            # the site back at the top with no featuring decision behind it.
+            if not existing.listed:
+                existing.featured = False
             existing.updated_at = now
         await db.commit()
 
