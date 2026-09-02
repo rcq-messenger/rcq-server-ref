@@ -247,10 +247,7 @@ its secrets, and neither is in git.
 
 ### Moving to a certificate authority later
 
-Every app applies one rule to every connection: a certificate the platform
-trusts is accepted, and the record for that address becomes "trusted through
-a certificate authority", pinned or not. So once a name points at the host,
-the move is a `.env` edit and a restart:
+Once a name points at the host, the move is a `.env` edit and a restart:
 
 ```ini
 RCQ_DOMAIN=island.example
@@ -261,21 +258,37 @@ RCQ_CADDYFILE=./deploy/Caddyfile.compose
 `docker compose up -d` recreates Caddy on the new file, and Let's Encrypt
 does the rest (answer 1 or 2 included, if you set them up).
 
-What users see depends on what they typed:
+What users see depends on how they added the island, and for the careful
+ones it is not nothing:
 
-* If they added the island by **name** (you ran fingerprint mode with
-  `RCQ_DOMAIN=island.example`, so the name was on the certificate), nothing.
-  The next connection validates through the authority and the pin is
-  replaced silently; there is no notice, because nothing a person could
-  evaluate has happened.
-* If they added it by **IP**, the address itself changes. An app that dials
+* Added by **name, the quick way** (they typed `island.example` and the app
+  pinned what it saw), or trusted from a banner: nothing. The next
+  connection validates through the authority, the record becomes "trusted
+  through a certificate authority", and there is no notice, because nothing
+  a person could evaluate has happened.
+* Added by **name, the careful way** (`island.example#ab12…`, the form this
+  page tells you to hand out): the red banner, once. A typed fingerprint
+  wins over an authority. The person gave the app the island's identity out
+  of band, and nothing that arrives over the network replaces it on its own,
+  an authority's signature included; otherwise anyone able to obtain a
+  certificate the platform trusts for your address could have replaced the
+  typed pin silently, and the careful way would not have been careful. So
+  the banner says the island presented a different fingerprint than the one
+  they entered, the app is offline for the island until they press "Trust
+  the new fingerprint", and from then on the record is the authority's.
+  Announce the move the way a rotation is announced: out of band, and in the
+  island's news while the old certificate is still up, with the day, so the
+  banner is expected rather than read as an interception. Nobody reads the
+  news once their app refuses the connection.
+* Added by **IP**: the address itself changes. An app that dials
   `203.0.113.5` after the switch meets either no certificate or one issued
   for the name; either way the island is refused at the old address until
   they add it again as `island.example`. ⚠ So decide at install time: if
   there is any chance of a domain later, give the installer the name now
   (`RCQ_DOMAIN=island.example RCQ_TLS=fingerprint`) even though nothing signs
   it yet. Users type the name, the certificate carries the name and the IP,
-  and the move later is invisible.
+  and the move later costs one banner for those who typed the fingerprint
+  and nothing for the rest.
 
 The reverse, from an authority back to a private certificate, is a **change**
 on every device that has ever validated the island through an authority, not
