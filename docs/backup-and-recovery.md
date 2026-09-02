@@ -12,9 +12,9 @@ Islands never replicate each other and never talk. This document is about an
 
 ## What an island stores
 
-- **Postgres** (the compose `db` service): users, contacts, group membership,
-  the offline queue (ciphertext, deleted on ACK), reports. The accounts live
-  here; the island's own identity does not (the next two items).
+- **Postgres** (the compose `postgres` service): users, contacts, group
+  membership, the offline queue (ciphertext, deleted on ACK), reports. The
+  accounts live here; the island's own identity does not (the next two items).
 - **`.env`**: `JWT_SECRET` (every session token is signed with it; a new one
   logs every device out), the database password, the TLS mode and the
   address. Not in git, not in Postgres.
@@ -38,37 +38,66 @@ Islands never replicate each other and never talk. This document is about an
 ## Minimum backup (every island, including a $6 droplet)
 
 A nightly `pg_dump` + a media rsync, pushed somewhere off the box (object
-storage, another host). Example cron on the host:
+storage, another host), and a DATED copy of the identity beside them.
+Example cron on the host:
 
 ```sh
+#!/bin/bash
 # /etc/cron.daily/rcq-backup  (chmod +x)
-#!/bin/sh
-set -e
+# pipefail: without it the dump line reports gzip's status, and a pg_dump
+# that fails writes an empty rcq-DATE.sql.gz every night with exit 0.
+set -eo pipefail
 STAMP=$(date +%F)
 DEST=/var/backups/rcq
 mkdir -p "$DEST" && chmod 700 "$DEST"
-# The island's identity and its secrets (0600 on the box; -p keeps it so)
-cp -p /opt/rcq-server/.env "$DEST/env"
-rsync -a --delete /opt/rcq-server/certs/ "$DEST/certs/"
-# DB dump from the compose db container
-docker compose -f /opt/rcq-server/docker-compose.yml exec -T db \
+# The island's identity and its secrets, dated and never pruned. A single
+# mirrored copy is overwritten by the next run: after a re-issued
+# certificate (install.sh issues one when it finds certs/ empty) or a
+# rewritten .env, within a day no copy held the old island.key, the one
+# file nothing regenerates. A few kilobytes each; tar keeps the 0600.
+tar -C /opt/rcq-server -cf "$DEST/identity-$STAMP.tar" .env certs
+chmod 600 "$DEST/identity-$STAMP.tar"
+# DB dump from the compose postgres service
+docker compose -f /opt/rcq-server/docker-compose.yml exec -T postgres \
   pg_dump -U rcq rcq | gzip > "$DEST/rcq-$STAMP.sql.gz"
 # Media (encrypted blobs)
 rsync -a --delete /opt/rcq-server/media/ "$DEST/media/"
 # Keep 14 daily dumps
 ls -1t "$DEST"/rcq-*.sql.gz | tail -n +15 | xargs -r rm -f
 # Then push $DEST off-box, e.g. rclone copy "$DEST" remote:rcq-backups
+# (copy never deletes there, and the dated names never overwrite)
 ```
 
 ⚠ `$DEST` now holds the island's key and secrets. Encrypt it before it leaves
 the box (`rclone` with a crypt remote, or `age`), to a place only you can read.
 
-Restore, in this order: put `.env` and `certs/` back into the checkout FIRST,
-before `install.sh` or `docker compose up` run (`install.sh` writes a fresh
-`.env` when it finds none, and on a fingerprint island issues a new
-certificate when it finds none, which is the rotation above). Then
-`gunzip -c rcq-YYYY-MM-DD.sql.gz | docker compose exec -T db psql -U rcq rcq`
-into the fresh stack, drop the media back into `RCQ_MEDIA_DIR`, `up -d`.
+### Restore
+
+On the new box, in this order. The order is the whole point: `install.sh`
+writes a fresh `.env` when it finds none (a new `JWT_SECRET`, every device
+logged out) and, on a fingerprint island, issues a new certificate when it
+finds none, which is the rotation above. It also clones into
+`/opt/rcq-server` only when that directory does not exist yet, so the two
+files cannot be put there ahead of it: `git clone` refuses a directory that
+is not empty, and the installer stops at its clone.
+
+1. The checkout, by hand:
+   `git clone https://github.com/rcq-messenger/rcq-server-ref.git /opt/rcq-server`
+2. The identity into it, from the copy made BEFORE whatever was lost (after
+   a lost `certs/`, the newest copy that still holds the old `island.key`;
+   the dates exist for this):
+   `tar -C /opt/rcq-server -xpf "$DEST/identity-YYYY-MM-DD.tar"`
+   That puts `.env` and `certs/` back under their own names, 0600.
+3. The database, before the app has created empty tables in it. From
+   `/opt/rcq-server`: `docker compose up -d postgres`, then
+   `docker compose exec -T postgres pg_isready -U rcq` until it says
+   accepting connections, then
+   `gunzip -c "$DEST/rcq-YYYY-MM-DD.sql.gz" | docker compose exec -T postgres psql -U rcq rcq`
+4. The media back into `RCQ_MEDIA_DIR`:
+   `rsync -a "$DEST/media/" /opt/rcq-server/media/`
+5. `bash /opt/rcq-server/install.sh`: it finds the checkout and pulls, keeps
+   the `.env` and `certs/` it finds, and brings the rest of the stack up.
+
 Clients reconnect to the same address and see their history: the keys live on
 the devices, so a restored DB plus the same domain, plus the same `certs/` on
 a fingerprint island, is a full recovery.
