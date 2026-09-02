@@ -384,8 +384,17 @@ async def _members_with_users(
         # Live presence: only show as their saved status if they currently have
         # a live WebSocket; otherwise force offline. Fake demo users skip this
         # Invisible always reads as offline so it stays hidden from group-mates.
-        raw_status = r.status if r.uin in online else "offline"
-        visible = "offline" if raw_status == "invisible" else raw_status
+        #
+        # ⚠ The VIEWER'S OWN row is the exception, twice over. The request is
+        # proof enough that they are here, and the presence set is a socket
+        # register: a phone that has just opened the app, or one whose socket
+        # dropped a second ago, is not in it, so a person opened their own group
+        # and read "offline" under their own name and below everyone else
+        # (#859, and the founder on iOS, 02.09). And their own invisible is
+        # theirs to see - it is hidden from group-mates, not from them.
+        me = viewer_uin is not None and r.uin == viewer_uin
+        raw_status = r.status if (me or r.uin in online) else "offline"
+        visible = raw_status if me else ("offline" if raw_status == "invisible" else raw_status)
         out.append(GroupMemberOut(
             uin=r.uin,
             nickname=r.nickname,
