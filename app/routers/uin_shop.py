@@ -39,7 +39,7 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -177,6 +177,16 @@ class QuoteOut(BaseModel):
     #: how to take is still "free", and everything else still says available
     #: only when it really can be had.
     acquire: str = "closed"
+    #: WHERE to pay, when `acquire` is "purchase". The island's own till.
+    #:
+    #: ⚠⚠ This exists because the till is NOT one shared service. Every client
+    #: shipped before 2026-09-04 has one compiled in (console-api.rcq.app) and
+    #: that till serves exactly one island, so a client that ignores this field
+    #: would take a self-hosted island's customer to OUR checkout and their
+    #: money would arrive somewhere that cannot give them the number. Which is
+    #: why an island only answers "purchase" to a client that has SAID it will
+    #: use this field — see `client_reads_checkout_url`.
+    checkout_url: str | None = None
 
 
 async def require_shop_open() -> None:
@@ -201,6 +211,7 @@ async def quote(
     body: QuoteIn,
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
+    x_rcq_checkout: str | None = Header(default=None),
 ) -> QuoteOut:
     length = _length(body.uin)
     if length < MIN_LEN:
@@ -257,11 +268,36 @@ async def quote(
         # claimed a sale it could not take money for. An island that cannot be
         # paid now says `closed`, which every already-released client renders
         # correctly without a new build.
-        till_is_ours = os.environ.get("RCQ_UIN_CLIENT_TILL_MINE", "").strip().lower() in {"1", "true", "yes"}
+        # ⚠⚠ AND THE BUYER HAS TO REACH THE RIGHT CHECKOUT.
+        #
+        # The till is not one shared service: each one serves a single island,
+        # and every client shipped before 2026-09-04 has ours compiled in
+        # (web-chat/src/lib/till.ts, rcq-android/.../net/TillApi.kt). So an
+        # island that answers "purchase" to such a client is sending its
+        # customer to OUR checkout — the money arrives where the number is not,
+        # their own till never sees it, and nobody can put it right afterwards.
+        #
+        # Two ways to be sure the buyer lands in the right place:
+        #
+        #   * the client SAYS it will use the address we hand back, by sending
+        #     `X-RCQ-Checkout: island`. Nothing older can say it, which is the
+        #     point — the declaration is the capability;
+        #   * or the checkout compiled into those older clients happens to be
+        #     ours, which only the flagship can say (`RCQ_UIN_CLIENT_TILL_MINE`).
+        #
+        # An island that satisfies neither says `closed` rather than taking a
+        # payment it cannot honour. That is not a restriction on self-hosting:
+        # set `RCQ_UIN_TILL_URL` and current clients buy from you directly.
+        client_reads_checkout_url = (x_rcq_checkout or "").strip().lower() == "island"
+        built_in_till_is_ours = os.environ.get(
+            "RCQ_UIN_CLIENT_TILL_MINE", ""
+        ).strip().lower() in {"1", "true", "yes"}
+        own_till = (os.environ.get("RCQ_UIN_TILL_URL") or "").strip().rstrip("/") or None
+        reachable = (client_reads_checkout_url and bool(own_till)) or built_in_till_is_ours
         sellable = (
             length >= MIN_SALE_LEN
             and bool(uin_voucher.public_key_b64())
-            and till_is_ours
+            and reachable
         )
         return QuoteOut(
             uin=body.uin,
@@ -271,6 +307,9 @@ async def quote(
             price_display=display if sellable else None,
             reason="reserved",
             acquire="purchase" if sellable else "closed",
+            # Always the island's OWN till when it has one, so a client that
+            # asked for it never falls back to whatever it was compiled with.
+            checkout_url=own_till if sellable else None,
         )
 
     return QuoteOut(
