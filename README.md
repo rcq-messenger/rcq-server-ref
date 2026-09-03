@@ -76,7 +76,8 @@ hosted-key tooling), keep an eye on releases.
   a canary liveness-gates what's served. Pairs with the standalone relay
   installer.
 * **Account migration + UIN shop** — atomic re-key of every owned-by-uin
-  row from old UIN to new. UIN shop uses a mock IAP receipt today; the
+  row from old UIN to new. Scarce numbers are sold for cryptocurrency
+  through a till that lives OUTSIDE the island (see below); the
   real StoreKit hook lives at one function on the iOS side.
 * **Reports / moderation** — bug-bounty submissions, abuse reports
   with encrypted-media evidence, admin SPA at `admin.<your-domain>`. A report
@@ -295,11 +296,20 @@ one paragraph in [SECURITY.md](SECURITY.md#islands-trusted-by-fingerprint).
   That's a separate, RCQ-specific operational layer. A self-hosted
   instance doesn't need it: clients reach you over direct TLS to
   whatever domain you point at this server.
-* **Apple receipt validation** — `/uin/purchase` accepts any non-empty
-  `receipt` string today (mock). Wire `App Store Server Notifications
-  V2` + receipt validation there before taking real money. Do not ship
-  a price to users until you have: a screen that charges nothing while
-  showing a figure is worse than a free feature.
+* **Selling numbers** — the island never touches money. It has no wallet, no
+  price list it can be paid against, and no transaction anywhere in its
+  database: a till running outside it watches the operator's own wallets
+  through public block explorers and signs an Ed25519 voucher naming the number
+  that was paid for. `POST /uin/redeem` verifies that signature, spends the
+  nonce once, and writes one row. Set `UIN_SHOP_ENABLED` and
+  `RCQ_UIN_VOUCHER_PUBKEY` (see `.env.example`); with no pubkey the shop refuses
+  to quote a price, which is the right default for an island that cannot be paid.
+
+  ⚠ This section used to describe an Apple IAP receipt that `/uin/purchase`
+  accepted without validating, and told you not to ship before wiring receipt
+  validation. Both statements were stale: the `receipt` argument is gone (a
+  field that looks like a payment check but is not is worse than none), and real
+  money has been taken through vouchers since 2026-09-03.
 
 ## Keeping it up to date
 
