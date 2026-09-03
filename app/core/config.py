@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     # UIN allocation out of band via an admin endpoint or DB write.
     UIN_SHOP_ENABLED: bool = False
 
+    # Prices live in `RCQ_UIN_PRICES` and are read where they are used
+    # (routers/uin_shop.py), next to the till key they belong with.
+
     # Hall of Fame leaderboard surface (rcq.app/hof). Off by default for
     # self-hosters — it's a flagship-community feature the operator doesn't run
     # or curate. Prod sets HALL_OF_FAME_ENABLED=true in /opt/rcq/.env, same as

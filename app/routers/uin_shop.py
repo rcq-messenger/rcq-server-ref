@@ -33,6 +33,9 @@ price as a public fact about a UIN's digit length, not as a secret.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -52,6 +55,8 @@ from app.models.user import User
 from app.routers.migrate import _perform_migration
 from app.services import uin_voucher
 from app.services.uin import is_reserved_uin, uin_is_taken
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
 
@@ -93,7 +98,12 @@ HOLD_MINUTES = 120
 
 # Price cents keyed by UIN length. Roughly geometric: ~3x per
 # digit drop until the 3-digit trophy tier at the Apple $999 cap.
-_PRICES_CENTS: dict[int, int] = {
+#
+# ⚠ THE FLAGSHIP'S ladder, and only the default. An island that sells numbers
+# is being paid into ITS OWN wallets by ITS OWN till, so the prices have to be
+# its operator's: `RCQ_UIN_PRICES` in the .env, JSON keyed by digit count. A
+# self-hosted island quoting these numbers is quoting a shop it is not.
+_DEFAULT_PRICES_CENTS: dict[int, int] = {
     9: 99,
     8: 199,
     7: 499,
@@ -102,6 +112,39 @@ _PRICES_CENTS: dict[int, int] = {
     4: 19900,
     3: 99900,
 }
+
+
+def _load_prices() -> dict[int, int]:
+    """The operator's ladder, or the flagship's when they have not set one.
+
+    A bad value is not a reason to fall back silently to somebody else's
+    prices: the operator asked for something and would never find out it was
+    ignored, and the thing being got wrong is what people are charged. It logs
+    loudly and keeps the default, which is the only safe direction — an island
+    that quotes nothing sells nothing, and an island that quotes the wrong
+    number takes the wrong money.
+    """
+    # os.environ, like `RCQ_UIN_VOUCHER_PUBKEY` next door: the till and its
+    # prices are one family of settings and are read the same way.
+    raw = (os.environ.get("RCQ_UIN_PRICES") or "").strip()
+    if not raw:
+        return dict(_DEFAULT_PRICES_CENTS)
+    try:
+        parsed = json.loads(raw)
+        out = {int(k): int(v) for k, v in parsed.items()}
+        if not out or any(v < 0 for v in out.values()):
+            raise ValueError("prices must be non-negative and non-empty")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "[uin-shop] RCQ_UIN_PRICES is not usable (%s); falling back to the "
+            "default ladder. Numbers will be quoted at the flagship's prices "
+            "until this is fixed.", exc,
+        )
+        return dict(_DEFAULT_PRICES_CENTS)
+
+
+_PRICES_CENTS: dict[int, int] = _load_prices()
 
 
 def _length(uin: int) -> int:
@@ -167,7 +210,13 @@ async def quote(
     if body.uin == me:
         return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="self")
 
-    cents = _PRICES_CENTS[length]
+    # ⚠ `.get`, not `[...]`. The ladder is the operator's now, and a length
+    # they left out is one they do not sell: an index would answer 500 to a
+    # perfectly reasonable question about a number nobody is selling.
+    cents = _PRICES_CENTS.get(length)
+    if cents is None:
+        return QuoteOut(uin=body.uin, length=length, available=False,
+                        price_cents=None, price_display=None, reason="not_for_sale")
     display = f"${cents / 100:.2f}"
     scarce = is_reserved_uin(body.uin)
     taken = await uin_is_taken(db, body.uin)
@@ -257,7 +306,9 @@ async def suggestions(
             continue
         if await uin_is_taken(db, candidate):
             continue
-        cents = _PRICES_CENTS[length]
+        cents = _PRICES_CENTS.get(length)
+        if cents is None:
+            continue
         out.append(SuggestionOut(
             uin=candidate,
             length=length,
