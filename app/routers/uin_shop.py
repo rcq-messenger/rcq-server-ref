@@ -170,19 +170,33 @@ async def quote(
     cents = _PRICES_CENTS[length]
     display = f"${cents / 100:.2f}"
     scarce = is_reserved_uin(body.uin)
-
-    # Scarce stock is sold, not claimed, and only where there is something to
-    # be paid: an island with no till cannot take money, so quoting a price on
-    # one would be advertising a shop that does not exist. Three digits are off
-    # the market whatever the till says.
-    if scarce and (length < MIN_SALE_LEN or not uin_voucher.public_key_b64()):
-        return QuoteOut(uin=body.uin, length=length, available=False,
-                        price_cents=None, price_display=None, reason="reserved")
-
     taken = await uin_is_taken(db, body.uin)
     if taken:
         return QuoteOut(uin=body.uin, length=length, available=False,
                         price_cents=None, price_display=None, reason="taken")
+
+    if scarce:
+        # ⚠⚠ `available` STAYS FALSE for scarce stock, and the price rides
+        # alongside it. Every client in people's hands reads that one field and
+        # draws a "take it" button from it, and the endpoint behind that button
+        # is `/uin/purchase`, which gives numbers away for nothing and refuses
+        # the scarce ones with a 403. Flipping this to true would have made
+        # three released clients offer, for free, exactly the numbers that are
+        # now for sale - and then fail in their faces.
+        #
+        # A client that understands `acquire` keys off THAT instead, and gets
+        # everything it needs: the price, and the one door that opens it.
+        sellable = length >= MIN_SALE_LEN and bool(uin_voucher.public_key_b64())
+        return QuoteOut(
+            uin=body.uin,
+            length=length,
+            available=False,
+            price_cents=cents if sellable else None,
+            price_display=display if sellable else None,
+            reason="reserved",
+            acquire="purchase" if sellable else "closed",
+        )
+
     return QuoteOut(
         uin=body.uin,
         length=length,
@@ -190,7 +204,7 @@ async def quote(
         price_cents=cents,
         price_display=display,
         reason=None,
-        acquire="purchase" if scarce else "free",
+        acquire="free",
     )
 
 

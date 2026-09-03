@@ -268,12 +268,14 @@ async def main() -> int:
         print("\nWhat the shop says a number costs, and how it is obtained:")
         q = (await c.post("/uin/quote", json={"uin": 4477}, headers=H3)).json()
         check(f"a four-digit number is FOR SALE ({q.get('acquire')}, {q.get('price_display')})",
-              q.get("available") is True and q.get("acquire") == "purchase"
-              and q.get("price_cents") == 19900)
+              q.get("acquire") == "purchase" and q.get("price_cents") == 19900)
+        check("  ⚠⚠ ... and still reads as unavailable to a client that predates "
+              "`acquire`, so three released clients do not offer it for free",
+              q.get("available") is False and q.get("reason") == "reserved")
         q = (await c.post("/uin/quote", json={"uin": 404}, headers=H3)).json()
         check("⚠ three digits are not for sale at any price",
               q.get("available") is False and q.get("reason") == "reserved"
-              and q.get("price_cents") is None)
+              and q.get("price_cents") is None and q.get("acquire") == "closed")
         q = (await c.post("/uin/quote", json={"uin": 748392015}, headers=H3)).json()
         check(f"an ordinary nine-digit number is still free ({q.get('acquire')})",
               q.get("available") is True and q.get("acquire") == "free")
