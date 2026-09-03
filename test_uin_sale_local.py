@@ -69,6 +69,8 @@ import shutil  # noqa: E402
 
 import httpx  # noqa: E402
 
+from sqlalchemy import select  # noqa: E402
+
 from app.core.db import SessionLocal, init_db  # noqa: E402
 from app.core.redis import close_redis, get_redis  # noqa: E402
 from app.core.security import issue_token  # noqa: E402
@@ -342,6 +344,37 @@ async def main() -> int:
               held == 10)
         check("  ... and the number in use is not one of them",
               mine.get("active") not in (mine.get("owned") or []))
+
+        print("\n⚠ A number bought WITH the move still leaves a deed:")
+        # `switch: true` hands the number to the migration, which used to write
+        # no `owned_uins` row at all - so the island kept no record that the
+        # number had been paid for. Read in a SEPARATE session, because a test
+        # that looks in the same one sees a flush and passes while prod loses
+        # the row.
+        MOVER = 700700700
+        async with SessionLocal() as db:
+            db.add(User(uin=MOVER, nickname="mover", identity_key=b64(), signing_key=b64()))
+            await db.commit()
+        HS = {"Authorization": f"Bearer {issue_token(MOVER, 0, 'phone')}"}
+        me_before = (await c.get("/uin/mine", headers=HS)).json().get("active")
+        r = await c.post("/uin/redeem", json={"uin": 4488, "voucher": voucher(4488), "switch": True},
+                         headers=HS)
+        check(f"redeem with the move ({r.status_code})", r.status_code == 200)
+        check("  ... the account is answering as it now", (r.json() or {}).get("new_uin") == 4488)
+        async with SessionLocal() as db:
+            deed = (await db.execute(
+                select(OwnedUin).where(OwnedUin.uin == 4488)
+            )).scalars().first()
+        check(f"  ... and the deed says it was PAID for "
+              f"({deed and (deed.uin, deed.owner_uin, deed.source)})",
+              deed is not None and deed.source == "purchase")
+        check("  ... held by the number it became", deed is not None and int(deed.owner_uin) == 4488)
+        tok = (r.json() or {}).get("token")
+        if tok:
+            mine2 = (await c.get("/uin/mine", headers={"Authorization": f"Bearer {tok}"})).json()
+            check("  ... and no collection lists you to yourself",
+                  4488 not in (mine2.get("owned") or []))
+        check("  ... and it was never the old number", me_before != 4488)
 
     await close_redis()
     shutil.rmtree(SITES_TMP, ignore_errors=True)

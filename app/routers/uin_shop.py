@@ -524,6 +524,25 @@ async def redeem(
     if hold is not None:
         await db.delete(hold)
 
+    # ⚠⚠ The deed for a PAID number is written HERE on the `switch` branch,
+    # because `_take` writes one only when `switch` is false: `switch=True`
+    # hands the number to `_perform_migration`, which makes it `users.uin` and
+    # creates no `owned_uins` row at all. So a number bought with `switch:
+    # true` left this island with NO record that it had ever been paid for.
+    # The only trail was a spent nonce, and that is deliberately not linkable
+    # to a number — which is a privacy property on the nonce and a hole here:
+    # neither the operator nor the buyer could answer "was this number paid
+    # for, and who holds it now".
+    #
+    # `owner_uin` is the buyer's number as it is right now; the migration below
+    # re-keys it onto the new one (`OwnedUin.owner_uin` is in PER_UIN_COLUMNS,
+    # services/uin_rows.py), leaving exactly what a `switch: false` purchase
+    # leaves once its owner activates it: (uin=N, owner_uin=N). The collection
+    # reader filters `uin != owner_uin`, so it lists nothing extra and
+    # `release` cannot be pointed at the number in use.
+    if body.switch:
+        db.add(OwnedUin(uin=target, owner_uin=int(user.uin), source="purchase"))
+        await db.flush()
     out = await _take(db, user, target, switch=bool(body.switch), device_id=device_id)
     await db.commit()
     return out
