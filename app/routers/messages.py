@@ -1725,7 +1725,27 @@ class GroupLogAckIn(BaseModel):
 @router.post(
     "/group-log/fetch",
     response_model=GroupLogFetchOut,
-    dependencies=[Depends(rate_limit("group_log_fetch", 120, 60))],
+    # ⚠⚠ 120/min was BELOW what one honest catch-up costs, and this is the
+    # receive path: over the ceiling the room simply stops arriving.
+    #
+    # The arithmetic nobody did when the number was picked. A client's drain
+    # pages until the island runs dry, capped at FORTY pages per drain
+    # (Session.kt, `pages >= 40`), and a drain fires on reconnect, on a push
+    # (10s throttle) and on foreground (30s throttle). A device that was away
+    # for a few hours in a big room runs the full forty, and a push ten seconds
+    # later runs forty more: 80 in a minute, from one phone, doing exactly what
+    # it is supposed to do. A reconnect on top of that crosses 120 — and then
+    # the drain dies mid-backlog, the backlog never clears, and the next drain
+    # starts over into the same wall. Self-perpetuating, and worst for the
+    # users with the most to catch up on: reported as "группа RCQ Beta работает
+    # через пень колоду, сообщения или не ходят, или ходят плохо" (#864), on
+    # the 2255-member flagship room.
+    #
+    # 480 leaves room for a real catch-up plus the reconnect that interrupts
+    # it, and the work is still bounded by the caller's own cursor: an idle
+    # account gets empty pages. Paired with group-log/ack below, which is one
+    # ack per page and so must not be the tighter of the two.
+    dependencies=[Depends(rate_limit("group_log_fetch", 480, 60))],
 )
 async def fetch_group_log(
     body: GroupLogFetchIn,
@@ -1823,7 +1843,10 @@ async def fetch_group_log(
 @router.post(
     "/group-log/ack",
     response_model=AckOut,
-    dependencies=[Depends(rate_limit("group_log_ack", 240, 60))],
+    # One ack per fetched page, so this ceiling has to stay at or above
+    # the fetch ceiling above: an ack refused after its page was read
+    # leaves the cursor behind and the room re-delivers the same rows.
+    dependencies=[Depends(rate_limit("group_log_ack", 480, 60))],
 )
 async def ack_group_log(
     body: GroupLogAckIn,
