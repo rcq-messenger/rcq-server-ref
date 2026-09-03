@@ -235,7 +235,34 @@ async def quote(
         #
         # A client that understands `acquire` keys off THAT instead, and gets
         # everything it needs: the price, and the one door that opens it.
-        sellable = length >= MIN_SALE_LEN and bool(uin_voucher.public_key_b64())
+        # ⚠⚠ AND THE CHECKOUT HAS TO BE OURS TO SEND PEOPLE TO.
+        #
+        # Every shipped client hardcodes ONE till — `console-api.rcq.app`
+        # (web-chat/src/lib/till.ts, rcq-android/.../net/TillApi.kt), and that
+        # till serves ONE island. So a self-hosted island that has its own till
+        # and its own pubkey used to answer `purchase` here, the client drew a
+        # buy button from it, and the customer was sent to OUR checkout to pay
+        # US for a number on SOMEBODY ELSE'S island. Their own till would never
+        # see the money and the buyer would never get the number.
+        #
+        # `RCQ_UIN_CLIENT_TILL_MINE` is the operator saying "the checkout the
+        # clients already carry sells for me". Only the flagship can truthfully
+        # say that today, which is also the standing rule: purchase is a
+        # flagship surface, and a self-hosted island hands numbers out by
+        # arrangement (`POST /admin/uin/grant`).
+        #
+        # This is the same principle the web market records at Market.tsx:48 —
+        # THE SERVER DECIDES, and a client draws whatever the quote says. The
+        # bug was never that clients lacked a gate; it was that the island
+        # claimed a sale it could not take money for. An island that cannot be
+        # paid now says `closed`, which every already-released client renders
+        # correctly without a new build.
+        till_is_ours = os.environ.get("RCQ_UIN_CLIENT_TILL_MINE", "").strip().lower() in {"1", "true", "yes"}
+        sellable = (
+            length >= MIN_SALE_LEN
+            and bool(uin_voucher.public_key_b64())
+            and till_is_ours
+        )
         return QuoteOut(
             uin=body.uin,
             length=length,

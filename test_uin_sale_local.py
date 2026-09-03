@@ -42,6 +42,10 @@ os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 os.environ.setdefault("ADMIN_USERNAME", "admin")
 os.environ.setdefault("ADMIN_PASSWORD", "adminpw")
 os.environ["UIN_SHOP_ENABLED"] = "true"
+# This test stands in for the FLAGSHIP: the till the released clients carry is
+# ours, so scarce numbers may be offered for sale. An island without this says
+# `closed` instead, which is asserted at the end.
+os.environ["RCQ_UIN_CLIENT_TILL_MINE"] = "true"
 import tempfile  # noqa: E402
 SITES_TMP = tempfile.mkdtemp(prefix="rcq-sites-sale-")
 os.environ["RCQ_SITES_DIR"] = SITES_TMP
@@ -375,6 +379,31 @@ async def main() -> int:
             check("  ... and no collection lists you to yourself",
                   4488 not in (mine2.get("owned") or []))
         check("  ... and it was never the old number", me_before != 4488)
+
+        print("\n⚠⚠ An island whose customers would pay SOMEBODY ELSE offers nothing:")
+        # Every released client has one till compiled into it, and that till
+        # serves one island. An island that is not that one must not answer
+        # `purchase` — the buyer would be sent to a checkout that cannot give
+        # them this number. Read through the same door a client uses.
+        import app.routers.uin_shop as shop_mod
+        os.environ["RCQ_UIN_CLIENT_TILL_MINE"] = "false"
+        QUOTER = 800800800
+        async with SessionLocal() as db:
+            db.add(User(uin=QUOTER, nickname="quoter", identity_key=b64(), signing_key=b64()))
+            await db.commit()
+        HQ = {"Authorization": f"Bearer {issue_token(QUOTER, 0, 'phone')}"}
+        r = await c.post("/uin/quote", json={"uin": 4321}, headers=HQ)
+        q = r.json()
+        check(f"a scarce number quotes closed ({r.status_code} {q.get('acquire')})", q.get("acquire") == "closed")
+        check("  ... and carries no price to draw a button from", q.get("price_cents") is None)
+        check("  ... and is still unavailable, as it always was", q.get("available") is False)
+        r = await c.post("/uin/quote", json={"uin": 84726193}, headers=HQ)
+        q2 = r.json()
+        check(f"  ... while ordinary space is untouched ({q2.get('acquire')})", q2.get("acquire") == "free")
+        os.environ["RCQ_UIN_CLIENT_TILL_MINE"] = "true"
+        r = await c.post("/uin/quote", json={"uin": 4321}, headers=HQ)
+        check(f"  ... and the flagship still sells it ({r.json().get('acquire')})",
+              r.json().get("acquire") == "purchase")
 
         print("\n⚠ A FREE claim is not a purchase, and the deed says so:")
         # /uin/purchase hands out an ordinary number for nothing and reached the
