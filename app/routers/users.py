@@ -466,15 +466,37 @@ async def search(
     exact_uin = int(raw[1:]) if raw.startswith("#") and raw[1:].isdigit() else (
         int(raw) if raw.isdigit() else None
     )
+    # ⚠ Being a contact is no longer a TIER of its own, it is the tiebreaker
+    # INSIDE a tier (#869). It used to outrank every kind of match: a friend
+    # whose name merely contained the text stood above a stranger whose name
+    # STARTED with it, so typing the first letters of a name you can see on
+    # screen did not put that name first, and the search read as broken. The
+    # rule "friends first" is kept exactly where it was meant to apply — among
+    # people who matched equally well — and match quality decides between
+    # tiers, which is also what the group filter and the mention picker have
+    # always done. One reporter found all three and asked for one rule.
+    #
+    # Prefix covers the real name too, on the same public-profile condition as
+    # [text_clause]: a person searching "Ser" for Sergey should not have to
+    # know whether that is the nickname or the first name.
+    prefix = f"{raw.lower()}%"
     rank = case(
         (User.uin == exact_uin, 0) if exact_uin is not None else (false(), 0),
-        (User.uin.in_(my_contacts), 1),
-        (func.lower(User.nickname) == raw.lower(), 2),
-        (User.nickname.ilike(f"{raw.lower()}%"), 3),
-        (cast(User.uin, String).like(f"%{raw}%") if raw.isdigit() else false(), 4),
-        (User.nickname.ilike(like), 5),
-        else_=6,
+        (func.lower(User.nickname) == raw.lower(), 1),
+        (
+            or_(
+                User.nickname.ilike(prefix),
+                and_(profile_public, User.first_name.ilike(prefix)),
+                and_(profile_public, User.last_name.ilike(prefix)),
+            ),
+            2,
+        ),
+        (cast(User.uin, String).like(f"%{raw}%") if raw.isdigit() else false(), 3),
+        (User.nickname.ilike(like), 4),
+        else_=5,
     )
+    # False sorts before True, so contacts lead their own tier.
+    contact_last = case((User.uin.in_(my_contacts), 0), else_=1)
     # Never include the caller in their own search results — Add-to-contacts on
     # self would 400, and "find people" silently shouldn't list me anyway.
     # Suspended accounts stay out of the directory. models/user.py has claimed
@@ -486,7 +508,7 @@ async def search(
             .where(clause)
             .where(User.uin != me)
             .where(User.is_suspended.is_(False))
-            .order_by(rank, func.lower(User.nickname), User.uin)
+            .order_by(rank, contact_last, func.lower(User.nickname), User.uin)
             .limit(limit)
         )
     ).scalars().all()
