@@ -33,9 +33,23 @@ class OwnedUin(Base):
     uin: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     # Whoever holds it, by their current uin.
     owner_uin: Mapped[int] = mapped_column(BigInteger, index=True)
-    # How it was obtained, for the shop's own bookkeeping and for support
-    # questions later: "purchase" today, room for "transfer" when numbers can
-    # change hands.
+    # How it was obtained. It is what tells a number somebody PAID for from one
+    # that was free, and support questions turn on that difference:
+    #
+    #   purchase  — a signed voucher was redeemed for it (/uin/redeem). Money.
+    #   claimed   — taken for free from the open shelf (/uin/purchase).
+    #   migrated  — kept on the way past, because it is scarce.
+    #
+    # "activate" is passed by /uin/activate and must never appear in the table:
+    # that path re-keys the deed that already exists. If it ever shows up, a
+    # branch that used to move the account has stopped doing so.
+    #
+    # ⚠⚠ Rows written before 2026-09-03 evening all say "purchase" whatever
+    # they were: /uin/purchase reached the same writer and did not say which
+    # door it came through, so a free claim and a paid redemption are
+    # indistinguishable in the old data and CANNOT be backfilled. Anything that
+    # counts money reads the till, not this column; this column answers "may
+    # this row be swept" (never, for a purchase) and "how did you get it".
     source: Mapped[str] = mapped_column(String(16), default="purchase")
     acquired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
