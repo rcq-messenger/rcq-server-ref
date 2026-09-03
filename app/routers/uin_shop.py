@@ -442,7 +442,12 @@ async def activate(
     # PER_UIN_COLUMNS), and `release` remains the one deliberate way to give a
     # number up. `_owned_uins` filters out whichever number the account is
     # currently answering as, so a collection never lists you to yourself.
-    return await _take(db, user, body.uin, switch=True, device_id=device_id)
+    # `source` is never written on this path: `switch=True` re-keys the deed
+    # that already exists rather than making one. Named anyway, so that if this
+    # ever stops moving the account the row it starts writing says where it
+    # came from instead of quietly claiming somebody paid.
+    return await _take(db, user, body.uin, switch=True, device_id=device_id,
+                       source="activate")
 
 
 class RedeemIn(BaseModel):
@@ -543,12 +548,14 @@ async def redeem(
     if body.switch:
         db.add(OwnedUin(uin=target, owner_uin=int(user.uin), source="purchase"))
         await db.flush()
-    out = await _take(db, user, target, switch=bool(body.switch), device_id=device_id)
+    out = await _take(db, user, target, switch=bool(body.switch), device_id=device_id,
+                      source="purchase")
     await db.commit()
     return out
 
 async def _take(
-    db: AsyncSession, user: User, target: int, *, switch: bool, device_id: str
+    db: AsyncSession, user: User, target: int, *, switch: bool, device_id: str,
+    source: str,
 ) -> PurchaseOut:
     """Give `target` to `user`, either as their new identity or as a held
     number. Shared by /purchase and /activate so the collection bookkeeping
@@ -562,6 +569,16 @@ async def _take(
         # limiter that was missing is money, not a number: `/uin/redeem` is the
         # only caller that reaches here, and it reaches here holding a voucher
         # the till signed for this exact number.
+        #
+        # ⚠⚠ `source` is a PARAMETER and not the string "purchase", and the
+        # sentence above about redeem being the only caller was WRONG when it
+        # was written (03.09): `/uin/purchase` reaches this same branch for a
+        # FREE ordinary number and stamped every one of those "purchase" too.
+        # So the column that is supposed to mean "somebody paid for this" was
+        # true of most rows that nobody paid for — which would have made the
+        # operator's sales counters fiction, and made the sweep guard in
+        # tools/reclaim_reserved.py protect free claims it was meant to
+        # reclaim.
         held_count = await db.scalar(
             select(func.count()).select_from(OwnedUin).where(
                 OwnedUin.owner_uin == owner, OwnedUin.uin != owner
@@ -572,7 +589,7 @@ async def _take(
                 status.HTTP_409_CONFLICT,
                 detail={"code": "collection_full", "max": MAX_OWNED_UINS},
             )
-        db.add(OwnedUin(uin=target, owner_uin=owner, source="purchase"))
+        db.add(OwnedUin(uin=target, owner_uin=owner, source=source))
         # ⚠⚠ COMMIT, not just flush. `get_db` yields a session and commits
         # NOTHING, so a route that only flushes answers 200 and saves nothing:
         # the session closes, the row rolls back, and the person is told they
@@ -678,7 +695,8 @@ async def claim(
 
     # The freed number's tokens are retired inside _perform_migration, so the
     # old bearer cannot follow the number to whoever claims it next.
-    return await _take(db, user, body.uin, switch=body.switch, device_id=device_id)
+    return await _take(db, user, body.uin, switch=body.switch, device_id=device_id,
+                       source="claimed")
 
 
 # `/quote` and `/suggestions` are pricing helpers for a shop that only the

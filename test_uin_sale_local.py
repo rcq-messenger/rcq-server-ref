@@ -376,6 +376,26 @@ async def main() -> int:
                   4488 not in (mine2.get("owned") or []))
         check("  ... and it was never the old number", me_before != 4488)
 
+        print("\n⚠ A FREE claim is not a purchase, and the deed says so:")
+        # /uin/purchase hands out an ordinary number for nothing and reached the
+        # same writer, stamping every one of them "purchase". The column that is
+        # supposed to mean "money changed hands" was true of rows where none
+        # had, which would make any sales counter fiction and make the sweep
+        # guard in tools/reclaim_reserved.py protect what it exists to reclaim.
+        FREE = 700700701
+        async with SessionLocal() as db:
+            db.add(User(uin=FREE, nickname="freebie", identity_key=b64(), signing_key=b64()))
+            await db.commit()
+        HF = {"Authorization": f"Bearer {issue_token(FREE, 0, 'phone')}"}
+        r = await c.post("/uin/purchase", json={"uin": 481516234, "switch": False}, headers=HF)
+        check(f"an ordinary number is still free ({r.status_code})", r.status_code == 200)
+        async with SessionLocal() as db:
+            deed = (await db.execute(
+                select(OwnedUin).where(OwnedUin.uin == 481516234)
+            )).scalars().first()
+        check(f"  ... and it is NOT recorded as paid for ({deed and deed.source})",
+              deed is not None and deed.source == "claimed")
+
     await close_redis()
     shutil.rmtree(SITES_TMP, ignore_errors=True)
     try:

@@ -20,7 +20,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, desc, func, or_, select
@@ -76,10 +76,28 @@ def _cache_put(key: str, value: object) -> None:
     _analytics_cache[key] = (_time.monotonic() + _ANALYTICS_TTL, value)
 
 
+async def _no_store(response: Response) -> None:
+    """Nothing under /admin may be written to the operator's disk by the browser.
+
+    ⚠⚠ A 200 GET with no `Cache-Control` is STORED in a private cache even when
+    its freshness lifetime is zero — storage and freshness are separate rules,
+    and `Authorization` only bars SHARED caches (RFC 9111 §3.5), not the
+    operator's own. So every admin listing this API has ever served has been
+    sitting on that laptop, keyed by URL, readable months later by anyone
+    holding it: the reports queue with reporter numbers, the user list, and now
+    the register of who holds which number. `/admin/console` set this header
+    from the start; the JSON the console actually reads never did.
+
+    On the router, not per route, because the next endpoint added would forget.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
 router = APIRouter(
     prefix="/admin",
     tags=["admin"],
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_admin), Depends(_no_store)],
 )
 
 
@@ -1586,6 +1604,170 @@ async def grant_uin(
     # it is one lookup away from naming its new holder.
     log.warning("[uin-grant] %s -> %s", log_identity(body.uin), log_identity(body.to_uin))
     return GrantUinOut(uin=body.uin, to_uin=body.to_uin, owned=[int(u) for u in owned])
+
+
+# ── The register of held numbers ────────────────────────────────────
+#
+# Who holds which number, since when, and through which door it came. There
+# was no way to read this at all: `POST /admin/uin/grant` answers
+# `already_held` for a number that is taken and will not say by whom, so both
+# "this number is disputed, who has it" and "they say they paid and got
+# nothing" needed a psql session on prod to answer.
+#
+# ⚠⚠ WHAT THIS CANNOT ANSWER, EVER: what a number cost, who paid, on which
+# chain, in which transaction. None of that is on this island and none of it is
+# coming here — the till watches the money and never learns an account, the
+# island verifies a signature and never learns a payment
+# (models/uin_sale.py, services/uin_voucher.py). The money side is read from
+# the till, and the two are joined by NUMBER in the operator's browser, at the
+# moment they look. Nothing joined is written down on either side.
+#
+# ⚠ And `source` is only as honest as the day the row was written. Every deed
+# from before 2026-09-03 evening says "purchase" whatever it was, because the
+# free-claim path reached the same writer without saying so (models/owned_uin.py).
+# So `purchased_total` here is "rows that CLAIM to be purchases", and a real
+# sales figure comes from the till. The counter is named accordingly.
+
+
+class OwnedUinRow(BaseModel):
+    uin: int
+    #: Digits, so the console can show which shelf a number came off without
+    #: re-deriving the shop's price ladder for itself.
+    length: int
+    owner_uin: int
+    owner_nickname: str | None = None
+    owner_suspended: bool = False
+    #: purchase | claimed | granted | migrated. See models/owned_uin.py, and
+    #: read the warning above before counting money with it.
+    source: str
+    acquired_at: datetime
+    #: The holder is answering AS this number right now. The deed survives being
+    #: used (2026-09-03), so this is the ordinary shape of a bought number
+    #: somebody activated, not a fault.
+    in_use: bool = False
+    #: A LIVE till hold on the same number: a sale in flight, or an operator
+    #: putting one aside. `hold_id` is the till's own invoice id and is opaque
+    #: here; it exists only while the sale is in flight, because redemption and
+    #: release both delete the hold.
+    hold_id: str | None = None
+    hold_expires_at: datetime | None = None
+
+
+class OwnedUinsListOut(BaseModel):
+    items: list[OwnedUinRow]
+    #: Rows matching the filter BEFORE the limit cut them off, so the console
+    #: can say a list was truncated instead of quietly showing the first
+    #: hundred and letting the operator believe that is all of them.
+    total: int
+    claims_purchase: int = 0
+    claimed_free: int = 0
+    granted_total: int = 0
+    migrated_total: int = 0
+    #: Numbers spoken for right now: sales in flight plus operator holds.
+    live_holds: int = 0
+
+
+@router.get("/uin/owned", response_model=OwnedUinsListOut)
+async def list_owned_uins(
+    source_filter: str = Query("all", alias="source"),
+    q: int | None = Query(None),
+    days: int = Query(0, ge=0, le=365),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> OwnedUinsListOut:
+    """`source` takes purchase | claimed | granted | migrated | all.
+
+    `q` is one exact number and matches EITHER side of the deed: the number
+    held, or whoever holds it. Both are what an operator arrives with — a
+    complaint names a number, and the follow-up question is what else that
+    person holds.
+    """
+    where = []
+    if source_filter != "all":
+        where.append(OwnedUin.source == source_filter)
+    if q is not None:
+        where.append(or_(OwnedUin.uin == q, OwnedUin.owner_uin == q))
+    if days:
+        where.append(
+            OwnedUin.acquired_at >= datetime.now(timezone.utc) - timedelta(days=days)
+        )
+
+    total = await db.scalar(
+        select(func.count()).select_from(OwnedUin).where(*where)
+    ) or 0
+    rows = (
+        await db.execute(
+            select(OwnedUin)
+            .where(*where)
+            .order_by(desc(OwnedUin.acquired_at), OwnedUin.uin)
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    # One query for the holders on THIS page, not one per row.
+    owners = {int(r.owner_uin) for r in rows}
+    holders: dict[int, User] = {}
+    if owners:
+        holders = {
+            int(u.uin): u
+            for u in (
+                await db.execute(select(User).where(User.uin.in_(owners)))
+            ).scalars().all()
+        }
+    # Live holds on the numbers on this page. An expired row is not a hold: the
+    # cron reaps them a minute later, and until then it must not be shown as
+    # one, or every reaped number looks like a sale in flight.
+    now = datetime.now(timezone.utc)
+    held: dict[int, UinHold] = {}
+    if rows:
+        held = {
+            int(h.uin): h
+            for h in (
+                await db.execute(
+                    select(UinHold).where(
+                        UinHold.uin.in_([int(r.uin) for r in rows]),
+                        UinHold.expires_at > now,
+                    )
+                )
+            ).scalars().all()
+        }
+
+    async def _count(src: str) -> int:
+        return await db.scalar(
+            select(func.count()).select_from(OwnedUin).where(OwnedUin.source == src)
+        ) or 0
+
+    items = []
+    for r in rows:
+        holder = holders.get(int(r.owner_uin))
+        hold = held.get(int(r.uin))
+        items.append(
+            OwnedUinRow(
+                uin=int(r.uin),
+                length=len(str(int(r.uin))),
+                owner_uin=int(r.owner_uin),
+                owner_nickname=holder.nickname if holder else None,
+                owner_suspended=bool(holder.is_suspended) if holder else False,
+                source=r.source or "purchase",
+                acquired_at=r.acquired_at,
+                in_use=int(r.uin) == int(r.owner_uin),
+                hold_id=hold.hold_id if hold else None,
+                hold_expires_at=hold.expires_at if hold else None,
+            )
+        )
+    return OwnedUinsListOut(
+        items=items,
+        total=int(total),
+        claims_purchase=await _count("purchase"),
+        claimed_free=await _count("claimed"),
+        granted_total=await _count("granted"),
+        migrated_total=await _count("migrated"),
+        live_holds=int(
+            await db.scalar(
+                select(func.count()).select_from(UinHold).where(UinHold.expires_at > now)
+            ) or 0
+        ),
+    )
 
 
 # ── Server-join invites ─────────────────────────────────────────────
