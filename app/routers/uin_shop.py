@@ -554,7 +554,19 @@ async def _take(
                 detail={"code": "collection_full", "max": MAX_OWNED_UINS},
             )
         db.add(OwnedUin(uin=target, owner_uin=owner, source="purchase"))
-        await db.flush()
+        # ⚠⚠ COMMIT, not just flush. `get_db` yields a session and commits
+        # NOTHING, so a route that only flushes answers 200 and saves nothing:
+        # the session closes, the row rolls back, and the person is told they
+        # own a number that was never written down. That is exactly what
+        # happened the morning this branch reopened - the founder bought a
+        # number, got 200 OK, and his collection stayed empty.
+        #
+        # The other two paths hid it: `switch=True` goes through
+        # `_perform_migration`, which commits inside its own transaction, and
+        # `/uin/redeem` commits right after calling this. Only the free take
+        # into the collection had nobody to commit for it, and that branch had
+        # been closed since 01.09, so reopening it exposed a gap nothing tested.
+        await db.commit()
         return PurchaseOut(
             new_uin=owner,
             token=None,
