@@ -264,11 +264,17 @@ async def _perform_migration(
             "to the pool"
         )
     elif stale is not None:
-        # Ours (the re-key above moved it), left over from when moving kept the
-        # number. Collections are closed, so it is deleted rather than restamped
-        # — otherwise a pre-existing row would quietly keep the number out of
-        # the pool that every other line here is now putting it back into.
-        await db.delete(stale)
+        # ⚠⚠ OURS, AND IT STAYS (2026-09-03, founder). This row is the deed to a
+        # number that was bought, and the re-key above has already pointed it at
+        # the new number. Leaving it alone is what makes the rule true: a free
+        # number is a loan and goes back to the pool when you step off it, a
+        # bought one is property and waits in your collection until you sell or
+        # release it.
+        #
+        # It used to be deleted here, with collections closed, which meant the
+        # commonest button in the app - "new number" - silently took back what
+        # somebody had paid for.
+        log.info("[migrate] vacated number is held, it stays in the collection")
     else:
         # ⚠⚠ The vacated number goes back into the POOL (2026-09-01).
         #

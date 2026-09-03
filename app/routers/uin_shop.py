@@ -38,7 +38,8 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -46,6 +47,8 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import carry_device_id, current_device_id, current_uin, issue_token, uin_epoch
 from app.models.owned_uin import OwnedUin
+from app.models.uin_sale import SpentVoucher, UinHold
+from app.services import uin_voucher
 from app.models.user import User
 from app.routers.migrate import _perform_migration
 from app.services.uin import is_reserved_uin, uin_is_taken
@@ -65,7 +68,7 @@ MAX_LEN = 9
 # eleven on one of them, while the short numbers everyone else picks from ran
 # out. The constant stays so the two endpoints that still report a cap can
 # tell a client the truth (`max_owned: 0`) rather than 404 at it.
-MAX_OWNED_UINS = 0
+MAX_OWNED_UINS = 10
 
 # Price cents keyed by UIN length. Roughly geometric: ~3x per
 # digit drop until the 3-digit trophy tier at the Apple $999 cap.
@@ -256,9 +259,18 @@ class MyUinsOut(BaseModel):
 
 
 async def _owned_uins(db: AsyncSession, owner: int) -> list[int]:
+    """The numbers this account holds and is NOT currently answering as.
+
+    ⚠ The deed for the active number stays in the table (that is what keeps a
+    bought number yours when you move off it), so the row for `owner` itself is
+    filtered here rather than deleted there. A collection that listed you to
+    yourself would also let `release` be pointed at the number you are using.
+    """
     rows = (
         await db.execute(
-            select(OwnedUin.uin).where(OwnedUin.owner_uin == owner).order_by(OwnedUin.uin)
+            select(OwnedUin.uin)
+            .where(OwnedUin.owner_uin == owner, OwnedUin.uin != owner)
+            .order_by(OwnedUin.uin)
         )
     ).scalars().all()
     return [int(u) for u in rows]
@@ -273,9 +285,16 @@ async def my_uins(
 
     Open regardless of UIN_SHOP_ENABLED: an operator switching the shop off
     should stop new sales, not hide from people what they already own."""
+    # ⚠ `uin != me` here for the same reason it is in `_owned_uins`: since
+    # 2026-09-03 the deed to a number SURVIVES being used, which is what keeps a
+    # bought number yours when you move off it. Two readers of one table have to
+    # answer the same way, or the collection screen lists the number you are
+    # answering as and offers to release it.
     rows = (
         await db.execute(
-            select(OwnedUin).where(OwnedUin.owner_uin == me).order_by(OwnedUin.acquired_at.desc())
+            select(OwnedUin)
+            .where(OwnedUin.owner_uin == me, OwnedUin.uin != me)
+            .order_by(OwnedUin.acquired_at.desc())
         )
     ).scalars().all()
     return MyUinsOut(
@@ -358,12 +377,102 @@ async def activate(
     if user.is_suspended:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
 
-    # Free the target first: migrating ONTO a number that is still recorded as
-    # held would leave a row claiming the number the account now occupies.
-    await db.delete(held)
-    await db.flush()
+    # ⚠⚠ The vault row STAYS (2026-09-03, founder: "коллекция должна быть
+    # коллекцией"). It used to be deleted here, on the reading that a number you
+    # are answering as is not a number you are holding. That reading is what
+    # made moving cost you what you had bought: with no row, the number you left
+    # looked like the free one the network lends at signup, and the migration
+    # put it back in the pool.
+    #
+    # So the row is the deed, not a parking ticket. It survives being used, it
+    # is re-keyed onto the new number with everything else (`owned_uins` is in
+    # PER_UIN_COLUMNS), and `release` remains the one deliberate way to give a
+    # number up. `_owned_uins` filters out whichever number the account is
+    # currently answering as, so a collection never lists you to yourself.
     return await _take(db, user, body.uin, switch=True, device_id=device_id)
 
+
+class RedeemIn(BaseModel):
+    uin: int = Field(gt=0)
+    #: The till's signed proof that this number was paid for. Base64 of a small
+    #: JSON document; see `app/services/uin_voucher.py` for its shape and for
+    #: why the island learns nothing else about the payment.
+    voucher: str = Field(min_length=16, max_length=4096)
+    #: Move onto the number now, or leave it in the collection for later.
+    switch: bool = False
+
+
+@router.post("/redeem", response_model=PurchaseOut,
+             dependencies=[Depends(rate_limit("uin_redeem", 20, 3600))])
+async def redeem(
+    body: RedeemIn,
+    me: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> PurchaseOut:
+    """Turn a paid-for voucher into a number.
+
+    This is the ONLY door through which a scarce number leaves the shelf to a
+    stranger, and the only one that may hand out a number without moving the
+    account onto it. Everything about the payment happened somewhere else: the
+    island checks a signature, checks the number is still free, and writes one
+    row.
+
+    ⚠ The order below is the whole safety of it. The voucher is verified, then
+    the nonce is claimed by INSERT (the primary key is what makes two
+    simultaneous redemptions of one voucher impossible, not a SELECT first),
+    then the number is taken. A crash between them leaves a spent nonce and no
+    number, which is a support question; the reverse leaves a number sold twice,
+    which is not.
+    """
+    if not settings.UIN_SHOP_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
+    target = int(body.uin)
+    length = _length(target)
+    if length < MIN_LEN or length > MAX_LEN:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
+    if target == me:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "self_target"})
+
+    user = await db.get(User, me)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    if user.is_suspended:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+
+    try:
+        nonce = uin_voucher.verify(body.voucher, expect_uin=target)
+    except uin_voucher.VoucherError as e:
+        code = e.code
+        status_code = (
+            status.HTTP_404_NOT_FOUND if code == "sales_disabled"
+            else status.HTTP_403_FORBIDDEN
+        )
+        raise HTTPException(status_code, detail={"code": code}) from None
+
+    # Free? Asked AFTER the signature, so an invalid voucher never becomes a way
+    # to probe which numbers exist. A hold placed by the till for THIS sale is
+    # not an obstacle: it was put there to keep the number for this buyer.
+    if await uin_is_taken(db, target):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
+
+    db.add(SpentVoucher(nonce=nonce))
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "voucher_spent"}
+        ) from None
+
+    # The hold this sale was made under, if there is one, has done its job.
+    hold = await db.get(UinHold, target)
+    if hold is not None:
+        await db.delete(hold)
+
+    out = await _take(db, user, target, switch=bool(body.switch), device_id=device_id)
+    await db.commit()
+    return out
 
 async def _take(
     db: AsyncSession, user: User, target: int, *, switch: bool, device_id: str
@@ -373,13 +482,30 @@ async def _take(
     cannot drift between the two."""
     owner = int(user.uin)
     if not switch:
-        # ⚠⚠ Collections are closed (2026-09-01). One identity, one number: a
-        # number you are not using is a number nobody can use, and this branch
-        # is how 161 of them ended up parked. Taking a number now means moving
-        # onto it, so the only way to hold two is to be two accounts.
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            detail={"code": "collections_closed", "max": 1},
+        # ⚠⚠ Holding a number without answering as it is PAID FOR, and nothing
+        # else re-opens this branch (2026-09-03). It was closed on 01-09 because
+        # taking was free, and free-and-keep is what parked 161 numbers across 54
+        # collections while the shelf everyone else picks from emptied. The
+        # limiter that was missing is money, not a number: `/uin/redeem` is the
+        # only caller that reaches here, and it reaches here holding a voucher
+        # the till signed for this exact number.
+        held_count = await db.scalar(
+            select(func.count()).select_from(OwnedUin).where(
+                OwnedUin.owner_uin == owner, OwnedUin.uin != owner
+            )
+        )
+        if (held_count or 0) >= MAX_OWNED_UINS:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"code": "collection_full", "max": MAX_OWNED_UINS},
+            )
+        db.add(OwnedUin(uin=target, owner_uin=owner, source="purchase"))
+        await db.flush()
+        return PurchaseOut(
+            new_uin=owner,
+            token=None,
+            switched=False,
+            owned=await _owned_uins(db, owner),
         )
 
     # Keeping the number they were using is `_perform_migration`'s job now, not
