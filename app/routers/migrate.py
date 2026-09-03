@@ -50,7 +50,7 @@ from app.models.device_token import DeviceToken
 from app.models.owned_uin import OwnedUin
 from app.models.user import User
 from app.services.connection_manager import manager
-from app.services.uin import allocate_uin
+from app.services.uin import allocate_uin, is_reserved_uin
 from app.services.uin_rows import rekey_uin_rows
 
 log = logging.getLogger(__name__)
@@ -275,8 +275,33 @@ async def _perform_migration(
         # commonest button in the app - "new number" - silently took back what
         # somebody had paid for.
         log.info("[migrate] vacated number is held, it stays in the collection")
+    elif is_reserved_uin(old_uin):
+        # ⚠⚠ SCARCE STOCK IS NEVER DROPPED ON THE FLOOR (2026-09-03, after it
+        # cost the founder #911).
+        #
+        # What happened: iOS still sends `/uin/purchase {switch: true}` - it was
+        # changed to that on 01.09, when collections were closed and the island
+        # refused `switch: false` outright. Collections reopened this morning and
+        # the released client was not told. So buying an ordinary seven-digit
+        # number MOVED the account onto it, the branch below returned the number
+        # left behind to the pool, and a three-digit number that had been handed
+        # over by name was on the public shelf a second later. Twice in a row.
+        #
+        # The loan rule is right for ORDINARY space - that is what stopped the
+        # hoarding - but a scarce number is not a loan. It was granted, bought
+        # or earned, it cannot be re-minted, and nobody steps off one by
+        # accident and means to lose it. So it follows its holder into the
+        # collection, exactly as a bought number does.
+        #
+        # ⚠ This does NOT reopen the hoarding door: `allocate_uin` never mints
+        # scarce numbers, `/uin/purchase` refuses them, and `desired_uin` cannot
+        # ask for one. The only ways to be holding one are a grant, an invite or
+        # a paid voucher - all doors with somebody standing at them - so a
+        # collection can only fill with numbers that were deliberately given.
+        db.add(OwnedUin(uin=old_uin, owner_uin=target_uin, source="migrated"))
+        log.info("[migrate] vacated number is scarce, it stays with its holder")
     else:
-        # ⚠⚠ The vacated number goes back into the POOL (2026-09-01).
+        # ⚠⚠ The vacated ORDINARY number goes back into the POOL (2026-09-01).
         #
         # It used to be stamped as an `owned_uins` row for the account that had
         # just left it, on the §10.1.3 reasoning that only its previous holder
@@ -284,12 +309,12 @@ async def _perform_migration(
         # into an acquisition: `/uin/purchase` was free during the beta, so the
         # cheapest way to collect numbers was to keep moving, and 161 of them
         # ended up parked across 54 collections while the shelf everyone else
-        # picks from emptied. One identity, one number.
+        # picks from emptied. One identity, one ordinary number.
         #
         # What this costs, honestly: a move is no longer reversible by right.
-        # Change your mind after migrating and the old number may already be
-        # gone. That is the same deal every other user gets, and it is the
-        # reason the number is there for them at all.
+        # Change your mind after migrating and the old ordinary number may
+        # already be gone. That is the same deal every other user gets, and it
+        # is the reason the number is there for them at all.
         log.info("[migrate] vacated number returned to the pool")
 
     # Device push tokens belong to the device, not the account. After
