@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -735,11 +735,19 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     # ⏭ This is a mitigation, not the fix. The fix is to stop accepting a
     # signing key at registration without proof of the matching private key —
     # /auth/recover/challenge already has the machinery.
+    # ⚠ COALESCE, and it is the whole repair. `created_at` is a fact about the
+    # NUMBER - a migration deliberately does not copy it - so ordering by it
+    # alone sent a person to the back of the queue for their own key every time
+    # they moved, and handed their recovery to any older row carrying the same
+    # key. `identity_created_at` follows the PERSON across a move; rows written
+    # before the column existed have NULL and fall back to `created_at`, which
+    # for a row that never moved is the same instant.
+    first_claim = func.coalesce(User.identity_created_at, User.created_at)
     uin = (
         await db.execute(
             select(User.uin)
             .where(User.signing_key == sk)
-            .order_by(User.created_at.asc(), User.uin.asc())
+            .order_by(first_claim.asc(), User.uin.asc())
             .limit(1)
         )
     ).scalar_one_or_none()

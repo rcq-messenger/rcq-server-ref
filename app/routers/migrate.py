@@ -147,6 +147,16 @@ async def _perform_migration(
         # `last_seen` and `created_at` are deliberately NOT copied: they are
         # facts about this row, and created_at is when this number began.
         #
+        # ⚠⚠ `identity_created_at` IS copied, and it exists for exactly this
+        # line. Recovery resolves a signing key to whoever claimed it first; the
+        # key travels with the person, so the claim has to travel with it. While
+        # only `created_at` carried that order, every move put the person behind
+        # any other row holding the same key - and on the flagship seven keys
+        # are already held by more than one account, one of them by twelve. A
+        # row that predates the column reads NULL and falls back to
+        # `created_at`, which for a number that never moved is the same moment.
+        identity_created_at=user.identity_created_at or user.created_at,
+        #
         # Three fields left this list on 2026-08-22 with the columns behind
         # them: `trade_policy` (guarded a router that has not existed since the
         # pivot) and `active_days` / `last_active_day`. The claim above that
