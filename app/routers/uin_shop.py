@@ -706,6 +706,13 @@ async def till_hold(
     (or released) that the till can release (or re-hold) again, and the till is
     the only thing that decides what a hold means. It can never grant anything.
     """
+    # ⚠ Behind the shop flag, like every other paid door here. An island whose
+    # operator never turned the shop on has nothing to sell, so it has no reason
+    # to let anything reserve its numbers - and a reservation is the one thing a
+    # holder of the till key can do that takes a number off the shelf.
+    if not settings.UIN_SHOP_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
+
     try:
         kind, uin, hold_id, _exp = uin_voucher.verify_hold(body.request)
     except uin_voucher.VoucherError as e:
