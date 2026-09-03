@@ -4,9 +4,13 @@ Two kinds of stock end up out of circulation without anybody deciding it
 should be:
 
   * PARKED — rows in ``owned_uins``. A number in a collection has no account
-    behind it; it is simply held. Collections are closed as of 2026-09-01
-    (services/uin, routers/uin_shop), so every remaining row is a leftover of
-    the era when moving accounts kept the number you moved off.
+    behind it; it is simply held.
+
+    ⚠⚠ This used to read "collections are closed as of 2026-09-01, so every
+    remaining row is a leftover", and the code below acted on it with an
+    unconditional DELETE of the whole table. Collections REOPENED on
+    2026-09-03 and numbers are sold now, so the table holds paid deeds too.
+    Rows with ``source='purchase'`` are property and are never reclaimed.
   * ABANDONED — a short or patterned number on an account that registered,
     did nothing at all, and never came back. "Nothing at all" is meant
     literally here: no contacts, no group memberships, no push tokens.
@@ -56,9 +60,25 @@ async def _release_parked(db, apply: bool) -> int:
         short = [u for u in held if is_reserved_uin(u)]
         print(f"  #{owner}: {len(held)} held, {len(short)} of them reserved")
     if apply:
-        await db.execute(delete(OwnedUin))
+        # ⚠⚠ NEVER an unconditional `delete(OwnedUin)`. It was exactly that,
+        # with no WHERE at all, on the strength of a docstring saying
+        # collections were closed so every row had to be a leftover. That
+        # stopped being true on 2026-09-03, when collections reopened and
+        # numbers went on sale: from that day the table also holds the DEEDS
+        # for numbers people have paid money for, and one run of this tool
+        # would have deleted every one of them, silently, with no way to tell
+        # afterwards which had existed.
+        #
+        # A purchase is never a leftover, so it is never reclaimed here. If
+        # some future rule should reclaim one, it will be written deliberately
+        # and it will say so; it will not arrive as a side effect of a sweep
+        # aimed at something else.
+        result = await db.execute(
+            delete(OwnedUin).where(OwnedUin.source != "purchase")
+        )
         await db.commit()
-        print(f"parked: released {len(rows)}")
+        kept = len(rows) - (result.rowcount or 0)
+        print(f"parked: released {result.rowcount or 0}, kept {kept} paid deed(s)")
     return len(rows)
 
 
