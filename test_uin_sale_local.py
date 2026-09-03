@@ -405,6 +405,31 @@ async def main() -> int:
         check(f"  ... and the flagship still sells it ({r.json().get('acquire')})",
               r.json().get("acquire") == "purchase")
 
+        print("\n🏝 A self-hoster sells to clients that will use THEIR checkout:")
+        # No built-in-till claim (they are not the flagship), but they run a
+        # till of their own and the client says it will use whatever address
+        # comes back. That is the whole handshake.
+        os.environ["RCQ_UIN_CLIENT_TILL_MINE"] = "false"
+        os.environ["RCQ_UIN_TILL_URL"] = "https://till.example.org/"
+        HDECL = {**HQ, "X-RCQ-Checkout": "island"}
+        r = await c.post("/uin/quote", json={"uin": 4321}, headers=HDECL)
+        q3 = r.json()
+        check(f"a declaring client is sold to ({q3.get('acquire')})", q3.get("acquire") == "purchase")
+        check(f"  ... and is told where to pay ({q3.get('checkout_url')})",
+              q3.get("checkout_url") == "https://till.example.org")
+        check("  ... with the island's own price", q3.get("price_cents") is not None)
+        r = await c.post("/uin/quote", json={"uin": 4321}, headers=HQ)
+        q4 = r.json()
+        check(f"⚠⚠ a client that did NOT declare gets nothing to buy ({q4.get('acquire')})",
+              q4.get("acquire") == "closed")
+        check("  ... and no address, so it cannot fall back to ours",
+              q4.get("checkout_url") is None)
+        os.environ.pop("RCQ_UIN_TILL_URL", None)
+        r = await c.post("/uin/quote", json={"uin": 4321}, headers=HDECL)
+        check(f"  ... and declaring buys nothing on an island with no till ({r.json().get('acquire')})",
+              r.json().get("acquire") == "closed")
+        os.environ["RCQ_UIN_CLIENT_TILL_MINE"] = "true"
+
         print("\n⚠ A FREE claim is not a purchase, and the deed says so:")
         # /uin/purchase hands out an ordinary number for nothing and reached the
         # same writer, stamping every one of them "purchase". The column that is
