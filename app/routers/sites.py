@@ -60,12 +60,62 @@ MAX_FILES = 64
 
 #: Lowercase letters, digits and dashes. Short on purpose: the address is read
 #: aloud and typed by hand.
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+#:
+#: ⚠ Three characters at least (founder, 03.09). One- and two-character names
+#: are the part of this namespace that cannot be made more of: 36 of one, about
+#: 1300 of two, and they were being handed out free to whoever typed first. The
+#: shelf is empty today, which is exactly why the door closes now rather than
+#: after somebody has taken `a`, `x` and `hi`. Nothing published is affected:
+#: the shortest name on the flagship is three characters.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,31}$")
 
 #: Names this router already answers to. A site called `mine` would be
 #: published happily and then never open, because the route above it wins -
 #: so it is refused at the door instead of becoming a support question.
 _ROUTE_NAMES = {"mine", "available"}
+
+#: Names that would read as the island speaking. A page is text and pictures
+#: with no scripts and no outward links, so the only thing an address buys an
+#: impostor is TRUST: `support.rcq` saying "recovery, write to #NNN" is the
+#: whole attack, and the rest of it happens in a chat with a human.
+#:
+#: ⚠ Exact strings, never a pattern. "Reserve everything containing rcq" would
+#: be a squatting market of our own making, which is the same reasoning that
+#: keeps letter names a common pool one screen below.
+#:
+#: A name already held by the caller is not refused here (see `put_site`), so
+#: an operator's own `rcq` page keeps updating.
+_AUTHORITY_NAMES = {
+    "support", "admin", "administrator", "security", "help", "helpdesk",
+    "abuse", "moderator", "moderation", "official", "root", "system",
+    "rcq", "rcq-team", "rcq-support", "rcqteam", "rcqsupport", "team",
+}
+
+#: Characters that make a string read differently from the bytes it is: the
+#: bidi overrides and isolates, the zero-width joiners and the soft hyphen.
+#: They belong to no honest catalogue line and they are what turns a title into
+#: something that reads as another site's name.
+_INVISIBLE = dict.fromkeys(
+    [0x00AD, 0x061C, 0x180E]
+    + list(range(0x200B, 0x2010))   # ZWSP..RLM
+    + list(range(0x202A, 0x202F))   # LRE..RLO + PDF
+    + list(range(0x2066, 0x206A))   # isolates
+    + [0xFEFF],
+    None,
+)
+
+
+def _clean_title(raw: str | None) -> str | None:
+    """The one line a site gets in the catalogue, with the invisibles removed.
+
+    ⚠ On the ISLAND rather than in the clients: it fixes the three that are
+    already in people's hands, and a client that draws a title correctly is not
+    the one that decides what a title may contain.
+    """
+    if raw is None:
+        return None
+    cleaned = raw.translate(_INVISIBLE).strip()
+    return cleaned or None
 
 #: What a bundle may contain. No fonts (an outside font is a fingerprint), no
 #: scripts (there is no JS at all), no video (the traffic is somebody else's
@@ -185,7 +235,18 @@ async def availability(name: str, db: AsyncSession = Depends(get_db)) -> Availab
     if not _NAME_RE.match(lower) or lower in _ROUTE_NAMES:
         return AvailabilityOut(name=lower, available=False, reason="invalid")
     row = await db.get(Site, lower)
-    return AvailabilityOut(name=lower, available=row is None, reason="taken" if row else None)
+    if row is not None:
+        return AvailabilityOut(name=lower, available=False, reason="taken")
+    # ⚠ The two rules `put_site` enforces and this check did not, so the panel
+    # said "free", the publish returned 403, and the person had no idea which
+    # of the two had happened. A digits name belongs to the holder of that
+    # number - this route has no caller to compare against, so it says
+    # "reserved" and lets the client, which knows its own number, say the rest.
+    if lower.isdigit():
+        return AvailabilityOut(name=lower, available=False, reason="reserved")
+    if lower in _AUTHORITY_NAMES:
+        return AvailabilityOut(name=lower, available=False, reason="reserved")
+    return AvailabilityOut(name=lower, available=True)
 
 
 @router.get("/{name}/manifest.json")
@@ -273,6 +334,12 @@ async def put_site(
     lower = name.strip().lower()
     if not _NAME_RE.match(lower) or lower in _ROUTE_NAMES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_name"})
+    # A name that would read as the island speaking, unless it is already this
+    # account's own page: the operator's `rcq` notice has to keep updating.
+    if lower in _AUTHORITY_NAMES:
+        held = await db.get(Site, lower)
+        if held is None or int(held.owner_uin) != me:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "reserved_name"})
     # ⚠ A name of digits only belongs to the holder of that number. `123456.rcq`
     # is indistinguishable from "the official page of #123456", and that is the
     # one impersonation worth closing with a single line. Letter names stay a
@@ -358,7 +425,7 @@ async def put_site(
     if existing is None:
         site = Site(
             name=lower, owner_uin=me, owner_key=owner_key, version=expected_version,
-            manifest=manifest, size_bytes=total, title=title, listed=bool(listed),
+            manifest=manifest, size_bytes=total, title=_clean_title(title), listed=bool(listed),
             show_owner=bool(show_owner), created_at=now, updated_at=now,
         )
         db.add(site)
@@ -367,7 +434,7 @@ async def put_site(
         site.version = expected_version
         site.manifest = manifest
         site.size_bytes = total
-        site.title = title
+        site.title = _clean_title(title)
         site.listed = bool(listed)
         site.show_owner = bool(show_owner)
         # The operator's pin does not outlive the owner's opt-in: a site that
