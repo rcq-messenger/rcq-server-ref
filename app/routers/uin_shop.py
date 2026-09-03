@@ -34,7 +34,7 @@ price as a public fact about a UIN's digit length, not as a secret.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -48,9 +48,9 @@ from app.core.rate_limit import rate_limit
 from app.core.security import carry_device_id, current_device_id, current_uin, issue_token, uin_epoch
 from app.models.owned_uin import OwnedUin
 from app.models.uin_sale import SpentVoucher, UinHold
-from app.services import uin_voucher
 from app.models.user import User
 from app.routers.migrate import _perform_migration
+from app.services import uin_voucher
 from app.services.uin import is_reserved_uin, uin_is_taken
 
 router = APIRouter(prefix="/uin", tags=["uin_shop"])
@@ -61,14 +61,35 @@ router = APIRouter(prefix="/uin", tags=["uin_shop"])
 # defense-in-depth gate.
 MIN_LEN = 3
 MAX_LEN = 9
-# How many numbers one account may hold at once. ⚠⚠ ZERO since 2026-09-01:
-# collections are closed and one identity holds exactly the one number it
-# answers as. Ten was "generous for a person and useless for a hoarder", and
-# the measurement said otherwise: 161 numbers parked across 54 accounts,
-# eleven on one of them, while the short numbers everyone else picks from ran
-# out. The constant stays so the two endpoints that still report a cap can
-# tell a client the truth (`max_owned: 0`) rather than 404 at it.
+# How many numbers one account may hold at once, beside the one it answers as.
+#
+# Was zero between 01.09 and 03.09, when collections were closed outright to
+# stop the hoarding that had emptied the shelf: 161 numbers parked across 54
+# accounts, eleven on one of them, while everyone else picked from what was
+# left. What reopened them was making them cost money (founder, 03.09) - a
+# hoard of ten short numbers is now a four-figure hoard, and the door they come
+# through is a payment rather than a request.
+#
+# ⚠ The cap counts PROPERTY, not the number in use: `_owned_uins` and
+# `/uin/mine` both hide the number the account answers as, so moving between
+# your own numbers can never be refused for being one too many.
 MAX_OWNED_UINS = 10
+
+#: The shortest number that is ever for sale. Three digits stay off the market
+#: entirely (founder, 03.09): 999 of them exist in the whole world, 761 are
+#: already spoken for, and what is left is worth more as something handed to a
+#: person by name than as the top row of a price list.
+MIN_SALE_LEN = 4
+
+#: How long the till's hold lasts. Two hours: an invoice lives one, and the
+#: slack covers a transfer that confirms slowly.
+#:
+#: ⚠ Deliberately not a day. Placing a hold costs nothing and needs no payment,
+#: so a long hold is a way to take numbers out of circulation for free - and
+#: the four-digit shelf is 9000 numbers wide, not a million. A payment that
+#: lands after the hold has lapsed is still honoured: a voucher does not need a
+#: hold to be redeemed, it only needs the number to still be free.
+HOLD_MINUTES = 120
 
 # Price cents keyed by UIN length. Roughly geometric: ~3x per
 # digit drop until the 3-digit trophy tier at the Apple $999 cap.
@@ -101,8 +122,18 @@ class QuoteOut(BaseModel):
     price_cents: int | None
     price_display: str | None
     # When available=False, `reason` tells the UI what to render:
-    # "taken" | "too_short" | "too_long" | "self".
+    # "taken" | "too_short" | "too_long" | "self" | "reserved".
     reason: str | None = None
+    #: How this number would be acquired, so a client can draw the right button
+    #: instead of inferring it from the length:
+    #:   "free"     - ordinary space, `POST /uin/purchase` takes it for nothing;
+    #:   "purchase" - scarce stock, only `POST /uin/redeem` with a paid voucher;
+    #:   "closed"   - not obtainable here at all (three digits, or an island
+    #:                with no till, or the number is already taken).
+    #: ⚠ Older clients ignore the field and keep working: everything they knew
+    #: how to take is still "free", and everything else still says available
+    #: only when it really can be had.
+    acquire: str = "closed"
 
 
 async def require_shop_open() -> None:
@@ -136,22 +167,30 @@ async def quote(
     if body.uin == me:
         return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="self")
 
-    # A reserved number is not on sale here, so it must not quote as available:
-    # the picker would offer it, the person would tap, and `/purchase` would
-    # answer 403. Same word both places.
-    if is_reserved_uin(body.uin):
-        return QuoteOut(uin=body.uin, length=length, available=False, price_cents=None, price_display=None, reason="reserved")
-
-    taken = await uin_is_taken(db, body.uin)
     cents = _PRICES_CENTS[length]
     display = f"${cents / 100:.2f}"
+    scarce = is_reserved_uin(body.uin)
+
+    # Scarce stock is sold, not claimed, and only where there is something to
+    # be paid: an island with no till cannot take money, so quoting a price on
+    # one would be advertising a shop that does not exist. Three digits are off
+    # the market whatever the till says.
+    if scarce and (length < MIN_SALE_LEN or not uin_voucher.public_key_b64()):
+        return QuoteOut(uin=body.uin, length=length, available=False,
+                        price_cents=None, price_display=None, reason="reserved")
+
+    taken = await uin_is_taken(db, body.uin)
+    if taken:
+        return QuoteOut(uin=body.uin, length=length, available=False,
+                        price_cents=None, price_display=None, reason="taken")
     return QuoteOut(
         uin=body.uin,
         length=length,
-        available=not taken,
-        price_cents=cents if not taken else None,
-        price_display=display if not taken else None,
-        reason="taken" if taken else None,
+        available=True,
+        price_cents=cents,
+        price_display=display,
+        reason=None,
+        acquire="purchase" if scarce else "free",
     )
 
 
@@ -451,9 +490,10 @@ async def redeem(
         raise HTTPException(status_code, detail={"code": code}) from None
 
     # Free? Asked AFTER the signature, so an invalid voucher never becomes a way
-    # to probe which numbers exist. A hold placed by the till for THIS sale is
-    # not an obstacle: it was put there to keep the number for this buyer.
-    if await uin_is_taken(db, target):
+    # to probe which numbers exist. ⚠⚠ `ignore_holds` is not an optimisation:
+    # the till holds the number for the minutes the payment takes, so without
+    # it every real sale would be refused by its own reservation.
+    if await uin_is_taken(db, target, ignore_holds=True):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
 
     db.add(SpentVoucher(nonce=nonce))
@@ -602,3 +642,75 @@ async def claim(
 # oracle (it reports whether any 3-9 digit UIN is taken), so an unmetered
 # version enumerates the user base of a product whose pitch is having no
 # public identifiers.
+
+
+class HoldRequestIn(BaseModel):
+    #: A base64 JSON document signed by the till, exactly as `/uin/redeem`
+    #: takes a voucher. See `app/services/uin_voucher.hold_signed_bytes`.
+    request: str = Field(min_length=16, max_length=4096)
+
+
+class HoldRequestOut(BaseModel):
+    uin: int
+    held: bool
+    expires_at: datetime | None = None
+
+
+@router.post("/hold", response_model=HoldRequestOut,
+             dependencies=[Depends(rate_limit("uin_hold", 120, 60))])
+async def till_hold(
+    body: HoldRequestIn,
+    db: AsyncSession = Depends(get_db),
+) -> HoldRequestOut:
+    """The till reserves a number while somebody pays for it, or lets it go.
+
+    ⚠⚠ NO ACCOUNT AND NO ADMIN PASSWORD. The caller proves itself with the same
+    Ed25519 key its vouchers carry, and that key can do exactly two things on
+    this island: reserve a number, and say a number was paid for. Handing the
+    till the admin credentials instead would have given a machine that watches
+    a blockchain the ability to read the member list, and there is no version of
+    that trade worth making.
+
+    Placing a hold is also the availability check, and deliberately so: asking
+    "is it free" and then reserving it are two steps a second buyer can walk
+    between. Here the answer and the reservation are one row.
+
+    ⚠ A hold request can be replayed inside its ten-minute life by anyone who
+    sees one. That is bounded on purpose - the worst outcome is a number held
+    (or released) that the till can release (or re-hold) again, and the till is
+    the only thing that decides what a hold means. It can never grant anything.
+    """
+    try:
+        kind, uin, hold_id, _exp = uin_voucher.verify_hold(body.request)
+    except uin_voucher.VoucherError as e:
+        code = e.code
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND if code == "sales_disabled" else status.HTTP_403_FORBIDDEN,
+            detail={"code": code},
+        ) from None
+
+    existing = await db.get(UinHold, uin)
+    if kind == "release":
+        # Only the hold this till placed, and only under the id it placed it
+        # with: releasing is idempotent, but it is not a way to lift somebody
+        # else's reservation.
+        if existing is not None and existing.hold_id == hold_id:
+            await db.delete(existing)
+            await db.commit()
+        return HoldRequestOut(uin=uin, held=False)
+
+    length = _length(uin)
+    if length < MIN_LEN or length > MAX_LEN:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_length"})
+    if existing is not None and existing.hold_id == hold_id:
+        # Re-placing our own hold extends it. This is what makes the till's
+        # retry after a timeout harmless.
+        existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=HOLD_MINUTES)
+        await db.commit()
+        return HoldRequestOut(uin=uin, held=True, expires_at=existing.expires_at)
+    if await uin_is_taken(db, uin):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
+    expires = datetime.now(timezone.utc) + timedelta(minutes=HOLD_MINUTES)
+    db.add(UinHold(uin=uin, hold_id=hold_id, expires_at=expires))
+    await db.commit()
+    return HoldRequestOut(uin=uin, held=True, expires_at=expires)

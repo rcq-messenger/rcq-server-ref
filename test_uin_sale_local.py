@@ -105,6 +105,17 @@ def voucher(uin: int, *, nonce: str | None = None, ttl: int = 3600, signer=None)
     return base64.b64encode(json.dumps(doc).encode()).decode()
 
 
+def hold_req(uin: int, hold_id: str, *, kind: str = "hold", ttl: int = 300, signer=None) -> str:
+    """How the till asks the island to reserve a number: the same key, a
+    different document. No account, no admin password."""
+    exp = int(time.time()) + ttl
+    body = uin_voucher.hold_signed_bytes(kind=kind, uin=uin, hold_id=hold_id, exp=exp)
+    sig = (signer or TILL).sign(body)
+    doc = {"v": uin_voucher.VERSION, "kind": kind, "uin": uin, "hold_id": hold_id,
+           "exp": exp, "sig": base64.b64encode(sig).decode()}
+    return base64.b64encode(json.dumps(doc).encode()).decode()
+
+
 ALICE = 700400001
 ADMIN = ("admin", "adminpw")
 
@@ -208,6 +219,68 @@ async def main() -> int:
         r = await c.delete("/admin/uin/hold/7654321", auth=ADMIN)
         check(f"releasing a hold is idempotent ({r.status_code})", r.status_code == 200)
 
+        # ⚠⚠ The sale must not be eaten by its own reservation: the till holds
+        # the number for the minutes the payment takes, and the voucher then
+        # arrives against a number the island considers spoken for.
+        r = await c.post("/admin/uin/hold", json={"uin": 5150, "hold_id": "inv-paid-1"}, auth=ADMIN)
+        check(f"the till holds a number for a buyer ({r.status_code})", r.status_code == 200)
+        r = await c.post("/uin/quote", json={"uin": 5150}, headers=H3)
+        check("  it quotes as taken to everybody else",
+              r.json().get("available") is False)
+        r = await c.post("/uin/redeem", json={"uin": 5150, "voucher": voucher(5150)}, headers=H3)
+        check(f"  ⚠ and the paid voucher goes through anyway ({r.status_code})",
+              r.status_code == 200)
+        async with SessionLocal() as db:
+            check("  ... with the hold cleared behind it",
+                  await db.get(UinHold, 5150) is None)
+
+        print("\nThe till reserves numbers with its own key, not an admin password:")
+        r = await c.post("/uin/hold", json={"request": hold_req(6006, "inv-till-1")})
+        check(f"a signed request holds a number ({r.status_code})", r.status_code == 200)
+        q = await c.post("/uin/quote", json={"uin": 6006}, headers=H3)
+        check("  the shop stops offering it", q.json().get("available") is False)
+        r = await c.post("/uin/hold", json={"request": hold_req(6006, "inv-till-1")})
+        check(f"  the till re-placing its OWN hold extends it ({r.status_code})",
+              r.status_code == 200)
+        r = await c.post("/uin/hold", json={"request": hold_req(6006, "inv-somebody-else")})
+        check(f"  another invoice cannot take it ({r.status_code} {code(r)})",
+              r.status_code == 409 and code(r) == "taken")
+        r = await c.post("/uin/hold", json={"request": hold_req(6006, "inv-somebody-else",
+                                                               kind="release")})
+        async with SessionLocal() as db:
+            check("  ⚠ and cannot RELEASE it either", await db.get(UinHold, 6006) is not None)
+        r = await c.post("/uin/hold", json={"request": hold_req(6006, "inv-till-1",
+                                                               kind="release")})
+        async with SessionLocal() as db:
+            check(f"  the invoice that placed it lets it go ({r.status_code})",
+                  r.status_code == 200 and await db.get(UinHold, 6006) is None)
+        forged2 = Ed25519PrivateKey.generate()
+        r = await c.post("/uin/hold", json={"request": hold_req(6007, "x", signer=forged2)})
+        check(f"  a request signed by somebody else ({r.status_code} {code(r)})",
+              r.status_code == 403 and code(r) == "bad_voucher")
+        r = await c.post("/uin/hold", json={"request": hold_req(6007, "x", ttl=-5)})
+        check(f"  an expired request ({r.status_code} {code(r)})",
+              r.status_code == 403 and code(r) == "voucher_expired")
+        r = await c.post("/uin/hold", json={"request": hold_req(6007, "x", ttl=99999)})
+        check(f"  one good for a week ({r.status_code} {code(r)})",
+              r.status_code == 403 and code(r) == "bad_voucher")
+
+        print("\nWhat the shop says a number costs, and how it is obtained:")
+        q = (await c.post("/uin/quote", json={"uin": 4477}, headers=H3)).json()
+        check(f"a four-digit number is FOR SALE ({q.get('acquire')}, {q.get('price_display')})",
+              q.get("available") is True and q.get("acquire") == "purchase"
+              and q.get("price_cents") == 19900)
+        q = (await c.post("/uin/quote", json={"uin": 404}, headers=H3)).json()
+        check("⚠ three digits are not for sale at any price",
+              q.get("available") is False and q.get("reason") == "reserved"
+              and q.get("price_cents") is None)
+        q = (await c.post("/uin/quote", json={"uin": 748392015}, headers=H3)).json()
+        check(f"an ordinary nine-digit number is still free ({q.get('acquire')})",
+              q.get("available") is True and q.get("acquire") == "free")
+        q = (await c.post("/uin/quote", json={"uin": 4242}, headers=H3)).json()
+        check("a number sitting in somebody's collection says taken",
+              q.get("available") is False and q.get("reason") == "taken")
+
         print("\n⚠⚠ A site belongs to the person, unless its name is the number:")
         # One site per account, so the two rules need two accounts.
         async def publish(headers, name, version=1):
@@ -250,16 +323,23 @@ async def main() -> int:
 
         print("\nThe collection is capped:")
         H3 = H5
-        got = 0
-        for n in range(500001, 500020):
+        stopped = None
+        for n in range(500001, 500030):
             r = await c.post("/uin/redeem", json={"uin": n, "voucher": voucher(n)}, headers=H3)
             if r.status_code == 200:
-                got += 1
                 continue
-            check(f"stopped at {got + 1} held ({r.status_code} {code(r)})",
-                  r.status_code == 409 and code(r) == "collection_full")
+            stopped = r
             break
-        check(f"  the cap is ten plus the one in use (held {got + 1})", got + 1 == 10)
+        check(f"buying stops with a reason ({stopped.status_code if stopped else None} "
+              f"{code(stopped) if stopped else None})",
+              stopped is not None and stopped.status_code == 409
+              and code(stopped) == "collection_full")
+        mine = (await c.get("/uin/mine", headers=H3)).json()
+        held = len(mine.get("owned") or [])
+        check(f"  the cap is ten PROPERTIES (held {held}, answering as {mine.get('active')})",
+              held == 10)
+        check("  ... and the number in use is not one of them",
+              mine.get("active") not in (mine.get("owned") or []))
 
     await close_redis()
     shutil.rmtree(SITES_TMP, ignore_errors=True)
