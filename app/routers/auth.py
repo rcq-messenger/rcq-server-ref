@@ -775,6 +775,25 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
 # session to somebody else's uin. Naming the uin removes the ambiguity, and
 # gives away nothing — the proof is still possession of the private key, which
 # an impersonator who registered a copy of the public one does not have.
+class RefreshOut(RegisterOut):
+    """`uin` + `token`, plus the one field that stops a second device from
+    deleting itself.
+
+    ⚠⚠ `moved_from` is set when the number asked for no longer exists and the
+    key resolved to one account instead: the person moved, and this device is
+    the one that was not in their hand at the time. Before this, that device
+    got `identity_not_found`, which every client reads as "the account was
+    burned" - so a phone left in a drawer wiped its own copy of the chats
+    because its owner bought a shorter number on their laptop.
+
+    A client that does not know the field still sees a different `uin` in the
+    answer and can refuse it, which is what the web one does. It ends up where
+    it started, retrying, rather than erasing anything.
+    """
+
+    moved_from: int | None = None
+
+
 class RefreshIn(BaseModel):
     uin: int
     signing_key: str
@@ -786,12 +805,12 @@ class RefreshIn(BaseModel):
 
 @router.post(
     "/refresh",
-    response_model=RegisterOut,
+    response_model=RefreshOut,
     # Once per start-up per install, plus the odd 401 retry. Keyed by IP (there
     # is no session yet), and loose for the same CGNAT reason as /auth/register.
     dependencies=[Depends(rate_limit("auth_refresh", 60, 3600))],
 )
-async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
+async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> RefreshOut:
     sk = body.signing_key.strip()
     if not verify_recover_challenge(body.challenge, sk):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_challenge"})
@@ -806,6 +825,35 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Regist
             select(User.uin).where(User.uin == body.uin, User.signing_key == sk).limit(1)
         )
     ).scalar_one_or_none()
+    moved_from: int | None = None
+    if owned is None:
+        # ⚠⚠ The number is not there. Two very different reasons, and answering
+        # both with "identity_not_found" is what made a second device delete a
+        # live account: the owner MOVED (bought a shorter number on another
+        # device, took a free one, was granted one) and this install is still
+        # asking about the number they left. The account is alive; only its
+        # name changed.
+        #
+        # The proof is unchanged - the signature above already showed
+        # possession of the private key - so resolving by key alone grants
+        # nothing `/auth/recover` would not grant the same caller. Two guards
+        # keep it narrow:
+        #
+        #   * the number asked for must be VACANT. If somebody else answers as
+        #     it now, this is not a move, and handing over a different account
+        #     would be answering a question nobody asked;
+        #   * the key must resolve to EXACTLY ONE account. Seven keys on the
+        #     flagship are carried by more than one, and picking a winner among
+        #     them is how a device ends up in a stranger's account. Ambiguity
+        #     goes to recovery, where a person is looking at the screen.
+        still_there = await db.scalar(select(User.uin).where(User.uin == body.uin))
+        if still_there is None:
+            candidates = (
+                await db.execute(select(User.uin).where(User.signing_key == sk).limit(2))
+            ).scalars().all()
+            if len(candidates) == 1:
+                owned = int(candidates[0])
+                moved_from = int(body.uin)
     if owned is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
     # ★ The whole point of report #607. Proving the signing key says WHO is
@@ -827,7 +875,11 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Regist
                 updated_at=datetime.now(timezone.utc),
             ))
             await db.commit()
-    return RegisterOut(uin=owned, token=issue_token(owned, await uin_epoch(owned), body.device_id))
+    return RefreshOut(
+        uin=owned,
+        token=issue_token(owned, await uin_epoch(owned), body.device_id),
+        moved_from=moved_from,
+    )
 
 
 # ── identity key re-issue (in-place rotation) ───────────────────────────────
