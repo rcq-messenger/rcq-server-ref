@@ -127,6 +127,11 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # deployment also needs the one-off backfill in
     # `tools/backfill_privacy_defaults.py`. A fresh island gets private
     # defaults straight from here.
+    # When the PERSON first appeared, kept across a move so recovery's
+    # first-to-claim-the-key order follows them rather than their number.
+    # Nullable on purpose: existing rows fall back to `created_at`, which for a
+    # row that never moved is the same instant.
+    ("identity_created_at", "TIMESTAMP WITH TIME ZONE"),
     ("last_seen_visibility", "TEXT DEFAULT 'contacts'"),
     ("gender_visibility", "TEXT DEFAULT 'nobody'"),
     ("group_invite_policy", "TEXT DEFAULT 'contacts'"),

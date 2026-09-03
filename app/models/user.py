@@ -293,6 +293,24 @@ class User(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
 
+    #: When this PERSON first appeared, as opposed to when this number began.
+    #:
+    #: ⚠⚠ Recovery resolves a signing key to the account that claimed it FIRST
+    #: (`/auth/recover`, ordered by this), which is what stops somebody who
+    #: learned a public key from registering with it and inheriting the owner's
+    #: way back in. `created_at` cannot carry that order, because a migration
+    #: deliberately does not copy it: it is a fact about the NUMBER, and the
+    #: number is new. The effect was that every move sent the person to the back
+    #: of the queue for their own key, and on the flagship seven keys are
+    #: already held by more than one account, one of them by twelve. Copied
+    #: verbatim by `_perform_migration`, so precedence follows the person.
+    #:
+    #: NULL on every row written before this column existed; readers fall back
+    #: to `created_at`, which for a row that never moved is the same instant.
+    identity_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=lambda: datetime.now(timezone.utc)
+    )
+
 
 # ── Presence ────────────────────────────────────────────────────────
 # "online" is DERIVED from `last_seen` freshness — never trusted from the
