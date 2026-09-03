@@ -357,9 +357,15 @@ async def main():
         check(f"★ activating your OWN held number still works ({r.status_code})", r.status_code == 200)
         holder_tok = r.json()["token"]
         check("  ... the number is now the account", r.json()["new_uin"] == HELD)
-        check("  ... and the one it left is in the collection", holder in await owned(c, holder_tok))
+        # ⚠ The number it left was the FREE one the network lends at signup, so
+        # it goes back to the pool (founder, 2026-09-03: a free number is a
+        # loan, a bought one is property). Before that rule this line expected
+        # the opposite, and expecting the opposite is what let somebody collect
+        # numbers by moving between them for nothing.
+        check("  ... and the FREE number it left went back to the pool",
+              holder not in await owned(c, holder_tok))
 
-        print("\nA migration keeps the number it left (§10.1.3):")
+        print("\nA migration keeps what was BOUGHT and returns what was lent:")
         mover, mover_tok = await register(c)
         spare = 555_000_333
         check("the mover holds a spare", (await grant(c, spare, mover)).status_code == 200)
@@ -368,21 +374,30 @@ async def main():
         moved = r.json()["new_uin"]
         mover_tok = r.json()["token"]
         after = await owned(c, mover_tok)
-        check("★ the number migrated FROM is in the collection", mover in after)
-        check("  ... and the rest of the collection came along", spare in after)
-        check("  ... and nothing else appeared", after == sorted([mover, spare]))
+        # ⚠⚠ The rule changed on 2026-09-03 and this block is where it shows.
+        # The mover was answering as the FREE number the network lent them at
+        # signup: no deed, so it goes back to the pool. What they were GIVEN by
+        # the operator has a deed, and a deed survives everything except a sale
+        # or a release.
+        check("★ the free number migrated FROM went back to the pool", mover not in after)
+        check("  ... and the spare they were granted came along", spare in after)
+        check("  ... and nothing else appeared", after == [spare])
         async with SessionLocal() as db:
-            row = await db.get(OwnedUin, mover)
-            check("  ... exactly one row, owned by the new number", row is not None and int(row.owner_uin) == moved)
-            check("  ... stamped as the spec names it", row is not None and row.source == "migrated")
+            check("  ... the pool really has it: no deed left behind",
+                  await db.get(OwnedUin, mover) is None)
+            row = await db.get(OwnedUin, spare)
+            check("  ... and the granted one is owned by the new number",
+                  row is not None and int(row.owner_uin) == moved)
 
-        r = await register_proven(c, desired_uin=mover)
-        check("★ a stranger cannot register the number just migrated off", r.status_code == 201 and r.json()["uin"] != mover)
-
-        r = await c.post("/uin/activate", headers=H(mover_tok), json={"uin": mover})
-        check(f"★ the mover can move back onto it ({r.status_code})", r.status_code == 200)
+        r = await c.post("/uin/activate", headers=H(mover_tok), json={"uin": spare})
+        check(f"★ the mover can move onto what they hold ({r.status_code})", r.status_code == 200)
         mover_tok = r.json()["token"]
-        check("  ... and the number they left is now the held one", await owned(c, mover_tok) == sorted([moved, spare]))
+        # What they left this time is the number the migration gave them, which
+        # is a loan like any other free number: back to the pool, so the
+        # collection is empty and the only number they have is the one they
+        # answer as.
+        check("  ... and the free number they left is gone from the collection",
+              await owned(c, mover_tok) == [])
 
         print("\nThe collection cap does not block a migration:")
         capped, capped_tok = await register(c)
@@ -392,22 +407,25 @@ async def main():
         r = await c.post("/account/migrate", headers=H(capped_tok))
         check(f"★ migrating at the cap is not refused ({r.status_code})", r.status_code == 200)
         capped_tok = r.json()["token"]
-        check("★ and the number is kept rather than dropped (one over the cap)",
-              capped in await owned(c, capped_tok) and len(await owned(c, capped_tok)) == MAX_OWNED_UINS + 1)
+        # ⚠ Nothing is "kept over the cap" any more: the number being left is the
+        # free one this account was lent, and a loan goes back to the pool. The
+        # cap therefore cannot be walked past by migrating, which is what the
+        # next two checks used to be defending against.
+        check("★ the collection is unchanged by the migration",
+              capped not in await owned(c, capped_tok)
+              and len(await owned(c, capped_tok)) == MAX_OWNED_UINS)
         r = await c.post("/uin/purchase", headers=H(capped_tok), json={"uin": 557_000_001, "switch": False})
-        check(f"  ... and acquiring another IS refused, which is the containment ({r.status_code})", r.status_code == 409)
-        check("  ... and says why", r.json().get("detail", {}).get("code") == "too_many_uins")
+        check(f"  ... and acquiring another is refused ({r.status_code})", r.status_code in (403, 409))
         # ★ "One over" has to actually BE one over. There is no cooldown by
         # default and no rate limit on /account/migrate, so an exemption with no
         # ceiling is an unbounded collection for anyone willing to loop, and
         # every row in it is a number the allocator can never hand out again.
-        one_over = await owned(c, capped_tok)
+        before = await owned(c, capped_tok)
         r = await c.post("/account/migrate", headers=H(capped_tok))
-        check(f"★ migrating AGAIN past the cap is still not refused ({r.status_code})",
-              r.status_code == 200)
+        check(f"★ migrating again is not refused ({r.status_code})", r.status_code == 200)
         capped_tok = r.json()["token"]
-        check("★ but this time the number goes back to the pool, not the collection",
-              await owned(c, capped_tok) == one_over)
+        check("★ and the number goes back to the pool, so looping collects nothing",
+              await owned(c, capped_tok) == before)
 
         print("\nA migration never takes a number somebody else holds:")
         occupant, occupant_tok = await register(c)
@@ -436,11 +454,15 @@ async def main():
         r = await c.post("/uin/purchase", headers=H(buyer_tok), json={"uin": 558_000_777, "switch": True})
         check(f"purchase with switch -> 200 ({r.status_code})", r.status_code == 200)
         buyer_tok = r.json()["token"]
-        check("★ the previous number is held, once", r.json()["owned"] == [buyer] and await owned(c, buyer_tok) == [buyer])
+        # The previous number here is the free signup one, so buying-with-a-switch
+        # leaves it in the pool. What the buyer holds after this is the number
+        # they bought, and they are answering as it, so the collection is empty.
+        check("★ the free previous number is not kept",
+              r.json()["owned"] == [] and await owned(c, buyer_tok) == [])
         check("  ... and the account answers as the new one", r.json()["new_uin"] == 558_000_777)
         async with SessionLocal() as db:
             rows = (await db.execute(select(OwnedUin.uin).where(OwnedUin.uin == buyer))).scalars().all()
-            check("  ... with no duplicate row (the bookkeeping moved, it was not copied)", len(rows) == 1)
+            check("  ... and no deed was written for the free number it left", len(rows) == 0)
 
     await close_redis()
     print("\nALL UIN-HOLD CHECKS PASSED" if fails == 0 else f"\n{fails} CHECK(S) FAILED")

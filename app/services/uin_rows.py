@@ -101,7 +101,7 @@ with a reason; the nine that are accounted for elsewhere:
 
 from __future__ import annotations
 
-from sqlalchemy import delete, text, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import LEGACY_POLL_TABLES
@@ -203,12 +203,48 @@ DROP_ON_REKEY: list[tuple[type, object]] = [
 ]
 
 
+async def _move_sites(db: AsyncSession, old_uin: int, new_uin: int | None) -> None:
+    """A `.rcq` site belongs to the PERSON, except when its name is a number.
+
+    ⚠⚠ `sites` was in no inventory at all: not in `PER_UIN_COLUMNS`, not in
+    `DROP_ON_REKEY`, no foreign key, no sweep. So a page outlived every change
+    of hands. After a move the owner could no longer touch their own site
+    (`put_site` compares `owner_uin` against the caller), and after a burn it
+    stayed on the shelf for ever, owned by a number that had gone back to the
+    pool - which for a name made of digits means the page claiming to be
+    "#123456's page" belongs to whoever held that number a year ago.
+
+    Two rules, and the second is the reason this is not one UPDATE:
+
+      * an ordinary name follows its owner. It is their work; the number they
+        answer as is not part of it;
+      * a name that IS the old number is deleted. `sites.py` gives digit names
+        to the holder of that number precisely because the address is a claim
+        about who is behind it, and that claim stops being true the moment the
+        number is not theirs. Renaming is not an option: the name is the
+        address, and readers have pinned the key under it.
+
+    `new_uin=None` is the burn: everything goes.
+    """
+    from app.models.site import Site  # local: models import the DB base
+
+    rows = (
+        await db.execute(select(Site).where(Site.owner_uin == old_uin))
+    ).scalars().all()
+    for site in rows:
+        if new_uin is None or site.name == str(old_uin):
+            await db.delete(site)
+        else:
+            site.owner_uin = new_uin
+
+
 async def rekey_uin_rows(db: AsyncSession, old_uin: int, new_uin: int) -> None:
     """Move every per-UIN row from `old_uin` to `new_uin`.
 
     Caller is responsible for having created the `new_uin` user row first
     (some of these tables are read via joins against `users`).
     """
+    await _move_sites(db, old_uin, new_uin)
     for model, column in PER_UIN_COLUMNS:
         await db.execute(
             update(model).where(column == old_uin).values({column.key: new_uin})
@@ -245,6 +281,7 @@ async def purge_gossip_mirror(db: AsyncSession, signing_key: str | None) -> int:
 
 async def purge_uin_rows(db: AsyncSession, uin: int) -> None:
     """Delete every per-UIN row for `uin`, so a recycled number starts clean."""
+    await _move_sites(db, uin, None)
     for model, column in PER_UIN_COLUMNS + DROP_ON_REKEY:
         await db.execute(delete(model).where(column == uin))
     # The polls leftovers, by raw SQL because there is no model to point at any

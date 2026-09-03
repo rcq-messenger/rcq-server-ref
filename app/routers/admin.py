@@ -32,6 +32,7 @@ from app.core.db import engine, get_db
 from app.core.security import mark_suspended, require_admin
 from app.models.invite import Invite, hash_invite_code
 from app.models.owned_uin import OwnedUin
+from app.models.uin_sale import UinHold
 from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
 from app.models.report_message import ReportMessage
@@ -43,7 +44,7 @@ from app.services.hof_stats import bug_report_stats
 # Shared with `services/uin.uin_is_taken`, which now asks the same question of
 # every number it hands out. Three readers of one predicate; when they drift a
 # number gets promised twice and neither side is told (see the docstring).
-from app.services.uin import invite_is_live
+from app.services.uin import invite_is_live, uin_is_taken
 
 import time as _time
 
@@ -1475,6 +1476,61 @@ class GrantUinOut(BaseModel):
     uin: int
     to_uin: int
     owned: list[int]
+
+
+class HoldUinIn(BaseModel):
+    uin: int = Field(gt=0)
+    #: The till's own handle for this hold, so it can release what it placed.
+    hold_id: str = Field(min_length=8, max_length=64)
+    #: Minutes to keep the number off the shelf. Deliberately allowed to be far
+    #: longer than an invoice: a payment that lands late should find the number
+    #: still there, and a number nobody paid for costs nothing to hold.
+    minutes: int = Field(default=1440, ge=5, le=10080)
+
+
+class HoldUinOut(BaseModel):
+    uin: int
+    hold_id: str
+    expires_at: datetime
+
+
+@router.post("/uin/hold", response_model=HoldUinOut)
+async def hold_uin(body: HoldUinIn, db: AsyncSession = Depends(get_db)) -> HoldUinOut:
+    """Keep a number off the shelf while somebody pays for it.
+
+    Called by the till, which holds this island's admin credentials already
+    (the same ones it uses to sell relay slots). It carries no buyer and no
+    price: the island's whole share of a sale is "this number is spoken for
+    until this moment".
+
+    ⚠ The hold is what stops two people paying for one number. With the money
+    watched outside this island there is no automatic refund, so a number sold
+    twice has no clean ending; a number held for a day and not paid for costs
+    nothing at all. That asymmetry is why the default window is generous.
+    """
+    if await uin_is_taken(db, body.uin):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
+    expires = datetime.now(timezone.utc) + timedelta(minutes=int(body.minutes))
+    existing = await db.get(UinHold, body.uin)
+    if existing is not None:
+        existing.hold_id = body.hold_id
+        existing.expires_at = expires
+    else:
+        db.add(UinHold(uin=body.uin, hold_id=body.hold_id, expires_at=expires))
+    await db.commit()
+    return HoldUinOut(uin=body.uin, hold_id=body.hold_id, expires_at=expires)
+
+
+@router.delete("/uin/hold/{uin}", response_model=dict)
+async def release_hold(uin: int, db: AsyncSession = Depends(get_db)) -> dict:
+    """Let a number go before its hold expires: the buyer walked away, or the
+    invoice was cancelled. Idempotent - releasing a hold that is already gone is
+    the same outcome the caller wanted."""
+    hold = await db.get(UinHold, uin)
+    if hold is not None:
+        await db.delete(hold)
+        await db.commit()
+    return {"ok": True}
 
 
 @router.post("/uin/grant", response_model=GrantUinOut)

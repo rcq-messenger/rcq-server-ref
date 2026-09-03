@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.invite import Invite
 from app.models.owned_uin import OwnedUin
+from app.models.uin_sale import UinHold
 from app.models.user import User
 
 
@@ -93,6 +94,17 @@ async def uin_is_taken(
     if await db.scalar(select(User.uin).where(User.uin == uin)) is not None:
         return True
     if await db.scalar(select(OwnedUin.uin).where(OwnedUin.uin == uin)) is not None:
+        return True
+    # ⚠ A LIVE HOLD is the fourth, and it exists for the minutes a payment takes
+    # (2026-09-03). While somebody is paying for a number, nothing else may hand
+    # it out: with the money watched outside this island there is no automatic
+    # refund, so "sold to two people" is a failure with no clean ending. An
+    # EXPIRED hold holds nothing, for the same reason a dead invite does not.
+    live_hold = select(UinHold.uin).where(
+        UinHold.uin == uin,
+        UinHold.expires_at > datetime.now(timezone.utc),
+    )
+    if await db.scalar(live_hold) is not None:
         return True
     reserving = select(Invite.code).where(Invite.uin == uin, *invite_is_live())
     if except_invite:

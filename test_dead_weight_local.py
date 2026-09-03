@@ -111,6 +111,12 @@ _UIN_COLUMN_ALLOWLIST: dict[str, str] = {
     "owned_uins.uin": "the number HELD, not its holder; the holder is owner_uin, which is listed",
     "invites.uin": "a reserved vanity number, not an owner. Known gap in the audit "
                    "(burn strands an unspent invite); the invite sweep owns it, not this list",
+    "sites.owner_uin": "handled by `_move_sites`, not by a column sweep: an ordinary name "
+                       "follows its owner and a name that IS the old number is deleted, "
+                       "because that address is a claim about who is behind it",
+    "uin_holds.uin": "the number being PAID FOR, not its buyer. Nobody holds it yet - a hold "
+                     "is only ever placed on a number `uin_is_taken` says is free - so there is "
+                     "no person here to follow, and the hold expires on its own clock",
     "report_messages.author_uin": "cascades off reports.id, which IS listed. Re-key leaves the "
                                   "old number on the thread turns, which only the admin console "
                                   "sees; noted rather than fixed here",
