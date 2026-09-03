@@ -1,0 +1,1857 @@
+import asyncio
+import contextlib
+import math
+import logging
+from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, insert, or_, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import log_identity, settings
+from app.core.db import engine, get_db
+from app.core.rate_limit import (
+    _client_ip,
+    bucket_name,
+    enforce_cost_budget,
+    enforce_rate_limit,
+    rate_limit,
+)
+from app.core.security import current_device_id, current_uin, current_uin_optional
+from app.models.capability import UserCapability
+from app.models.device_token import DeviceToken
+from app.models.group import Group, GroupMember, OfflineGroupMessage
+from app.models.group_log import GroupLog, GroupLogCursor
+from app.services.group_log import log_readers as _group_log_readers, mark_reader as _mark_group_log_reader, room_head as _group_head
+from app.models.message import OfflineMessage
+from app.models.queue_cursor import QueueCursor
+from app.models.user import User, _as_aware
+from app.services.activity_rollup import bump_bg as activity_bump
+from app.services.apns import (
+    PushEndpoints,
+    group_push_targets,
+    send_to_user as apns_send,
+    send_voip_to_user,
+)
+from app.services.unifiedpush import send_call_to_user as up_call, send_to_user as up_send
+from app.services.connection_manager import manager
+from app.services.offline_queue_sweep import dormant_cutoff
+from app.services.queue_drain import account_watermark, drain_floor
+
+log = logging.getLogger(__name__)
+
+# Stage 2a: the server no longer branches on the legible per-recipient
+# interaction TYPE. It records a 3-value CLASS (`offline_messages.cls`) beside
+# envelope_type and branches on that. envelope_type stays as the INGEST ALIAS
+# every old client and the federation wire keep sending (islands upgrade
+# independently, so it is accepted forever); `_cls_for` maps it to a class on
+# the way in, and a new client sends `cls` directly.
+#
+#   cls 0 ephemeral  typing, read, visit, presence, nudge, bounce
+#                    delivery-state plumbing and cosmetic pings: never worth a
+#                    wake, and a dormant recipient loses nothing by missing one.
+#   cls 1 content    message, reaction, edit, delete, system, secscreen, gmsg,
+#                    call, and any unknown/future kind (fail toward keeping and
+#                    delivering rather than silently dropping). This is the
+#                    pushable class.
+#   cls 2 critical   skdm, sknack and every future key-distribution kind: never
+#                    a banner, but MUST survive the dormant sweep, because a
+#                    member who loses an skdm cannot read a single later
+#                    broadcast (#544). See `_keep_for` and the group sweep.
+#
+# secscreen stays content (cls 1) so the screenshot-taken notice still pushes:
+# it carries both that alert and the silent secure-mode toggle in one sealed
+# blob the server cannot open, and the NSE splits them client-side.
+_CRITICAL_TYPES = {"skdm", "sknack"}
+_EPHEMERAL_TYPES = {"typing", "read", "visit", "presence", "nudge", "bounce"}
+
+# ⚠⚠ A self-carbon is content that must NOT be pushed, which no class expressed.
+# A carbon is a copy of a message the user themself just sent, mirrored to their
+# own other devices, so waking their phone for it is a notification about their
+# own typing. It fell to cls 1 through the default below and was pushed on every
+# send, and the only reason nobody saw a banner is that all three clients filter
+# the type on their side after the push has already crossed APNs and the
+# UnifiedPush host. Every client's comment claims the island filters this; it
+# never did, and the set they name has not existed here for months.
+#
+# It cannot simply join _EPHEMERAL_TYPES: cls 0 changes retention too, and a
+# carbon has to survive until the other device drains it. So it stays content
+# for storage and is refused a push explicitly at the branch.
+_NEVER_PUSH_TYPES = {"carbon"}
+
+# ⚠ "call" stays a content-class row, never a legible "call" kind. A call
+# deposit is already coerced to frame type "message" on the live socket (see the
+# comment in `send_sealed`), and the RINGING wake is now driven by the `ring`
+# request flag, not by the stored type. So a call is stored exactly like a text
+# message and only `ring` (which is never stored) tells the island to ring. Old
+# clients had no `ring` field and asked for a ring by typing the envelope
+# "call"; both are honoured. `_CALL_TYPE` survives only as that legacy alias.
+_CALL_TYPE = "call"
+
+
+def _cls_for(envelope_type: str) -> int:
+    """Map a legacy / federation `envelope_type` to its storage class.
+
+    The ingest alias, applied on every deposit that does not carry an explicit
+    `cls`: old clients and peer islands send only the type forever
+    (web-chat/src/lib/federation-send.ts), and this is how the island files it
+    into the 3-value class it actually branches on. Unknown kinds fall to
+    content (cls 1) so a future type from a lagging peer is still kept,
+    delivered and pushed rather than silently dropped.
+
+    It is also the read-side fallback for a stored row whose `cls` is NULL (the
+    ~4331 rows that predate the column), so a mixed table branches correctly.
+    """
+    if envelope_type in _CRITICAL_TYPES:
+        return 2
+    if envelope_type in _EPHEMERAL_TYPES:
+        return 0
+    return 1
+
+
+async def _next_mailbox_seq(db: AsyncSession, to_uin: int) -> int:
+    """Allocate the next durable per-mailbox sequence for `to_uin` (stage 2b).
+
+    ⚠ Durable, NOT MAX()-derived. A counter seeded from MAX(seq) reseeds to 0
+    the moment the sweep empties a quiet mailbox, and the fresh rows then land
+    BELOW every device's stored cursor where ?after= can never reach them:
+    silent permanent loss, the one thing the founder ruled out. The counter
+    lives in its own `mailbox_seq` row the queue sweep never touches, so an
+    emptied mailbox keeps counting up.
+
+    Allocated inside the caller's deposit transaction with an atomic
+    INSERT ... ON CONFLICT DO UPDATE ... RETURNING, which takes the mailbox
+    row's lock for the rest of that transaction: two concurrent deposits to the
+    same recipient serialise and get distinct numbers rather than colliding.
+    (to_uin, seq) is unique as the loud backstop if the counter ever drifts.
+    """
+    if engine.dialect.name == "postgresql":
+        sql = text(
+            "INSERT INTO mailbox_seq (to_uin, next_seq) VALUES (:u, 1) "
+            "ON CONFLICT (to_uin) DO UPDATE SET next_seq = mailbox_seq.next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    else:
+        sql = text(
+            "INSERT INTO mailbox_seq (to_uin, next_seq) VALUES (:u, 1) "
+            "ON CONFLICT (to_uin) DO UPDATE SET next_seq = next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    return int((await db.execute(sql, {"u": to_uin})).scalar_one())
+
+# Ceiling on the sealed envelope we are willing to carry INSIDE a wake payload.
+# APNs caps a VoIP push at 5KB total and ntfy (the common UnifiedPush
+# distributor) caps a message at 4KB, and an offer envelope carries a whole SDP,
+# so a large one would be rejected by the push provider and the device would
+# never ring at all. Above the ceiling we send the wake WITHOUT the envelope:
+# the app still comes up, connects its socket, and drains the deposit from the
+# queue — a beat slower, but it rings.
+# ── Stage 5: one log per room ───────────────────────────────────────────────
+#
+# A post into a room used to be written once per member. Now it is one row in
+# the room's log (`group_log`), read through a per-(room, account, device)
+# cursor. The per-member table is kept only for accounts whose client has not
+# yet read the log: iOS ships through the founder's Xcode and can be weeks
+# behind, so "new posts go only to the log from day one" would have silenced
+# every room on every old install. The switch is per account and implicit:
+# the switch is per DEVICE and implicit: a /messages/group-log/fetch marks
+# the device a reader (`group_log_readers`), and the writers stop producing
+# legacy rows for an account once every device that drains its legacy queue
+# is a reader (services/group_log.log_readers). The rows it already has stay
+# in the old queue and the new client keeps draining that queue too (dual
+# read), deduping by UUID.
+
+
+async def _next_group_seq(db: AsyncSession, group_id: int) -> int:
+    """Allocate the next durable per-room sequence. Same shape and same
+    reasons as `_next_mailbox_seq`: never MAX()-derived, allocated inside the
+    post's transaction so two concurrent posts serialise on the room's row."""
+    if engine.dialect.name == "postgresql":
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, 1) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = group_seq.next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    else:
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, 1) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = next_seq + 1 "
+            "RETURNING next_seq"
+        )
+    return int((await db.execute(sql, {"g": group_id})).scalar_one())
+
+
+async def _next_group_seqs(db: AsyncSession, group_id: int, count: int) -> range:
+    """Allocate `count` consecutive room sequences in ONE round-trip.
+
+    Same durable counter and same guarantees as `_next_group_seq` above
+    (never MAX()-derived, awarded inside the post's transaction); the only
+    difference is that the whole block is claimed by a single statement
+    instead of one statement per row.
+
+    ⚠ This is not a micro-optimisation, it is the fix for an island-wide
+    stall measured on prod 2026-08-25. The sealed group path used to award a
+    seq per addressed log row INSIDE its per-recipient loop, so one post to
+    the flagship group (152 log readers that day) spent ~150 sequential
+    round-trips inside a single open transaction. The managed database pools
+    in TRANSACTION mode with 15 server connections for the whole island, so a
+    dozen concurrent group posts pinned 13 of those 15 as `idle in
+    transaction` while executing almost nothing (1 active query in 94% of
+    samples). Everything else on the island then queued inside PgBouncer,
+    where none of our instruments can see it: /contacts, /vault and
+    /server/info all peaked at ~11s together while the CPU sat at 0.2, and
+    /messages/group-sealed itself ran p95 28.6s against a p50 of 0.61s, which
+    is past the clients' own 30s timeout.
+
+    Returns the awarded block, lowest first, for the caller to zip onto its
+    rows. An empty block for `count <= 0` so the caller needs no special case.
+    """
+    if count <= 0:
+        return range(0)
+    if engine.dialect.name == "postgresql":
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, :n) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = group_seq.next_seq + :n "
+            "RETURNING next_seq"
+        )
+    else:
+        sql = text(
+            "INSERT INTO group_seq (group_id, next_seq) VALUES (:g, :n) "
+            "ON CONFLICT (group_id) DO UPDATE SET next_seq = next_seq + :n "
+            "RETURNING next_seq"
+        )
+    last = int((await db.execute(sql, {"g": group_id, "n": count})).scalar_one())
+    return range(last - count + 1, last + 1)
+
+
+_CALL_WAKE_ENV_MAX = 3500
+
+
+async def _wake_for_sealed_call(to_uin: int, payload: str) -> int:
+    """Ring the recipient's devices for a cross-island call deposit (§5d).
+
+    ⚠ WHAT THIS DISCLOSES TO THE RECIPIENT'S ISLAND — this is the whole
+    tradeoff, decided by the founder on 2026-08-15 and worth stating plainly:
+
+      The island now learns that A CALL IS ARRIVING FOR THIS USER, at this
+      instant. Before this change the deposit was indistinguishable from a
+      text message. It is not indistinguishable any more, because the caller
+      asked for `envelope_type: "call"` and we act on it.
+
+      What it still does NOT learn: WHO is calling, on which island they live,
+      the call id, whether it is audio or video, or the SDP. All of that lives
+      inside the sealed envelope, which the island cannot open — so this
+      function must never invent any of it. There is no caller nickname
+      here, and since 2026-08-24 there is none on the same-island road
+      either: that island DOES know the caller, which is exactly why it must
+      not tell Apple or the distributor (see the ⚠ block in the header of
+      services/apns.py). The client renders "Incoming call" until it decrypts
+      the envelope, or resolves the name from its own roster.
+
+      Accepted because a censor watching the wire can already infer a call
+      from packet timing and size, and a call that does not ring is not a
+      call.
+
+    The wake fires only when the account has NO live socket, exactly like the
+    same-island `call_offer` fallback in ws.py. Neither `send_voip_to_user` nor
+    `send_call_to_user` can skip an individual connected device, and the client
+    cannot dedupe a ring against the socket copy (it has no call id until it
+    decrypts), so waking while a socket is up would ring twice.
+    """
+    wake: dict = {
+        # Discriminator: this is a SEALED call wake, not the flat call payload
+        # a same-island offer sends. A client that does not know it has no
+        # call_id/sdp to act on and falls back to its malformed-payload path,
+        # which is a report-then-end on iOS and a drop on Android — i.e. the
+        # pre-change behaviour of not ringing, never a crash.
+        "kind": "sealed",
+        # Recipient in plain, same reason the message push carries it: a
+        # multi-account device has one token and needs to know which local
+        # account to swap in before it can decrypt anything.
+        "to_uin": to_uin,
+        "envType": _CALL_TYPE,
+    }
+    if len(payload) <= _CALL_WAKE_ENV_MAX:
+        # Verbatim, byte for byte, the ciphertext we were handed. Same field
+        # name (`env`) the message push uses, so the client's existing decrypt
+        # helper takes it unchanged.
+        wake["env"] = payload
+    sent = await send_voip_to_user(to_uin, payload=wake)
+    # Android has no PushKit — the UnifiedPush call payload raises the
+    # full-screen incoming-call UI. No-op when there are no Android endpoints.
+    sent += await up_call(to_uin, payload=wake)
+    return sent
+
+# Ceiling on one group fan-out POST. The largest live group is ~1.9k members
+# (the founder beta group every registration is added to), so this leaves
+# generous headroom for the biggest legitimate send while bounding a request
+# body that had no limit anywhere: not on the model, not in Caddy.
+_MAX_GROUP_PAYLOADS = 4096
+
+# Recipients per minute per caller, shared across BOTH group endpoints (same
+# rule name, so a dual-send spends one budget). The unit is recipients, not
+# requests, because that is what actually costs us — one row in
+# `offline_group_messages` plus one APNs/UnifiedPush wake each.
+#
+# Sized off real traffic, not off the request caps: the flagship group is
+# ~1.9k members, so the authenticated budget is ~30 posts/min into the
+# biggest group we have and effectively unreachable in any normal one.
+#
+# The anonymous budget is separate and lower, but NOT tight, because the
+# identity there is an IP and most of our API traffic arrives collapsed
+# behind a handful of relay exits — a strict per-IP number would punish
+# everyone sharing an exit. It still cuts the single-source worst case by
+# an order of magnitude.
+_FANOUT_BUDGET_AUTHED = 60_000
+_FANOUT_BUDGET_ANON = 30_000
+_FANOUT_WINDOW_SECONDS = 60
+
+router = APIRouter(prefix="/messages", tags=["messages"])
+
+
+def _fanout_charge(request: Request, caller: int | None) -> tuple[str, int]:
+    """Budget identity + allowance for a group fan-out.
+
+    Authenticated callers are charged per UIN; sealed-sender posts (the
+    normal path for an 'all' group, where the server deliberately does not
+    learn the author) fall back to the client IP on a smaller allowance.
+    """
+    if caller is not None:
+        return f"uin:{caller}", _FANOUT_BUDGET_AUTHED
+    return f"ip:{_client_ip(request)}", _FANOUT_BUDGET_ANON
+
+
+async def _sender_device_tokens(db: AsyncSession, caller: int | None) -> frozenset[str]:
+    """Every push token/endpoint registered by `caller`, any platform.
+
+    Used to keep the PHYSICAL sending device out of a push fan-out: on a
+    multi-account phone each local account registers the same token string,
+    so a `uin == caller` check alone still wakes the author's own phone
+    through a sibling account that looks offline server-side. Matching by
+    token identifies "same device" regardless of which account is targeted."""
+    if caller is None:
+        return frozenset()
+    rows = (
+        await db.execute(select(DeviceToken.token).where(DeviceToken.uin == caller))
+    ).scalars().all()
+    return frozenset(rows)
+
+
+class SealedSendIn(BaseModel):
+    to_uin: int
+    # message | call | nudge | delete | system | read | reaction | bounce | visit.
+    # The server is type-agnostic for ROUTING — it just forwards the opaque
+    # payload. Stage 2a: this stays the INGEST ALIAS. It is accepted forever
+    # (old clients and the federation wire send only this), stored verbatim for
+    # old readers, and mapped to `cls` on the way in. The server branches on
+    # `cls` and `ring`, never on this string.
+    envelope_type: str = Field(default="message")
+    # Stage 2a: the 3-value storage class a new client sends directly
+    # (0 ephemeral | 1 content | 2 critical). Absent (or out of range) = derive
+    # it from envelope_type via `_cls_for`.
+    cls: int | None = None
+    # Stage 2a: "wake this recipient's phone RINGING" — a request instruction we
+    # act on and NEVER store. It replaces typing the envelope "call": a new
+    # client sends a content deposit with ring=true, an old one still types
+    # "call", and both ring. See `_wake_for_sealed_call` for exactly what a ring
+    # discloses to the recipient's island.
+    ring: bool = False
+    payload: str  # base64 LibSignal sealed-sender ciphertext (sender lives inside)
+    # F3 deposit-auth: an OPTIONAL anonymous blinded token {epoch_id, prepared, sig}
+    # the recipient's island issued (RFC 9474 RSABSSA). When present it is verified
+    # + consumed (single-use), letting the island rate-limit deposits without
+    # de-anonymizing the sender. Absent = the legacy per-IP path (back compatible).
+    deposit_token: dict | None = None
+    # Which of the recipient's libsignal devices this ciphertext is for.
+    #
+    # A device-aware sender encrypts the message once PER recipient device (each
+    # device is its own ratchet) and posts each copy with the matching id here.
+    # The queue then hands each device only its own copy. Absent = the legacy
+    # "every device drains it" behaviour, which is still correct while only one
+    # of the recipient's devices holds keys.
+    to_device_id: int | None = None
+
+
+class SendOut(BaseModel):
+    delivered: bool
+    queued: bool
+    server_time: datetime
+
+
+class HistoryRow(BaseModel):
+    id: int
+    envelope_type: str
+    # Stage 2a: the 3-value storage class, served ALONGSIDE envelope_type so a
+    # new client reads `cls` and an old one keeps reading `envelope_type`.
+    # Derived from envelope_type for the legacy rows that predate the column, so
+    # it is never null on the wire.
+    cls: int | None = None
+    payload: str
+    received_at: datetime
+    group_id: int | None = None
+    # Stage 2b: the durable per-mailbox sequence, served ALONGSIDE `id`. Present
+    # for 1:1 rows written after the column landed; null for legacy rows and for
+    # group rows (which get their own per-room log in stage 5). Clients read
+    # `seq` when present and fall back to `id`; ?after= still cursors on `id`.
+    seq: int | None = None
+    # The libsignal device this copy was encrypted for, when the sender fanned
+    # out. Echoed so a client can tell "this one is not mine" apart from "this
+    # one is mine and broken" — the first is ACKed and dropped, the second is
+    # left queued for a retry.
+    to_device_id: int | None = None
+
+
+@router.post(
+    "/sealed",
+    response_model=SendOut,
+    # Cap sends at 120/min per identity. Sealed-sender means we
+    # can't always bind to UIN (server doesn't know who's sending),
+    # so the limiter falls back to client IP. 120/min covers heavy
+    # legit use (typing fast, sending media) while one-script abuse
+    # tops out before saturating uvicorn.
+    dependencies=[Depends(rate_limit("messages_send", 120, 60))],
+)
+async def send_sealed(
+    body: SealedSendIn,
+    db: AsyncSession = Depends(get_db),
+) -> SendOut:
+    """Anonymous, server-side metadata-free 1:1 delivery.
+
+    The server intentionally does NOT take any auth here — sealed sender is the whole
+    point: the recipient is the only party who can identify the sender (by decrypting
+    the envelope client-side). Block lists therefore move to the client: the recipient
+    decrypts, sees who sent it, drops the message silently if blocked.
+
+    For dev we accept all requests. Production will plant a delivery-token mechanism
+    here (recipient-issued tokens, redeemable anonymously) to discourage spam without
+    re-introducing sender identification. Marked TODO below.
+    """
+    target = await db.get(User, body.to_uin)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+
+    # F3 deposit-auth (anonymous delivery-token rate limiting). A token, when
+    # present, is verified + atomically consumed (single-use, double-spend
+    # rejected) — sealed sender preserved. Absent = the legacy per-IP cap above.
+    # Enforcement (DEPOSIT_AUTH_REQUIRED) is a deliberate operator flip once
+    # clients mint tokens; until then this is purely additive.
+    token_ok = False
+    if body.deposit_token is not None:
+        from app.core import deposit_auth_store
+        from app.core.redis import get_redis
+        if not await deposit_auth_store.verify_and_consume_token(body.deposit_token, await get_redis()):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid or spent deposit token")
+        token_ok = True
+    if settings.DEPOSIT_AUTH_REQUIRED and not token_ok:
+        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, "a deposit token is required")
+
+    now = datetime.now(timezone.utc)
+    # Stage 2a. The queue row keeps envelope_type verbatim (old readers + the
+    # federation wire), and ALSO records the class the server branches on. A new
+    # client sends `cls`; anything else (old client, peer island) is mapped from
+    # envelope_type. `ring` is the request instruction to wake the phone ringing
+    # and is never stored; an old client asked for it by typing "call".
+    cls = body.cls if body.cls in (0, 1, 2) else _cls_for(body.envelope_type)
+    ring = body.ring or body.envelope_type == _CALL_TYPE
+    pkt = {
+        # ⚠⚠ THE SOCKET FRAME FOR A CALL DEPOSIT IS LABELLED "message", NOT
+        # "call". The deposit type is an instruction to THIS ISLAND (ring the
+        # recipient's devices instead of posting a message banner); the frame
+        # type is how the RECIPIENT'S CLIENT routes it, and every client in the
+        # field — including the three updated on 2026-08-15 — accepts sealed
+        # envelopes from an explicit list of frame types. `iOS
+        # WebSocketService` ends that list with `default: break` and Android's
+        # is the `SEALED_WS_TYPES` set, so a frame typed "call" was DROPPED IN
+        # SILENCE by a running app. That is the worst case, not the harmless
+        # one: the wake below only fires when nothing is connected, so calling
+        # somebody whose app was OPEN rang nothing at all and the caller timed
+        # out — a total regression against the "message" deposits this replaced.
+        #
+        # The envelope is a sealed blob either way and every client routes it
+        # by its INNER kind (`kind:"call"` → the call state machine), so the
+        # label costs the client nothing and buys compatibility with every
+        # build ever shipped. Same reasoning Android's `TYPED_CONTROL_SENDS =
+        # false` records for reactions/edits/deletes: keep labelling the wire
+        # "message" until the typed form is understood everywhere.
+        #
+        # The QUEUE row keeps the real `envelope_type` (below) — nothing
+        # dispatches on it there, and it is what makes the deposit auditable.
+        "type": "message" if body.envelope_type == _CALL_TYPE else body.envelope_type,
+        "payload": body.payload,
+        "server_time": now.isoformat(),
+        # Present only for a fan-out copy. Every socket of the account still
+        # gets every copy (filtering live delivery would mean teaching the
+        # connection manager which libsignal device is behind each socket, for
+        # no gain), so the addressee is stated and the other devices drop it
+        # without trying to decrypt. Absent = "for whoever can read it".
+        **({"to_device_id": body.to_device_id} if body.to_device_id is not None else {}),
+    }
+    # Always queue alongside WS delivery. `manager.send()` returning
+    # True only means the bytes hit the OS write buffer — the recipient
+    # can still lose them if their WS dropped mid-flight, if iOS
+    # backgrounded with a stale socket, or if the network NAT'ed
+    # them out. The client dedupes by message UUID in MessageStore,
+    # so receiving the same envelope via WS and via /queue drain on
+    # next reconnect is a no-op. Drain-and-delete pattern in fetch_queue
+    # keeps the table from growing.
+    delivered = await manager.send(body.to_uin, pkt)
+    # Stage 2b: allocate the durable per-mailbox sequence in THIS deposit's
+    # transaction, right beside the row it numbers. `id` keeps being written too.
+    seq = await _next_mailbox_seq(db, body.to_uin)
+    msg = OfflineMessage(
+        to_uin=body.to_uin,
+        envelope_type=body.envelope_type,
+        cls=cls,
+        seq=seq,
+        payload=body.payload,
+        received_at=now,
+        to_device_id=body.to_device_id,
+    )
+    db.add(msg)
+    try:
+        await db.commit()
+    except IntegrityError:
+        # (to_uin, seq) is unique as a loud backstop against a drifted counter.
+        # A collision must NEVER overwrite a queued envelope: roll back the whole
+        # deposit (which also releases the seq it tried to take) and tell the
+        # client to retry. This should not happen with the atomic allocator; if
+        # it does, it is a DB inconsistency worth a 503 rather than data loss.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "seq allocation collided, retry"
+        )
+    queued = True
+    pushed = 0
+    # Wake the devices that did NOT get it over the socket.
+    #
+    # `delivered` answers "is this ACCOUNT online anywhere", not "did every
+    # device get it" — so a desktop left open used to suppress the wake for the
+    # phone in the user's pocket, and the message only surfaced when the app was
+    # next opened ("сообщения пропускаются, когда приложение выключено",
+    # 2026-08-04). Asking which DEVICES hold a socket lets the other ones be
+    # woken while the connected one is left alone (it already has the envelope).
+    # Endpoints that predate device-aware registration carry no device id; when
+    # something IS connected they are skipped, exactly as before, since they
+    # might belong to that connected device.
+    if ring:
+        # §5d cross-island call. The live-socket send above already happened and
+        # is byte-identical to a "message" deposit, so a call to somebody whose
+        # app is in the foreground is completely unchanged by this branch. What
+        # is new is that a CLOSED app now rings: previously this deposit went out
+        # as an ordinary message push and nothing on the device knew a call was
+        # arriving. The row is queued either way (above), so the offline drain
+        # still delivers the envelope if the wake is late or lost.
+        if not delivered:
+            pushed = await _wake_for_sealed_call(body.to_uin, body.payload)
+    elif cls == 1 and body.envelope_type in _NEVER_PUSH_TYPES:
+        # Stored and delivered like any content row, never woken for. See
+        # _NEVER_PUSH_TYPES.
+        pass
+    elif cls == 1:
+        online_devices = frozenset(await manager.online_devices(body.to_uin))
+        if not delivered or online_devices:
+            pushed = await apns_send(
+                body.to_uin,
+                alert_body="New message",
+                envelope_b64=body.payload,
+                envelope_type=body.envelope_type,
+                to_device_id=body.to_device_id,
+                skip_devices=online_devices,
+            )
+            # Android has no APNs — fire the parallel UnifiedPush wake (no-op when
+            # the recipient has no Android endpoints, the iOS-only common case).
+            pushed += await up_send(
+                body.to_uin,
+                alert_body="New message",
+                envelope_b64=body.payload,
+                envelope_type=body.envelope_type,
+                to_device_id=body.to_device_id,
+                skip_devices=online_devices,
+            )
+    # ⚠ No recipient on the default line. This ran at WARNING for every single
+    # 1:1 delivery, so journald held the recipient uin, the envelope kind and
+    # the minute for every message the island carried. That is the delivery graph the
+    # database refuses to store, rebuilt in plain text next to it, and for the
+    # sealed-sender endpoint above all. What the line is actually read for is
+    # the four flags: did the socket take it, did the queue, did a push go out.
+    # Those stay. `to=` is available behind RCQ_LOG_IDENTITIES for an operator
+    # debugging their own island.
+    log.warning(
+        "[sealed] to=%s type=%s ws_delivered=%s queued=%s pushed=%s",
+        log_identity(body.to_uin), body.envelope_type, delivered, queued, pushed,
+    )
+    activity_bump("msg")
+    return SendOut(delivered=delivered, queued=queued, server_time=now)
+
+
+def _queueable(member_rows: list[tuple[int, datetime | None]]) -> set[int]:
+    """Of `(uin, last_seen)`, the members whose group backlog we actually
+    keep — everyone the dormant sweep would not immediately delete again.
+
+    Group fan-out writes one row PER MEMBER, so the flagship's 1733-member
+    group turns a single post into 1733 inserts. `offline_queue_sweep` has
+    reaped the dormant share of those since 2026-07-31 (tens of thousands per
+    six-hour cycle on prod) precisely because nobody drains them. Deciding the
+    same thing at write time costs one already-needed join and skips the
+    insert entirely.
+
+    `users.last_seen` is refreshed on WS connect, heartbeat and disconnect, so
+    a member who is online right now is never in the skipped set — and one who
+    comes back later is woken by push (the fan-out below still targets them)
+    and starts accumulating backlog again from that moment.
+    """
+    cutoff = dormant_cutoff()
+    if cutoff is None:
+        return {uin for uin, _ in member_rows}
+    # `_as_aware` rather than a bare compare: SQLite hands back naive
+    # datetimes, and `naive >= aware` raises. On Postgres this is a no-op, so
+    # the only thing it changes is a self-hosted island, where without it EVERY
+    # group message answered 500 "internal_error" and the group simply did not
+    # work. Same coercion the presence path already does (`models/user.py`);
+    # this call site was written later and missed it.
+    return {
+        uin for uin, last_seen in member_rows
+        if last_seen is not None and _as_aware(last_seen) >= cutoff
+    }
+
+
+def _keep_for(
+    recipients: Iterable[int],
+    queueable: set[int],
+    cls: int,
+    wake: Iterable[int],
+    envelope_type: str,
+) -> set[int]:
+    """Who this group envelope is actually stored for.
+
+    `_queueable` alone was the answer, and it was the wrong one twice.
+
+    1. **It skipped SENDER-KEY DISTRIBUTION.** An `skdm` is not backlog, it is
+       the chain key without which every later `gmsg` in the group decrypts to
+       nothing. Dropping one costs the member the whole group, silently: the
+       client gets the broadcast, `deriveInbound` returns null, the payload is
+       discarded, and there is no bubble, no unread and NO SOUND — report #544,
+       "человек, которого я добавил, не получил звук ни на моё сообщение, ни на
+       твоё". The dormant rule exists to stop us hoarding *content* nobody will
+       read; key material is a few hundred bytes and it is the difference
+       between a working member and a broken one. So the CRITICAL class (cls 2 —
+       stage 2a, the old `_SENDER_KEY_CONTROL` set) is kept for every recipient,
+       dormant or not.
+
+    2. **It disagreed with the push.** The wake fan-out below never consulted
+       it, so a member absent longer than OFFLINE_GROUP_DORMANT_DAYS got a
+       "New group message" banner for a message that was never written down.
+       They open the group and it is empty — report #547, "приходит
+       уведомление, что есть сообщение в группе, захожу, а его там нет". If we
+       are willing to wake somebody, we are willing to keep their copy: a
+       registered push endpoint is also the best evidence we have that this
+       member still comes back.
+
+    `cls` is the derived class of the deposit (always known here — the deposit
+    path maps envelope_type when a client does not send `cls`). The group
+    dormant sweep applies the same rule to STORED rows, falling back to
+    envelope_type for the legacy rows that carry NULL there.
+
+    3. **And then it was too generous, in exactly one direction.** The
+       keep-for-everyone rule above is about KEY MATERIAL: an `skdm` is the
+       chain key, and a member who never receives it cannot read a single
+       later broadcast. A `sknack` is the opposite, it is the QUESTION ("who
+       holds key id X?"), and it is worthless the moment it is stale: the
+       asking client re-fires per key id every ten minutes and again after a
+       restart, so an hour-old copy will never be the one that recovers
+       anybody. Both landed in cls 2 together, so one recovery request in the
+       flagship group wrote a row for all ~930 members. Measured on prod
+       2026-08-25, five real posts produced 552 fan-outs and 152 286 queue
+       rows in a single hour, and 336k of the table's 556k rows were this
+       housekeeping rather than anything a person wrote. A `sknack` now
+       follows the normal rule: live to whoever is connected, stored only for
+       members who are actually around. That is also what a LEGACY sknack
+       (cls NULL) already did on the read side, so the two sides now agree.
+
+       ⚠ `sknack` stays cls 2 everywhere ELSE, and it has to. cls 1 is what
+       drives the push fan-out, so demoting the class itself would send every
+       member a "New group message" banner for a key-recovery question.
+       Only the keep decision changes.
+    """
+    if cls == 2 and envelope_type != "sknack":
+        return set(recipients)
+    return set(queueable) | set(wake)
+
+
+# How long the second half of a dual-send may follow the first before it has
+# to buy its own slowmode slot. A dual-send (one broadcast to the capable
+# members + one legacy sealed tail) is one logical post issued back-to-back;
+# 30s covers a slow uplink without opening a real second-message window.
+_SLOWMODE_PAIR_GRACE_SEC = 30
+
+
+def _slowmode_identity(group_id: int, caller: int) -> str:
+    """Limiter identity for one (group, member) slowmode slot.
+
+    ⚠ The group id rides INSIDE the identity now, where it gets hashed, rather
+    than in the rule name where it used to sit. `rl:group_slowmode:<gid>:uin:
+    <caller>` spelled out in plain text in Redis that account X posted in group
+    Y at time T. A room rule meant to slow down flooding was quietly trading away
+    the sender anonymity of every group that turns it on. Only the rule name
+    survives into the key unhashed, so anything that is a social fact has to be
+    on this side of the line.
+
+    The bucket is still exactly one per (group, member): same slot, same
+    window, same 429. Two different groups cannot share a slot and two members
+    of one group cannot either, which is all the old key shape guaranteed.
+    """
+    return f"g{group_id}:uin:{caller}"
+
+
+def _slowmode_free_key(path: str, group_id: int, caller: int) -> str:
+    """Redis key for the one-shot pass that lets a dual-send's OTHER half
+    through.
+
+    Hashed for the same reason as [_slowmode_identity]: `gslowfree:<path>:
+    <gid>:<caller>` was the same social fact with a thirty-second life. The
+    mechanism is untouched: one key per (path, group, member), armed by the
+    half that consumed the slot, consumed by a GETDEL on the other half.
+
+    ⚠ The key SHAPE changed, so markers armed by the previous build are
+    unreadable by this one. They expire in 30s on their own; the only cost is
+    that a dual-send whose two halves straddle the restart pays for two slots
+    and the tail may 429. Restart is a blip and slowmode is on in very few
+    rooms, so this is the cheapest available answer to a plaintext key.
+    """
+    return f"gslowfree:{bucket_name(f'{path}:g{group_id}:uin:{caller}')}"
+
+
+async def _enforce_group_slowmode(
+    db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str, path: str
+) -> None:
+    """Group slowmode: one *message* per `g.slowmode_sec` window per
+    identified non-moderator member (same phase-1 trust shape as owner_only —
+    an anonymous poster stays on the client-side gate, because sealed sender
+    hides who they are). The owner, an admin, and any member holding a
+    granted cap are exempt, matching what every client's composer shows.
+
+    `path` is 'sealed' or 'broadcast'. A mixed group's post is a DUAL-SEND —
+    the same message POSTed to both endpoints — and a naive per-path check
+    would 429 the legacy tail and cut the non-capable members out of the
+    conversation. So only the half that actually consumed the slot arms a
+    short-lived free pass for the OTHER path; the freed half arms nothing,
+    which keeps two same-path posts from ever sharing one slot."""
+    if envelope_type != "message" or g is None or (g.slowmode_sec or 0) <= 0:
+        return
+    if caller is None or caller == g.owner_uin:
+        return
+    row = (
+        await db.execute(
+            select(GroupMember.role, GroupMember.permissions).where(
+                GroupMember.group_id == g.id, GroupMember.uin == caller
+            )
+        )
+    ).first()
+    if row is None:
+        return  # not a member — the fan-out budget is the gate for those
+    role, perms = row
+    if role == "admin" or bool((perms or "").strip()):
+        return
+    redis = None
+    try:
+        from app.core.redis import get_redis
+
+        redis = await get_redis()
+        if await redis.getdel(_slowmode_free_key(path, g.id, caller)):
+            return
+    except Exception:  # noqa: BLE001 — fail-soft, like the limiter itself
+        redis = None
+    await enforce_rate_limit(_slowmode_identity(g.id, caller), "group_slowmode", 1, g.slowmode_sec)
+    if redis is not None:
+        other = "sealed" if path == "broadcast" else "broadcast"
+        with contextlib.suppress(Exception):
+            await redis.set(_slowmode_free_key(other, g.id, caller), "1", ex=_SLOWMODE_PAIR_GRACE_SEC)
+
+
+async def _enforce_account_age_gate(
+    db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str
+) -> None:
+    """Anti-spam floor (#803, #833): a room may require a member to have waited
+    `g.min_account_age_hours` before it can POST a message. Registration here
+    takes five seconds, so a ban list only breeds throwaway accounts; a wait
+    makes every throwaway sit it out, which is the one currency a spammer does
+    not print.
+
+    ⚠ It counts from JOINING THE ROOM when that is known, and from account
+    creation otherwise. #833 is why: counting from registration is beaten by
+    ageing one account — spam, get kicked, walk back in and carry on, because
+    the account is still old. Counted from joining, a kick costs the wait
+    again. Never weaker than the old rule either way: you cannot join a room
+    before you exist, so joined_at >= created_at.
+
+    `joined_at` is NULL for anyone who joined before the room armed its floor,
+    and deliberately so — it is stamped only for armed rooms and only to the
+    day (see `_armed_join_stamp`). Those members fall back to account age,
+    which is exactly the pre-#833 behaviour.
+
+    Same phase-1 trust shape as owner_only and slowmode: an anonymous poster
+    stays on the client-side gate (sealed sender hides who they are), and the
+    owner, an admin and any member holding a granted cap are exempt, matching
+    the composer. A caller with no local User row is a cross-island guest:
+    their age lives on their home island where we cannot read it, so phase 1
+    lets them through rather than muting every guest.
+    """
+    if envelope_type != "message" or g is None or (g.min_account_age_hours or 0) <= 0:
+        return
+    if caller is None or caller == g.owner_uin:
+        return
+    row = (
+        await db.execute(
+            select(
+                GroupMember.role, GroupMember.permissions, GroupMember.joined_at
+            ).where(GroupMember.group_id == g.id, GroupMember.uin == caller)
+        )
+    ).first()
+    if row is None:
+        return  # not a member; the membership check below is the gate
+    role, perms, joined = row
+    if role == "admin" or bool((perms or "").strip()):
+        return
+    since = joined
+    if since is None:
+        u = await db.get(User, caller)
+        since = getattr(u, "created_at", None)
+    if since is None:
+        return
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - since).total_seconds() / 3600.0
+    need = float(g.min_account_age_hours)
+    if age_h >= need:
+        return
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "account_too_young",
+            "hours_left": max(1, math.ceil(need - age_h)),
+        },
+    )
+
+
+class GroupRecipientPayload(BaseModel):
+    to_uin: int
+    payload: str
+
+
+class GroupSealedSendIn(BaseModel):
+    group_id: int
+    envelope_type: str = Field(default="message")
+    # Stage 2 e2ee: sender encrypts the envelope ONCE PER MEMBER (skipping
+    # themselves) using each member's identity_key. Server fans the right
+    # ciphertext to the right recipient. The list shape replaces the old
+    # single-payload schema — every iOS Stage-1 client sends this version.
+    payloads: list[GroupRecipientPayload] = Field(max_length=_MAX_GROUP_PAYLOADS)
+
+
+@router.post(
+    "/group-sealed",
+    response_model=SendOut,
+    # Group sends ship N payloads in one POST (one per member), so
+    # the per-call cost is higher than a 1:1 send. 60/min keeps a
+    # script from group-blasting at scale while a real user posting
+    # in a few groups stays well under.
+    dependencies=[Depends(rate_limit("messages_group_send", 60, 60))],
+)
+async def send_group_sealed(
+    request: Request,
+    body: GroupSealedSendIn,
+    caller: int | None = Depends(current_uin_optional),
+    db: AsyncSession = Depends(get_db),
+) -> SendOut:
+    """Per-recipient fan-out for a group. Sender provides one ciphertext
+    per member; server validates each `to_uin` is actually a member and
+    routes accordingly. Server has no plaintext access — every payload is
+    a sealed-sender envelope encrypted to that one recipient's identity
+    key. Confidentiality and authentication match the 1:1 path.
+
+    Broadcast-mode enforcement (post_policy='owner_only'): sealed sender
+    normally hides WHICH member sent a message, but in a broadcast group
+    every post is known to come from the owner, so requiring the owner to
+    authenticate leaks nothing AND is the only way to enforce the policy
+    server-side — the composer-hide on clients is bypassable (an old/web/
+    modified client can POST here directly). We therefore reject any
+    *identified* non-owner caller. Auth is OPTIONAL so we stay
+    backward-compatible: clients that still send the group fan-out
+    anonymously (no token) fall back to the client-side gate for now; once
+    every client attaches the owner token for owner_only sends, this can
+    tighten to reject anonymous owner_only posts too (see TODO below)."""
+    # Only an actual POST ("message" — text/media bubble) is gated. Reactions,
+    # reads, typing, edits and deletes still fan out from any member so a
+    # broadcast group keeps its reaction/read interactions (and web clients,
+    # which always send a token, don't get their member reactions rejected).
+    # Fetched unconditionally, and it has to stay that way. It used to be
+    # bound only under the "message" gate, which left `g` unbound on a
+    # "system"/"secscreen" group send: an UnboundLocalError 500 raised AFTER
+    # the commit, i.e. recipients got the message and the sender saw a
+    # failure. iOS types systemNotice as "system", so that path is reachable
+    # from a shipped client. The reader below it was the push block titling
+    # its banner with `g.name`, which is gone; `_enforce_group_slowmode` runs
+    # unconditionally and takes `g` too, so the hazard is unchanged.
+    # A sender-key recovery ask (`sknack`) fans ONE sealed payload to EVERY
+    # capable member, so a client stuck in an ask loop is an island-wide
+    # problem, not its own: measured 30.08, one install asked a 971-member
+    # room every ten minutes around the clock (366 posts in 12h), each post
+    # parsing ~1MB of payloads, bulk-inserting ~950 queue rows and holding a
+    # pool connection for over a second - the "everything worst 4-7s" spikes
+    # on the instruments were exactly these. Real recovery is a handful of
+    # asks; ten an hour is generous. The client's send is best-effort and
+    # swallows the 429, so an old looping install degrades to ~silent.
+    if body.envelope_type == "sknack":
+        ident = f"uin:{caller}" if caller is not None else f"ip:{request.client.host if request.client else 'unknown'}"
+        await enforce_rate_limit(ident, "messages_sknack", 10, 3600)
+        # And per ROOM: the measured storm was one install asking one room
+        # about its ~5 dead kids every window, which rode the account budget
+        # at exactly 10/hour - still ~10k deposits a day. Two asks per room
+        # per hour answers every recoverable kid (a live owner answers the
+        # first ask); only the dead ones are slowed, and dead is what they
+        # are.
+        await enforce_rate_limit(f"{ident}:g{body.group_id}", "messages_sknack_room", 2, 3600)
+    g = await db.get(Group, body.group_id)
+    if body.envelope_type == "message":
+        if g is not None and g.post_policy == "owner_only" and caller is not None and caller != g.owner_uin:
+            # An authenticated caller who is NOT the owner tried to post to a
+            # broadcast group. Web clients always send their token, so this
+            # closes the "any member can post via chat.rcq.app" hole at once.
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
+        # TODO(owner_only-phase2): once Android+iOS attach the owner token for
+        # owner_only MESSAGE sends (anonymous otherwise, to keep sealed-sender
+        # for 'all' groups), drop the `caller is not None` clause so an
+        # anonymous owner_only post is rejected too — closing the
+        # modified-native-client bypass.
+    # Membership AND recency in one read: whether we hold offline backlog for
+    # a member depends on how long they have been away (see `_queueable`).
+    member_rows = (
+        await db.execute(
+            select(GroupMember.uin, User.last_seen)
+            .outerjoin(User, User.uin == GroupMember.uin)
+            .where(GroupMember.group_id == body.group_id)
+        )
+    ).all()
+    if not member_rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "group has no members")
+    members = {uin for uin, _ in member_rows}
+    queueable = _queueable(member_rows)
+
+    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="sealed")
+    await _enforce_account_age_gate(db, g, caller, body.envelope_type)
+
+    now = datetime.now(timezone.utc)
+    # Stage 2a: the class the server branches on (push + keep), derived from the
+    # ingest alias. Group clients keep sending only envelope_type in this stage;
+    # stage 5 reshapes this queue. skdm/sknack -> cls 2, kept for everyone.
+    cls = _cls_for(body.envelope_type)
+    # Drop entries that don't correspond to real group members. Cheap client
+    # mistake guard — we don't error on it because the client is anonymous
+    # (sealed sender) and we can't tell who they are.
+    entries = [e for e in body.payloads if e.to_uin in members]
+    # Charge the fan-out BEFORE doing any of it. This endpoint does not (and
+    # must not) check that the SENDER is a member — sealed sender means the
+    # server cannot know who is posting — so without a budget anyone who knows
+    # a group id and some member UINs can aim the whole group's worth of queue
+    # rows and pushes at the database, repeatedly. Counting `entries` rather
+    # than `body.payloads` charges the real work: junk recipients were already
+    # dropped above and cost nothing.
+    identity, allowance = _fanout_charge(request, caller)
+    await enforce_cost_budget(
+        identity, "group_fanout", len(entries), allowance, _FANOUT_WINDOW_SECONDS
+    )
+    # One pipelined publish for the whole group instead of a `manager.send()`
+    # per member (two Redis round-trips each, awaited in series).
+    online = await manager.fanout_each([
+        (
+            e.to_uin,
+            {
+                "type": body.envelope_type,
+                "payload": e.payload,
+                "group_id": body.group_id,
+                "server_time": now.isoformat(),
+            },
+        )
+        for e in entries
+    ])
+    delivered_any = bool(online)
+    offline_recipients = [e.to_uin for e in entries if e.to_uin not in online]
+    # Group fan-out: same per-recipient encrypted-envelope pattern as
+    # 1:1. Each offline member needs THEIR ciphertext (each is sealed to
+    # one identity key), so we look up the matching payload entry from
+    # the request before pushing.
+    #
+    # APNs sends are detached (fire-and-forget) so the sender's HTTP
+    # response doesn't wait on N×Apple-roundtrip. With ~20-member groups
+    # the awaited loop was holding the sender's HTTP response for
+    # multiple seconds, leaving the sender's bubble stuck on the
+    # "sending" clock icon while recipients had already received the
+    # message via WS. Each task opens its own short DB session inside
+    # apns_send / up_send, so detaching is safe.
+    #
+    # ⚠ Resolved BEFORE the queue rows are written, because who we wake now
+    # decides who we keep the message for — see `_keep_for` below.
+    wake: dict[int, PushEndpoints] = {}
+    if cls == 1:
+        payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
+        envelope_type = body.envelope_type
+        group_id = body.group_id
+        # ⚠ The group's NAME used to be read here and sent twice, as the banner
+        # title and as a `group_name` field, so that the client could show WHICH
+        # group. It reached Apple and the Android distributor before it reached
+        # the client, which is the leak the map calls the strongest off-island
+        # one we had (§1.6). The wake now carries only `group_id`; the client
+        # titles the banner from its own copy of the roster.
+        sender_tokens = await _sender_device_tokens(db, caller)
+        # Never push the sender their OWN message (they backgrounded right
+        # after sending); their other devices still get the queue carbon.
+        # `group_push_targets` then drops everyone with no registered endpoint
+        # and everyone who muted this group — two queries for the whole group,
+        # where the old per-recipient shape opened three sessions EACH.
+        wake = await group_push_targets(
+            db, [uin for uin in offline_recipients if uin != caller], group_id
+        )
+    # Queue regardless of the live send: being online at publish time is
+    # optimistic (bytes in an OS buffer != client ingested them), so the
+    # recipient drains anything they missed on their next /messages/queue
+    # fetch and dedupes by UUID.
+    # Stage 5: a member whose client reads the room log gets an ADDRESSED log
+    # row (sealed to them, served only to them); everyone else gets the legacy
+    # per-member row under the old dormancy rules. Every addressed row is kept:
+    # the dormancy machinery existed to bound the per-member table, and a room
+    # log has one retention window for the whole room instead.
+    readers = await _group_log_readers(db, (e.to_uin for e in entries))
+    addressed = [e for e in entries if e.to_uin in readers]
+    # One statement for the whole block of seqs instead of one per row. See
+    # `_next_group_seqs` for why the loop that used to sit here was the thing
+    # that stalled the island every time somebody posted in the big group.
+    log_rows = [
+        {
+            "group_id": body.group_id,
+            "seq": seq,
+            "to_uin": e.to_uin,
+            "envelope_type": body.envelope_type,
+            "cls": cls,
+            "payload": e.payload,
+            "received_at": now,
+        }
+        for e, seq in zip(
+            addressed, await _next_group_seqs(db, body.group_id, len(addressed))
+        )
+    ]
+    if log_rows:
+        await db.execute(insert(GroupLog), log_rows)
+    keep = _keep_for(
+        (e.to_uin for e in entries if e.to_uin not in readers),
+        queueable,
+        cls,
+        wake,
+        body.envelope_type,
+    )
+    rows = [
+        {
+            "to_uin": e.to_uin,
+            "group_id": body.group_id,
+            "envelope_type": body.envelope_type,
+            "cls": cls,
+            "payload": e.payload,
+            "received_at": now,
+        }
+        for e in entries
+        if e.to_uin in keep and e.to_uin not in readers
+    ]
+    if rows:
+        await db.execute(insert(OfflineGroupMessage), rows)
+    await db.commit()
+    if wake:
+
+        async def _push(target_uin: int, ends: PushEndpoints) -> None:
+            await apns_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload_by_uin.get(target_uin),
+                envelope_type=envelope_type,
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+                exclude_tokens=sender_tokens,
+                tokens=ends.ios,
+            )
+            await up_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload_by_uin.get(target_uin),
+                envelope_type=envelope_type,
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+                exclude_tokens=sender_tokens,
+                endpoints=ends.android,
+            )
+
+        for uin, ends in wake.items():
+            asyncio.create_task(_push(uin, ends))
+    # Same treatment as the 1:1 line above, and the group id goes with the uins.
+    # A gid is not a person on its own, but the membership table turns it into
+    # one: `gid=41 at 22:44` plus a SELECT is the same delivery graph, for
+    # everyone in the room at once. The counts answer the operational question
+    # (is the fan-out working, how big was it, how much of it went to the queue)
+    # without naming the room.
+    log.warning(
+        "[group-sealed] gid=%s type=%s payloads=%d queued=%d logged=%d delivered_any=%s offline=%d",
+        log_identity(body.group_id), body.envelope_type, len(body.payloads), len(rows),
+        len(log_rows), delivered_any, len(offline_recipients),
+    )
+    activity_bump("gmsg")
+    return SendOut(delivered=delivered_any, queued=True, server_time=now)
+
+
+class GroupBroadcastIn(BaseModel):
+    group_id: int
+    # Declared inner type — "message" today (reactions/edits/reads keep the
+    # per-member path for now). Drives the owner_only gate + pushability;
+    # the queued/WS envelope itself always rides as type "gmsg".
+    envelope_type: str = Field(default="message")
+    # base64 of the sender-keys wire JSON {v, kid, e, i, n, ct}: ONE
+    # ChaCha20-Poly1305 ciphertext under the sender's current group message
+    # key. The server cannot read it and cannot tell who sent it — `kid` is
+    # an opaque per-(sender, group, epoch) distribution id, so group posts
+    # stay pseudonymous at the server (vs fully anonymous on the legacy
+    # sealed path; accepted — members learn the sender anyway).
+    payload: str = Field(max_length=1_500_000)
+
+
+@router.post(
+    "/group-broadcast",
+    response_model=SendOut,
+    # One small POST per group message regardless of group size — same
+    # budget as 1:1 sends (the legacy group endpoint's 60/min existed
+    # because every call carried N payloads).
+    dependencies=[Depends(rate_limit("messages_broadcast", 120, 60))],
+)
+async def send_group_broadcast(
+    request: Request,
+    body: GroupBroadcastIn,
+    caller: int | None = Depends(current_uin_optional),
+    db: AsyncSession = Depends(get_db),
+) -> SendOut:
+    """Sender-keys group delivery: the sender encrypts ONCE with their group
+    chain key and the server fans the SAME ciphertext to every member whose
+    client advertised the `sender_keys` capability — O(1) crypto + upload for
+    the sender instead of the legacy once-per-member sealing. Members without
+    the capability are deliberately skipped (they can't parse `gmsg`); the
+    sender covers them with the legacy per-member fan-out (dual-send) until
+    their clients update.
+
+    The chain key itself was distributed per-member over the existing sealed
+    channel (`skdm` envelopes via /messages/group-sealed), so confidentiality
+    still ends at the members: the server only ever holds one opaque blob.
+
+    owner_only enforcement is STRICT here from day one (unlike the legacy
+    endpoint's phase-1 leniency): this endpoint is new, no deployed client
+    posts to it anonymously in owner_only groups, so an unauthenticated or
+    non-owner `message` broadcast to a broadcast-mode group is rejected
+    outright."""
+    # Authentication is REQUIRED here, unlike the legacy sealed path. This is
+    # the cheapest amplifier in the API: a single small POST fans one blob to
+    # every capable member, so the per-request cap alone priced an anonymous
+    # caller at the whole flagship group times 120 a minute. Requiring a token
+    # costs no privacy on this path — every shipped client (iOS, Android,
+    # web/desktop) already authenticates it, so the server learns the poster
+    # today regardless, and `kid` makes them pseudonymous to the server on the
+    # wire anyway. The legacy sealed endpoint stays anonymous; that is where
+    # sealed sender actually lives.
+    if caller is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "group-broadcast requires authentication",
+        )
+    g = await db.get(Group, body.group_id)
+    if g is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+    if (
+        body.envelope_type == "message"
+        and g.post_policy == "owner_only"
+        and caller != g.owner_uin
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
+
+    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="broadcast")
+    await _enforce_account_age_gate(db, g, caller, body.envelope_type)
+
+    recipient_rows = (
+        await db.execute(
+            select(GroupMember.uin, User.last_seen)
+            .join(UserCapability, UserCapability.uin == GroupMember.uin)
+            .outerjoin(User, User.uin == GroupMember.uin)
+            .where(
+                GroupMember.group_id == body.group_id,
+                UserCapability.sender_keys.is_(True),
+            )
+        )
+    ).all()
+    recipients = [uin for uin, _ in recipient_rows]
+    if not recipients:
+        # A capable client always advertises before its first broadcast, so
+        # at minimum the sender's own uin matches. Empty therefore means a
+        # bogus group id / not-a-member race — nothing to deliver.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no broadcast-capable members")
+
+    # Same budget, same rule name as the sealed path: a dual-send (broadcast to
+    # capable members + per-member fan-out to the legacy ones) is one logical
+    # post and spends one allowance.
+    identity, allowance = _fanout_charge(request, caller)
+    await enforce_cost_budget(
+        identity, "group_fanout", len(recipients), allowance, _FANOUT_WINDOW_SECONDS
+    )
+
+    now = datetime.now(timezone.utc)
+    queueable = _queueable(recipient_rows)
+    # Stage 2a: class of the declared inner type (drives push + keep). The stored
+    # row rides as envelope_type "gmsg", which is also content (cls 1); a
+    # broadcast never carries key-distribution material (that goes per-member via
+    # /messages/group-sealed), so this is content in every real case.
+    cls = _cls_for(body.envelope_type)
+    # Stage 5: ONE row in the room's log for everyone who reads it, written
+    # before the live publish so the frame can carry its `seq` and a reader
+    # can move its cursor without a round trip. Members still on the
+    # per-member queue get their legacy copies below.
+    readers = await _group_log_readers(db, recipients)
+    seq: int | None = None
+    if readers:
+        seq = await _next_group_seq(db, body.group_id)
+        await db.execute(insert(GroupLog), [{
+            "group_id": body.group_id,
+            "seq": seq,
+            "to_uin": None,
+            "envelope_type": "gmsg",
+            "cls": cls,
+            "payload": body.payload,
+            "received_at": now,
+        }])
+    # The sender's own uin is included on purpose: their other devices get
+    # the broadcast as the carbons copy (the sending device dedupes by
+    # message UUID, same as the WS/queue double-delivery case).
+    pkt = {
+        "type": "gmsg",
+        "payload": body.payload,
+        "group_id": body.group_id,
+        "server_time": now.isoformat(),
+    }
+    if seq is not None:
+        pkt["seq"] = seq
+    online = await manager.fanout(recipients, pkt)
+    delivered_any = bool(online)
+    offline_recipients = [uin for uin in recipients if uin not in online]
+    # Push offline members for real posts only (mirrors _PUSHABLE_TYPES
+    # gating on the declared inner type). Everyone gets the SAME envelope —
+    # that's the whole point. The iOS NSE shows a generic group banner for
+    # gmsg (it never advances ratchet state out-of-process).
+    #
+    # ⚠ Resolved BEFORE the queue rows are written: waking a member we did not
+    # keep the message for is a notification for a message that will never
+    # arrive (#547). See `_keep_for`.
+    wake: dict[int, PushEndpoints] = {}
+    if cls == 1:
+        group_id = body.group_id
+        payload = body.payload
+        # Same as the sealed path above: the name is not sent, only the id.
+        sender_tokens = await _sender_device_tokens(db, caller)
+        # Never push the sender their OWN message: they backgrounded right
+        # after sending and fell into offline_recipients. Their other devices
+        # still get the WS/queue carbon — just no APNs banner. The rest of the
+        # filtering (no endpoint registered, group muted) is batched, not one
+        # short-lived DB session per recipient.
+        wake = await group_push_targets(
+            db, [uin for uin in offline_recipients if uin != caller], group_id
+        )
+    # The stored row rides as "gmsg" here, not as the declared inner type, so
+    # that is what the keep rule is asked about. A broadcast never carries
+    # key-distribution material anyway.
+    keep = _keep_for((u for u in recipients if u not in readers), queueable, cls, wake, "gmsg")
+    rows = [
+        {
+            "to_uin": uin,
+            "group_id": body.group_id,
+            "envelope_type": "gmsg",
+            "cls": cls,
+            "payload": body.payload,
+            "received_at": now,
+        }
+        for uin in recipients
+        if uin in keep and uin not in readers
+    ]
+    if rows:
+        await db.execute(insert(OfflineGroupMessage), rows)
+    await db.commit()
+    if wake:
+
+        async def _push(target_uin: int, ends: PushEndpoints) -> None:
+            await apns_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload,
+                envelope_type="gmsg",
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+                exclude_tokens=sender_tokens,
+                tokens=ends.ios,
+            )
+            await up_send(
+                target_uin,
+                alert_body="New group message",
+                envelope_b64=payload,
+                envelope_type="gmsg",
+                thread_id=f"group-{group_id}",
+                group_id=group_id,
+                exclude_tokens=sender_tokens,
+                endpoints=ends.android,
+            )
+
+        for uin, ends in wake.items():
+            asyncio.create_task(_push(uin, ends))
+    # Identity-free by default, same reasoning as [group-sealed] above.
+    log.warning(
+        "[group-broadcast] gid=%s type=%s recipients=%d queued=%d logged=%s delivered_any=%s offline=%d",
+        log_identity(body.group_id), body.envelope_type, len(recipients), len(rows),
+        seq is not None, delivered_any, len(offline_recipients),
+    )
+    activity_bump("gmsg")
+    return SendOut(delivered=delivered_any, queued=True, server_time=now)
+
+
+class AckIn(BaseModel):
+    # IDs the client successfully ingested into its local store. Two
+    # parallel arrays because OfflineMessage.id and OfflineGroupMessage.id
+    # are auto-increment per-table and can collide; clients split by the
+    # `group_id` field on HistoryRow (None → direct, set → group).
+    direct_ids: list[int] = Field(default_factory=list)
+    group_ids: list[int] = Field(default_factory=list)
+
+
+class AckOut(BaseModel):
+    deleted: int
+
+
+async def _acked_prefix(
+    db: AsyncSession, model: type, uin: int, base: int, acked: list[int] | None,
+    dev: int | None = None,
+) -> int:
+    """How far the cursor may move given the ids a client actually persisted.
+
+    ⚠ This exists because taking `max(acked)` loses messages, permanently, and
+    it did (founder's second account, 2026-08-13).
+
+    The cursor is a single watermark and the drain asks for `id > cursor`, so
+    everything below it is unreachable for good. A client that acks a SUBSET —
+    say the sender-key distributions it could process, but not the group
+    messages interleaved between them — moved the watermark to the highest id
+    in that subset and buried every un-acked row underneath. One account lost
+    532 group messages over nine days that way: they were still on disk, still
+    addressed to it, and no request could ever return them again. It looked to
+    the user like the group simply stopped at a date.
+
+    So the cursor advances over the CONTIGUOUS acked prefix and stops at the
+    first hole. Anything past the hole stays queued and comes back on the next
+    drain, which is exactly what a queue is for.
+    """
+    if not acked:
+        return base
+    acked_set = set(acked)
+    where = [model.to_uin == uin, model.id > base]
+    # Count only the rows this device is ever handed. A fan-out copy for a
+    # SIBLING device is withheld by the drain, so it can never be acked — and as
+    # an un-acked row it would be the "first hole" the prefix stops at, forever.
+    # The queue would then grow without bound and nothing below it would reap:
+    # the same permanent-burial failure this function exists to prevent, entered
+    # from the other side.
+    if dev is not None and hasattr(model, "to_device_id"):
+        where.append(or_(model.to_device_id.is_(None), model.to_device_id == dev))
+    ids = (
+        await db.execute(
+            select(model.id).where(*where).order_by(model.id.asc())
+        )
+    ).scalars().all()
+    out = base
+    for i in ids:
+        if i not in acked_set:
+            break
+        out = i
+    return out
+
+
+async def _advance_cursor(
+    db: AsyncSession, uin: int, device_id: str, max_direct: int, max_group: int,
+    cursor: QueueCursor | None = None,
+) -> int:
+    """Move THIS device's drain cursor forward (never backward), then reap any
+    queued rows now below EVERY device's cursor. Returns rows reaped.
+
+    ⚠ A cursor created here starts at this account's watermark, NOT at zero: an
+    axis left at zero would hand this device the whole queue on its next drain
+    (and pin the account's reap floor at zero forever). The caller has already
+    read above that watermark, so seeding it loses nothing.
+    """
+    if cursor is None:
+        cursor = await db.get(QueueCursor, (uin, device_id))
+    if cursor is None:
+        floor_direct, floor_group = await account_watermark(db, uin)
+        cursor = QueueCursor(
+            uin=uin, device_id=device_id,
+            last_direct_id=floor_direct, last_group_id=floor_group,
+        )
+        db.add(cursor)
+    if max_direct > cursor.last_direct_id:
+        cursor.last_direct_id = max_direct
+    if max_group > cursor.last_group_id:
+        cursor.last_group_id = max_group
+    cursor.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    return await _reap_below_min(db, uin)
+
+
+# How long a drain cursor may go untouched before it stops holding the queue
+# back. Comfortably longer than a holiday with the phone off, short enough that
+# a reinstalled device does not pin an account's queue for a season.
+STALE_CURSOR_DAYS = 30
+
+# ...but a cursor that another device of the SAME account has long overtaken is
+# a different animal, and the 30-day rule is far too generous for it. A phone
+# switched off for a fortnight is indistinguishable from a dead install only
+# while it is the account's ONLY device; the moment a sibling cursor keeps
+# moving, the still one belongs to an install that is gone — reinstalled,
+# uninstalled, wiped — and holding everybody's sealed envelopes for it is a
+# fortnight of stored metadata bought for nobody. Measured on prod 18.08: two
+# accounts alone were pinning 3926 envelopes behind cursors last touched two
+# weeks earlier, while their live devices sat at zero pending.
+SUPERSEDED_CURSOR_DAYS = 7
+
+
+def _as_utc(ts: datetime | None) -> datetime | None:
+    """Read a timestamp back as aware UTC. Postgres hands these back aware, but
+    SQLite (the local test harness) drops the zone, and comparing the two raises."""
+    if ts is None or ts.tzinfo is not None:
+        return ts
+    return ts.replace(tzinfo=timezone.utc)
+
+
+async def _reap_below_min(db: AsyncSession, uin: int) -> int:
+    """Delete queued rows every one of the user's devices has already drained
+    (id <= the minimum cursor across the user's LIVE devices). The TTL sweep is
+    the backstop for rows held up by a device that went away without
+    unlinking."""
+    cursors = (
+        await db.execute(select(QueueCursor).where(QueueCursor.uin == uin))
+    ).scalars().all()
+    # Drop cursors nobody is behind any more. Reinstalling mints a NEW device
+    # id, so the abandoned one would otherwise sit at its old position forever
+    # and hold every later row above the reap floor — the queue would then only
+    # ever be cleared by the TTL sweep. A stamp-less row predates the column and
+    # is left alone until it next acks (which stamps it).
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=STALE_CURSOR_DAYS)
+    # The freshest cursor is the proof that somebody is still reading this
+    # account somewhere, and the SUPERSEDED rule below never takes it.
+    #
+    # ⚠ The 30-day rule does, and this comment used to claim otherwise. A
+    # single-device account quiet for a month loses its cursor (there is a test
+    # for it, `test_cursor_reap_local.py` case 3), the next drain finds none,
+    # falls back to `account_watermark`, and with no cursors left that is
+    # (0, 0). Which is FINE for the lone-cursor case, and precisely why: every
+    # ack reaps the rows below the minimum cursor, so a lone device's drained
+    # rows are already gone, and a floor of zero serves only the surviving,
+    # i.e. undrained, rows. The only re-serve window is multi-device with ALL
+    # cursors stale at once: a returning install is re-handed the slice it had
+    # drained but a lagging sibling had not. Clients dedupe by envelope id, so
+    # that costs transfer, not duplicates. Deliberate, tested, and now
+    # described as it is.
+    stamps = [_as_utc(c.updated_at) for c in cursors if _as_utc(c.updated_at) is not None]
+    newest = max(stamps) if stamps else None
+    superseded_cutoff = now - timedelta(days=SUPERSEDED_CURSOR_DAYS)
+    fresh_sibling = newest is not None and newest >= superseded_cutoff
+
+    def _drop(c: QueueCursor) -> bool:
+        ts = _as_utc(c.updated_at)
+        if ts is None:  # predates the column; left alone until it next acks
+            return False
+        if ts < cutoff:
+            return True
+        # Overtaken by a device that is still reading: a much shorter leash.
+        # A cursor older than this cutoff cannot be the freshest one, since
+        # `fresh_sibling` says the freshest is newer than the same cutoff — so
+        # this can never drop the only cursor an account has.
+        return fresh_sibling and ts < superseded_cutoff
+
+    stale = [c for c in cursors if _drop(c)]
+    if stale:
+        for c in stale:
+            await db.delete(c)
+        await db.flush()
+        cursors = [c for c in cursors if c not in stale]
+    if not cursors:
+        return 0
+    min_direct = min(c.last_direct_id for c in cursors)
+    min_group = min(c.last_group_id for c in cursors)
+    reaped = 0
+    if min_direct > 0:
+        res = await db.execute(
+            delete(OfflineMessage).where(
+                OfflineMessage.to_uin == uin, OfflineMessage.id <= min_direct
+            )
+        )
+        reaped += res.rowcount or 0
+    if min_group > 0:
+        res = await db.execute(
+            delete(OfflineGroupMessage).where(
+                OfflineGroupMessage.to_uin == uin, OfflineGroupMessage.id <= min_group
+            )
+        )
+        reaped += res.rowcount or 0
+    return reaped
+
+
+@router.get("/queue", response_model=list[HistoryRow])
+async def fetch_queue(
+    ack: bool = False,
+    dev: int = 1,
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> list[HistoryRow]:
+    """Fetch queued offline envelopes for the authenticated UIN, PER DEVICE.
+
+    The queue is shared across a user's devices (their phone + a connect-to-web
+    browser). Each device drains independently via a per-device cursor
+    (`QueueCursor`): we return only rows above THIS device's cursor, so a phone
+    and a linked browser each receive every message instead of whichever drains
+    first deleting them for the other (founder report).
+
+    `ack=true` (new clients): rows are returned without advancing the cursor; the
+    client POSTs /messages/queue/ack with the ids it persisted, which advances
+    the cursor. `ack=false` (legacy drain-on-fetch): we advance this device's
+    cursor past everything returned (instead of the old per-uin delete, which
+    robbed the user's other devices). A row is reaped only once every device's
+    cursor has passed it; the TTL sweep backstops abandoned cursors.
+    """
+    # The token's first live use ends the link row's PENDING state (the ghost
+    # web-session fix): a fresh web session drains within seconds of adopting
+    # the blob, so this covers builds that predate the flag too. Local import
+    # for the same cycle reason auth.py notes.
+    from app.routers.devices import mark_device_seen
+    await mark_device_seen(uin, device_id)
+
+    # ⚠ A device we have never seen starts where this account's furthest device
+    # already got to — NOT at zero. See app/services/queue_drain.py.
+    #
+    # Reinstalling mints a new device id, so starting at zero replayed the
+    # entire queue: up to the 30-day TTL of history, including messages the
+    # person had deleted on the old install, whose local tombstones died with
+    # it. A tester hit this repeatedly ("ресетнула приложение ... но при входе
+    # продолжает подгружаться переписка, вместе с удалёнными"), and her account
+    # carries eight cursors — eight reinstalls, eight replays. It reads as the
+    # app hoarding history somewhere secret; it is the island's own queue,
+    # handed out again to something it considers a brand-new device.
+    #
+    # Anything genuinely undelivered sits ABOVE that mark and still arrives,
+    # which is what the queue is for. Anything below it was already delivered to
+    # this account once, and re-delivering it is the bug.
+    after_direct, after_group, cursor = await drain_floor(db, uin, device_id)
+    if cursor is None:
+        # Pin that floor as this device's cursor NOW, before handing rows out.
+        # Leaving it unwritten until the ack lets a sibling device's ack raise
+        # the account watermark in between, and this device would then be
+        # rebased onto the higher mark — burying the very rows it is holding.
+        cursor = QueueCursor(
+            uin=uin, device_id=device_id,
+            last_direct_id=after_direct, last_group_id=after_group,
+            updated_at=datetime.now(timezone.utc),
+        )
+        db.add(cursor)
+        try:
+            await db.commit()
+        except IntegrityError:  # concurrent first drain from the same device
+            await db.rollback()
+            cursor = await db.get(QueueCursor, (uin, device_id))
+            if cursor is not None:
+                after_direct, after_group = cursor.last_direct_id, cursor.last_group_id
+
+    # `dev` is the caller's LIBSIGNAL device id (1 = primary), not the install
+    # id the cursor is keyed by. A fan-out copy addressed to another device is
+    # not this device's business: it cannot decrypt it, and handing it over
+    # would only park an undecryptable row in front of its cursor. Rows with no
+    # addressee predate fan-out and belong to everyone, as before.
+    rows_1to1 = (
+        await db.execute(
+            select(OfflineMessage)
+            .where(
+                OfflineMessage.to_uin == uin,
+                OfflineMessage.id > after_direct,
+                or_(
+                    OfflineMessage.to_device_id.is_(None),
+                    OfflineMessage.to_device_id == dev,
+                ),
+            )
+            .order_by(OfflineMessage.received_at.asc())
+        )
+    ).scalars().all()
+    rows_group = (
+        await db.execute(
+            select(OfflineGroupMessage)
+            .where(OfflineGroupMessage.to_uin == uin, OfflineGroupMessage.id > after_group)
+            .order_by(OfflineGroupMessage.received_at.asc())
+        )
+    ).scalars().all()
+
+    out: list[HistoryRow] = []
+    for r in rows_1to1:
+        # Stage 2: serve BOTH shapes. `envelope_type` and `id` still ride for old
+        # clients; `cls` (derived for legacy NULL rows so it is never null on the
+        # wire) and `seq` ride for new ones. ?after= still cursors on `id`.
+        out.append(HistoryRow(
+            id=r.id, envelope_type=r.envelope_type,
+            cls=r.cls if r.cls is not None else _cls_for(r.envelope_type),
+            seq=r.seq, payload=r.payload,
+            received_at=r.received_at, group_id=None, to_device_id=r.to_device_id,
+        ))
+    for r in rows_group:
+        # Group rows carry cls but no per-mailbox seq (stage 5 gives them a
+        # per-room log). seq stays null; the client falls back to id, unchanged.
+        out.append(HistoryRow(
+            id=r.id, envelope_type=r.envelope_type,
+            cls=r.cls if r.cls is not None else _cls_for(r.envelope_type),
+            payload=r.payload,
+            received_at=r.received_at, group_id=r.group_id,
+        ))
+    out.sort(key=lambda x: x.received_at)
+
+    if not ack:
+        # Legacy drain-on-fetch: the client takes everything in one shot, so
+        # advance this device's cursor past all returned rows.
+        max_direct = max((r.id for r in rows_1to1), default=after_direct)
+        max_group = max((r.id for r in rows_group), default=after_group)
+        await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
+        await db.commit()
+    else:
+        # Every value is already copied into pydantic rows; a backlogged
+        # mailbox on a slow phone otherwise parks this pooled connection
+        # 'idle in transaction' for the entire transfer (11s captured by
+        # the 30.08 spike sampler — same shape as get_group).
+        await db.rollback()
+    return out
+
+
+@router.post("/queue/ack", response_model=AckOut)
+async def ack_queue(
+    body: AckIn,
+    dev: int = 1,
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> AckOut:
+    """Advance THIS device's drain cursor past the envelopes it has persisted.
+
+    Per-device (keyed off the token's `dev` claim): acking on the linked browser
+    does NOT remove rows the phone still needs — a queued row is reaped only once
+    every device's cursor has passed it. The cursor only moves FORWARD, so a
+    stale or out-of-order ACK list is harmless (idempotent). Returns rows
+    actually reaped by the resulting min-cursor cleanup.
+
+    ⚠ A device with no cursor bases off the account watermark, NOT zero. Basing
+    at zero was the second half of the replay bug: the fetch above already hands
+    a brand-new device only the rows above that watermark, so the ids it acks
+    never form a contiguous prefix from zero — `_acked_prefix` therefore stopped
+    at the very first row and wrote a cursor of 0, and the device's next drain
+    was the entire queue, as notifications.
+    """
+    base_direct, base_group, cursor = await drain_floor(db, uin, device_id)
+    max_direct = await _acked_prefix(db, OfflineMessage, uin, base_direct, body.direct_ids, dev)
+    max_group = await _acked_prefix(db, OfflineGroupMessage, uin, base_group, body.group_ids)
+    reaped = await _advance_cursor(db, uin, device_id, max_direct, max_group, cursor)
+    await db.commit()
+    return AckOut(deleted=reaped)
+
+
+# ── Stage 5: reading the room log ───────────────────────────────────────────
+
+
+class GroupLogRoomIn(BaseModel):
+    gid: int
+    # The client's own idea of where it is. Omitted = the island's stored
+    # cursor for this device (a device that has never read a room starts at
+    # the room's head: a fresh install owes nobody a replay of the backlog,
+    # the same rule as the 1:1 account watermark). Given = read from there,
+    # which a client uses to re-drain after it lost local state; it never
+    # moves the stored cursor, only an ack does.
+    after: int | None = None
+
+
+class GroupLogFetchIn(BaseModel):
+    # Omitted = every room the account is a member of. Batched on purpose:
+    # a client with thirty rooms makes one round trip, not thirty.
+    rooms: list[GroupLogRoomIn] | None = None
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+class GroupLogRow(BaseModel):
+    gid: int
+    seq: int
+    envelope_type: str
+    cls: int
+    payload: str
+    received_at: datetime
+
+
+class GroupLogFetchOut(BaseModel):
+    rows: list[GroupLogRow]
+    # Per room: the head of the log as of this fetch, so a client can tell
+    # "nothing new" from "the room has no log yet", and where its cursor
+    # stands after the call (for a device that had none, the head).
+    heads: dict[int, int]
+    cursors: dict[int, int]
+    # True when `limit` cut the answer short; fetch again from the last seq.
+    more: bool
+
+
+class GroupLogAckRoomIn(BaseModel):
+    gid: int
+    upto: int
+
+
+class GroupLogAckIn(BaseModel):
+    rooms: list[GroupLogAckRoomIn]
+
+
+@router.post(
+    "/group-log/fetch",
+    response_model=GroupLogFetchOut,
+    dependencies=[Depends(rate_limit("group_log_fetch", 120, 60))],
+)
+async def fetch_group_log(
+    body: GroupLogFetchIn,
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> GroupLogFetchOut:
+    """Drain the room logs this device is behind on, all rooms in one call.
+
+    Rows are the broadcasts every member reads plus the rows sealed to THIS
+    member, in one sequence per room, above this device's cursor. The cursor
+    is created at the room's head on a device's first read and moved only by
+    /group-log/ack, so a client that crashes between fetch and persist sees
+    the same rows again rather than losing them.
+
+    ⚠ The fetch also marks THIS DEVICE as a log reader. Once every device
+    that drains the account's legacy queue is a reader, the writers stop
+    producing per-member legacy rows for the account. Anything already in the
+    legacy queue stays there and the client keeps draining /messages/queue
+    too, deduping by message UUID, until that queue runs dry.
+    """
+    from app.routers.devices import mark_device_seen
+    await mark_device_seen(uin, device_id)
+
+    # Which rooms. The island keeps the roster in this stage, so "all my
+    # rooms" is one query; a named room the caller is not in is skipped, not
+    # an error (membership can change between the client's view and ours).
+    member_of = set((
+        await db.execute(select(GroupMember.group_id).where(GroupMember.uin == uin))
+    ).scalars().all())
+    if body.rooms is None:
+        wanted: list[tuple[int, int | None]] = [(g, None) for g in sorted(member_of)]
+    else:
+        wanted = [(r.gid, r.after) for r in body.rooms if r.gid in member_of]
+
+    cursors = {
+        c.group_id: c
+        for c in (await db.execute(
+            select(GroupLogCursor).where(
+                GroupLogCursor.uin == uin, GroupLogCursor.device_id == device_id,
+                GroupLogCursor.group_id.in_([g for g, _ in wanted] or [-1]),
+            )
+        )).scalars().all()
+    }
+    now = datetime.now(timezone.utc)
+    out_rows: list[GroupLogRow] = []
+    heads: dict[int, int] = {}
+    cur_out: dict[int, int] = {}
+    budget = body.limit
+    more = False
+    for gid, after in wanted:
+        head = await _group_head(db, gid)
+        heads[gid] = head
+        cursor = cursors.get(gid)
+        if cursor is None:
+            # First read of this room from this device: start at the head.
+            cursor = GroupLogCursor(group_id=gid, uin=uin, device_id=device_id, last_seq=head, updated_at=now)
+            db.add(cursor)
+            cursors[gid] = cursor
+        cur_out[gid] = cursor.last_seq
+        start = after if after is not None else cursor.last_seq
+        if budget <= 0:
+            if head > start:
+                more = True
+            continue
+        rows = (await db.execute(
+            select(GroupLog)
+            .where(
+                GroupLog.group_id == gid,
+                GroupLog.seq > start,
+                or_(GroupLog.to_uin.is_(None), GroupLog.to_uin == uin),
+            )
+            .order_by(GroupLog.seq.asc())
+            .limit(budget + 1)
+        )).scalars().all()
+        if len(rows) > budget:
+            more = True
+            rows = rows[:budget]
+        budget -= len(rows)
+        for r in rows:
+            out_rows.append(GroupLogRow(
+                gid=gid, seq=r.seq, envelope_type=r.envelope_type, cls=r.cls,
+                payload=r.payload, received_at=r.received_at,
+            ))
+    await _mark_group_log_reader(db, uin, device_id)
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Two devices of one account, or one device twice, racing on their
+        # first read: the cursors are already there, the rows were read.
+        await db.rollback()
+    return GroupLogFetchOut(rows=out_rows, heads=heads, cursors=cur_out, more=more)
+
+
+@router.post(
+    "/group-log/ack",
+    response_model=AckOut,
+    dependencies=[Depends(rate_limit("group_log_ack", 240, 60))],
+)
+async def ack_group_log(
+    body: GroupLogAckIn,
+    uin: int = Depends(current_uin),
+    device_id: str = Depends(current_device_id),
+    db: AsyncSession = Depends(get_db),
+) -> AckOut:
+    """Move this device's cursor in each room forward to `upto`. Forward only,
+    so a stale or out-of-order ack is harmless. The row is not deleted here:
+    a room log has one retention window for the whole room (the sweep), not
+    a per-member keep, which is the whole point of the stage."""
+    now = datetime.now(timezone.utc)
+    moved = 0
+    for r in body.rooms:
+        cursor = await db.get(GroupLogCursor, (r.gid, uin, device_id))
+        if cursor is None:
+            # An ack for a room this device never fetched: record it as the
+            # cursor rather than dropping it, a client that persisted the row
+            # from the live socket is telling us where it is.
+            cursor = GroupLogCursor(group_id=r.gid, uin=uin, device_id=device_id, last_seq=r.upto, updated_at=now)
+            db.add(cursor)
+            moved += 1
+        elif r.upto > cursor.last_seq:
+            cursor.last_seq = r.upto
+            cursor.updated_at = now
+            moved += 1
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+    return AckOut(deleted=moved)

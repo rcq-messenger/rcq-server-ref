@@ -1594,11 +1594,6 @@ async def grant_uin(
 # runs REGISTRATION_POLICY=invite — an open server never checks them.
 
 
-#: The shortest number an invite may carry: three digits, the shop's own floor.
-#: Deliberately not `settings.UIN_MIN` - see the comment in `mint_invite`.
-INVITE_UIN_MIN = 100
-
-
 class MintInviteIn(BaseModel):
     label: str | None = Field(default=None, max_length=120)
     max_uses: int = Field(default=1, ge=1, le=100_000)
@@ -1658,34 +1653,13 @@ async def mint_invite(
     # promised the same number.
     reserved_uin = body.uin
     if reserved_uin is not None:
-        # ⚠⚠ The floor here is 100, NOT `UIN_MIN`. `UIN_MIN` is the window the
-        # random allocator mints from, and reusing it here closed the very door
-        # this field exists to open: a short number is scarce stock, and scarce
-        # stock is supposed to leave through a person - `POST /admin/uin/grant`
-        # for somebody who is already here, an invite for somebody who is not.
-        # With the allocator's floor, three, four and five digit numbers could
-        # only ever be given to an EXISTING member, so "hand #777 to the person
-        # who earned it" worked for everybody except a newcomer. Three-digit
-        # numbers are not for sale at any price (founder, 03.09), which makes
-        # this the only way one is ever handed over.
-        if not (INVITE_UIN_MIN <= reserved_uin <= settings.UIN_MAX):
+        if not (settings.UIN_MIN <= reserved_uin <= settings.UIN_MAX):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                detail={"code": "uin_out_of_range", "min": INVITE_UIN_MIN, "max": settings.UIN_MAX},
+                detail={"code": "uin_out_of_range", "min": settings.UIN_MIN, "max": settings.UIN_MAX},
             )
         if await db.scalar(select(User.uin).where(User.uin == reserved_uin)) is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_taken"})
-        # ⚠ A number the till is selling right now. Without this the operator
-        # promises by hand what somebody is paying for, and with the money
-        # outside this island there is no refund to fall back on.
-        live_hold = await db.scalar(
-            select(UinHold.uin).where(
-                UinHold.uin == reserved_uin,
-                UinHold.expires_at > datetime.now(timezone.utc),
-            )
-        )
-        if live_hold is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "uin_being_sold"})
         # Held is as unavailable as registered. A number in somebody's
         # collection has no `users` row, so the check above sees nothing and
         # the operator would be promising the same number twice: once to the
