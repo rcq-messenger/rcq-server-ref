@@ -1498,10 +1498,13 @@ class HoldUinOut(BaseModel):
 async def hold_uin(body: HoldUinIn, db: AsyncSession = Depends(get_db)) -> HoldUinOut:
     """Keep a number off the shelf while somebody pays for it.
 
-    Called by the till, which holds this island's admin credentials already
-    (the same ones it uses to sell relay slots). It carries no buyer and no
-    price: the island's whole share of a sale is "this number is spoken for
-    until this moment".
+    This is the OPERATOR's door, for holding a number by hand. The till uses
+    `POST /uin/hold`, which proves itself with the same signing key its
+    vouchers carry: a machine that only needs to reserve numbers has no
+    business holding the credentials that can also read the member list.
+
+    Either way the hold carries no buyer and no price: the island's whole share
+    of a sale is "this number is spoken for until this moment".
 
     ⚠ The hold is what stops two people paying for one number. With the money
     watched outside this island there is no automatic refund, so a number sold

@@ -135,3 +135,71 @@ def verify(voucher: str, *, expect_uin: int, now: int | None = None) -> str:
         raise VoucherError("bad_voucher") from None
 
     return nonce
+
+
+#: A hold request is good for minutes, not days: it is a message from the till
+#: to the island, made and used in the same breath. ⚠ Anyone who sees one may
+#: replay it inside that window, which is why it can only place or lift a hold
+#: on a number the till named - the worst a replay does is re-place a hold the
+#: till can lift again, and it can never grant anything.
+HOLD_MAX_AGE_SECONDS = 600
+
+_HOLD_KINDS = ("hold", "release")
+
+
+def hold_signed_bytes(*, kind: str, uin: int, hold_id: str, exp: int) -> bytes:
+    """The bytes the till signs to reserve or release a number.
+
+    ⚠ `kind` is inside the signature, and the field set differs from a
+    voucher's, so neither document can ever be read as the other. That is
+    domain separation, and it is the reason one key can safely do both jobs.
+    """
+    doc = {"v": VERSION, "kind": str(kind), "uin": int(uin),
+           "hold_id": str(hold_id), "exp": int(exp)}
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+
+
+def verify_hold(request: str, *, now: int | None = None) -> tuple[str, int, str, int]:
+    """Check a signed hold request; return `(kind, uin, hold_id, exp)`.
+
+    Raises `VoucherError` with the same vocabulary the redemption uses, so a
+    client never has to learn two.
+    """
+    pub_b64 = public_key_b64()
+    if not pub_b64:
+        raise VoucherError("sales_disabled")
+
+    try:
+        raw = base64.b64decode(request.strip(), validate=True)
+        doc = json.loads(raw)
+    except (ValueError, binascii.Error, TypeError):
+        raise VoucherError("bad_voucher") from None
+    if not isinstance(doc, dict) or doc.get("v") != VERSION:
+        raise VoucherError("bad_voucher")
+    try:
+        kind = str(doc["kind"])
+        uin = int(doc["uin"])
+        hold_id = str(doc["hold_id"])
+        exp = int(doc["exp"])
+        sig = base64.b64decode(str(doc["sig"]), validate=True)
+    except (KeyError, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+    if kind not in _HOLD_KINDS or not (1 <= len(hold_id) <= 64) or not hold_id.isascii():
+        raise VoucherError("bad_voucher")
+
+    seconds = int(time.time() if now is None else now)
+    if exp <= seconds:
+        raise VoucherError("voucher_expired")
+    if exp - seconds > HOLD_MAX_AGE_SECONDS:
+        raise VoucherError("bad_voucher")
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64, validate=True))
+        pub.verify(sig, hold_signed_bytes(kind=kind, uin=uin, hold_id=hold_id, exp=exp))
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+
+    return kind, uin, hold_id, exp

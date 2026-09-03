@@ -41,7 +41,8 @@ def invite_is_live():
 
 
 async def uin_is_taken(
-    db: AsyncSession, uin: int, *, except_invite: str | None = None
+    db: AsyncSession, uin: int, *, except_invite: str | None = None,
+    ignore_holds: bool = False,
 ) -> bool:
     """Is this number spoken for? Three tables answer, and all three have to.
 
@@ -90,6 +91,17 @@ async def uin_is_taken(
     Deliberately NOT parameterised by "unless the caller holds it": the one
     flow that must accept a held number is `/uin/activate`, which looks the row
     up by primary key, checks the owner itself, and never asks this question.
+
+    `ignore_holds` is for `/uin/redeem`, and ONLY for it. ⚠⚠ Without it the
+    sale eats itself: the till holds the number so nobody else can take it
+    while the buyer pays, the payment lands, and the redemption is then refused
+    by the very hold that was protecting it. A signed voucher for a number can
+    only exist because the till decided to sell that number, and the till is
+    also the thing that placed the hold, so at redemption time a hold is not a
+    competing claim - it is this sale's own reservation. And if an operator
+    put a manual hold on it after the invoice went out, the money has already
+    moved: honouring the voucher is the only resolution that does not take
+    somebody's payment and give them nothing.
     """
     if await db.scalar(select(User.uin).where(User.uin == uin)) is not None:
         return True
@@ -100,12 +112,13 @@ async def uin_is_taken(
     # it out: with the money watched outside this island there is no automatic
     # refund, so "sold to two people" is a failure with no clean ending. An
     # EXPIRED hold holds nothing, for the same reason a dead invite does not.
-    live_hold = select(UinHold.uin).where(
-        UinHold.uin == uin,
-        UinHold.expires_at > datetime.now(timezone.utc),
-    )
-    if await db.scalar(live_hold) is not None:
-        return True
+    if not ignore_holds:
+        live_hold = select(UinHold.uin).where(
+            UinHold.uin == uin,
+            UinHold.expires_at > datetime.now(timezone.utc),
+        )
+        if await db.scalar(live_hold) is not None:
+            return True
     reserving = select(Invite.code).where(Invite.uin == uin, *invite_is_live())
     if except_invite:
         reserving = reserving.where(Invite.code != except_invite)
