@@ -121,6 +121,19 @@ _reg(SettingSpec("uin_till_url", "str", lambda: os.environ.get("RCQ_UIN_TILL_URL
                  "has one checkout compiled in, and it is not yours, so an island "
                  "that cannot name its own would send its customers to pay "
                  "somebody else for a number they would never receive."))
+_reg(SettingSpec("uin_resale_enabled", "bool", lambda: False, "numbers",
+                 "Let people resell numbers",
+                 "⚠ Not finished. The island half is in place but the till and the "
+                 "apps are not, and an adversarial pass found ways a seller keeps "
+                 "both the money and the number. Leave this off."))
+_reg(SettingSpec("uin_payout_addresses", "str",
+                 lambda: os.environ.get("RCQ_UIN_PAYOUT_ADDRESSES", ""), "numbers",
+                 "Your wallets",
+                 'Where buyers pay YOU for numbers this island sells, as JSON by '
+                 'chain: {"tron": "T...", "ton": "UQ..."}. Your till asks the island '
+                 'for these, so changing one here changes where the next invoice '
+                 'sends money. ⚠ An address you do not control is an invoice you '
+                 'cannot collect, and nothing here can undo a payment.'))
 _reg(SettingSpec("uin_voucher_pubkey", "str",
                  lambda: os.environ.get("RCQ_UIN_VOUCHER_PUBKEY", ""), "numbers",
                  "Your till's public key",

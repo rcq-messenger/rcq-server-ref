@@ -248,7 +248,9 @@ async def quote(
     # actually type a number (founder, 04.09: typing a number that somebody is
     # selling should say so, and say by whom).
     listing = await db.get(UinListing, body.uin)
-    if listing is not None and listing.seller_uin != me:
+    if listing is not None and listing.seller_uin != me and await server_settings.get_bool(
+        "uin_resale_enabled"
+    ):
         held = await _listing_held(db, body.uin)
         return QuoteOut(
             uin=body.uin, length=length,
@@ -397,7 +399,28 @@ def _listing_out(row: UinListing, held: bool) -> ListingOut:
     )
 
 
-@router.post("/listings", response_model=ListingOut, dependencies=[Depends(require_shop_open)])
+async def require_resale_open() -> None:
+    """Resale is OFF until its own half is finished, and this is why.
+
+    ⚠⚠ The island side shipped ahead of the till, and an adversarial pass over
+    it found holes that end with somebody keeping both the money and the
+    number: a listed number can never be HELD (`/uin/hold` refuses anything
+    with a deed, which every listing has), so every "somebody is paying for
+    this right now" guard on this path is dead code; re-pricing a live listing
+    voids a voucher already paid for; an ordinary migration re-keys the seller
+    and does the same; and the till still charges its own ladder rather than
+    the one the island quotes.
+
+    None of that is reachable while this returns 404 — there is no client UI
+    yet either — and it stays 404 until each one is closed and tested. A door
+    that is nearly safe is a door that is open.
+    """
+    if not await server_settings.get_bool("uin_resale_enabled"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "resale is not open yet")
+
+
+@router.post("/listings", response_model=ListingOut,
+             dependencies=[Depends(require_shop_open), Depends(require_resale_open)])
 async def create_listing(
     body: ListingIn,
     me: int = Depends(current_uin),
@@ -468,7 +491,8 @@ async def delete_listing(
     return {"ok": True}
 
 
-@router.get("/listings", response_model=list[ListingOut], dependencies=[Depends(require_shop_open)])
+@router.get("/listings", response_model=list[ListingOut],
+            dependencies=[Depends(require_shop_open), Depends(require_resale_open)])
 async def listings(
     count: int = Query(12, ge=1, le=50),
     me: int = Depends(current_uin),
@@ -512,6 +536,99 @@ async def _held_uins(db: AsyncSession, uins: list[int]) -> set[int]:
         )
     ).scalars().all()
     return {int(u) for u in rows}
+
+
+class PayoutTargetOut(BaseModel):
+    """Where the till should send a buyer of one number, and for how much."""
+
+    uin: int
+    #: "island" — this island is selling its own stock, the money is the
+    #: operator's. "resale" — a person is selling, the money is theirs.
+    kind: str
+    price_cents: int
+    #: {chain: address}. Whose they are depends on `kind`, and the till does
+    #: not need to care: it invoices whatever comes back.
+    addresses: dict[str, str]
+    #: Present only for a resale, and the till signs it into the voucher so the
+    #: island can check the number did not change hands mid-payment.
+    seller_uin: int | None = None
+
+
+class PayoutQuestionIn(BaseModel):
+    #: A signed `payout` document (services/uin_voucher.payout_signed_bytes).
+    request: str
+
+
+@router.post("/payout-target", response_model=PayoutTargetOut,
+             dependencies=[Depends(require_shop_open)])
+async def payout_target(
+    body: PayoutQuestionIn,
+    db: AsyncSession = Depends(get_db),
+) -> PayoutTargetOut:
+    """The till asking: somebody wants this number, where do they pay?
+
+    ⚠⚠ THE ISLAND IS THE ONE PLACE THAT KNOWS. For its own stock the addresses
+    are the operator's, set from their console and changeable there; for a
+    resale they are the seller's, copied onto the listing when it went up. The
+    till used to carry the operator's wallets compiled into itself, which meant
+    a self-hoster could not change one without a redeploy and could not sell
+    anybody else's number at all.
+
+    Signed, not open: the answer names who is selling what, and an island that
+    told anyone would be a way to enumerate its listings and their owners. The
+    signature is the till's own key, the same one that signs vouchers, with its
+    own document kind so this can never be read as one.
+
+    ⚠ No authentication beyond that signature, and none is needed: the reply
+    contains an address and a price, both of which the buyer is about to be
+    shown anyway. What it must not do is answer a stranger, which it does not.
+    """
+    try:
+        uin = uin_voucher.verify_payout(body.request)
+    except uin_voucher.VoucherError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": e.code}) from None
+
+    listing = await db.get(UinListing, uin)
+    if listing is not None and await server_settings.get_bool("uin_resale_enabled"):
+        addrs = {k: str(v) for k, v in (listing.payout or {}).items() if str(v).strip()}
+        if not addrs:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "no_payout"})
+        return PayoutTargetOut(uin=uin, kind="resale", price_cents=int(listing.price_cents),
+                               addresses=addrs, seller_uin=int(listing.seller_uin))
+
+    length = _length(uin)
+    cents = (await _prices()).get(length)
+    if cents is None or length < MIN_SALE_LEN or not is_reserved_uin(uin):
+        # Ordinary space is free and three digits are not sold at all. Either
+        # way there is no invoice to write, and saying so is better than
+        # quoting a price for something nobody can be charged for.
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_for_sale"})
+    if await uin_is_taken(db, uin, ignore_holds=True):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
+
+    addrs = await operator_addresses()
+    if not addrs:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "no_payout"})
+    return PayoutTargetOut(uin=uin, kind="island", price_cents=int(cents), addresses=addrs)
+
+
+async def operator_addresses() -> dict[str, str]:
+    """The operator's own wallets, from their console. Empty means they have
+    not set any, which is a shop that cannot take money rather than one that
+    takes it somewhere else."""
+    raw = str(await server_settings.get("uin_payout_addresses") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return {str(k): str(v).strip() for k, v in parsed.items() if str(v).strip()}
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "[uin-shop] the payout addresses are not usable (%s). No invoice can "
+            "be written until this is fixed in the console; refusing rather than "
+            "sending anybody's money to a guess.", exc,
+        )
+        return {}
 
 
 class SuggestionOut(BaseModel):
@@ -822,7 +939,7 @@ async def redeem(
     # listing, and a resale voucher must never conjure a free number: the
     # signed field sets differ, so neither can be read as the other.
     listing = await db.get(UinListing, target)
-    if listing is not None:
+    if listing is not None and await server_settings.get_bool("uin_resale_enabled"):
         return await _redeem_resale(db, user, listing, body, device_id=device_id)
 
     try:
