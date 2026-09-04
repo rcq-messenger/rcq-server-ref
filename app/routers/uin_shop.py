@@ -819,6 +819,17 @@ async def my_uins(
             .order_by(OwnedUin.acquired_at.desc())
         )
     ).scalars().all()
+    # What this account is selling. Read here rather than from the market
+    # window, which hides your own listings on purpose: your collection is
+    # where you see what you have put up, and the price you asked.
+    mine_listed = []
+    if await server_settings.get_bool("uin_resale_enabled"):
+        listing_rows = (
+            await db.execute(select(UinListing).where(UinListing.seller_uin == me))
+        ).scalars().all()
+        held_now = await _held_uins(db, [int(r.uin) for r in listing_rows])
+        mine_listed = [_listing_out(r, held=int(r.uin) in held_now) for r in listing_rows]
+
     return MyUinsOut(
         active=me,
         max_owned=MAX_OWNED_UINS,
@@ -826,6 +837,7 @@ async def my_uins(
             OwnedUinOut(uin=int(r.uin), length=_length(int(r.uin)), acquired_at=r.acquired_at)
             for r in rows
         ],
+        listed=mine_listed,
     )
 
 
