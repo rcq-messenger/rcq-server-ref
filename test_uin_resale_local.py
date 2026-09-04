@@ -305,6 +305,8 @@ async def main() -> int:
               t.get("addresses") == {"tron": "TSellerWallet"})
         check("  ... their price, and who they are",
               t.get("price_cents") == 7700 and t.get("seller_uin") == SELLER)
+        check(f"  ⚠⚠ ... and the OFFER id the voucher must name ({t.get('listing_id')})",
+              t.get("listing_id") == await listing_id_of(LIVE))
 
         # Island stock: the money is the OPERATOR's, from their console.
         async with SessionLocal() as db:

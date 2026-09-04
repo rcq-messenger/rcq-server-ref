@@ -232,6 +232,16 @@ _GOSSIP_RECORD_COLUMNS: list[tuple[str, str]] = [
 # without this line the catalogue selects a column that is not there and every
 # read of it is a 500. `featured` (same day) is the operator's pin to the top
 # of the catalogue; nothing is featured until an operator says so.
+_UIN_LISTING_COLUMNS: list[tuple[str, str]] = [
+    # ⚠ The table shipped a day before this column did, so an island that
+    # already booted the resale build has the table without it and every read
+    # of a listing raises `UndefinedColumn`. Additive and nullable: existing
+    # rows are impossible anyway (resale has never been enabled), and a fresh
+    # island gets it from the model.
+    ("listing_id", "VARCHAR(32)"),
+]
+
+
 _SITE_COLUMNS: list[tuple[str, str]] = [
     ("show_owner", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("featured", "BOOLEAN NOT NULL DEFAULT FALSE"),
@@ -417,6 +427,7 @@ async def init_db() -> None:
         ("contact_requests", _CONTACT_REQUEST_COLUMNS),
         ("gossip_records", _GOSSIP_RECORD_COLUMNS),
         ("sites", _SITE_COLUMNS),
+        ("uin_listings", _UIN_LISTING_COLUMNS),
     ]
     for table, columns in additive:
         for col, typ in columns:
