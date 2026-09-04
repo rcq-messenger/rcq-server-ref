@@ -778,6 +778,10 @@ class MyUinsOut(BaseModel):
     # instead of only finding out at the eleventh attempt, and so a self-hoster
     # who changes the cap does not need a client release to reflect it.
     max_owned: int = MAX_OWNED_UINS
+    # What this account is SELLING, which the market window deliberately hides
+    # from its owner. Empty when resale is off, so a client asking for it on an
+    # island that does not do resale simply sees nothing rather than an error.
+    listed: list[ListingOut] = []
 
 
 async def _owned_uins(db: AsyncSession, owner: int) -> list[int]:
