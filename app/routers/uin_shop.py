@@ -586,8 +586,13 @@ class PayoutTargetOut(BaseModel):
     #: {chain: address}. Whose they are depends on `kind`, and the till does
     #: not need to care: it invoices whatever comes back.
     addresses: dict[str, str]
-    #: Present only for a resale, and the till signs it into the voucher so the
-    #: island can check the number did not change hands mid-payment.
+    #: Present only for a resale. The till signs THIS into the voucher, so the
+    #: island can tell the offer that was paid for from any other: a re-price
+    #: mints a new one, and a seller changing their own number does not.
+    listing_id: str | None = None
+    #: Who is being paid, for the till's own display. ⚠ NOT what the voucher
+    #: binds to: a seller's number moves when they switch between their own,
+    #: and a voucher naming it would be void the moment they did.
     seller_uin: int | None = None
 
 
@@ -631,7 +636,8 @@ async def payout_target(
         if not addrs:
             raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "no_payout"})
         return PayoutTargetOut(uin=uin, kind="resale", price_cents=int(listing.price_cents),
-                               addresses=addrs, seller_uin=int(listing.seller_uin))
+                               addresses=addrs, listing_id=str(listing.listing_id),
+                               seller_uin=int(listing.seller_uin))
 
     length = _length(uin)
     cents = (await _prices()).get(length)
