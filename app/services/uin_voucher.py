@@ -225,7 +225,56 @@ def verify(voucher: str, *, expect_uin: int, now: int | None = None) -> str:
 #: till can lift again, and it can never grant anything.
 HOLD_MAX_AGE_SECONDS = 600
 
+# ⚠ "payout" joins them because it is the same shape of message: the till
+# asking the island a question about ONE number, signed, short-lived, and
+# worthless to replay. It carries no hold id, so `verify_hold` would reject it
+# on the field set alone, which is the domain separation working as intended.
 _HOLD_KINDS = ("hold", "release")
+
+
+def payout_signed_bytes(*, uin: int, exp: int) -> bytes:
+    """The bytes the till signs to ask WHERE a buyer of `uin` should pay.
+
+    The answer is an address, not money, and the question is public knowledge
+    (anyone can see what is for sale), so a replay inside the window buys
+    nothing. It is signed anyway: an island that answered this to anyone would
+    be a way to enumerate which numbers are listed and by whom.
+    """
+    doc = {"v": VERSION, "kind": "payout", "uin": int(uin), "exp": int(exp)}
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+
+
+def verify_payout(request: str, *, now: int | None = None) -> int:
+    """Check a signed payout question; return the uin it asks about."""
+    pub_b64 = public_key_b64()
+    if not pub_b64:
+        raise VoucherError("sales_disabled")
+    try:
+        doc = json.loads(base64.b64decode(request.strip(), validate=True))
+    except (ValueError, binascii.Error, TypeError):
+        raise VoucherError("bad_voucher") from None
+    if not isinstance(doc, dict) or doc.get("v") != VERSION or doc.get("kind") != "payout":
+        raise VoucherError("bad_voucher")
+    try:
+        uin = int(doc["uin"])
+        exp = int(doc["exp"])
+        sig = base64.b64decode(str(doc["sig"]), validate=True)
+    except (KeyError, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+
+    seconds = int(time.time() if now is None else now)
+    if exp <= seconds or exp - seconds > HOLD_MAX_AGE_SECONDS:
+        raise VoucherError("voucher_expired")
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64, validate=True))
+        pub.verify(sig, payout_signed_bytes(uin=uin, exp=exp))
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+    return uin
 
 
 def hold_signed_bytes(*, kind: str, uin: int, hold_id: str, exp: int) -> bytes:

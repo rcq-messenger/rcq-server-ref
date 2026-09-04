@@ -24,6 +24,11 @@ os.environ["UIN_SHOP_ENABLED"] = "true"
 os.environ["RCQ_UIN_CLIENT_TILL_MINE"] = "true"
 os.environ["RCQ_UIN_TILL_URL"] = "https://till.example.org"
 
+# Resale is OFF by default until the till and the apps catch up, so this file
+# turns it on for itself. ⚠ The default is asserted at the end: a build where
+# resale quietly became reachable is a build that fails here.
+_RESALE_ON = True
+
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 from cryptography.hazmat.primitives.serialization import (  # noqa: E402
     Encoding, PublicFormat,
@@ -96,6 +101,12 @@ FOR_SALE = 4242
 
 async def main() -> int:
     await init_db()
+    async with SessionLocal() as db:
+        from app.models.server_setting import ServerSetting
+        db.add(ServerSetting(key="uin_resale_enabled", value="true"))
+        await db.commit()
+    from app.services import server_settings as _ss0
+    _ss0._cache.at = 0
     await (await get_redis()).flushdb()
     async with SessionLocal() as db:
         for uin, nick in ((SELLER, "seller"), (BUYER, "buyer"), (STRANGER, "stranger")):
@@ -217,6 +228,55 @@ async def main() -> int:
         r = await c.post("/uin/redeem", json={
             "uin": GONE, "voucher": resale_voucher(GONE, SELLER, 1000), "switch": False}, headers=HB)
         check(f"a number the seller no longer holds is refused ({code(r)})", code(r) == "seller_gone")
+
+        print("\n💰 The till asking where a buyer pays:")
+        import time as _t
+        def payout_q(uin, ttl=300, signer=None):
+            exp = int(_t.time()) + ttl
+            payload = uin_voucher.payout_signed_bytes(uin=uin, exp=exp)
+            sig = (signer or _SK).sign(payload)
+            doc = {"v": uin_voucher.VERSION, "kind": "payout", "uin": uin, "exp": exp,
+                   "sig": base64.b64encode(sig).decode()}
+            return base64.b64encode(json.dumps(doc).encode()).decode()
+
+        # A live listing: the money is the SELLER's.
+        LIVE = 6161
+        async with SessionLocal() as db:
+            db.add(OwnedUin(uin=LIVE, owner_uin=SELLER, source="purchase"))
+            db.add(UinListing(uin=LIVE, seller_uin=SELLER, price_cents=7700,
+                              payout={"tron": "TSellerWallet"}))
+            await db.commit()
+        r = await c.post("/uin/payout-target", json={"request": payout_q(LIVE)})
+        t = r.json()
+        check(f"a resale points at the seller's wallet ({t.get('kind')})", t.get("kind") == "resale")
+        check(f"  ... their address ({t.get('addresses')})",
+              t.get("addresses") == {"tron": "TSellerWallet"})
+        check("  ... their price, and who they are",
+              t.get("price_cents") == 7700 and t.get("seller_uin") == SELLER)
+
+        # Island stock: the money is the OPERATOR's, from their console.
+        async with SessionLocal() as db:
+            from app.models.server_setting import ServerSetting
+            db.add(ServerSetting(key="uin_payout_addresses",
+                                 value=json.dumps({"tron": "TOperatorWallet"})))
+            await db.commit()
+        from app.services import server_settings as _ss
+        _ss._cache.at = 0
+        r = await c.post("/uin/payout-target", json={"request": payout_q(4321)})
+        t2 = r.json()
+        check(f"island stock points at the operator's wallet ({t2.get('kind')})",
+              t2.get("kind") == "island")
+        check(f"  ... changed from the console, not a redeploy ({t2.get('addresses')})",
+              t2.get("addresses") == {"tron": "TOperatorWallet"})
+
+        r = await c.post("/uin/payout-target", json={"request": payout_q(4321, signer=Ed25519PrivateKey.generate())})
+        check(f"⚠⚠ a stranger cannot ask ({r.status_code} {code(r)})",
+              r.status_code == 403 and code(r) == "bad_voucher")
+        r = await c.post("/uin/payout-target", json={"request": payout_q(4321, ttl=-10)})
+        check(f"⚠ nor can a stale question be replayed ({code(r)})", code(r) == "voucher_expired")
+        r = await c.post("/uin/payout-target", json={"request": payout_q(847261935)})
+        check(f"⚠ ordinary free space has no invoice to write ({r.status_code} {code(r)})",
+              r.status_code == 409 and code(r) == "not_for_sale")
 
         print("\nA listing is spoken for while it is up:")
         r = await c.delete(f"/uin/listings/{GONE}", headers=HS)
