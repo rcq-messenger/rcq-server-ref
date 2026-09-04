@@ -264,7 +264,15 @@ async def quote(
             reason="listed",
             acquire="closed" if held else "resale",
             seller_uin=listing.seller_uin,
-            checkout_url=(await own_till_url()) if not held else None,
+            # ⚠⚠ ALWAYS, even while held. `acquire` already tells a client not
+            # to start a new purchase; blanking the address as well broke the
+            # one case that needs it most — a buyer coming back to a payment
+            # they had already started, whose own invoice is WHY the listing is
+            # held. They fell through to the checkout compiled into the client,
+            # which has never heard of their invoice, and the money they had
+            # already sent looked lost. The address is not a secret: it is
+            # printed on the invoice they are holding.
+            checkout_url=await own_till_url(),
         )
 
     if taken:
