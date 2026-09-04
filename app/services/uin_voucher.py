@@ -69,7 +69,7 @@ def signed_bytes(*, uin: int, nonce: str, exp: int) -> bytes:
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
-def resale_signed_bytes(*, uin: int, seller: int, price_cents: int, nonce: str, exp: int) -> bytes:
+def resale_signed_bytes(*, uin: int, listing_id: str, price_cents: int, nonce: str, exp: int) -> bytes:
     """The bytes the till signs for a number sold by a PERSON, not by the island.
 
     ⚠⚠ A separate document, and deliberately not an extra field on the other
@@ -79,19 +79,19 @@ def resale_signed_bytes(*, uin: int, seller: int, price_cents: int, nonce: str, 
     later against a listing somebody priced at $250. Same key, two jobs, no
     overlap — the reasoning `hold_signed_bytes` already records.
 
-    `seller` and `price_cents` are inside the signature because the island
-    checks them against the listing before it moves anybody's property. A till
-    that signed for one seller cannot have its voucher spent on another's
-    number, and a price that changed between invoice and redemption stops the
-    redemption rather than surprising either side.
+    ⚠⚠ `listing_id` and not the seller's number. The seller's number moves
+    when they switch between their own (PER_UIN_COLUMNS re-keys the listing),
+    and a voucher naming it was void the moment they did — with the buyer's
+    money already gone. The listing id does not move, and a re-price mints a
+    new one, so a voucher still names exactly the offer that was paid for.
     """
-    doc = {"v": VERSION, "kind": "resale", "uin": int(uin), "seller": int(seller),
+    doc = {"v": VERSION, "kind": "resale", "uin": int(uin), "listing": str(listing_id),
            "price_cents": int(price_cents), "nonce": str(nonce), "exp": int(exp)}
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
-def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> tuple[str, int, int]:
-    """Check a resale voucher; return `(nonce, seller, price_cents)`.
+def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> tuple[str, str, int]:
+    """Check a resale voucher; return `(nonce, listing_id, price_cents)`.
 
     Same vocabulary of errors as `verify`, so a client never has to learn two.
     """
@@ -106,7 +106,7 @@ def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> t
         raise VoucherError("bad_voucher")
     try:
         uin = int(doc["uin"])
-        seller = int(doc["seller"])
+        listing_id = str(doc["listing"])
         price_cents = int(doc["price_cents"])
         exp = int(doc["exp"])
         nonce = str(doc["nonce"])
@@ -117,7 +117,7 @@ def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> t
         raise VoucherError("bad_voucher")
     if uin != int(expect_uin):
         raise VoucherError("voucher_other_uin")
-    if price_cents < 0 or seller <= 0:
+    if price_cents < 0 or not (1 <= len(listing_id) <= 32) or not listing_id.isascii():
         raise VoucherError("bad_voucher")
 
     seconds = int(time.time() if now is None else now)
@@ -131,12 +131,12 @@ def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> t
 
     try:
         pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64, validate=True))
-        pub.verify(sig, resale_signed_bytes(uin=uin, seller=seller,
+        pub.verify(sig, resale_signed_bytes(uin=uin, listing_id=listing_id,
                                             price_cents=price_cents, nonce=nonce, exp=exp))
     except (InvalidSignature, ValueError, TypeError, binascii.Error):
         raise VoucherError("bad_voucher") from None
 
-    return nonce, seller, price_cents
+    return nonce, listing_id, price_cents
 
 
 def public_key_b64() -> str | None:

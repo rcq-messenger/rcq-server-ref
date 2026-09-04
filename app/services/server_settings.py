@@ -14,6 +14,7 @@ few seconds of lag, so this avoids a DB read on every request without needing a
 pub/sub invalidation.
 """
 import time as _time
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -238,6 +239,34 @@ async def island_name() -> str:
     return str(await get("island_name") or "").strip() or _env.APP_NAME.strip()
 
 
+
+def _check_json_map(key: str, raw: str) -> None:
+    """A setting whose value is JSON is checked HERE, when it is saved.
+
+    ⚠⚠ Both of these decide money. `uin_prices` is what people are charged and
+    `uin_payout_addresses` is where their money goes, and both used to be
+    stored as opaque strings: a trailing comma or a truncated paste saved
+    cleanly, showed green in the console, and then failed at read time — where
+    the only safe fallback is somebody else's prices, or no sale at all.
+    Refusing at save is the difference between a typo and an incident.
+    """
+    if not raw:
+        return
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise ValueError(f"{key} must be JSON") from None
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError(f"{key} must be a non-empty JSON object")
+    for k, v in parsed.items():
+        if key == "uin_prices":
+            if not str(k).isdigit() or not isinstance(v, int) or v < 0:
+                raise ValueError('uin_prices looks like {"4": 25000}: digits to whole cents')
+        else:
+            if not str(v).strip():
+                raise ValueError("an empty address is an invoice nobody can pay")
+
+
 def validate(updates: dict[str, Any]) -> dict[str, str]:
     """Coerce a {key: value} patch to {key: serialized}. Raises ValueError on a
     bad key / type / range / choice so the endpoint can 400 cleanly."""
@@ -269,6 +298,8 @@ def validate(updates: dict[str, Any]) -> dict[str, str]:
             value = value.strip()
             if spec.choices is not None and value not in spec.choices:
                 raise ValueError(f"'{key}' must be one of {list(spec.choices)}")
+            if key in ("uin_prices", "uin_payout_addresses"):
+                _check_json_map(key, value)
             out[key] = value[:2048]
     return out
 
