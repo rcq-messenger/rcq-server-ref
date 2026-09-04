@@ -186,7 +186,12 @@ async def server_info() -> ServerInfo:
         welcome=eff["welcome_text"],
         logo_version=await island_logo.version(),
         capabilities=ServerCapabilities(
-            uin_shop=settings.UIN_SHOP_ENABLED,
+            # ⚠ From the console like every other capability on this reply.
+            # It alone read the .env constant, so an operator who opened their
+            # shop in the console moved the ENDPOINTS and not the clients: the
+            # apps kept hiding the storefront because /server/info still said
+            # off, and nothing explained why.
+            uin_shop=eff["uin_shop_enabled"],
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=eff["registration_policy"],
             random_chat=eff["random_enabled"],

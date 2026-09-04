@@ -138,6 +138,7 @@ async def get_settings() -> dict[str, Any]:
 @router.patch("/settings", include_in_schema=False)
 async def patch_settings(
     body: dict[str, Any],
+    admin: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     try:
@@ -145,6 +146,17 @@ async def patch_settings(
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "bad_setting", "message": str(exc)})
     if serialized:
+        # ⚠⚠ A change to any of these decides where money goes or what people
+        # are charged, and it used to leave no trace at all — while the
+        # neighbouring money door, `/admin/uin/grant`, logs every call. An
+        # operator asking "when did our payout address change" deserves an
+        # answer, and so does anyone reading the logs after it changed without
+        # them. Values are logged because there is nothing secret in them: a
+        # public key, a price list, and addresses that are printed on every
+        # invoice anyway.
+        money = {k: v for k, v in serialized.items() if k.startswith("uin_")}
+        if money:
+            log.warning("[admin] money settings changed by %s: %s", admin, money)
         await server_settings.apply(db, serialized)
         await db.commit()
     return {"settings": await server_settings.describe()}

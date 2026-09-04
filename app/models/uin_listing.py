@@ -17,7 +17,7 @@ somebody was already sending.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, DateTime, Integer, JSON
+from sqlalchemy import BigInteger, DateTime, Integer, JSON, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -32,6 +32,16 @@ class UinListing(Base):
     #: seller who moves between their own numbers keeps their listings, and
     #: burning the account takes them down with it.
     seller_uin: Mapped[int] = mapped_column(BigInteger, index=True)
+    #: This listing, as a thing that can be named in a signature.
+    #:
+    #: ⚠⚠ The voucher binds to THIS, not to `seller_uin`, and that is the whole
+    #: reason it exists. A seller's number is mutable — moving between your own
+    #: numbers re-keys `seller_uin` (PER_UIN_COLUMNS) — so a voucher naming the
+    #: seller was void the moment they switched, and the buyer had paid.
+    #: Minted fresh on every price change too: a re-priced listing is a
+    #: different offer, and a voucher bought against the old price must not
+    #: open the new one.
+    listing_id: Mapped[str] = mapped_column(String(32), index=True)
     #: What they are asking, in cents. The island quotes it and the till signs
     #: for it; a listing whose price changed mid-sale stops the redemption
     #: rather than surprising either side.

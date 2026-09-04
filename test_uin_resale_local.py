@@ -65,16 +65,30 @@ def b64(n=32):
     return base64.b64encode(os.urandom(n)).decode()
 
 
-def resale_voucher(uin: int, seller: int, cents: int, *, nonce=None, ttl=3600, signer=None):
+def resale_voucher(uin: int, listing_id: str, cents: int, *, nonce=None, ttl=3600, signer=None):
     nonce = nonce or base64.b64encode(os.urandom(18)).decode()
     exp = int(time.time()) + ttl
     payload = uin_voucher.resale_signed_bytes(
-        uin=uin, seller=seller, price_cents=cents, nonce=nonce, exp=exp
+        uin=uin, listing_id=listing_id, price_cents=cents, nonce=nonce, exp=exp
     )
     sig = (signer or _SK).sign(payload)
-    doc = {"v": uin_voucher.VERSION, "kind": "resale", "uin": uin, "seller": seller,
+    doc = {"v": uin_voucher.VERSION, "kind": "resale", "uin": uin, "listing": listing_id,
            "price_cents": cents, "nonce": nonce, "exp": exp,
            "sig": base64.b64encode(sig).decode()}
+    return base64.b64encode(json.dumps(doc).encode()).decode()
+
+
+async def listing_id_of(uin: int) -> str:
+    async with SessionLocal() as db:
+        row = await db.get(UinListing, uin)
+        return row.listing_id if row else ""
+
+
+def hold_req(uin: int, hold_id: str, *, kind="hold", ttl=300):
+    exp = int(time.time()) + ttl
+    sig = _SK.sign(uin_voucher.hold_signed_bytes(kind=kind, uin=uin, hold_id=hold_id, exp=exp))
+    doc = {"v": uin_voucher.VERSION, "kind": kind, "uin": uin, "hold_id": hold_id,
+           "exp": exp, "sig": base64.b64encode(sig).decode()}
     return base64.b64encode(json.dumps(doc).encode()).decode()
 
 
@@ -168,29 +182,29 @@ async def main() -> int:
               r.status_code == 403 and code(r) == "bad_voucher")
 
         r = await c.post("/uin/redeem", json={
-            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, SELLER, 99), "switch": False},
+            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, await listing_id_of(FOR_SALE), 99), "switch": False},
             headers=HB)
         check(f"a resale voucher at the WRONG price is refused ({code(r)})", code(r) == "price_changed")
 
         r = await c.post("/uin/redeem", json={
-            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, STRANGER, 25000), "switch": False},
+            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, "deadbeefdeadbeef", 25000), "switch": False},
             headers=HB)
-        check(f"a resale voucher naming the WRONG seller is refused ({code(r)})",
-              code(r) == "seller_changed")
+        check(f"a voucher naming a DIFFERENT offer is refused ({code(r)})",
+              code(r) == "offer_changed")
 
         other = Ed25519PrivateKey.generate()
         r = await c.post("/uin/redeem", json={
-            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, SELLER, 25000, signer=other),
+            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, await listing_id_of(FOR_SALE), 25000, signer=other),
             "switch": False}, headers=HB)
         check(f"a voucher signed by somebody else is refused ({code(r)})", code(r) == "bad_voucher")
 
         r = await c.post("/uin/redeem", json={
-            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, SELLER, 25000), "switch": False},
+            "uin": FOR_SALE, "voucher": resale_voucher(FOR_SALE, await listing_id_of(FOR_SALE), 25000), "switch": False},
             headers=HS)
         check(f"⚠ the seller cannot buy their own listing ({code(r)})", code(r) == "own_listing")
 
         print("\nThe sale itself:")
-        v = resale_voucher(FOR_SALE, SELLER, 25000)
+        v = resale_voucher(FOR_SALE, await listing_id_of(FOR_SALE), 25000)
         r = await c.post("/uin/redeem", json={"uin": FOR_SALE, "voucher": v, "switch": False},
                          headers=HB)
         check(f"the buyer redeems ({r.status_code})", r.status_code == 200)
@@ -218,16 +232,54 @@ async def main() -> int:
         GONE = 5151
         async with SessionLocal() as db:
             db.add(OwnedUin(uin=GONE, owner_uin=SELLER, source="purchase"))
-            db.add(UinListing(uin=GONE, seller_uin=SELLER, price_cents=1000,
-                              payout={"tron": "TSellerWallet"}))
+            db.add(UinListing(uin=GONE, seller_uin=SELLER, listing_id="gonelisting01",
+                              price_cents=1000, payout={"tron": "TSellerWallet"}))
             await db.commit()
         async with SessionLocal() as db:
             deed = await db.get(OwnedUin, GONE)
             await db.delete(deed)
             await db.commit()
         r = await c.post("/uin/redeem", json={
-            "uin": GONE, "voucher": resale_voucher(GONE, SELLER, 1000), "switch": False}, headers=HB)
+            "uin": GONE, "voucher": resale_voucher(GONE, await listing_id_of(GONE), 1000), "switch": False}, headers=HB)
         check(f"a number the seller no longer holds is refused ({code(r)})", code(r) == "seller_gone")
+
+        print("\n⚠⚠ A payment in flight freezes the offer (the guards that were dead code):")
+        FROZEN = 5252
+        async with SessionLocal() as db:
+            db.add(OwnedUin(uin=FROZEN, owner_uin=SELLER, source="purchase"))
+            await db.commit()
+        r = await c.post("/uin/listings", json={
+            "uin": FROZEN, "price_cents": 3000, "payout": {"tron": "TSellerWallet"}}, headers=HS)
+        check(f"listed ({r.status_code})", r.status_code == 200)
+        lid_before = await listing_id_of(FROZEN)
+
+        r = await c.post("/uin/hold", json={"request": hold_req(FROZEN, "hold-a")})
+        check(f"⚠⚠ a LISTED number CAN be held now ({r.status_code})", r.status_code == 200)
+        check("  ... which is what every 'somebody is paying' guard depends on",
+              (r.json() or {}).get("held") is True)
+
+        r = await c.post("/uin/listings", json={
+            "uin": FROZEN, "price_cents": 9999, "payout": {"tron": "TSellerWallet"}}, headers=HS)
+        check(f"⚠⚠ re-pricing under a payment is refused ({code(r)})", code(r) == "being_paid")
+        check("  ... and the offer is untouched", await listing_id_of(FROZEN) == lid_before)
+        r = await c.delete(f"/uin/listings/{FROZEN}", headers=HS)
+        check(f"⚠⚠ nor can it be taken off the market ({code(r)})", code(r) == "being_paid")
+
+        r = await c.post("/uin/hold", json={"request": hold_req(FROZEN, "hold-a", kind="release")})
+        check(f"the till lets go ({r.status_code})", r.status_code == 200)
+        r = await c.post("/uin/listings", json={
+            "uin": FROZEN, "price_cents": 9999, "payout": {"tron": "TSellerWallet"}}, headers=HS)
+        check(f"  ... and then re-pricing is ordinary ({r.status_code})", r.status_code == 200)
+        check("  ⚠ a re-price is a NEW offer, so old vouchers stop opening it",
+              await listing_id_of(FROZEN) != lid_before)
+
+        print("\n⚠ A seller cannot route around what the island refuses to sell:")
+        async with SessionLocal() as db:
+            db.add(OwnedUin(uin=777, owner_uin=SELLER, source="granted"))
+            await db.commit()
+        r = await c.post("/uin/listings", json={
+            "uin": 777, "price_cents": 100000, "payout": {"tron": "T"}}, headers=HS)
+        check(f"three digits are not for sale at any price ({code(r)})", code(r) == "not_for_sale")
 
         print("\n💰 The till asking where a buyer pays:")
         import time as _t
@@ -243,8 +295,8 @@ async def main() -> int:
         LIVE = 6161
         async with SessionLocal() as db:
             db.add(OwnedUin(uin=LIVE, owner_uin=SELLER, source="purchase"))
-            db.add(UinListing(uin=LIVE, seller_uin=SELLER, price_cents=7700,
-                              payout={"tron": "TSellerWallet"}))
+            db.add(UinListing(uin=LIVE, seller_uin=SELLER, listing_id="livelisting01",
+                              price_cents=7700, payout={"tron": "TSellerWallet"}))
             await db.commit()
         r = await c.post("/uin/payout-target", json={"request": payout_q(LIVE)})
         t = r.json()

@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -448,19 +448,41 @@ async def create_listing(
     ):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "no_payout"})
 
+    # The same floor the island's own stock has. Three digits are not for sale
+    # at any price (founder, 03.09), and letting a person sell what the island
+    # refuses to sell would route around that decision rather than honour it.
+    if _length(target) < MIN_SALE_LEN:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "not_for_sale"})
+
     deed = await db.get(OwnedUin, target)
     if deed is None or int(deed.owner_uin) != me:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_owned"})
 
     existing = await db.get(UinListing, target)
     if existing is not None:
+        # ⚠⚠ NOT while somebody is paying. Re-pricing mints a new listing id,
+        # which is exactly what makes a voucher bought at the old price stop
+        # working — and if that voucher has already been PAID FOR, the seller
+        # would be keeping both the money and the number. The hold is what says
+        # a payment is in flight; outside one, changing your own price is
+        # ordinary and allowed.
+        if await _listing_held(db, target):
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "being_paid"})
+        changed = (
+            int(existing.price_cents) != int(body.price_cents)
+            or existing.payout != {k: v.strip() for k, v in body.payout.items()}
+        )
         existing.price_cents = int(body.price_cents)
         existing.payout = {k: v.strip() for k, v in body.payout.items()}
+        # A changed offer is a different offer, and gets a name of its own.
+        if changed:
+            existing.listing_id = secrets.token_hex(8)
         await db.commit()
-        return _listing_out(existing, held=await _listing_held(db, target))
+        return _listing_out(existing, held=False)
 
     row = UinListing(
-        uin=target, seller_uin=me, price_cents=int(body.price_cents),
+        uin=target, seller_uin=me, listing_id=secrets.token_hex(8),
+        price_cents=int(body.price_cents),
         payout={k: v.strip() for k, v in body.payout.items()},
     )
     db.add(row)
@@ -468,13 +490,19 @@ async def create_listing(
     return _listing_out(row, held=False)
 
 
-@router.delete("/listings/{uin}", dependencies=[Depends(require_shop_open)])
+@router.delete("/listings/{uin}")
 async def delete_listing(
     uin: int,
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Take a number off the market.
+
+    ⚠ NOT behind the shop flag, and that is deliberate: `delete_listing` used
+    to 404 the moment an operator closed the shop, while `release` and
+    `activate` both refuse a listed number — so closing the shop locked every
+    listed number away from its owner permanently. Taking your own property off
+    the market is not a sale.
 
     ⚠ Refused while somebody is paying for it. The hold is what makes the
     payment window safe, and a seller who could pull the listing out from under
@@ -522,7 +550,16 @@ async def listings(
 
 async def _listing_held(db: AsyncSession, uin: int) -> bool:
     hold = await db.get(UinHold, uin)
-    return hold is not None and hold.expires_at > datetime.now(timezone.utc)
+    if hold is None:
+        return False
+    # ⚠ SQLite hands back a naive datetime where Postgres hands back an aware
+    # one, and comparing the two raises rather than answering. Raising here
+    # would mean "is somebody paying for this" throws a 500 in the middle of a
+    # sale, so the value is normalised instead of trusted.
+    expires = hold.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires > datetime.now(timezone.utc)
 
 
 async def _held_uins(db: AsyncSession, uins: list[int]) -> set[int]:
@@ -603,7 +640,12 @@ async def payout_target(
         # way there is no invoice to write, and saying so is better than
         # quoting a price for something nobody can be charged for.
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_for_sale"})
-    if await uin_is_taken(db, uin, ignore_holds=True):
+    # ⚠ WITHOUT `ignore_holds`. At redemption a hold is this sale's own
+    # reservation and must be ignored; at invoice time it is somebody ELSE's,
+    # and answering "here is where to pay" for a number another buyer has
+    # reserved invites two people to pay for one number with no way to refund
+    # either.
+    if await uin_is_taken(db, uin):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
 
     addrs = await operator_addresses()
@@ -1019,8 +1061,19 @@ async def _redeem_resale(
     if int(listing.seller_uin) == int(user.uin):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "own_listing"})
 
+    # ⚠ The cap counts here too. It is enforced in exactly one place otherwise
+    # (`_take`'s no-switch branch), and this path never goes through it, so a
+    # buyer could hold unlimited numbers simply by buying them from people
+    # rather than from the island. Checked BEFORE the nonce is spent: a voucher
+    # burnt against a refusal is a payment with nothing to show for it.
+    if not body.switch and len(await _owned_uins(db, int(user.uin))) >= MAX_OWNED_UINS:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "too_many_uins", "max": MAX_OWNED_UINS},
+        )
+
     try:
-        nonce, seller, price_cents = uin_voucher.verify_resale(body.voucher, expect_uin=target)
+        nonce, listing_id, price_cents = uin_voucher.verify_resale(body.voucher, expect_uin=target)
     except uin_voucher.VoucherError as e:
         code = e.code
         status_code = (
@@ -1029,8 +1082,10 @@ async def _redeem_resale(
         )
         raise HTTPException(status_code, detail={"code": code}) from None
 
-    if seller != int(listing.seller_uin):
-        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "seller_changed"})
+    if listing_id != str(listing.listing_id):
+        # A different offer from the one that was paid for: re-priced, taken
+        # down and put back, or simply another listing of the same number.
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "offer_changed"})
     if price_cents != int(listing.price_cents):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "price_changed"})
 
@@ -1043,17 +1098,20 @@ async def _redeem_resale(
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "voucher_spent"}) from None
 
-    deed = await db.get(OwnedUin, target)
-    if deed is None or int(deed.owner_uin) != int(listing.seller_uin):
-        # The seller no longer holds what they were selling: released, burned,
-        # or already transferred. Nothing to hand over, and saying so plainly
-        # is better than inventing a deed out of a voucher.
+    # ⚠⚠ ONE conditional UPDATE, not read-then-write. Reading the deed, checking
+    # it, and assigning to it are three statements with nothing between them
+    # holding the row, so two buyers who both paid could both pass the check and
+    # the second write would win — one number, two payments, no refunds. The
+    # WHERE clause is the lock: exactly one of them changes a row, and the other
+    # is told the seller no longer holds it.
+    moved = await db.execute(
+        update(OwnedUin)
+        .where(OwnedUin.uin == target, OwnedUin.owner_uin == int(listing.seller_uin))
+        .values(owner_uin=int(user.uin), source="purchase")
+    )
+    if not moved.rowcount:
+        # Released, burned, already sold, or handed over by the operator.
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "seller_gone"})
-
-    # The transfer itself: the deed changes hands, the shop window comes down,
-    # and the hold that protected the payment has done its job.
-    deed.owner_uin = int(user.uin)
-    deed.source = "purchase"
     await db.delete(listing)
     hold = await db.get(UinHold, target)
     if hold is not None:
@@ -1293,7 +1351,14 @@ async def till_hold(
         existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=HOLD_MINUTES)
         await db.commit()
         return HoldRequestOut(uin=uin, held=True, expires_at=existing.expires_at)
-    if await uin_is_taken(db, uin):
+    # ⚠⚠ A LISTED number is taken and that is the point: somebody owns it and is
+    # selling it. Asking `uin_is_taken` alone refused every listing, so no hold
+    # could ever exist on one — which made every "somebody is paying for this
+    # right now" guard in the resale path dead code, and left a seller free to
+    # re-price or delist out from under a payment already made. A listing is
+    # exactly the case where a hold is needed most.
+    listing = await db.get(UinListing, uin)
+    if listing is None and await uin_is_taken(db, uin):
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "taken"})
     expires = datetime.now(timezone.utc) + timedelta(minutes=HOLD_MINUTES)
     db.add(UinHold(uin=uin, hold_id=hold_id, expires_at=expires))
