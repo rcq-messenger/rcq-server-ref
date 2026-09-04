@@ -69,11 +69,92 @@ def signed_bytes(*, uin: int, nonce: str, exp: int) -> bytes:
     return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
+def resale_signed_bytes(*, uin: int, seller: int, price_cents: int, nonce: str, exp: int) -> bytes:
+    """The bytes the till signs for a number sold by a PERSON, not by the island.
+
+    ⚠⚠ A separate document, and deliberately not an extra field on the other
+    one. The field sets differ, so neither can ever be read as the other, and
+    that is what stops the substitution this design would otherwise invite: a
+    voucher bought for $0.99 against ordinary space being redeemed a moment
+    later against a listing somebody priced at $250. Same key, two jobs, no
+    overlap — the reasoning `hold_signed_bytes` already records.
+
+    `seller` and `price_cents` are inside the signature because the island
+    checks them against the listing before it moves anybody's property. A till
+    that signed for one seller cannot have its voucher spent on another's
+    number, and a price that changed between invoice and redemption stops the
+    redemption rather than surprising either side.
+    """
+    doc = {"v": VERSION, "kind": "resale", "uin": int(uin), "seller": int(seller),
+           "price_cents": int(price_cents), "nonce": str(nonce), "exp": int(exp)}
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+
+
+def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> tuple[str, int, int]:
+    """Check a resale voucher; return `(nonce, seller, price_cents)`.
+
+    Same vocabulary of errors as `verify`, so a client never has to learn two.
+    """
+    pub_b64 = public_key_b64()
+    if not pub_b64:
+        raise VoucherError("sales_disabled")
+    try:
+        doc = json.loads(base64.b64decode(voucher.strip(), validate=True))
+    except (ValueError, binascii.Error, TypeError):
+        raise VoucherError("bad_voucher") from None
+    if not isinstance(doc, dict) or doc.get("v") != VERSION or doc.get("kind") != "resale":
+        raise VoucherError("bad_voucher")
+    try:
+        uin = int(doc["uin"])
+        seller = int(doc["seller"])
+        price_cents = int(doc["price_cents"])
+        exp = int(doc["exp"])
+        nonce = str(doc["nonce"])
+        sig = base64.b64decode(str(doc["sig"]), validate=True)
+    except (KeyError, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+    if not (16 <= len(nonce) <= 128) or not nonce.isascii():
+        raise VoucherError("bad_voucher")
+    if uin != int(expect_uin):
+        raise VoucherError("voucher_other_uin")
+    if price_cents < 0 or seller <= 0:
+        raise VoucherError("bad_voucher")
+
+    seconds = int(time.time() if now is None else now)
+    if exp <= seconds:
+        raise VoucherError("voucher_expired")
+    if exp - seconds > MAX_AGE_SECONDS:
+        raise VoucherError("bad_voucher")
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64, validate=True))
+        pub.verify(sig, resale_signed_bytes(uin=uin, seller=seller,
+                                            price_cents=price_cents, nonce=nonce, exp=exp))
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+
+    return nonce, seller, price_cents
+
+
 def public_key_b64() -> str | None:
     """The till's public half, from the environment. Absent means numbers are
     not for sale on this island, which is the right default for a self-hosted
     one: an operator who has not set up a till cannot be paid, so nothing here
     should pretend otherwise."""
+    # ⚠ The console's value wins, the .env is the default. An operator who
+    # pastes their till's key into the admin page expects it to take effect,
+    # and an island that needed a restart for it would be a shop that cannot be
+    # opened by the person who owns it. Read synchronously from a cache the
+    # settings service keeps warm, because verification happens on a hot path
+    # and must not open a database session per voucher.
+    from app.services import server_settings
+
+    override = server_settings.cached_str("uin_voucher_pubkey")
+    if override:
+        return override
     return (os.environ.get("RCQ_UIN_VOUCHER_PUBKEY") or "").strip() or None
 
 
