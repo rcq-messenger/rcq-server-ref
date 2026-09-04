@@ -1051,7 +1051,16 @@ async function setRelay(tag, patch){ try{ await rawApi('POST','/broker/admin/set
 async function removeRelay(tag){ if(!confirm('Remove relay '+tag+'?'))return; try{ await rawApi('DELETE','/broker/admin/'+encodeURIComponent(tag)); loadRelays(); }catch(e){ alert(e.message); } }
 
 /* ---- features (operator toggles) ---- */
-const FGROUPS = { features:'Features', limits:'Limits & policy', branding:'Branding' };
+const FGROUPS = { features:'Features', limits:'Limits & policy', numbers:'Selling numbers', branding:'Branding' };
+/* ⚠⚠ Preferred order, not the whole list: a group the server grew and this page
+   had not heard of used to vanish, leaving settings that existed in the API and
+   were editable by nobody. Anything unknown renders after these under its own
+   raw name, which is ugly enough to notice and better than absent. */
+function fgroupOrder(groups){
+  const known = Object.keys(FGROUPS).filter(g=>groups[g]);
+  const rest = Object.keys(groups).filter(g=>!(g in FGROUPS)).sort();
+  return known.concat(rest);
+}
 function escAttr(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
 async function loadFeatures(){
   try { const r = await api('GET','/settings'); renderFeatures((r&&r.settings)||[]); }
@@ -1060,8 +1069,8 @@ async function loadFeatures(){
 function renderFeatures(list){
   const groups = {}; list.forEach(s=>{ (groups[s.group]=groups[s.group]||[]).push(s); });
   ISLAND_NAME = (list.find(s=>s.key==='island_name')||{}).value || '';
-  $('features').innerHTML = Object.keys(FGROUPS).filter(g=>groups[g]).map(g=>`
-    <div class="card pad"><div class="ftitle">${FGROUPS[g]}</div>
+  $('features').innerHTML = fgroupOrder(groups).map(g=>`
+    <div class="card pad"><div class="ftitle">${FGROUPS[g] || g}</div>
       ${g==='branding'?'<div id="logorow"></div>':''}
       ${groups[g].map((s,i)=>frow(s,i===0&&g!=='branding')).join('')}</div>`).join('')
     || '<div class="card pad"><div class="empty">No settings.</div></div>';

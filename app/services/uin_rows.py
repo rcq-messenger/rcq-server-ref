@@ -120,6 +120,7 @@ from app.models.invite import Invite
 from app.models.mailbox_seq import MailboxSeq
 from app.models.message import OfflineMessage
 from app.models.owned_uin import OwnedUin
+from app.models.uin_listing import UinListing
 from app.models.queue_cursor import QueueCursor
 from app.models.report import Report
 from app.models.vault import VaultSlot
@@ -168,6 +169,11 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     # burned — a released number goes back in the pool rather than staying
     # reserved by a person who no longer exists.
     (OwnedUin, OwnedUin.owner_uin),
+    # A resale follows its SELLER, for the same reason the deed does: moving
+    # between your own numbers must not quietly take your shop window down, and
+    # burning the account must take it down completely rather than leaving a
+    # number for sale by somebody who no longer exists.
+    (UinListing, UinListing.seller_uin),
     (Report, Report.reporter_uin),
     # Moderation history follows the PERSON, not the number: without this a
     # user could shed an open report simply by migrating to a new UIN.

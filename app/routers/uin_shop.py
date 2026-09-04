@@ -50,10 +50,12 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import carry_device_id, current_device_id, current_uin, issue_token, uin_epoch
 from app.models.owned_uin import OwnedUin
+from app.models.uin_listing import UinListing
 from app.models.uin_sale import SpentVoucher, UinHold
 from app.models.user import User
 from app.routers.migrate import _perform_migration
 from app.services import uin_voucher
+from app.services import server_settings
 from app.services.uin import is_reserved_uin, uin_is_taken
 
 log = logging.getLogger(__name__)
@@ -114,19 +116,18 @@ _DEFAULT_PRICES_CENTS: dict[int, int] = {
 }
 
 
-def _load_prices() -> dict[int, int]:
+async def _prices() -> dict[int, int]:
     """The operator's ladder, or the flagship's when they have not set one.
 
-    A bad value is not a reason to fall back silently to somebody else's
-    prices: the operator asked for something and would never find out it was
-    ignored, and the thing being got wrong is what people are charged. It logs
-    loudly and keeps the default, which is the only safe direction — an island
-    that quotes nothing sells nothing, and an island that quotes the wrong
-    number takes the wrong money.
+    ⚠ Read live from `server_settings`, so a wrong price is corrected from the
+    console rather than by a restart. A bad value is not a reason to fall back
+    silently to somebody else's prices: the operator asked for something and
+    would never find out it was ignored, and what is being got wrong is what
+    people are charged. It logs loudly and keeps the default, which is the only
+    safe direction — an island that quotes nothing sells nothing, and one that
+    quotes the wrong number takes the wrong money.
     """
-    # os.environ, like `RCQ_UIN_VOUCHER_PUBKEY` next door: the till and its
-    # prices are one family of settings and are read the same way.
-    raw = (os.environ.get("RCQ_UIN_PRICES") or "").strip()
+    raw = str(await server_settings.get("uin_prices") or "").strip()
     if not raw:
         return dict(_DEFAULT_PRICES_CENTS)
     try:
@@ -137,14 +138,13 @@ def _load_prices() -> dict[int, int]:
         return out
     except Exception as exc:  # noqa: BLE001
         log.error(
-            "[uin-shop] RCQ_UIN_PRICES is not usable (%s); falling back to the "
-            "default ladder. Numbers will be quoted at the flagship's prices "
-            "until this is fixed.", exc,
+            "[uin-shop] the price ladder is not usable (%s); falling back to the "
+            "default. Numbers are quoted at the flagship's prices until this is "
+            "fixed in the console.", exc,
         )
         return dict(_DEFAULT_PRICES_CENTS)
 
 
-_PRICES_CENTS: dict[int, int] = _load_prices()
 
 
 def _length(uin: int) -> int:
@@ -171,13 +171,19 @@ class QuoteOut(BaseModel):
     #: instead of inferring it from the length:
     #:   "free"     - ordinary space, `POST /uin/purchase` takes it for nothing;
     #:   "purchase" - scarce stock, only `POST /uin/redeem` with a paid voucher;
+    #:   "resale"   - somebody is SELLING it: `price_cents` is their price and
+    #:                `seller_uin` is who gets paid;
     #:   "closed"   - not obtainable here at all (three digits, or an island
-    #:                with no till, or the number is already taken).
+    #:                with no till, or the number is already taken, or a resale
+    #:                somebody else is paying for right now).
     #: ⚠ Older clients ignore the field and keep working: everything they knew
     #: how to take is still "free", and everything else still says available
     #: only when it really can be had.
     acquire: str = "closed"
-    #: WHERE to pay, when `acquire` is "purchase". The island's own till.
+    #: Whose number it is, when `acquire` is "resale". A person, not the
+    #: island: what they are asking is their price and the money goes to them.
+    seller_uin: int | None = None
+    #: WHERE to pay, when `acquire` is "purchase" or "resale". The island's own till.
     #:
     #: ⚠⚠ This exists because the till is NOT one shared service. Every client
     #: shipped before 2026-09-04 has one compiled in (console-api.rcq.app) and
@@ -190,15 +196,19 @@ class QuoteOut(BaseModel):
 
 
 async def require_shop_open() -> None:
-    """The shop is a FLAGSHIP surface. A self-hosted island hands numbers out
-    by arrangement (see `POST /admin/uin/grant`) and has no storefront at all,
-    so the pricing endpoints have to be absent there, not merely unused: a
-    private island quoting "$999.00" for a number it will never sell is
-    advertising somebody else's shop.
+    """The shop is the operator's decision, taken live.
 
-    `UIN_SHOP_ENABLED` defaults to false and prod sets it true in its .env.
+    ⚠ Read through `server_settings`, not straight off the .env: an operator
+    who opens or closes their shop from the console expects it to happen, and
+    an island that needed a restart to stop selling would keep selling for as
+    long as nobody had shell access. The .env value remains the default, so an
+    island that never touches the console behaves exactly as before.
+
+    Off, the endpoints are ABSENT rather than merely unused: an island that
+    will never sell a number must not quote a price for one, because that is
+    advertising somebody else's shop.
     """
-    if not settings.UIN_SHOP_ENABLED:
+    if not await server_settings.get_bool("uin_shop_enabled"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
 
 
@@ -224,13 +234,37 @@ async def quote(
     # ⚠ `.get`, not `[...]`. The ladder is the operator's now, and a length
     # they left out is one they do not sell: an index would answer 500 to a
     # perfectly reasonable question about a number nobody is selling.
-    cents = _PRICES_CENTS.get(length)
+    cents = (await _prices()).get(length)
     if cents is None:
         return QuoteOut(uin=body.uin, length=length, available=False,
                         price_cents=None, price_display=None, reason="not_for_sale")
     display = f"${cents / 100:.2f}"
     scarce = is_reserved_uin(body.uin)
     taken = await uin_is_taken(db, body.uin)
+
+    # ⚠⚠ ASKED BEFORE "taken", because a listed number IS taken — it belongs to
+    # the person selling it. Reading availability first would answer "taken" to
+    # everyone and the market would be invisible from the one place people
+    # actually type a number (founder, 04.09: typing a number that somebody is
+    # selling should say so, and say by whom).
+    listing = await db.get(UinListing, body.uin)
+    if listing is not None and listing.seller_uin != me:
+        held = await _listing_held(db, body.uin)
+        return QuoteOut(
+            uin=body.uin, length=length,
+            # False, like scarce stock: an older client reads this field alone
+            # and would otherwise draw a "take it" button over somebody's
+            # property. `acquire` is what a client that understands resale
+            # keys off.
+            available=False,
+            price_cents=listing.price_cents,
+            price_display=_price_display_for(listing.price_cents),
+            reason="listed",
+            acquire="closed" if held else "resale",
+            seller_uin=listing.seller_uin,
+            checkout_url=(await own_till_url()) if not held else None,
+        )
+
     if taken:
         return QuoteOut(uin=body.uin, length=length, available=False,
                         price_cents=None, price_display=None, reason="taken")
@@ -292,7 +326,7 @@ async def quote(
         built_in_till_is_ours = os.environ.get(
             "RCQ_UIN_CLIENT_TILL_MINE", ""
         ).strip().lower() in {"1", "true", "yes"}
-        own_till = (os.environ.get("RCQ_UIN_TILL_URL") or "").strip().rstrip("/") or None
+        own_till = await own_till_url()
         reachable = (client_reads_checkout_url and bool(own_till)) or built_in_till_is_ours
         sellable = (
             length >= MIN_SALE_LEN
@@ -321,6 +355,163 @@ async def quote(
         reason=None,
         acquire="free",
     )
+
+
+async def own_till_url() -> str | None:
+    """This island's own checkout, or None when it runs no till.
+
+    One place, so a resale and an island sale can never disagree about where a
+    buyer pays, and read live so an operator can correct it from the console.
+    """
+    raw = str(await server_settings.get("uin_till_url") or "").strip()
+    return raw.rstrip("/") or None
+
+
+def _price_display_for(cents: int) -> str:
+    return f"${cents / 100:.2f}"
+
+
+class ListingIn(BaseModel):
+    uin: int = Field(gt=0)
+    price_cents: int = Field(ge=1, le=100_000_00)
+    #: {chain: address}. At least one, and the chains are the till's to know —
+    #: the island stores what it is given and never spends it.
+    payout: dict[str, str]
+
+
+class ListingOut(BaseModel):
+    uin: int
+    seller_uin: int
+    price_cents: int
+    price_display: str
+    #: Somebody is paying for it right now, so the buy button is spent. The
+    #: hold is short by design (founder, 04.09): a listing blocked for hours by
+    #: a payment that never arrives is a listing nobody can buy.
+    held: bool = False
+
+
+def _listing_out(row: UinListing, held: bool) -> ListingOut:
+    return ListingOut(
+        uin=row.uin, seller_uin=row.seller_uin, price_cents=row.price_cents,
+        price_display=_price_display_for(row.price_cents), held=held,
+    )
+
+
+@router.post("/listings", response_model=ListingOut, dependencies=[Depends(require_shop_open)])
+async def create_listing(
+    body: ListingIn,
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> ListingOut:
+    """Put a number you hold up for sale.
+
+    ⚠⚠ Only a number in your COLLECTION, never the one you are answering as.
+    Selling the number you are using would hand your identity to a stranger
+    mid-conversation, and there is no undo for that. `_owned_uins` already
+    filters the active number out, so this reads the deed directly and refuses
+    when it is the one in use.
+
+    The money never touches this island: the buyer pays the address in
+    `payout` directly, and the till (which watches that address from outside)
+    signs a voucher the buyer brings back here. So there is no commission to
+    take and nothing in escrow, which is exactly why the seller's address is
+    required up front — a listing nobody can pay is not a listing.
+    """
+    target = int(body.uin)
+    if target == me:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "in_use"})
+    if not body.payout or not all(
+        isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in body.payout.items()
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "no_payout"})
+
+    deed = await db.get(OwnedUin, target)
+    if deed is None or int(deed.owner_uin) != me:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_owned"})
+
+    existing = await db.get(UinListing, target)
+    if existing is not None:
+        existing.price_cents = int(body.price_cents)
+        existing.payout = {k: v.strip() for k, v in body.payout.items()}
+        await db.commit()
+        return _listing_out(existing, held=await _listing_held(db, target))
+
+    row = UinListing(
+        uin=target, seller_uin=me, price_cents=int(body.price_cents),
+        payout={k: v.strip() for k, v in body.payout.items()},
+    )
+    db.add(row)
+    await db.commit()
+    return _listing_out(row, held=False)
+
+
+@router.delete("/listings/{uin}", dependencies=[Depends(require_shop_open)])
+async def delete_listing(
+    uin: int,
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Take a number off the market.
+
+    ⚠ Refused while somebody is paying for it. The hold is what makes the
+    payment window safe, and a seller who could pull the listing out from under
+    a payment in flight would be taking money for nothing. Holds are short, so
+    the wait is minutes.
+    """
+    row = await db.get(UinListing, uin)
+    if row is None or int(row.seller_uin) != me:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_listed"})
+    if await _listing_held(db, uin):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "being_paid"})
+    await db.delete(row)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/listings", response_model=list[ListingOut], dependencies=[Depends(require_shop_open)])
+async def listings(
+    count: int = Query(12, ge=1, le=50),
+    me: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> list[ListingOut]:
+    """A handful of what people are selling, newest first.
+
+    A window rather than a catalogue, and refreshable — the same shape the
+    free-number carousel has, for the same reason: a list that tries to be
+    complete is a list nobody reads, and a market with ten thousand rows in it
+    is a scroll, not a shop.
+
+    Your own listings are not in it. You know what you are selling, and the
+    place that shows it is your own collection.
+    """
+    rows = (
+        await db.execute(
+            select(UinListing)
+            .where(UinListing.seller_uin != me)
+            .order_by(UinListing.created_at.desc())
+            .limit(count)
+        )
+    ).scalars().all()
+    held = await _held_uins(db, [r.uin for r in rows])
+    return [_listing_out(r, held=r.uin in held) for r in rows]
+
+
+async def _listing_held(db: AsyncSession, uin: int) -> bool:
+    hold = await db.get(UinHold, uin)
+    return hold is not None and hold.expires_at > datetime.now(timezone.utc)
+
+
+async def _held_uins(db: AsyncSession, uins: list[int]) -> set[int]:
+    if not uins:
+        return set()
+    rows = (
+        await db.execute(
+            select(UinHold.uin).where(
+                UinHold.uin.in_(uins), UinHold.expires_at > datetime.now(timezone.utc)
+            )
+        )
+    ).scalars().all()
+    return {int(u) for u in rows}
 
 
 class SuggestionOut(BaseModel):
@@ -372,7 +563,7 @@ async def suggestions(
             continue
         if await uin_is_taken(db, candidate):
             continue
-        cents = _PRICES_CENTS.get(length)
+        cents = (await _prices()).get(length)
         if cents is None:
             continue
         out.append(SuggestionOut(
@@ -382,10 +573,6 @@ async def suggestions(
             price_display=_price_display_for(cents),
         ))
     return out
-
-
-def _price_display_for(cents: int) -> str:
-    return f"${cents / 100:.2f}"
 
 
 class ClaimIn(BaseModel):
@@ -505,6 +692,13 @@ async def release(
     Not gated on UIN_SHOP_ENABLED, for the same reason `/mine` is not: an
     operator closing the shop should stop sales, not trap people in a
     collection."""
+    # ⚠⚠ A number on the market is spoken for. Releasing it back to the pool
+    # while somebody may be paying for it would sell a number that is no longer
+    # there, and the buyer's money is already gone. Take it off the market
+    # first; that is one tap and it says what it means.
+    listed = await db.get(UinListing, uin)
+    if listed is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "listed"})
     if uin == me:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "uin_in_use"})
     held = await db.get(OwnedUin, uin)
@@ -538,6 +732,13 @@ async def activate(
     already hold. A self-hosted island that granted a member a second number by
     hand must still let them switch to it, and an operator who closes their
     shop afterwards must not strand people on the wrong number."""
+    # ⚠⚠ A number on the market is spoken for. Answering as it
+    # while somebody may be paying for it would sell a number that is no longer
+    # there, and the buyer's money is already gone. Take it off the market
+    # first; that is one tap and it says what it means.
+    listed = await db.get(UinListing, int(body.uin))
+    if listed is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "listed"})
     held = await db.get(OwnedUin, body.uin)
     if held is None or int(held.owner_uin) != me:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_owned"})
@@ -600,7 +801,7 @@ async def redeem(
     number, which is a support question; the reverse leaves a number sold twice,
     which is not.
     """
-    if not settings.UIN_SHOP_ENABLED:
+    if not await server_settings.get_bool("uin_shop_enabled"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
     target = int(body.uin)
     length = _length(target)
@@ -614,6 +815,15 @@ async def redeem(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
     if user.is_suspended:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "suspended"})
+
+    # ⚠⚠ A LISTED number is bought from its owner, not from the shelf, and the
+    # two are verified with different documents on purpose. A voucher paid for
+    # against ordinary space must never be spendable on somebody's $250
+    # listing, and a resale voucher must never conjure a free number: the
+    # signed field sets differ, so neither can be read as the other.
+    listing = await db.get(UinListing, target)
+    if listing is not None:
+        return await _redeem_resale(db, user, listing, body, device_id=device_id)
 
     try:
         nonce = uin_voucher.verify(body.voucher, expect_uin=target)
@@ -669,6 +879,77 @@ async def redeem(
                       source="purchase")
     await db.commit()
     return out
+
+async def _redeem_resale(
+    db: AsyncSession, user: User, listing: UinListing, body: RedeemIn, *, device_id: str
+) -> PurchaseOut:
+    """Move a number from the person selling it to the person who paid them.
+
+    Nothing here touches money. The buyer paid the seller's own address
+    directly and the till, which watched that address, signed for it; this
+    checks the signature, checks it is for THIS listing at THIS price, and
+    moves one row.
+
+    ⚠⚠ The seller and the price are checked against the listing as it stands
+    NOW, not as it stood when the invoice was made. A seller who re-priced
+    mid-payment, or a listing that changed hands, stops the redemption instead
+    of completing a sale neither side agreed to. The buyer is not out of pocket
+    silently: the till refuses to sign in the same situation, so a voucher that
+    reaches here and fails is the narrow window the founder chose to accept
+    (04.09) rather than hold anybody's money in escrow.
+    """
+    target = int(listing.uin)
+    if int(listing.seller_uin) == int(user.uin):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "own_listing"})
+
+    try:
+        nonce, seller, price_cents = uin_voucher.verify_resale(body.voucher, expect_uin=target)
+    except uin_voucher.VoucherError as e:
+        code = e.code
+        status_code = (
+            status.HTTP_404_NOT_FOUND if code == "sales_disabled"
+            else status.HTTP_403_FORBIDDEN
+        )
+        raise HTTPException(status_code, detail={"code": code}) from None
+
+    if seller != int(listing.seller_uin):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "seller_changed"})
+    if price_cents != int(listing.price_cents):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "price_changed"})
+
+    # The nonce first, by INSERT: the primary key is what makes two
+    # simultaneous redemptions impossible, and a SELECT would not.
+    db.add(SpentVoucher(nonce=nonce))
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "voucher_spent"}) from None
+
+    deed = await db.get(OwnedUin, target)
+    if deed is None or int(deed.owner_uin) != int(listing.seller_uin):
+        # The seller no longer holds what they were selling: released, burned,
+        # or already transferred. Nothing to hand over, and saying so plainly
+        # is better than inventing a deed out of a voucher.
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "seller_gone"})
+
+    # The transfer itself: the deed changes hands, the shop window comes down,
+    # and the hold that protected the payment has done its job.
+    deed.owner_uin = int(user.uin)
+    deed.source = "purchase"
+    await db.delete(listing)
+    hold = await db.get(UinHold, target)
+    if hold is not None:
+        await db.delete(hold)
+
+    if body.switch:
+        out = await _take(db, user, target, switch=True, device_id=device_id, source="purchase")
+        await db.commit()
+        return out
+
+    await db.commit()
+    return PurchaseOut(switched=False, owned=await _owned_uins(db, int(user.uin)))
+
 
 async def _take(
     db: AsyncSession, user: User, target: int, *, switch: bool, device_id: str,
@@ -767,7 +1048,7 @@ async def claim(
     Before this is ever framed to a user as a purchase, a real receipt /
     settlement check goes here, and the docstring above stops saying FREE.
     """
-    if not settings.UIN_SHOP_ENABLED:
+    if not await server_settings.get_bool("uin_shop_enabled"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
 
     length = _length(body.uin)
@@ -864,7 +1145,7 @@ async def till_hold(
     # operator never turned the shop on has nothing to sell, so it has no reason
     # to let anything reserve its numbers - and a reservation is the one thing a
     # holder of the till key can do that takes a number off the shelf.
-    if not settings.UIN_SHOP_ENABLED:
+    if not await server_settings.get_bool("uin_shop_enabled"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "uin shop is disabled")
 
     try:

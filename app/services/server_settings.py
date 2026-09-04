@@ -14,6 +14,7 @@ few seconds of lag, so this avoids a DB read on every request without needing a
 pub/sub invalidation.
 """
 import time as _time
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -94,6 +95,39 @@ _reg(SettingSpec("max_accounts_per_device", "int", lambda: 5, "limits",
 # its own endpoints (models/island_logo.py has the full reasoning), and reaches
 # clients as a 12-character `logo_version` on /server/info plus the public
 # GET /server/logo.
+# ── Selling numbers (the operator's own shop)
+#
+# ⚠⚠ These used to be .env-only, which meant a self-hoster could not open a
+# shop without shell access and a restart, and could not correct a wrong price
+# at all without one. They are settings, so they change live from the console
+# like every other operator decision — and the .env values stay the defaults,
+# so an island that never touches the console behaves exactly as it did.
+_reg(SettingSpec("uin_shop_enabled", "bool", lambda: _env.UIN_SHOP_ENABLED, "numbers",
+                 "Sell numbers",
+                 "Offer numbers for sale on this island. Off, the shop endpoints "
+                 "are absent rather than merely quiet: an island that will never "
+                 "sell must not quote a price, because that advertises somebody "
+                 "else's shop. Handing numbers out by arrangement works either way."))
+_reg(SettingSpec("uin_prices", "str", lambda: os.environ.get("RCQ_UIN_PRICES", ""), "numbers",
+                 "Your prices",
+                 'What YOU charge, in cents, by how many digits the number has: '
+                 '{"4": 25000, "5": 5000}. Empty means the flagship\'s ladder, which '
+                 'is almost certainly not what you want when the money is yours. A '
+                 'length you leave out is one you do not sell.'))
+_reg(SettingSpec("uin_till_url", "str", lambda: os.environ.get("RCQ_UIN_TILL_URL", ""), "numbers",
+                 "Your checkout",
+                 "The address of YOUR till, handed to buyers so they pay you. "
+                 "Without it nothing is offered for sale: every released client "
+                 "has one checkout compiled in, and it is not yours, so an island "
+                 "that cannot name its own would send its customers to pay "
+                 "somebody else for a number they would never receive."))
+_reg(SettingSpec("uin_voucher_pubkey", "str",
+                 lambda: os.environ.get("RCQ_UIN_VOUCHER_PUBKEY", ""), "numbers",
+                 "Your till's public key",
+                 "The public half of the key your till signs with, base64. This is "
+                 "what lets the island believe a payment happened without ever "
+                 "seeing one. Not a secret; the private half never leaves the till."))
+
 _reg(SettingSpec("island_name", "str", lambda: _env.APP_NAME, "branding",
                  "Island name",
                  "What your island calls itself. Shown next to your logo "
@@ -142,6 +176,20 @@ async def _overrides() -> dict[str, str]:
     _cache.rows = {k: v for k, v in rows}
     _cache.at = now
     return _cache.rows
+
+
+def cached_str(key: str) -> str | None:
+    """A string override from the warm cache, WITHOUT touching the database.
+
+    ⚠ For hot paths that cannot be async and must not open a session per call —
+    voucher verification is the one that asked for it. It reads whatever the
+    last refresh saw, which is at most `_TTL` old; a key changed in the console
+    takes effect within seconds rather than instantly, and never blocks a
+    signature check on a database round trip. Returns None when there is no
+    override, so the caller falls back to its own default.
+    """
+    raw = _cache.rows.get(key)
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
 
 async def effective() -> dict[str, Any]:
