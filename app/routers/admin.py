@@ -1566,6 +1566,47 @@ async def release_hold(uin: int, db: AsyncSession = Depends(get_db)) -> dict:
     return {"ok": True}
 
 
+@router.delete("/uin/listings/{uin}", include_in_schema=False)
+async def remove_listing(
+    uin: int,
+    admin: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Take somebody's number off the market, as the operator.
+
+    ⚠⚠ Needed because a listing is a public offer to take a stranger's money.
+    A price that is a scam, a wallet address that is a typo nobody can reach, a
+    number listed to harass its previous holder — the seller can take any of
+    those down, and an operator has to be able to when the seller will not.
+
+    Only the listing goes. The number stays exactly where it is and nobody is
+    paid or unpaid by this: it removes an advertisement, not property.
+
+    ⚠ Refused while somebody is paying, for the same reason the seller's own
+    delete is: pulling the offer out from under a payment in flight takes money
+    for nothing. Wait for the hold to lapse, minutes at most.
+    """
+    from app.models.uin_listing import UinListing
+
+    row = await db.get(UinListing, uin)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_listed"})
+    hold = await db.get(UinHold, uin)
+    if hold is not None:
+        expires = hold.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires > datetime.now(timezone.utc):
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "being_paid"})
+    seller = int(row.seller_uin)
+    await db.delete(row)
+    await db.commit()
+    # Logged like every other money-adjacent operator action: taking down
+    # somebody's offer is a thing they will ask about.
+    log.warning("[admin] %s removed the listing for %s (seller %s)", admin, uin, seller)
+    return {"ok": True, "uin": uin, "seller_uin": seller}
+
+
 @router.post("/uin/grant", response_model=GrantUinOut)
 async def grant_uin(
     body: GrantUinIn,
