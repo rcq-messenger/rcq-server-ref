@@ -279,6 +279,10 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # The roster's validator: a browser cannot read a response header that is
+    # not listed here, and without it the web client can never ask "still the
+    # same?" (GET /contacts answers 304 to If-None-Match).
+    expose_headers=["ETag"],
     allow_credentials=False,
 )
 
