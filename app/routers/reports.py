@@ -128,7 +128,12 @@ class ReportAttachmentIn(BaseModel):
 
 
 class CreateReportIn(BaseModel):
-    target_uin: int = Field(gt=0)
+    # ⚠ 0 means "no person": a report about a SITE or a GROUP whose owner the
+    # client cannot name (a site with no published owner, a room whose owner
+    # is on another island). Allowed only with a `site:` or `group:` context,
+    # checked in the route; anything else still has to name somebody
+    # (founder, 05.09: reports on every surface, not only on a contact).
+    target_uin: int = Field(ge=0)
     reason: str = Field(min_length=1, max_length=MAX_REASON_LEN)
     context: str = Field(default="", max_length=MAX_CONTEXT_LEN)
     attachments: list[ReportAttachmentIn] = Field(default_factory=list)
@@ -197,6 +202,13 @@ async def create_report(
     # submissions, which ride this same endpoint with `context =
     # "bug_bounty"` and use target_uin == self as a "submitter is
     # also the subject" stand-in (the real signal is the body text).
+    if body.target_uin == 0 and not (
+        body.context.startswith("site:") or body.context.startswith("group:")
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "target_required", "message": "name the account you are reporting"},
+        )
     if body.target_uin == uin and body.context != "bug_bounty":
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,

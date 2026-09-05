@@ -683,9 +683,9 @@ async function loadReports() {
     const r = await api('GET','/reports?status=open&kind=user');
     $('reports').innerHTML = (r.items||[]).map(rp=>`<tr>
       <td>${rp.id}</td>
-      <td class="mono">${rp.target_uin}${rp.target_nickname?' <span style="color:var(--dim)">('+esc(rp.target_nickname)+')</span>':''}</td>
+      <td class="mono">${rp.target_uin?rp.target_uin:'—'}${rp.target_nickname?' <span style="color:var(--dim)">('+esc(rp.target_nickname)+')</span>':''}${siteOf(rp)?' <span style="color:var(--dim)">'+esc(siteOf(rp))+'</span>':''}</td>
       <td style="white-space:normal;overflow-wrap:anywhere">${esc(rp.reason||'')}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${esc(contextLabel(rp.context))}</span></td>
-      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> ${isAbuse(rp)?'<button class="btn danger sm" onclick="resolve('+rp.id+',true)">Ban</button>':''}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> ${siteOf(rp)?'<button class="btn danger sm" onclick="freezeReportedSite('+rp.id+', \''+esc(siteOf(rp))+'\')">Freeze site</button> ':''}${isAbuse(rp)?'<button class="btn danger sm" onclick="resolve('+rp.id+',true)">Ban</button>':''}</td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
 }
@@ -700,8 +700,33 @@ function isAbuse(rp){ return (rp.context||'') !== 'bug_bounty' && !(rp.reason||'
    'constructor' or 'toString' looks the label up on Object.prototype and the
    queue renders a chunk of JS source. The context comes from a client, so it
    is whatever a client sends. */
-const CONTEXT_LABELS = Object.assign(Object.create(null), {bug_bounty:'Bug report', contact:'From a chat', hood:'From the Hood', search:'From search', story:'From a story', message:'About a message', user:'About a user', premium_media:'Paid content'});
-function contextLabel(c){ if(!c) return '—'; return CONTEXT_LABELS[c] || (c.startsWith('group:') ? 'In a group' : c); }
+const CONTEXT_LABELS = Object.assign(Object.create(null), {bug_bounty:'Bug report', contact:'From a chat', hood:'From the Hood', search:'From search', story:'From a story', message:'About a message', user:'About a user', premium_media:'Paid content', random:'Random chat', stranger_mode:'Random chat', profile:'From a profile', chat:'From a chat', group:'In a group'});
+function contextLabel(c){
+  if(!c) return '—';
+  if (CONTEXT_LABELS[c]) return CONTEXT_LABELS[c];
+  if (c.startsWith('group:')) return 'About a group';
+  if (c.startsWith('site:')) return 'About a site';
+  if (c.startsWith('message:')) return 'About a message';
+  return c;
+}
+/* A report about a site names it as `site:<name>@<host>`; the name is what
+   the freeze endpoint takes. A site on another island is not ours to freeze,
+   so only a bare name or our own host qualifies. */
+function siteOf(rp){
+  const c = rp.context || '';
+  if (!c.startsWith('site:')) return '';
+  const ref = c.slice(5); const at = ref.indexOf('@');
+  if (at < 0) return ref;
+  const host = ref.slice(at+1);
+  return (MOCK ? host === 'island.example' : host === location.host) ? ref.slice(0, at) : '';
+}
+/* Freezing stops the site being served and delists it; the report stays open
+   so the operator still answers the person who wrote in. */
+async function freezeReportedSite(id, name){
+  if(!confirm('Freeze site "'+name+'"? It stops being served and drops out of the catalogue.')) return;
+  try { await api('POST','/sites/'+encodeURIComponent(name)+'/freeze?frozen=true'); alert('Frozen: '+name); }
+  catch(e){ alert(e.message); }
+}
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
 /* Answer the reporter. The text is stored on the report and the reporter reads
    it back over their own authenticated session; the push we send is only a
