@@ -8,13 +8,13 @@ can run their own instance instead of trusting `api.rcq.app`.
 
 ## Status
 
-**Beta, but live in production.** This is the same code that runs
+**Live in production.** This is the same code that runs
 `api.rcq.app`, which serves real users today across a federated network
-of islands, with iOS, Android and web clients. It's released open
-source (AGPL-3.0) as the reference implementation and so anyone can run
-their own island. It's still beta — the protocol and features evolve —
-and the *self-hosted* path specifically is the newer surface (fewer
-operators have run it than the flagship). The included
+of islands, with iOS, Android, web and desktop clients. It is released
+open source (AGPL-3.0) as the reference implementation, so anyone can run
+their own island. The protocol and features keep evolving, and the
+*self-hosted* path is the newer surface (fewer operators have run it than
+the flagship). The included
 `docker-compose.yml` covers TLS (Caddy + Let's Encrypt, or the island's own
 pinned certificate when no authority will issue to you:
 [`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md)) and APNs setup
