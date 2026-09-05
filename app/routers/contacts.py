@@ -35,7 +35,9 @@ vault list. Marked at the call site.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+import hashlib
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, TypeAdapter
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -132,6 +134,7 @@ class RespondIn(BaseModel):
 
 @router.get("", response_model=list[ContactRow])
 async def list_contacts(
+    request: Request,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
     # ⚠ Returns a pre-serialized Response, NOT a list — see the return.
@@ -210,9 +213,22 @@ async def list_contacts(
     # and re-walks it through `jsonable_encoder`. This is the most-called
     # endpoint on the island, so the duplicated pass is paid ~20 times a
     # minute for nothing. TypeAdapter gives the identical bytes in one pass.
+    body = _CONTACT_ROWS.dump_json(out)
+    # Weak validator over the exact bytes served. The clients re-read the
+    # roster on every foreground, reconnect and presence frame, and most of
+    # those reads answer with the list they already hold; a matching
+    # `If-None-Match` turns that into an empty 304 instead of the full roster
+    # (a 300-contact list is ~120 KB). Weak on purpose: Cloudflare downgrades
+    # strong tags when it recompresses, and it must round-trip unchanged.
+    # Presence and last_seen are IN the hash, so a status that changed while
+    # the client was away still comes back as a full body.
+    etag = 'W/"' + hashlib.sha256(body).hexdigest()[:24] + '"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
     return Response(
-        content=_CONTACT_ROWS.dump_json(out).decode(),
+        content=body.decode(),
         media_type="application/json",
+        headers={"ETag": etag},
     )
 
 
