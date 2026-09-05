@@ -448,7 +448,17 @@ async def search(
     elif raw.isdigit():
         # A bare number still searches both ways: somebody who types 1990 may
         # want the number or may want it in a nickname, and we cannot tell.
-        clause = or_(User.uin == int(raw), text_clause)
+        #
+        # ⚠ It also has to match numbers that CONTAIN those digits. The rank
+        # below has had a tier for "uin contains the query" since #525, but no
+        # such row could ever reach it: this clause only admitted the exact
+        # number and text matches, so searching 123 never surfaced 51234 and
+        # the tier ranked an empty set (#883).
+        clause = or_(
+            User.uin == int(raw),
+            cast(User.uin, String).like(f"%{raw}%"),
+            text_clause,
+        )
     else:
         clause = text_clause
     # ORDER, and it is not a nicety (#524, #525). A single letter matches 123
@@ -480,8 +490,11 @@ async def search(
     # [text_clause]: a person searching "Ser" for Sergey should not have to
     # know whether that is the nickname or the first name.
     prefix = f"{raw.lower()}%"
-    rank = case(
-        (User.uin == exact_uin, 0) if exact_uin is not None else (false(), 0),
+    # A query that is nothing but digits is a query about NUMBERS, so numbers
+    # come first and the names that happen to contain those digits follow
+    # (#883). Anything with a letter in it keeps the old order, where a name
+    # match is what the person meant.
+    name_tiers = (
         (func.lower(User.nickname) == raw.lower(), 1),
         (
             or_(
@@ -491,10 +504,19 @@ async def search(
             ),
             2,
         ),
-        (cast(User.uin, String).like(f"%{raw}%") if raw.isdigit() else false(), 3),
-        (User.nickname.ilike(like), 4),
-        else_=5,
+        (User.nickname.ilike(like), 3),
     )
+    exact_tier = (User.uin == exact_uin, 0) if exact_uin is not None else (false(), 0)
+    if raw.isdigit():
+        uin_contains = cast(User.uin, String).like(f"%{raw}%")
+        rank = case(
+            exact_tier,
+            (uin_contains, 1),
+            *((cond, tier + 1) for cond, tier in name_tiers),
+            else_=5,
+        )
+    else:
+        rank = case(exact_tier, *name_tiers, else_=5)
     # False sorts before True, so contacts lead their own tier.
     contact_last = case((User.uin.in_(my_contacts), 0), else_=1)
     # Never include the caller in their own search results — Add-to-contacts on
