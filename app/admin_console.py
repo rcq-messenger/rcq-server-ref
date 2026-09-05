@@ -298,16 +298,21 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 
     <!-- USERS -->
     <section class="view" id="v-users">
-      <div class="head"><div><h1>Users</h1><p>Search by number or nickname, suspend abusers.</p></div></div>
+      <div class="head"><div><h1>Users &amp; groups</h1><p>Search by number, nickname or group name. Suspend abusers, give a badge.</p></div></div>
       <div class="card pad">
         <div class="row">
-          <input id="u_q" placeholder="Search by UIN or nickname" style="flex:1" onkeydown="if(event.key==='Enter')searchUsers()">
+          <input id="u_q" placeholder="Search by UIN, nickname or group name" style="flex:1" onkeydown="if(event.key==='Enter')searchUsers()">
           <button class="btn ghost" onclick="searchUsers()">Search</button>
         </div>
+        <p class="hint" style="margin:8px 0 0">A badge is your island vouching for an account in front of everyone on it. It shows next to the name in every client. Nothing outside this island can grant one, and nothing outside it will believe yours.</p>
       </div>
       <div class="card pad">
-        <table><thead><tr><th>UIN</th><th>Nickname</th><th>Status</th><th>Reports</th><th></th></tr></thead>
-          <tbody id="users"><tr><td colspan="5" class="empty">Search to list users.</td></tr></tbody></table>
+        <table><thead><tr><th>UIN</th><th>Nickname</th><th>Status</th><th>Reports</th><th>Badge</th><th></th></tr></thead>
+          <tbody id="users"><tr><td colspan="6" class="empty">Search to list users.</td></tr></tbody></table>
+      </div>
+      <div class="card pad">
+        <table><thead><tr><th>Group</th><th>Owner</th><th>Members</th><th>Badge</th></tr></thead>
+          <tbody id="ugroups"><tr><td colspan="4" class="empty">Groups matching the search appear here.</td></tr></tbody></table>
       </div>
     </section>
 
@@ -613,18 +618,63 @@ async function createAccess() {
 async function revokeAccess(id){ try{ await api('POST','/access-tokens/'+id+'/revoke'); loadAccess(); }catch(e){ alert(e.message); } }
 
 /* ---- users ---- */
+/* The kinds THIS island knows. Asked once; an island that has none falls back
+   to the three the server ships with, so the picker is never empty. */
+let BADGE_KINDS = null;
+async function badgeKinds() {
+  if (BADGE_KINDS) return BADGE_KINDS;
+  try { const r = await api('GET','/badges'); BADGE_KINDS = (r&&r.kinds&&r.kinds.length)?r.kinds:['official','tester','special']; }
+  catch(e){ BADGE_KINDS = ['official','tester','special']; }
+  return BADGE_KINDS;
+}
+function badgePicker(kinds, current, onchange) {
+  const opts = ['<option value="">no badge</option>'].concat(
+    kinds.map(k=>`<option value="${escAttr(k)}"${k===current?' selected':''}>${escAttr(k)}</option>`)
+  );
+  /* An island may carry a kind the console does not list (set by hand, or
+     added after this page was written). Keep it selectable rather than
+     silently rewriting it to nothing on the next change. */
+  if (current && kinds.indexOf(current) < 0) opts.push(`<option value="${escAttr(current)}" selected>${escAttr(current)}</option>`);
+  return `<select style="width:130px" onchange="${onchange}">${opts.join('')}</select>`;
+}
 async function searchUsers() {
   const q=$('u_q').value.trim(); if(!q) return;
+  const kinds = await badgeKinds();
   try {
     const r = await api('GET','/users?q='+encodeURIComponent(q));
     $('users').innerHTML = (r.items||[]).map(u=>`<tr>
-      <td class="mono">${u.uin}</td><td>${u.nickname||''}</td>
+      <td class="mono">${u.uin}</td><td>${escAttr(u.nickname||'')}</td>
       <td>${u.is_suspended?'<span class="pill red">suspended</span>':'<span style="color:var(--mut)">'+(u.status||'active')+'</span>'}</td>
       <td>${u.reports_against}</td>
+      <td>${badgePicker(kinds, u.badge||'', 'setUserBadge('+u.uin+', this.value, this)')}</td>
       <td style="text-align:right"><button class="btn ${u.is_suspended?'ghost':'danger'} sm" onclick="ban(${u.uin},${!u.is_suspended})">${u.is_suspended?'Unban':'Ban'}</button></td>
-    </tr>`).join('') || '<tr><td colspan="5" class="empty">No matches.</td></tr>';
-  } catch(e){ $('users').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
+    </tr>`).join('') || '<tr><td colspan="6" class="empty">No matches.</td></tr>';
+  } catch(e){ $('users').innerHTML='<tr><td colspan="6" class="err">'+e.message+'</td></tr>'; }
+  /* Groups are searched with the same words. A closed group still shows: the
+     operator has to be able to reach one to badge or inspect it. */
+  try {
+    const g = await api('GET','/groups?q='+encodeURIComponent(q));
+    $('ugroups').innerHTML = (g.items||[]).map(x=>`<tr>
+      <td>${escAttr(x.name||('Group '+x.id))}${x.is_closed?' <span class="pill">closed</span>':''}<div class="mono" style="color:var(--dim);font-size:11px">id ${x.id}</div></td>
+      <td class="mono">${x.owner_uin}${x.owner_nickname?' <span style="color:var(--mut)">'+escAttr(x.owner_nickname)+'</span>':''}</td>
+      <td>${x.member_count}</td>
+      <td>${badgePicker(kinds, x.badge||'', 'setGroupBadge('+x.id+', this.value, this)')}</td>
+    </tr>`).join('') || '<tr><td colspan="4" class="empty">No groups match.</td></tr>';
+  } catch(e){ $('ugroups').innerHTML='<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
 }
+/* The select is the source of truth while the request is in flight: disable it
+   so a second change cannot race the first, and put the old value back if the
+   island refuses. No full re-search, which would throw away the operator's
+   place in a long list. */
+async function setBadgeOn(path, value, el) {
+  const before = el.getAttribute('data-was') || '';
+  el.disabled = true;
+  try { await api('POST', path, {badge: value || null}); el.setAttribute('data-was', value); }
+  catch(e){ el.value = before; alert(e.message); }
+  finally { el.disabled = false; }
+}
+function setUserBadge(uin, value, el){ return setBadgeOn('/users/'+uin+'/badge', value, el); }
+function setGroupBadge(id, value, el){ return setBadgeOn('/groups/'+id+'/badge', value, el); }
 async function ban(uin,suspended){ try{ await api('POST','/users/'+uin+'/ban',{suspended}); searchUsers(); }catch(e){ alert(e.message); } }
 
 /* ---- reports (user + bug reports; auto crash dumps are a maintainer concern) ---- */
@@ -1308,6 +1358,14 @@ const MOCK_BUNDLE = {
   },
 };
 function mock(method, path, body) {
+  if (path==='/badges') return {kinds:['official','tester','special']};
+  if (path.indexOf('/badge')>0 && method==='POST') return {ok:true};
+  if (path.startsWith('/users?q=')) return {items:[
+    {uin:100200300, nickname:'ann', is_suspended:false, badge:'official', status:'active', reports_against:0},
+    {uin:100200301, nickname:'bo', is_suspended:false, badge:null, status:'active', reports_against:2}]};
+  if (path.startsWith('/groups?q=')) return {items:[
+    {id:21, name:'Island Beta', owner_uin:100200300, owner_nickname:'ann', member_count:2210, is_closed:false, badge:'official'},
+    {id:44, name:'Bug reports', owner_uin:100200301, owner_nickname:'bo', member_count:38, is_closed:true, badge:null}]};
   if (path==='/sites') return MOCK_SITES;
   if (path.startsWith('/sites/') && method==='POST') {
     /* No backslashes: this JS lives inside a plain Python string. */
