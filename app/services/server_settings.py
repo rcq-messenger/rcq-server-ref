@@ -111,22 +111,27 @@ _reg(SettingSpec("uin_shop_enabled", "bool", lambda: _env.UIN_SHOP_ENABLED, "num
                  "else's shop. Handing numbers out by arrangement works either way."))
 _reg(SettingSpec("uin_prices", "str", lambda: os.environ.get("RCQ_UIN_PRICES", ""), "numbers",
                  "Your prices",
-                 'What YOU charge, in cents, by how many digits the number has: '
-                 '{"4": 25000, "5": 5000}. Empty means the flagship\'s ladder, which '
-                 'is almost certainly not what you want when the money is yours. A '
-                 'length you leave out is one you do not sell.'))
+                 'What YOU charge for a number, by how many digits it has. Empty '
+                 'means the flagship\'s ladder, which is almost certainly not what '
+                 'you want when the money is yours. A length you leave blank is '
+                 'one you do not sell; three digits are never sold.'))
 _reg(SettingSpec("uin_till_url", "str", lambda: os.environ.get("RCQ_UIN_TILL_URL", ""), "numbers",
                  "Your checkout",
-                 "The address of YOUR till, handed to buyers so they pay you. "
-                 "Without it nothing is offered for sale: every released client "
-                 "has one checkout compiled in, and it is not yours, so an island "
-                 "that cannot name its own would send its customers to pay "
-                 "somebody else for a number they would never receive."))
+                 "The address of YOUR till: your own copy of the checkout worker "
+                 "(deploy/console-worker), deployed with UIN_ISLAND_API pointing at "
+                 "this island, so it asks THIS island where buyers pay and signs "
+                 "vouchers this island then trusts (its public key goes in the "
+                 "field below). The flagship's till serves the flagship only. "
+                 "Leave this empty and nothing is offered for sale, which is the "
+                 "safe answer: a client would otherwise be sent to pay somebody "
+                 "else for a number they would never receive."))
 _reg(SettingSpec("uin_resale_enabled", "bool", lambda: False, "numbers",
                  "Let people resell numbers",
-                 "⚠ Not finished. The island half is in place but the till and the "
-                 "apps are not, and an adversarial pass found ways a seller keeps "
-                 "both the money and the number. Leave this off."))
+                 "People on this island can put a number they hold up for sale, "
+                 "naming a price and their own wallet; the buyer pays them "
+                 "directly and the island only hands the number over once your "
+                 "till has seen the payment. Needs the same till as selling your "
+                 "own stock. Live on the flagship since 2026-09-04."))
 _reg(SettingSpec("uin_payout_addresses", "str",
                  lambda: os.environ.get("RCQ_UIN_PAYOUT_ADDRESSES", ""), "numbers",
                  "Your wallets",
