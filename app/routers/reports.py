@@ -69,7 +69,9 @@ async def require_reports_open() -> None:
 # keep the queue readable + bound disk usage. The context tag is
 # even shorter (it's a surface code like "contact" or "hood").
 MAX_REASON_LEN: int = 1000
-MAX_CONTEXT_LEN: int = 64
+# 320, not 64: `site:<name>@<host>` is 5 + 32 + 1 + a hostname, and a 64 cap
+# turned a long island name into a 422 the reader saw as "could not send".
+MAX_CONTEXT_LEN: int = 320
 
 # Per-hour submission budgets, per UIN. Reports ABOUT another member are
 # rate-limited as a harassment guard (see create_report). Bug reports are
