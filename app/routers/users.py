@@ -57,6 +57,11 @@ def _validate_hof_avatar(raw: str) -> str:
 class PublicUser(BaseModel):
     uin: int
     nickname: str
+    # The island's mark on this account: null, or a kind ("official",
+    # "tester", "special", more later). Not gated by any visibility setting:
+    # it is the island's statement, not the person's. A client colours the
+    # kinds it knows and draws the rest neutral.
+    badge: str | None = None
     first_name: str | None = None
     last_name: str | None = None
     age: int | None = None
@@ -214,6 +219,7 @@ class PublicUser(BaseModel):
         return cls(
             uin=u.uin,
             nickname=u.nickname,
+            badge=u.badge,
             avatar_media_id=u.avatar_media_id if avatar_ok else None,
             avatar_media_key=u.avatar_media_key if avatar_ok else None,
             first_name=u.first_name if profile_visible else None,
@@ -279,6 +285,7 @@ class PublicUser(BaseModel):
         return cls(
             uin=u.uin,
             nickname=u.nickname,
+            badge=u.badge,
             profile_openable=openable,
             first_name=u.first_name if visible else None,
             last_name=u.last_name if visible else None,
@@ -629,6 +636,7 @@ class LookupRow(BaseModel):
 
     uin: int
     nickname: str
+    badge: str | None = None
     status: str
     status_message: str | None = None
     identity_key: str
@@ -827,6 +835,7 @@ async def lookup(
             LookupRow(
                 uin=u.uin,
                 nickname=u.nickname,
+                badge=u.badge,
                 status=visible_status(u),
                 status_message=u.status_message if profile_visible else None,
                 identity_key=u.identity_key,
@@ -894,7 +903,9 @@ async def info(
     )
 
 
-async def _announce_rename(db: AsyncSession, uin: int, nickname: str) -> None:
+async def _announce_rename(
+    db: AsyncSession, uin: int, nickname: str, badge: str | None = ..., 
+) -> None:
     """Tell everyone holding this user as a contact that the name changed.
 
     A NEW packet type rather than a field bolted onto `presence`: presence has
@@ -914,7 +925,14 @@ async def _announce_rename(db: AsyncSession, uin: int, nickname: str) -> None:
             .where(Contact.blocked == False)  # noqa: E712
         )
     ).all()
-    packet = {"type": "contact_renamed", "uin": uin, "nickname": nickname}
+    packet: dict[str, object] = {"type": "contact_renamed", "uin": uin, "nickname": nickname}
+    # The island's mark rides the same packet when it changes: it is drawn
+    # beside the name everywhere the name is, and it has the same audience.
+    # Absent on a plain rename (the sentinel default), so a client that keys
+    # on the field is not told "no badge" by every nickname change; null is
+    # a real value meaning the mark was taken away.
+    if badge is not ...:
+        packet["badge"] = badge
     for owner_uin in set(owners):
         await manager.send(owner_uin, packet)
 

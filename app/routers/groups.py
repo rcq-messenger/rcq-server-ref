@@ -69,6 +69,9 @@ router = APIRouter(prefix="/groups", tags=["groups"])
 class GroupOut(BaseModel):
     id: int
     name: str
+    # The island's mark on this room, a kind or null ("official" for the
+    # island's own rooms). Operator-set.
+    badge: str | None = None
     # Voluntary catalog: the owner chose to list this room publicly, which is
     # the only reason search may match it (stage 6, founder decision 30.08).
     in_catalog: bool = False
@@ -134,6 +137,7 @@ class GroupOut(BaseModel):
 class GroupMemberOut(BaseModel):
     uin: int
     nickname: str
+    badge: str | None = None
     role: str
     # Granular moderator caps the owner granted this member (subset of
     # delete|members|info). Empty for plain members; the owner implicitly
@@ -307,6 +311,7 @@ async def _members_with_users(
                 GroupMember.role,
                 GroupMember.permissions,
                 User.nickname,
+                User.badge,
                 User.status,
                 User.identity_key,
                 User.signing_key,
@@ -398,6 +403,7 @@ async def _members_with_users(
         out.append(GroupMemberOut(
             uin=r.uin,
             nickname=r.nickname,
+            badge=r.badge,
             avatar_media_id=r.avatar_media_id,
             avatar_media_key=r.avatar_media_key,
             role=r.role,
@@ -749,6 +755,7 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
     return GroupOut(
         id=g.id,
         name=g.name,
+        badge=g.badge,
         in_catalog=g.in_catalog,
         state_blob=base64.b64encode(g.state_blob).decode() if g.state_blob else None,
         state_ver=g.state_ver or 0,
@@ -841,6 +848,7 @@ class GroupPreviewOut(BaseModel):
     render the group without exposing membership or message history."""
     id: int
     name: str
+    badge: str | None = None
     description: str | None = None
     member_count: int
     is_closed: bool = False
@@ -952,6 +960,7 @@ async def preview_group(
     return GroupPreviewOut(
         id=g.id,
         name=g.name,
+        badge=g.badge,
         description=g.description,
         member_count=int(member_count or 0),
         is_closed=g.is_closed,
@@ -1055,6 +1064,7 @@ async def search_groups(
         GroupPreviewOut(
             id=g.id,
             name=g.name,
+            badge=g.badge,
             description=g.description,
             member_count=counts.get(g.id, 0),
             is_closed=g.is_closed,

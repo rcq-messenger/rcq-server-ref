@@ -56,6 +56,8 @@ router = APIRouter(prefix="/contacts", tags=["contacts"])
 class ContactRow(BaseModel):
     uin: int
     nickname: str
+    # The island's mark on this account, a kind or null (drawn beside the name).
+    badge: str | None = None
     status: str
     status_message: str | None = None
     blocked: bool = False
@@ -180,6 +182,7 @@ async def list_contacts(
             ContactRow(
                 uin=u.uin,
                 nickname=u.nickname,
+                badge=u.badge,
                 status=live_status,
                 status_message=u.status_message,
                 avatar_media_id=u.avatar_media_id,
