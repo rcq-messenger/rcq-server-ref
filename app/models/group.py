@@ -67,6 +67,10 @@ class Group(Base):
     # wait it out. Server-enforced for authenticated senders on both group
     # send paths - see messages.py `_enforce_account_age_gate`.
     min_account_age_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # The island's mark on a room, a kind or NULL, same vocabulary as
+    # User.badge ("official" for the island's own rooms). Operator-only and
+    # unreachable from GroupPatchIn on purpose.
+    badge: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Sealed room identity (stage 6, phase 2): deflate-then-AEAD under a room
     # key distributed over the sealed channel. Single writer, strictly
     # increasing version, 409 on stale - the vault's #605 rule at room scale.

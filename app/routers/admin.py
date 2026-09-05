@@ -36,6 +36,7 @@ from app.models.uin_sale import UinHold
 from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
 from app.models.report_message import ReportMessage
+from app.models.group import Group, GroupMember
 from app.models.user import User, effective_status
 from app.services import island_logo, server_settings
 from app.services.apns import send_to_user as apns_send
@@ -377,6 +378,7 @@ class UserSummary(BaseModel):
     uin: int
     nickname: str
     is_suspended: bool
+    badge: str | None = None
     status: str
     last_seen: datetime
     created_at: datetime
@@ -389,6 +391,34 @@ class UserSearchOut(BaseModel):
 
 class BanIn(BaseModel):
     suspended: bool
+
+
+# The island's mark, as a KIND. The vocabulary is open on purpose: the
+# console offers the kinds below, the server accepts any short slug, and a
+# client colours the kinds it knows and draws the rest neutral, so a new kind
+# is a string in three places rather than a migration in five.
+BADGE_KINDS = ("official", "tester", "special")
+
+
+class BadgeIn(BaseModel):
+    # None takes the mark away.
+    badge: str | None = Field(default=None, max_length=16, pattern=r"^[a-z][a-z0-9_-]{0,15}$")
+
+
+class GroupSummary(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+    owner_uin: int
+    owner_nickname: str | None = None
+    member_count: int
+    is_closed: bool = False
+    badge: str | None = None
+    created_at: datetime | None = None
+
+
+class GroupSearchOut(BaseModel):
+    items: list[GroupSummary]
 
 
 class StatsOut(BaseModel):
@@ -892,6 +922,109 @@ async def set_ban(uin: int, body: BanIn, db: AsyncSession = Depends(get_db)) -> 
     return await _summarize(db, user)
 
 
+@router.post("/users/{uin}/badge", response_model=UserSummary)
+async def set_user_badge(
+    uin: int, body: BadgeIn, request: Request, db: AsyncSession = Depends(get_db)
+) -> UserSummary:
+    """The island's mark on a person: a kind, or null to take it away.
+    Nothing gates on it (unlike a ban, so there is no Redis mirror); it is
+    drawn beside the name everywhere the name is. Contacts holding this
+    person are told at once through the packet that carries a rename, so
+    open clients repaint without a roster pull.
+    """
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    user.badge = body.badge
+    await db.commit()
+    await db.refresh(user)
+    admin = getattr(request.state, "admin", None) or "admin"
+    log.info("badge %r on user %s by %s", body.badge, uin, admin)
+    from app.routers.users import _announce_rename
+    await _announce_rename(db, uin, user.nickname, badge=user.badge)
+    return await _summarize(db, user)
+
+
+@router.get("/badges")
+async def badge_kinds() -> dict[str, list[str]]:
+    """The kinds this island's console offers. Advisory: the console draws
+    its picker from this list, and any short slug is still accepted."""
+    return {"kinds": list(BADGE_KINDS)}
+
+
+# ── Groups ────────────────────────────────────────────────────────────
+#
+# The console searched people and nothing else, so an official room could
+# not be marked at all. Same shape as the user trio: search, one, set.
+
+
+async def _group_summary(db: AsyncSession, g: Group) -> GroupSummary:
+    member_count = await db.scalar(
+        select(func.count(GroupMember.id)).where(GroupMember.group_id == g.id)
+    ) or 0
+    owner = await db.get(User, g.owner_uin)
+    return GroupSummary(
+        id=g.id,
+        name=g.name,
+        description=g.description,
+        owner_uin=g.owner_uin,
+        owner_nickname=owner.nickname if owner else None,
+        member_count=int(member_count),
+        is_closed=bool(getattr(g, "is_closed", False)),
+        badge=g.badge,
+        created_at=getattr(g, "created_at", None),
+    )
+
+
+@router.get("/groups", response_model=GroupSearchOut)
+async def search_groups(
+    q: str = Query(..., min_length=1, max_length=64),
+    limit: int = Query(20, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> GroupSearchOut:
+    """`q` matches the group id (when digits) OR the name (case-insensitive).
+    Every room, catalogue or not, closed or not: this is the operator's own
+    island and marking a private official room is a legitimate thing to do."""
+    needle = q.strip()
+    query = select(Group).limit(limit)
+    if needle.isdigit():
+        query = query.where(or_(Group.id == int(needle), Group.name.ilike(f"%{needle}%")))
+    else:
+        query = query.where(Group.name.ilike(f"%{needle}%"))
+    groups = (await db.execute(query)).scalars().all()
+    return GroupSearchOut(items=[await _group_summary(db, g) for g in groups])
+
+
+@router.get("/groups/{group_id}", response_model=GroupSummary)
+async def get_group(group_id: int, db: AsyncSession = Depends(get_db)) -> GroupSummary:
+    g = await db.get(Group, group_id)
+    if g is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+    return await _group_summary(db, g)
+
+
+@router.post("/groups/{group_id}/badge", response_model=GroupSummary)
+async def set_group_badge(
+    group_id: int, body: BadgeIn, request: Request, db: AsyncSession = Depends(get_db)
+) -> GroupSummary:
+    """The island's mark on a room, a kind or null. Members holding the room
+    open are told through the ordinary membership snapshot, the same packet a
+    rename of the room rides, so the list and the header repaint without a
+    refetch."""
+    g = await db.get(Group, group_id)
+    if g is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+    g.badge = body.badge
+    await db.commit()
+    await db.refresh(g)
+    admin = getattr(request.state, "admin", None) or "admin"
+    log.info("badge %r on group %s by %s", body.badge, group_id, admin)
+    from app.routers.groups import _broadcast_membership, _members_with_users, _serialize
+    members = await _members_with_users(db, g.id)
+    await _broadcast_membership(g.id, members, _serialize(g, members))
+    return await _group_summary(db, g)
+
+
 async def _summarize(db: AsyncSession, user: User) -> UserSummary:
     reports_against = await db.scalar(
         select(func.count(Report.id)).where(Report.target_uin == user.uin)
@@ -900,6 +1033,7 @@ async def _summarize(db: AsyncSession, user: User) -> UserSummary:
         uin=user.uin,
         nickname=user.nickname,
         is_suspended=user.is_suspended,
+        badge=user.badge,
         status=effective_status(user),
         last_seen=user.last_seen,
         created_at=user.created_at,

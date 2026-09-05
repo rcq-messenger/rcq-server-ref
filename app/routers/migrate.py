@@ -127,6 +127,9 @@ async def _perform_migration(
         # clean account and a ban lasted exactly as long as it took the
         # banned user to press "new number".
         is_suspended=user.is_suspended,
+        # So does the island's mark: the person the island vouched for is
+        # the same person on the new number.
+        badge=user.badge,
         last_seen_visibility=user.last_seen_visibility,
         gender_visibility=user.gender_visibility,
         profile_visibility=user.profile_visibility,

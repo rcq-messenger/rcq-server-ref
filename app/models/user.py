@@ -82,6 +82,15 @@ class User(Base):
     # what was sent to them before the ban (no rage-quit through chat
     # disappearance).
     is_suspended: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # The island's mark on this account, drawn beside the name everywhere
+    # the name is: NULL for none, else a short kind such as "official" (the
+    # island's own people), "tester", "special". A KIND rather than a
+    # yes/no so the operator can tell an official account from a tester
+    # from whatever comes next without a migration (founder, 05.09).
+    # Granted and revoked from the admin console only; no client endpoint
+    # can set it. Not gated by any visibility setting: it is the island's
+    # statement about the person, not the person's about themselves.
+    badge: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Hall of Fame. `hof_opt_in` is set by the user from their client (consent
     # to be considered). `hof_approved` is set by the founder from the admin

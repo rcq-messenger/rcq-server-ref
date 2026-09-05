@@ -160,6 +160,10 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # Admin-set ban flag. Default false — only flipped via
     # /admin/users/{uin}/ban after a Reports-queue review.
     ("is_suspended", "BOOLEAN DEFAULT FALSE"),
+    # The island's mark on a person, a kind or NULL, granted from the admin
+    # console (05.09). ⚠ A boolean `verified` column shipped for an hour the
+    # same morning and may exist on the flagship; it is unmapped and unused.
+    ("badge", "VARCHAR(16)"),
     # Profile picture (see models/user.py). Additive: NULL on every existing
     # row means "no picture", which is exactly the old behaviour.
     ("avatar_media_id", "VARCHAR(64)"),
@@ -281,6 +285,9 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     # added now so the schema is ready and the toggle can ship first.
     ("in_catalog", "BOOLEAN DEFAULT FALSE"),
     ("min_account_age_hours", "INTEGER DEFAULT 0"),
+    # The island's mark on a room, a kind or NULL (05.09). Same note as on
+    # users about a stray boolean `verified` column.
+    ("badge", "VARCHAR(16)"),
     ("state_blob", "BYTEA"),
     ("state_ver", "BIGINT DEFAULT 0"),
 ]
