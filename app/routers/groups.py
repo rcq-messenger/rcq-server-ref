@@ -1030,10 +1030,12 @@ async def discover_groups(
             is_closed=g.is_closed,
             owner_uin=g.owner_uin,
             owner_nickname=owner_nick.get(g.owner_uin),
-            # Not the caller's room, so not the caller's key to hold. Same
-            # rule as search and preview.
-            avatar_media_id=None,
-            avatar_media_key=None,
+            # An OPEN room in a public carousel wears its own face: the picture
+            # is the room's advertisement, and anyone may walk in and hold the
+            # key a moment later anyway. A closed room keeps it (founder,
+            # 05.09: "why has none of them an avatar").
+            avatar_media_id=g.avatar_media_id if not g.is_closed else None,
+            avatar_media_key=g.avatar_media_key if not g.is_closed else None,
         )
         for g, n in rows
     ]
