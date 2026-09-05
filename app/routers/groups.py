@@ -974,6 +974,72 @@ async def preview_group(
 # Must be registered before the `/{group_id}` catch-all so the literal
 # segment doesn't get coerced into the int path-parameter and 422'd.
 @router.get(
+    "/discover",
+    response_model=list[GroupPreviewOut],
+    dependencies=[Depends(rate_limit("groups_discover", 30, 60))],
+)
+async def discover_groups(
+    limit: int = 12,
+    viewer_uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> list[GroupPreviewOut]:
+    """Open rooms the caller is not in, biggest first: the carousel a new
+    account sees instead of an empty screen (founder, 05.09). Every new
+    account used to be dropped into one beta room; this is the replacement,
+    and joining is the person's own tap.
+
+    Same shape and same ghost-member join as `/search`: the count that
+    orders the list is the count the row shows, or the third-biggest room
+    would sit above the second."""
+    capped = max(1, min(limit, 50))
+    own_group_ids = (
+        await db.execute(
+            select(GroupMember.group_id).where(GroupMember.uin == viewer_uin)
+        )
+    ).scalars().all()
+    live_count = (
+        select(GroupMember.group_id, func.count(GroupMember.id).label("n"))
+        .join(User, User.uin == GroupMember.uin)
+        .group_by(GroupMember.group_id)
+        .subquery()
+    )
+    rows = (
+        await db.execute(
+            select(Group, live_count.c.n)
+            .join(live_count, live_count.c.group_id == Group.id)
+            .where(Group.is_closed.is_(False))
+            .where(Group.id.notin_(own_group_ids) if own_group_ids else True)
+            .order_by(live_count.c.n.desc(), Group.created_at.asc())
+            .limit(capped)
+        )
+    ).all()
+    if not rows:
+        return []
+    owner_uins = {g.owner_uin for g, _ in rows}
+    owners = (
+        await db.execute(select(User).where(User.uin.in_(owner_uins)))
+    ).scalars().all()
+    owner_nick = {u.uin: u.nickname for u in owners}
+    return [
+        GroupPreviewOut(
+            id=g.id,
+            name=g.name,
+            badge=g.badge,
+            description=g.description,
+            member_count=int(n),
+            is_closed=g.is_closed,
+            owner_uin=g.owner_uin,
+            owner_nickname=owner_nick.get(g.owner_uin),
+            # Not the caller's room, so not the caller's key to hold. Same
+            # rule as search and preview.
+            avatar_media_id=None,
+            avatar_media_key=None,
+        )
+        for g, n in rows
+    ]
+
+
+@router.get(
     "/search",
     response_model=list[GroupPreviewOut],
     dependencies=[Depends(rate_limit("groups_search", 60, 60))],
