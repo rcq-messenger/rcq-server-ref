@@ -45,6 +45,17 @@ class ServerCapabilities(BaseModel):
     # invite token is required). Clients prompt for an invite when "invite".
     # Defaults to "open" so old clients that ignore the field are unaffected.
     registration_policy: str = "open"
+    # ⚠ A CLOSED ISLAND WITHHOLDS THE KEY that seals an envelope to a resident,
+    # so knowing a number stops being enough to write to somebody. Published
+    # because the refusal itself deliberately cannot say so: it is byte for
+    # byte "no such number", or a closed island becomes a directory for
+    # guessing which numbers exist. The client is the only thing that can tell
+    # a person the truth ("this island is closed, you need a link from the
+    # person"), and it can only do that if it was told in advance.
+    #
+    # Defaults FALSE, so an island older than the field, and every open island,
+    # is unchanged.
+    closed_island: bool = False
     # Operator-toggled optional features (admin console -> Features). Each
     # defaults True so old clients that ignore the field keep showing the tab;
     # a client that reads these hides the tab when the operator turns it off.
@@ -255,6 +266,7 @@ async def server_info() -> ServerInfo:
             uin_shop=eff["uin_shop_enabled"],
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=eff["registration_policy"],
+            closed_island=bool(eff["closed_island"]),
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
