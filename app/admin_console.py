@@ -1336,9 +1336,154 @@ async function removeLogo(){
 }
 
 let MOCK_LOGO = {has_logo:false, version:'', max_bytes:65536, mimes:['image/png','image/jpeg','image/webp','image/gif']};
+/* ⚠⚠ THREE SETTINGS ARE JSON, AND AN OPERATOR SHOULD NEVER TYPE JSON.
+ *
+ * `uin_payout_addresses`, `uin_prices` and `badge_labels` are stored as JSON
+ * strings because that is what the island parses, and until now this console
+ * put that string in a 220px text box and left the operator to get the braces
+ * right. Somebody naming a badge had to write
+ * {"official":{"label":"...","description":"...","color":"#3B9EE8"}} in one
+ * line, and somebody entering a wallet had to know the chain ids. One typo and
+ * the island logs a parse error and quietly keeps the old value.
+ *
+ * The wire format does not change: these editors build the same JSON and PATCH
+ * the same key. What changes is that a person sees fields.
+ *
+ * The `editor` hint comes from the island (server_settings.describe). A console
+ * that does not know a hint falls through to the text box, which is what keeps
+ * an older console usable against a newer island. */
+
+const CHAINS = [
+  ['tron', 'USDT (TRC-20)', 'T…'],
+  ['ton', 'TON', 'UQ…'],
+  ['btc', 'Bitcoin', 'bc1…'],
+];
+/* Nine down to four. Three-digit numbers are never sold (uin_shop.py), so the
+ * row is not offered rather than offered and refused. */
+const PRICE_LENGTHS = [9, 8, 7, 6, 5, 4];
+const BADGE_SEED = ['official', 'tester', 'special'];
+
+function parseJSONSetting(v){
+  if (!v) return {};
+  try { const o = JSON.parse(v); return (o && typeof o === 'object') ? o : {}; }
+  catch(e){ return null; }   /* null = unparseable; we say so instead of eating it */
+}
+
+function walletsEditor(s){
+  const cur = parseJSONSetting(s.value);
+  if (cur === null) return null;
+  const rows = CHAINS.map(([id, label, hint]) => `
+    <div class="erow">
+      <label for="w_${id}">${label}</label>
+      <input id="w_${id}" value="${escAttr(cur[id]||'')}" placeholder="${hint}" spellcheck="false">
+    </div>`).join('');
+  return `<div class="editor">${rows}
+    <button class="btn sm" onclick="saveWallets()">Save wallets</button>
+    <div class="ehelp">Leave a chain empty and it is not offered at checkout.</div></div>`;
+}
+function saveWallets(){
+  const out = {};
+  for (const [id] of CHAINS){
+    const v = ($('w_'+id).value||'').trim();
+    if (v) out[id] = v;
+  }
+  setFeature('uin_payout_addresses', Object.keys(out).length ? JSON.stringify(out) : '');
+}
+
+function pricesEditor(s){
+  const cur = parseJSONSetting(s.value);
+  if (cur === null) return null;
+  const rows = PRICE_LENGTHS.map((n) => `
+    <div class="erow">
+      <label for="p_${n}">${n} digits</label>
+      <input id="p_${n}" type="number" min="0" step="0.01" style="width:110px"
+             value="${cur[n]!=null ? (Number(cur[n])/100) : ''}" placeholder="not sold">
+      <span class="ehint">USD</span>
+    </div>`).join('');
+  return `<div class="editor">${rows}
+    <button class="btn sm" onclick="savePrices()">Save prices</button>
+    <div class="ehelp">A length you leave blank is one you do not sell. Three-digit
+      numbers are never sold.</div></div>`;
+}
+function savePrices(){
+  const out = {};
+  for (const n of PRICE_LENGTHS){
+    const raw = ($('p_'+n).value||'').trim();
+    if (raw === '') continue;
+    const cents = Math.round(parseFloat(raw) * 100);
+    if (!isFinite(cents) || cents < 0) { alert(n + ' digits: enter a price like 4.99, or leave it blank.'); return; }
+    out[n] = cents;
+  }
+  setFeature('uin_prices', Object.keys(out).length ? JSON.stringify(out) : '');
+}
+
+function badgesEditor(s){
+  const cur = parseJSONSetting(s.value);
+  if (cur === null) return null;
+  /* The kinds this island already names, plus the three the clients know, plus
+   * a blank row so a new kind can be minted without leaving the page. */
+  const kinds = Array.from(new Set([...Object.keys(cur), ...BADGE_SEED]));
+  const rows = kinds.map((k, i) => badgeRow(k, cur[k]||{}, i)).join('');
+  return `<div class="editor" id="badge-rows">${rows}
+    <button class="btn sm ghost" onclick="addBadgeRow()">Add a kind</button>
+    <button class="btn sm" onclick="saveBadges()">Save badges</button>
+    <div class="ehelp">Leave a row blank and the apps use their own translated
+      wording for that mark. The kind is the slug the island stores on an
+      account (a-z, digits, - and _).</div></div>`;
+}
+function badgeRow(kind, v, i){
+  return `<div class="brow" data-i="${i}">
+    <input class="bkind" value="${escAttr(kind)}" placeholder="kind" style="width:110px" spellcheck="false">
+    <input class="blabel" value="${escAttr(v.label||'')}" placeholder="name shown to people" style="width:160px">
+    <input class="bcolor" type="color" value="${/^#[0-9a-fA-F]{6}$/.test(v.color||'') ? v.color : '#3b9ee8'}" title="colour">
+    <input class="bdesc" value="${escAttr(v.description||'')}" placeholder="one sentence: what this mark means" style="flex:1;min-width:220px">
+  </div>`;
+}
+let badgeSeq = 900;
+function addBadgeRow(){
+  const host = $('badge-rows');
+  const btn = host.querySelector('button');
+  btn.insertAdjacentHTML('beforebegin', badgeRow('', {}, badgeSeq++));
+}
+function saveBadges(){
+  const out = {};
+  for (const row of document.querySelectorAll('#badge-rows .brow')){
+    const kind = (row.querySelector('.bkind').value||'').trim().toLowerCase();
+    if (!kind) continue;
+    if (!/^[a-z0-9_-]{1,16}$/.test(kind)) { alert('"'+kind+'" is not a kind: a-z, digits, - and _, up to 16 characters.'); return; }
+    const label = (row.querySelector('.blabel').value||'').trim();
+    const description = (row.querySelector('.bdesc').value||'').trim();
+    const color = (row.querySelector('.bcolor').value||'').trim();
+    /* A row with nothing in it is a kind the operator has not renamed: leave it
+     * out entirely so the apps fall back to their own translated wording,
+     * rather than writing empty strings that mean the same thing but look set. */
+    if (!label && !description) continue;
+    const e = {};
+    if (label) e.label = label;
+    if (description) e.description = description;
+    if (color) e.color = color;
+    out[kind] = e;
+  }
+  setFeature('badge_labels', Object.keys(out).length ? JSON.stringify(out) : '');
+}
+
 function frow(s, first){
   let ctl;
-  if (s.type==='bool')
+  if (s.editor) {
+    const built = s.editor==='wallets' ? walletsEditor(s)
+                : s.editor==='prices'  ? pricesEditor(s)
+                : s.editor==='badges'  ? badgesEditor(s) : null;
+    /* ⚠ Unparseable existing value: do NOT draw the fields over it. The editor
+     * would save whatever the empty fields hold and silently discard what is
+     * there. Fall back to the raw box and say why. */
+    ctl = built !== null && built !== undefined
+      ? built
+      : `<div><div class="ehelp" style="color:var(--err)">This value is not valid JSON, so the
+           fields cannot be shown. Fix or clear it here.</div>
+         <input id="f_${s.key}" value="${escAttr(s.value)}" style="width:220px">
+         <button class="btn sm" onclick="setFeature('${s.key}', $('f_${s.key}').value)">Save</button></div>`;
+  }
+  else if (s.type==='bool')
     ctl = `<button class="btn sm ${s.value?'':'ghost'}" onclick="setFeature('${s.key}', ${!s.value})">${s.value?'On':'Off'}</button>`;
   else if (s.type==='int')
     ctl = `<input type="number" id="f_${s.key}" value="${s.value}"${s.min!=null?' min='+s.min:''}${s.max!=null?' max='+s.max:''} style="width:88px"><button class="btn sm" onclick="setFeature('${s.key}', parseInt($('f_${s.key}').value,10))">Save</button>`;
@@ -1361,6 +1506,9 @@ let MOCK_SETTINGS = [
   {key:'max_accounts_per_device',type:'int',group:'limits',label:'Max accounts / device',help:'How many accounts one device may hold.',value:5,default:5,overridden:false,min:1,max:50,choices:null},
   {key:'island_name',type:'str',group:'branding',label:'Island name',help:'Display name clients read from /server/info.',value:'Example Island',default:'RCQ Backend',overridden:true,min:null,max:null,choices:null},
   {key:'welcome_text',type:'str',group:'branding',label:'Welcome / rules',help:'Optional welcome or rules text shown in the app.',value:'',default:'',overridden:false,min:null,max:null,choices:null},
+  {key:'badge_labels',type:'str',group:'branding',label:'Badge names and descriptions',help:'What your island calls its badges. Leave a row blank and the apps use their own translated wording.',value:'{"official":{"label":"Official","description":"Confirmed by this island.","color":"#3b9ee8"},"resident":{"label":"Resident","description":"Holds residency on this island.","color":"#22c55e"}}',default:'',overridden:true,min:null,max:null,choices:null,editor:'badges'},
+  {key:'uin_payout_addresses',type:'str',group:'numbers',label:'Your wallets',help:'Where buyers pay YOU for numbers this island sells.',value:'{"tron":"TYj5rJMVSJ5LATG9kPgemEiaDH9ft1FqY5"}',default:'',overridden:true,min:null,max:null,choices:null,editor:'wallets'},
+  {key:'uin_prices',type:'str',group:'numbers',label:'Your prices',help:'What YOU charge for a number, by how many digits it has.',value:'{"6":1499,"7":499}',default:'',overridden:true,min:null,max:null,choices:null,editor:'prices'},
 ];
 
 const MOCK_SITES = [

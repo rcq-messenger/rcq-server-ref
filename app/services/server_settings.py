@@ -37,6 +37,16 @@ class SettingSpec:
     min: Optional[int] = None
     max: Optional[int] = None
     choices: Optional[tuple] = None
+    #: How the admin UIs should DRAW this setting, when a text box is the wrong
+    #: shape for it. The value on the wire is unchanged — still the same JSON
+    #: string the island parses — but an operator should never have to type
+    #: JSON by hand to name a badge or paste a wallet address. One of
+    #: "wallets" | "prices" | "badges", or None for a plain field.
+    #:
+    #: ⚠ A hint, not a contract. An admin UI that does not know the hint falls
+    #: back to the text box and still works, which is what keeps an older
+    #: console usable against a newer island.
+    editor: Optional[str] = None
 
 
 REGISTRY: dict[str, SettingSpec] = {}
@@ -114,7 +124,8 @@ _reg(SettingSpec("uin_prices", "str", lambda: os.environ.get("RCQ_UIN_PRICES", "
                  'What YOU charge for a number, by how many digits it has. Empty '
                  'means the flagship\'s ladder, which is almost certainly not what '
                  'you want when the money is yours. A length you leave blank is '
-                 'one you do not sell; three digits are never sold.'))
+                 'one you do not sell; three digits are never sold.',
+                 editor="prices"))
 _reg(SettingSpec("uin_till_url", "str", lambda: os.environ.get("RCQ_UIN_TILL_URL", ""), "numbers",
                  "Your checkout",
                  "The address of YOUR till: your own copy of the checkout worker "
@@ -139,7 +150,8 @@ _reg(SettingSpec("uin_payout_addresses", "str",
                  'chain: {"tron": "T...", "ton": "UQ..."}. Your till asks the island '
                  'for these, so changing one here changes where the next invoice '
                  'sends money. ⚠ An address you do not control is an invoice you '
-                 'cannot collect, and nothing here can undo a payment.'))
+                 'cannot collect, and nothing here can undo a payment.',
+                 editor="wallets"))
 _reg(SettingSpec("uin_voucher_pubkey", "str",
                  lambda: os.environ.get("RCQ_UIN_VOUCHER_PUBKEY", ""), "numbers",
                  "Your till's public key",
@@ -158,7 +170,8 @@ _reg(SettingSpec("badge_labels", "str", lambda: "", "branding",
                  'island can mint "resident", "founder" or anything else and '
                  'name it here. A kind with no entry still renders — with the '
                  'client default if it knows the slug, and as a plain mark from '
-                 'this island if it does not.'))
+                 'this island if it does not.',
+                 editor="badges"))
 
 _reg(SettingSpec("island_name", "str", lambda: _env.APP_NAME, "branding",
                  "Island name",
@@ -352,5 +365,6 @@ async def describe() -> list[dict[str, Any]]:
             "min": spec.min,
             "max": spec.max,
             "choices": list(spec.choices) if spec.choices else None,
+            "editor": spec.editor,
         })
     return out
