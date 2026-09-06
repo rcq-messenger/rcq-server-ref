@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me-in-prod"
     JWT_ALG: str = "HS256"
     JWT_TTL_SECONDS: int = 60 * 60 * 24 * 30
+    #: The island's own ceiling on minting identities, independent of who asks.
+    #: Far above real life (the busiest minute in the flagship's history outside
+    #: a scripted flood was twelve) and settable because a test, a migration or
+    #: an operator running an onboarding day legitimately needs more.
+    REGISTER_CEILING_PER_MINUTE: int = 40
+    REGISTER_CEILING_PER_HOUR: int = 400
+
     UIN_MIN: int = 100_000
     UIN_MAX: int = 999_999_999
 

@@ -127,6 +127,13 @@ async def uin_is_taken(
 
 #: Numbers short enough to be worth something on their own. Six digits and
 #: below: 999 three-digit numbers exist in the whole world and never more.
+#: ⚠ Six for now. Founder asked on 2026-09-06 for EIGHT, so that only a
+#: nine-digit number is free and everything shorter is sold. One character, and
+#: the pricing side of it is already built (`price_length`) — but it also flips
+#: seven- and eight-digit numbers from LOANS into PROPERTY: `routers/migrate.py`
+#: keeps a scarce number in its holder's collection when they step off it, so
+#: that stock would only ever shrink. Waiting on him rather than shipping the
+#: consequence quietly.
 RESERVED_MAX_LEN = 6
 
 #: The shapes people actually ask for. Kept deliberately small and readable
@@ -153,6 +160,39 @@ _PATTERNS = (
 
 #: A run of one digit long enough to be the whole point of the number.
 _RUN = re.compile(r"(\d)\1{3,}")
+
+
+def price_length(uin: int) -> int:
+    """The digit count this number is PRICED at, which is not always its own.
+
+    The ladder is keyed by length because length is what makes a number scarce
+    — and then there are eight-digit numbers people want more than most
+    five-digit ones. 777000777 sold at its own length would go for a dollar
+    ninety-nine. So a number that reads as chosen rather than issued is priced
+    at a shorter tier, and the same arithmetic runs in the till (`uins.js`,
+    `priceLength`): the island quotes and the till charges, and if the two
+    disagree a customer is shown one price and billed another.
+
+    Tiers, deliberately few:
+      * two different digits or fewer -> priced as three (the trophy tier)
+      * a palindrome, a run of four, or three different digits -> as four
+      * four different digits in a short number -> as five
+
+    Never more expensive than its own length would already be, so this only
+    ever moves a number UP the ladder.
+    """
+    s = str(uin)
+    n = len(s)
+    distinct = len(set(s))
+    if distinct <= 2:
+        tier = 3
+    elif distinct <= 3 or s == s[::-1] or _RUN.search(s) or any(p.search(s) for p in _PATTERNS):
+        tier = 4
+    elif distinct <= 4 and n <= 7:
+        tier = 5
+    else:
+        tier = n
+    return min(n, tier)
 
 
 def is_reserved_uin(uin: int) -> bool:

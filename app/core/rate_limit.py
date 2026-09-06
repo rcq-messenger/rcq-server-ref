@@ -418,12 +418,26 @@ def rate_limit(
 # island's whole history outside that flood was 12 registrations, and the
 # busiest ARTICLE day was about 40 in a day. 40/minute and 400/hour leave every
 # honest spike untouched and turn a flood into a trickle nobody notices.
-def island_ceiling(rule: str, per_minute: int, per_hour: int) -> Callable:
-    """A cap on the whole island, not on one caller. Fails closed."""
+def island_ceiling(
+    rule: str,
+    per_minute: int | Callable[[], int],
+    per_hour: int | Callable[[], int],
+) -> Callable:
+    """A cap on the whole island, not on one caller. Fails closed.
+
+    The limits may be callables, because a dependency is built once at import
+    and the number behind it can change afterwards: an operator raising the
+    ceiling from settings, or a test that legitimately registers a hundred
+    accounts in a minute and would otherwise be refused by the island's own
+    protection.
+    """
+
+    def _limit(v: int | Callable[[], int]) -> int:
+        return int(v() if callable(v) else v)
 
     async def _dep(request: Request) -> None:
         now = time.time()
-        for window, limit in ((60, per_minute), (3600, per_hour)):
+        for window, limit in ((60, _limit(per_minute)), (3600, _limit(per_hour))):
             key = f"rl:ceiling:{rule}:{window}"
             try:
                 redis = await get_redis()

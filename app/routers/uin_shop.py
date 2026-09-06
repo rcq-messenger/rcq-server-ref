@@ -56,7 +56,7 @@ from app.models.user import User
 from app.routers.migrate import _perform_migration
 from app.services import uin_voucher
 from app.services import server_settings
-from app.services.uin import is_reserved_uin, uin_is_taken
+from app.services.uin import is_reserved_uin, price_length, uin_is_taken
 
 log = logging.getLogger(__name__)
 
@@ -234,7 +234,7 @@ async def quote(
     # ⚠ `.get`, not `[...]`. The ladder is the operator's now, and a length
     # they left out is one they do not sell: an index would answer 500 to a
     # perfectly reasonable question about a number nobody is selling.
-    cents = (await _prices()).get(length)
+    cents = (await _prices()).get(price_length(body.uin))
     if cents is None:
         return QuoteOut(uin=body.uin, length=length, available=False,
                         price_cents=None, price_display=None, reason="not_for_sale")
@@ -648,7 +648,7 @@ async def payout_target(
                                seller_uin=int(listing.seller_uin))
 
     length = _length(uin)
-    cents = (await _prices()).get(length)
+    cents = (await _prices()).get(price_length(uin))
     if cents is None or length < MIN_SALE_LEN or not is_reserved_uin(uin):
         # Ordinary space is free and three digits are not sold at all. Either
         # way there is no invoice to write, and saying so is better than
@@ -736,7 +736,7 @@ async def suggestions(
             continue
         if await uin_is_taken(db, candidate):
             continue
-        cents = (await _prices()).get(length)
+        cents = (await _prices()).get(price_length(candidate))
         if cents is None:
             continue
         out.append(SuggestionOut(

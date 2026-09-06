@@ -289,7 +289,11 @@ async def register_challenge(body: RegisterChallengeIn) -> RegisterChallengeOut:
     dependencies=[
         Depends(rate_limit("auth_register", 20, 3600, fail_closed=True)),
         Depends(rate_limit("auth_register_net", 60, 3600, fail_closed=True, by_subnet=True)),
-        Depends(island_ceiling("auth_register", 40, 400)),
+        Depends(island_ceiling(
+            "auth_register",
+            lambda: settings.REGISTER_CEILING_PER_MINUTE,
+            lambda: settings.REGISTER_CEILING_PER_HOUR,
+        )),
     ],
 )
 async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
