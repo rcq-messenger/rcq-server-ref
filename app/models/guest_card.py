@@ -101,5 +101,10 @@ class GuestCard(Base):
     last_used_on: Mapped[date | None] = mapped_column(Date, nullable=True)
     #: Revoked cards are KEPT, not deleted: a revoked row is what makes the
     #: refusal instant and what stops the same card being re-registered by
-    #: somebody who kept a copy. They are swept by age elsewhere.
+    #: somebody who kept a copy.
+    #:
+    #: ⚠ They are removed with their owner, through `PER_UIN_COLUMNS`, and by
+    #: nothing else. An earlier draft of this comment claimed an age sweep that
+    #: does not exist, which is worse than no comment: it invites the next
+    #: reader to assume the table is bounded when it is not.
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

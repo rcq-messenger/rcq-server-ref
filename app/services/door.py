@@ -18,12 +18,21 @@ things and the wrong answer is invisible in a smoke test:
 The resolution is not a middle setting, it is a distinction between two shapes
 of request:
 
-  POINT   "give me the key for number N", one number, named by the caller.
-          A resident may. This is messaging a colleague.
-  LIST    a search result, a lookup of many, a directory page.
-          Nobody may, ever, on a closed island. A list is a harvest, and the
-          harvest is the attack. Lists keep their nicknames and avatars and
-          lose the three key fields.
+  POINT      "give me the key for number N", one number, named by the caller.
+             A resident may. This is messaging a colleague.
+  DISCOVERY  a search result, a lookup of arbitrary numbers, a directory page.
+             Nobody may, ever, on a closed island. Bulk IS the attack. These
+             keep their nicknames and avatars and lose the three key fields.
+
+⚠⚠ AND THE DISTINCTION IS NOT "point versus list", which is where the first
+draft of this file was wrong and would have taken the island down. `GET
+/contacts` is a list. A group roster is a list. Both CARRY the relationship
+rather than search for one: your contacts are people you already added, a
+roster is a room you are already in. Strip those and every existing
+conversation stops sending at once, and group messaging does not degrade but
+stops dead, because `POST /messages/group-sealed` wants one ciphertext per
+member and a roster without keys cannot produce them. The line is between a
+list that ANSWERS a relationship and a list that SEARCHES for one.
 
 A stranger holds neither, and gets in with a GUEST CARD instead: 32 bytes the
 resident generated and handed out themselves (models/guest_card.py). That is
@@ -52,13 +61,23 @@ async def island_is_closed() -> bool:
     return bool(await server_settings.get("closed_island"))
 
 
-def strip_keys_from_lists(closed: bool) -> bool:
-    """True when a LIST response must not carry identity/signing keys.
+def strip_keys_from_discovery(closed: bool) -> bool:
+    """True when a DISCOVERY response must not carry identity/signing keys.
 
-    Deliberately not a per-caller decision. On a closed island a list is never
-    a legitimate way to obtain a sealing key, for anybody, including a resident
-    in good standing: the one and only thing a list adds over a point lookup is
-    doing it in bulk, and bulk is the whole of the attack.
+    Discovery is `/users/search` and a lookup of numbers the caller merely
+    named: lists that hand back people the caller has no relationship with.
+    Deliberately not a per-caller decision, because the one thing discovery
+    adds over a point lookup is doing it in bulk, and bulk is the attack.
+
+    ⚠ NOT for `/contacts`, group rosters, or a roulette pairing. Those answer a
+    relationship instead of searching for one, and stripping them stops every
+    conversation on the island at once. See the module docstring.
+
+    ⚠ Stripping is not refusing. `/users/search` is the ONLY way to add a
+    same-island contact in the web (pages/AddContact.tsx) and the only thing
+    behind `rcq find`, and the rows there render a nickname, a badge and a
+    number and never touch the key. Refuse the rows and a closed island can
+    never gain a contact; strip the keys and nobody notices.
     """
     return closed
 
@@ -97,6 +116,30 @@ async def redeem_card(db: AsyncSession, *, target_uin: int, raw: str | None) -> 
             update(GuestCard).where(GuestCard.id == row.id).values(last_used_on=today)
         )
     return True
+
+
+#: ⚠⚠ DOORS 2, 3 AND 7 ARE DELIBERATELY NOT GATED, and this is a finding rather
+#: than an omission. `/keys/{uin}/bundle`, `/keys/{uin}/devices/{id}/bundle` and
+#: `/keys/{uin}/devices` have no refusal code left to use:
+#:
+#:   * 404 already means something else there. `routers/keys.py:418` returns it
+#:     for "multi-device: v=1 only", and its own comment says senders treat a
+#:     404 as the signal to fall back. A byte-identical 404 would not refuse
+#:     anybody, it would quietly downgrade their cryptography.
+#:   * 403 is worse than useless: all three clients answer it by RETRYING THE
+#:     SAME REQUEST WITH THE SESSION TOKEN (RcqApi.kt:419+431,
+#:     SignalSession.swift:379, signal-device.ts:1008). A closed island
+#:     refusing an anonymous fetch therefore gets the request back
+#:     authenticated, `may_fetch_key` sees a resident, and lets it through. The
+#:     gate removes itself, and on the way it drags every bundle fetch back
+#:     onto the authenticated path, re-linking sender to recipient and undoing
+#:     the point of anonymous key fetches.
+#:
+#: They also protect nothing on their own: a v=1 envelope is sealed with the
+#: key from door 6, so gating 2/3/7 while 6 is open buys forward secrecy for an
+#: attacker and nothing for the island. The gate lives on door 6 (same island)
+#: and door 1 (another island), and doors 2/3/7 answer exactly what door 6
+#: would have answered for the same target.
 
 
 async def may_fetch_key(

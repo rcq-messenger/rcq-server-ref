@@ -34,7 +34,7 @@ from app.models.user import User  # noqa: E402
 from app.services.door import (  # noqa: E402
     may_fetch_key,
     redeem_card,
-    strip_keys_from_lists,
+    strip_keys_from_discovery,
 )
 
 RESIDENT = 500100100
@@ -78,8 +78,8 @@ async def main() -> None:
             await may_fetch_key(db, target_uin=RESIDENT, caller_uin=None, card=None, closed=False),
         )
         check(
-            "an open island puts keys in lists too",
-            strip_keys_from_lists(False) is False,
+            "an open island puts keys in discovery results too",
+            strip_keys_from_discovery(False) is False,
         )
 
         # ── the closed island ──────────────────────────────────────────────
@@ -102,8 +102,9 @@ async def main() -> None:
 
         # ⚠ THE ONE THAT MATTERS: the colleague rule must not become a harvest.
         check(
-            "a closed island never puts keys in a list, not even for a resident",
-            strip_keys_from_lists(True) is True,
+            "a closed island never puts keys in a DISCOVERY result, not even "
+            "for a resident",
+            strip_keys_from_discovery(True) is True,
         )
 
         # ── the guest card ─────────────────────────────────────────────────

@@ -24,6 +24,7 @@ the schema and the row bookkeeping, not the routing.
 Run: cd backend && PYTHONPATH=. .venv/bin/python test_dead_weight_local.py
 """
 import asyncio
+from datetime import datetime, timezone
 import os
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_dead_weight.db"
@@ -88,11 +89,17 @@ _LEGACY_SHAPES: dict[str, tuple[str, str]] = {
             contact_uin BIGINT NOT NULL, blocked BOOLEAN NOT NULL,
             created_at DATETIME NOT NULL,
             CONSTRAINT uq_owner_contact UNIQUE (owner_uin, contact_uin))"""),
-    "group_members": ("joined_at", """
-        CREATE TABLE group_members (
-            id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL, uin BIGINT NOT NULL,
-            role VARCHAR(16) NOT NULL, permissions VARCHAR(128) NOT NULL DEFAULT '',
-            joined_at DATETIME NOT NULL)"""),
+    # ⚠ `group_members.joined_at` USED to be here, as a column the cut of
+    # 2026-08-22 deleted. It came BACK on 31.08 (#833) for the anti-spam floor,
+    # written only when a room arms the floor and floored to the day, so it is
+    # a live column now and `init_db` is right to keep it. The entry is gone
+    # rather than commented out, because a legacy shape whose column is
+    # supposed to survive tests nothing.
+    #
+    # This file asserted the opposite for a week and nobody saw it, because the
+    # setup below inserted a member without the column into a NOT NULL table
+    # and the whole run died before the first check. A test that cannot start
+    # reports nothing, which is indistinguishable from a test that passes.
     "user_capabilities": ("updated_at", """
         CREATE TABLE user_capabilities (
             uin BIGINT NOT NULL PRIMARY KEY, sender_keys BOOLEAN NOT NULL,
@@ -111,15 +118,21 @@ _UIN_COLUMN_ALLOWLIST: dict[str, str] = {
     "owned_uins.uin": "the number HELD, not its holder; the holder is owner_uin, which is listed",
     "invites.uin": "a reserved vanity number, not an owner. Known gap in the audit "
                    "(burn strands an unspent invite); the invite sweep owns it, not this list",
-    "sites.owner_uin": "handled by `_move_sites`, not by a column sweep: an ordinary name "
-                       "follows its owner and a name that IS the old number is deleted, "
-                       "because that address is a claim about who is behind it",
-    "uin_holds.uin": "the number being PAID FOR, not its buyer. Nobody holds it yet - a hold "
-                     "is only ever placed on a number `uin_is_taken` says is free - so there is "
-                     "no person here to follow, and the hold expires on its own clock",
     "report_messages.author_uin": "cascades off reports.id, which IS listed. Re-key leaves the "
                                   "old number on the thread turns, which only the admin console "
                                   "sees; noted rather than fixed here",
+    # ⚠ The three below appeared after this list was written, and this file
+    # stopped running on 31.08 (see the joined_at note), so nothing said so.
+    # Each is genuinely handled; none of them is handled by PER_UIN_COLUMNS,
+    # which is why the check could not see it.
+    "sites.owner_uin": "moved by `_move_sites`, not by PER_UIN_COLUMNS, because a site whose "
+                       "NAME is the old number has to be deleted rather than re-keyed. See "
+                       "uin_rows.py:229 — this is the same 'in no inventory at all' bug this "
+                       "check exists to catch, already found and already fixed by hand",
+    "uin_holds.uin": "the number BEING HELD while somebody pays for it, not its holder. Same "
+                     "shape as owned_uins.uin above; the holder is the purchase row",
+    "uin_listings.uin": "the number ON SALE, not its seller. The seller is seller_uin, which "
+                        "IS in PER_UIN_COLUMNS",
 }
 
 
@@ -206,7 +219,9 @@ async def main() -> None:
         "users": ("trade_policy", "active_days", "last_active_day",
                   "reputation", "reputation_visibility"),
         "groups": ("entry_price_tokens", "pinned_by"),
-        "group_members": ("joined_at",),
+        # ⚠ `group_members.joined_at` is deliberately absent: it came back on
+        # 31.08 for the anti-spam floor and IS mapped again. See the note in
+        # _LEGACY_SHAPES.
         "contacts": ("created_at",),
         "user_capabilities": ("updated_at",),
         "audio_room_memberships": ("joined_at",),
@@ -227,9 +242,18 @@ async def main() -> None:
         db.add(g)
         await db.flush()
         # Insert order IS the join order, which is the whole argument for `id`.
+        #
+        # ⚠ `joined_at` is passed EXPLICITLY, and it has to be. This test builds
+        # `group_members` from the LEGACY ddl above, where the column is NOT
+        # NULL, precisely so it can prove `init_db` refuses to drop it. The ORM
+        # has mapped the column as nullable since it came back on 31.08 for the
+        # anti-spam floor, so an insert that omits it sends NULL into a NOT NULL
+        # column and the whole file died on setup — the test stopped checking
+        # anything at all, quietly, the day the column returned.
         for uin in (2001, 2002, 2003):
             db.add(GroupMember(group_id=g.id, uin=uin,
-                               role="owner" if uin == 2001 else "member"))
+                               role="owner" if uin == 2001 else "member",
+                               joined_at=datetime(2026, 8, 27, tzinfo=timezone.utc)))
         await db.commit()
 
         oldest = await db.scalar(

@@ -121,6 +121,7 @@ from app.models.mailbox_seq import MailboxSeq
 from app.models.message import OfflineMessage
 from app.models.owned_uin import OwnedUin
 from app.models.uin_listing import UinListing
+from app.models.guest_card import GuestCard
 from app.models.queue_cursor import QueueCursor
 from app.models.report import Report
 from app.models.vault import VaultSlot
@@ -194,6 +195,22 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     # burning account. Re-keying it would move somebody else's promise, and
     # deleting it on burn would cancel a reservation the operator made.
     (Invite, Invite.created_by),
+    # ⚠⚠ The guest cards a resident of a CLOSED island handed out. Being in no
+    # inventory cost two things at once, and both were silent.
+    #
+    # Migration: `redeem_card` matches on `owner_uin`, so buying a short number
+    # made every card the person had ever given out stop opening their door —
+    # under a shop that advertises "contacts, groups, profile and history move
+    # with you", and with no error anywhere, because the caller simply looks
+    # like a stranger again.
+    #
+    # Burn and recycle: `uin_epochs` exists precisely so a number can be handed
+    # to somebody else later. Left behind, a card row keeps `revoked = false`
+    # against a number whose owner is gone, so the stranger holding it opens
+    # the door of WHOEVER GETS THAT NUMBER NEXT. That is the same class of bug
+    # `invites.code` had until 2026-08-22, cited in this model's own docstring,
+    # arriving from the other direction.
+    (GuestCard, GuestCard.owner_uin),
 ]
 
 # Rows that must NOT ride along to the new UIN — they assert something about
