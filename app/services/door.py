@@ -159,9 +159,19 @@ async def redeem_card(db: AsyncSession, *, target_uin: int, raw: str | None) -> 
 #:
 #: They also protect nothing on their own: a v=1 envelope is sealed with the
 #: key from door 6, so gating 2/3/7 while 6 is open buys forward secrecy for an
-#: attacker and nothing for the island. The gate lives on door 6 (same island)
-#: and door 1 (another island), and doors 2/3/7 answer exactly what door 6
-#: would have answered for the same target.
+#: attacker and nothing for the island. The gate belongs on door 6 (same
+#: island) and door 1 (another island), and doors 2/3/7 answer exactly what
+#: door 6 would have answered for the same target.
+#:
+#: ⚠⚠ AS OF TODAY ONLY DOOR 6 IS ACTUALLY GATED. Door 1,
+#: `/federation/keys/{uin}`, still hands the identity key to any browser with
+#: no account at all, so a closed island is closed from the inside and open
+#: from the outside. This comment claimed both were done and it was wrong.
+#:
+#: It is left open ON PURPOSE until the clients ship, and the order cannot be
+#: reversed: gating door 1 first would cut every cross-island conversation on
+#: every island, because no released client presents a card there yet. Clients
+#: first, then this.
 
 
 async def may_fetch_key(
