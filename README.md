@@ -288,6 +288,23 @@ the move to an authority later:
 [`docs/tls-without-a-ca.md`](docs/tls-without-a-ca.md). The trust model is
 one paragraph in [SECURITY.md](SECURITY.md#islands-trusted-by-fingerprint).
 
+## The `test_*_local.py` files
+
+The fifty-odd files in the root are the server's own tests, and they are here
+on purpose: a reference implementation whose claims about its own behaviour
+cannot be run is a claim on trust. Each one stands alone against a throwaway
+SQLite file, needs no network and no Docker, and is named after the thing it
+pins.
+
+```bash
+python3 test_uin_hold_local.py       # one of them
+for f in test_*_local.py; do python3 "$f" || break; done
+```
+
+They leave a `.db` behind, which is why `*.db` is ignored. If you are reading
+this repository to decide whether to trust it, these are the files to read
+first: they say what the server refuses to do.
+
 ## What's intentionally NOT in this repo
 
 * **APNs `.p8` key** — Apple ties this to your own developer account,

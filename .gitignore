@@ -30,6 +30,12 @@ rcq.db-shm
 rcq.db-wal
 *.sqlite
 *.sqlite3
+# ⚠ Every SQLite file, not just the server's own. The local test scripts each
+# leave one behind (test_uin_hold.db and friends), and on 2026-09-03 a `git add
+# -A` in a DOCS commit carried three of them into this public repository as
+# binary blobs. They held only synthetic rows, but a test artefact in a
+# reference implementation reads as something a self-hoster is meant to keep.
+*.db
 
 # Uploads (per-deployment data, never committed)
 media/
