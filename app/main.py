@@ -19,6 +19,7 @@ from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth
 from app.routers import random as random_chat
 from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
+from app.services.dead_account_sweep import dead_account_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
 
 
@@ -193,6 +194,8 @@ async def lifespan(_: FastAPI):
         _log.exception("[boot] broker transport set unavailable")
     expire_task = asyncio.create_task(random_chat.expire_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
+    # Accounts minted and never used — see dead_account_sweep's docstring.
+    dead_account_sweep_task = asyncio.create_task(dead_account_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.
     evidence_sweep_task = asyncio.create_task(evidence_sweep_loop())
     # Five-minute online samples for the hourly activity history. Every worker
@@ -253,6 +256,7 @@ async def lifespan(_: FastAPI):
     finally:
         expire_task.cancel()
         offline_queue_sweep_task.cancel()
+        dead_account_sweep_task.cancel()
         evidence_sweep_task.cancel()
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()

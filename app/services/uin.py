@@ -127,13 +127,13 @@ async def uin_is_taken(
 
 #: Numbers short enough to be worth something on their own. Six digits and
 #: below: 999 three-digit numbers exist in the whole world and never more.
-#: ⚠ Six for now. Founder asked on 2026-09-06 for EIGHT, so that only a
-#: nine-digit number is free and everything shorter is sold. One character, and
-#: the pricing side of it is already built (`price_length`) — but it also flips
-#: seven- and eight-digit numbers from LOANS into PROPERTY: `routers/migrate.py`
-#: keeps a scarce number in its holder's collection when they step off it, so
-#: that stock would only ever shrink. Waiting on him rather than shipping the
-#: consequence quietly.
+#: ⚠ Six, and it stays six (founder, 2026-09-06). Making it eight would mean
+#: only nine-digit numbers are free, which he considered and declined: the
+#: threshold also flips seven- and eight-digit numbers from LOANS into
+#: PROPERTY, because `routers/migrate.py` keeps a scarce number in its holder's
+#: collection when they step off it, so that stock would only ever shrink.
+#: The pricing half of the idea shipped anyway — see `price_length`, which
+#: charges a pretty number at a shorter tier than its own length.
 RESERVED_MAX_LEN = 6
 
 #: The shapes people actually ask for. Kept deliberately small and readable
