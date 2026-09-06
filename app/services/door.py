@@ -42,11 +42,33 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
+from fastapi import Request
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.guest_card import GuestCard, hash_card
 from app.models.user import User
+
+
+#: The header a caller presents a guest card in.
+#:
+#: ⚠ A HEADER, not a query parameter, and this is not a style choice. A card is
+#: a live credential: in a query string it lands in the island's access log, in
+#: Caddy's, in any middlebox between them, and in a Referer. That is exactly
+#: how session tokens leaked into journald until 22.08 — 816 distinct tokens
+#: over 449 accounts, 815 of them still valid — and a card has no expiry at all.
+GUEST_CARD_HEADER = "X-RCQ-Guest-Card"
+
+
+def card_from(request: Request) -> str | None:
+    """The card a caller presented, if any. Never logged, never echoed."""
+    raw = request.headers.get(GUEST_CARD_HEADER)
+    if not raw:
+        return None
+    raw = raw.strip()
+    # A card is `secrets.token_urlsafe(32)`, so ~43 characters. Anything wildly
+    # longer is not a card and must not become a database lookup.
+    return raw if 0 < len(raw) <= 128 else None
 
 
 async def island_is_closed() -> bool:

@@ -5,7 +5,7 @@ import hmac
 import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import String, and_, case, cast, delete, false, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -20,6 +20,7 @@ from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen
+from app.services import door
 from app.services.connection_manager import manager
 from app.services.contact_source import mark_vault_device, unmark_vault_device
 
@@ -258,7 +259,14 @@ class PublicUser(BaseModel):
         )
 
     @classmethod
-    def from_model(cls, u: User, *, viewer_uin: int | None = None, is_contact: bool = False) -> "PublicUser":
+    def from_model(
+        cls,
+        u: User,
+        *,
+        viewer_uin: int | None = None,
+        is_contact: bool = False,
+        with_keys: bool = True,
+    ) -> "PublicUser":
         # Legacy entry point — used by /users/search where we can't
         # cheaply gate every result against the contact graph. Search
         # results never include last_seen; viewers see the precise
@@ -299,9 +307,15 @@ class PublicUser(BaseModel):
             homepage=u.homepage if visible else None,
             status=u.status,
             status_message=u.status_message if visible else None,
-            identity_key=u.identity_key,
-            signing_key=u.signing_key,
-            signal_identity_key=u.signal_identity_key,
+            # ⚠ Blanked on a closed island: this builder serves DISCOVERY
+            # (/users/search), and a search result is the one place a key is
+            # handed to somebody with no relationship to its owner, in bulk.
+            # The row keeps everything a person needs to recognise somebody and
+            # press Add; it loses the three fields that let a stranger seal an
+            # envelope to them.
+            identity_key=u.identity_key if with_keys else "",
+            signing_key=u.signing_key if with_keys else None,
+            signal_identity_key=u.signal_identity_key if with_keys else None,
             signal_registration_id=u.signal_registration_id,
         )
 
@@ -564,8 +578,19 @@ async def search(
                 )
             ).all()
         )
+    closed = door.strip_keys_from_discovery(await door.island_is_closed())
     return [
-        PublicUser.from_model(u, viewer_uin=me, is_contact=u.uin in contact_set)
+        PublicUser.from_model(
+            u, viewer_uin=me, is_contact=u.uin in contact_set,
+            # ⚠ SEARCH IS DISCOVERY: on a closed island it keeps the nickname,
+            # the badge and the number and loses the three key fields. Not
+            # refused — stripped. Refusing the rows would mean a closed island
+            # can never gain a same-island contact at all, because this
+            # endpoint is the only add path the web has (pages/AddContact.tsx)
+            # and the only thing behind `rcq find`; and the rows never touch
+            # the key anyway, they render a name and send back a number.
+            with_keys=not closed,
+        )
         for u in rows
     ]
 
@@ -868,11 +893,28 @@ async def lookup(
 )
 async def info(
     uin: int,
+    request: Request,
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> PublicUser:
     user = await db.get(User, uin)
     if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # ⚠⚠ THE CLOSED-ISLAND DOOR, and the ONE place the gate lives for
+    # same-island lookups. Everything about the refusal is deliberate:
+    #
+    #   * the SAME 404 and the same detail string as "no such user" above,
+    #     byte for byte. A distinguishable refusal turns a closed island into a
+    #     directory: ask about a number, learn whether it exists. We sell short
+    #     numbers, so that directory has a price list attached.
+    #   * AFTER the existence check, not before, so the two paths cost the same
+    #     lookup and the timing does not answer what the status code refuses to.
+    #   * a resident asking about ONE named number passes (services/door.py
+    #     explains why that is safe only because discovery lists are stripped),
+    #     and a stranger passes only with a card the target handed out.
+    if not await door.may_fetch_key(
+        db, target_uin=uin, caller_uin=me, card=door.card_from(request)
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     is_contact: bool
     if me == user.uin:
