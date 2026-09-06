@@ -133,6 +133,15 @@ RESERVED_MAX_LEN = 6
 #: rather than clever: every extra rule here takes numbers out of circulation
 #: for ordinary users, and a number nobody would pay for is a number somebody
 #: should just be given.
+#:
+#: ⚠⚠ These are exact shapes, and exact shapes are a losing game. Measured on
+#: prod 2026-09-06: one account held six numbers taken through the FREE door —
+#: 777000777, 1001010, 3003030, 5005050, 101010100, 1000500 — and every one of
+#: them passed as ordinary, because a repeated-block rule only matches when the
+#: block fills the WHOLE number. Two more accounts were doing the same with
+#: palindromes (1020102, 1030103, 10200102). The rules below are kept for what
+#: they read clearly, and the general tests in `is_reserved_uin` are what
+#: actually holds the door.
 _PATTERNS = (
     re.compile(r"^(\d)\1+$"),          # 4444, 777777777
     re.compile(r"^(\d\d)\1+$"),        # 1212, 505050
@@ -141,6 +150,9 @@ _PATTERNS = (
     re.compile(r"^9?876543210*$"),     # and down
     re.compile(r"\d0{4,}$"),           # 120000000
 )
+
+#: A run of one digit long enough to be the whole point of the number.
+_RUN = re.compile(r"(\d)\1{3,}")
 
 
 def is_reserved_uin(uin: int) -> bool:
@@ -170,6 +182,20 @@ def is_reserved_uin(uin: int) -> bool:
         return False
     s = str(uin)
     if len(s) <= RESERVED_MAX_LEN:
+        return True
+    # How few different digits it uses. This is the one test that generalises:
+    # everything people actually farmed here was low-entropy rather than any
+    # particular shape, and counting distinct digits catches 777000777 and
+    # 3003030 without anybody having to think of them first.
+    distinct = len(set(s))
+    if distinct <= 3:
+        return True
+    if distinct <= 4 and len(s) <= 7:
+        return True
+    # Reads the same forwards and backwards.
+    if s == s[::-1]:
+        return True
+    if _RUN.search(s):
         return True
     return any(p.search(s) for p in _PATTERNS)
 
