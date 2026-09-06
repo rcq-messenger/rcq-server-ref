@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.rate_limit import rate_limit
+from app.core.rate_limit import rate_limit, island_ceiling
 from base64 import b64decode
 
 from cryptography.exceptions import InvalidSignature
@@ -245,7 +245,10 @@ class RegisterChallengeOut(BaseModel):
 @router.post(
     "/register/challenge",
     response_model=RegisterChallengeOut,
-    dependencies=[Depends(rate_limit("auth_register_challenge", 60, 3600))],
+    dependencies=[
+        Depends(rate_limit("auth_register_challenge", 60, 3600, fail_closed=True)),
+        Depends(rate_limit("auth_register_challenge_net", 240, 3600, fail_closed=True, by_subnet=True)),
+    ],
 )
 async def register_challenge(body: RegisterChallengeIn) -> RegisterChallengeOut:
     """A short-lived nonce to sign at registration, proving the caller holds the
@@ -278,7 +281,16 @@ async def register_challenge(body: RegisterChallengeIn) -> RegisterChallengeOut:
     # users. Failing a legitimate registration is a worse outcome than letting
     # someone create a few junk accounts, which invite-only islands gate
     # anyway. Do not tighten this without checking that trade again.
-    dependencies=[Depends(rate_limit("auth_register", 20, 3600))],
+    # Three caps, because 2026-09-01 showed that one is not a cap. Per address
+    # as before; per /24 or /64, because 28 addresses inside one rented machine
+    # is not 28 actors; and the island's own ceiling, which is the only one a
+    # rotating source cannot walk around. All three fail closed: an account is
+    # minted here, and minting must stop when the bookkeeping stops.
+    dependencies=[
+        Depends(rate_limit("auth_register", 20, 3600, fail_closed=True)),
+        Depends(rate_limit("auth_register_net", 60, 3600, fail_closed=True, by_subnet=True)),
+        Depends(island_ceiling("auth_register", 40, 400)),
+    ],
 )
 async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
     # An account whose keys are not keys is not an account: nobody can seal to

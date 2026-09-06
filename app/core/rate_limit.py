@@ -40,6 +40,9 @@ import hashlib
 import hmac
 import logging
 import os
+from collections import defaultdict, deque
+
+import ipaddress
 import time
 from typing import Callable
 
@@ -285,7 +288,66 @@ async def enforce_cost_budget(
     )
 
 
-def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
+# ── the backstop for when Redis is not there ─────────────────────────────
+#
+# ⚠⚠ WHY THIS EXISTS. On 2026-09-01, 552 accounts were registered in three
+# minutes (211 in one of them) through a route carrying
+# `rate_limit("auth_register", 20, 3600)`. The limiter did what it was told to:
+# every Redis error was fail-soft, so an outage — or anything that made the
+# eval throw — turned the cap off entirely. A messenger that mints identities
+# cannot have its only cap live in another process.
+#
+# So minting routes now fail CLOSED, and "closed" does not mean "refuse
+# everyone": it means fall back to this in-process window, which needs nothing
+# outside the worker. It is deliberately coarse. With N uvicorn workers the
+# effective cap is N times the number, and that is fine — the point is to turn
+# an unbounded flood into a bounded trickle, not to be exact.
+_LOCAL_HITS: dict[str, deque[float]] = defaultdict(deque)
+_LOCAL_MAX_KEYS = 20_000
+
+
+def _local_allow(key: str, limit: int, window_seconds: int, now: float) -> tuple[bool, int]:
+    """Sliding window in this process. Returns (allowed, retry_after)."""
+    if len(_LOCAL_HITS) > _LOCAL_MAX_KEYS:
+        # A flood from rotating addresses would otherwise grow this map without
+        # end. Dropping it costs one window of accuracy and no correctness: the
+        # ceiling below is what actually bounds the island.
+        _LOCAL_HITS.clear()
+    hits = _LOCAL_HITS[key]
+    cutoff = now - window_seconds
+    while hits and hits[0] < cutoff:
+        hits.popleft()
+    if len(hits) >= limit:
+        return False, max(1, int(hits[0] + window_seconds - now))
+    hits.append(now)
+    return True, 0
+
+
+def _subnet_of(ip: str) -> str:
+    """The block an address sits in: /24 for IPv4, /64 for IPv6.
+
+    One address is the wrong unit to price a flood in. 552 registrations at 20
+    per address per hour is 28 addresses, which is a morning's work with any
+    proxy pool; 28 addresses inside one /24 is one rented machine. Keyed per
+    subnet the same flood needs 28 genuinely different networks.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 4:
+        return str(ipaddress.ip_network(f"{addr}/24", strict=False).network_address) + "/24"
+    return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address) + "/64"
+
+
+def rate_limit(
+    rule: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    fail_closed: bool = False,
+    by_subnet: bool = False,
+) -> Callable:
     """Build a FastAPI dependency that enforces `limit` calls per
     `window_seconds` keyed by (rule, identity).
 
@@ -304,7 +366,10 @@ def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
         request: Request,
         creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     ) -> None:
-        key = f"rl:{rule}:{bucket_name(_identity(request, creds))}"
+        identity = _identity(request, creds)
+        if by_subnet and identity.startswith("ip:"):
+            identity = f"net:{_subnet_of(identity[3:])}"
+        key = f"rl:{rule}:{bucket_name(identity)}"
         now = time.time()
         try:
             redis = await get_redis()
@@ -312,11 +377,22 @@ def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
                 _LIMITER_SCRIPT, 1, key, now, window_seconds, limit
             )
         except Exception as exc:  # noqa: BLE001
-            # Fail-soft: Redis hiccup shouldn't 429 a legit user. We
-            # log loudly so the outage is visible, but let the request
-            # through. Spammers won't notice the brief gap.
-            log.warning("[rate_limit] redis unavailable, allowing: %s", exc)
-            return
+            if not fail_closed:
+                # Fail-soft: Redis hiccup shouldn't 429 a legit user. We
+                # log loudly so the outage is visible, but let the request
+                # through. Spammers won't notice the brief gap.
+                log.warning("[rate_limit] redis unavailable, allowing: %s", exc)
+                return
+            # Fail-closed rules keep a cap without Redis, in this process.
+            log.warning("[rate_limit] redis unavailable, local window for %s: %s", rule, exc)
+            allowed, retry_after = _local_allow(key, limit, window_seconds, now)
+            if allowed:
+                return
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={"code": "rate_limited", "retry_after": retry_after},
+                headers={"Retry-After": str(retry_after)},
+            )
 
         accepted = int(result[0])
         if accepted == 1:
@@ -327,6 +403,46 @@ def rate_limit(rule: str, limit: int, window_seconds: int) -> Callable:
             detail={"code": "rate_limited", "retry_after": retry_after},
             headers={"Retry-After": str(retry_after)},
         )
+
+    return _dep
+
+
+# ── the island-wide ceiling ──────────────────────────────────────────────
+#
+# Per-identity limits price abuse for ONE actor. They say nothing about how
+# many identities may be minted in total, and that is the number that was
+# missing on 2026-09-01: whatever the source did with addresses, the island
+# itself had no opinion about 552 accounts in three minutes.
+#
+# The ceiling is deliberately far above real life. The busiest minute in the
+# island's whole history outside that flood was 12 registrations, and the
+# busiest ARTICLE day was about 40 in a day. 40/minute and 400/hour leave every
+# honest spike untouched and turn a flood into a trickle nobody notices.
+def island_ceiling(rule: str, per_minute: int, per_hour: int) -> Callable:
+    """A cap on the whole island, not on one caller. Fails closed."""
+
+    async def _dep(request: Request) -> None:
+        now = time.time()
+        for window, limit in ((60, per_minute), (3600, per_hour)):
+            key = f"rl:ceiling:{rule}:{window}"
+            try:
+                redis = await get_redis()
+                result = await redis.eval(_LIMITER_SCRIPT, 1, key, now, window, limit)
+                accepted = int(result[0])
+                retry_after = int(result[1]) if len(result) > 1 else 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[ceiling] redis unavailable, local window for %s: %s", rule, exc)
+                allowed, retry_after = _local_allow(key, limit, window, now)
+                accepted = 1 if allowed else 0
+            if accepted != 1:
+                # 503, not 429: nothing is wrong with THIS caller, the island
+                # is simply not minting right now. The client retries.
+                log.warning("[ceiling] %s hit the island cap (%s per %ss)", rule, limit, window)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"code": "island_busy", "retry_after": retry_after},
+                    headers={"Retry-After": str(retry_after)},
+                )
 
     return _dep
 
