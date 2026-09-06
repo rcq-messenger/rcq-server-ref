@@ -147,6 +147,19 @@ _reg(SettingSpec("uin_voucher_pubkey", "str",
                  "what lets the island believe a payment happened without ever "
                  "seeing one. Not a secret; the private half never leaves the till."))
 
+_reg(SettingSpec("badge_labels", "str", lambda: "", "branding",
+                 "Badge names and descriptions",
+                 'What your island calls its badges, as JSON keyed by kind: '
+                 '{"official": {"label": "Official", "description": "...", '
+                 '"color": "#3B9EE8"}}. Leave empty and the clients use their '
+                 'own translated defaults for the kinds they know. This is how '
+                 'a badge becomes YOUR badge: the kind is a slug the island '
+                 'chooses (a-z, digits, - and _, up to 16 characters), so an '
+                 'island can mint "resident", "founder" or anything else and '
+                 'name it here. A kind with no entry still renders — with the '
+                 'client default if it knows the slug, and as a plain mark from '
+                 'this island if it does not.'))
+
 _reg(SettingSpec("island_name", "str", lambda: _env.APP_NAME, "branding",
                  "Island name",
                  "What your island calls itself. Shown next to your logo "

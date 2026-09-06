@@ -14,6 +14,9 @@ to a value that keeps old clients working, and gate the new client-side
 feature behind the lookup.
 """
 
+import json
+import re
+import logging
 from fastapi import APIRouter, Header, status
 from fastapi.responses import Response as RawResponse
 from pydantic import BaseModel
@@ -147,6 +150,16 @@ class ServerCapabilities(BaseModel):
     media_max_blob_bytes: int = 0
 
 
+class BadgeText(BaseModel):
+    """What this island calls one of its badges."""
+
+    label: str = ""
+    description: str = ""
+    #: A hex colour, so an island can mint a kind the clients have never seen
+    #: and still have it look like something. Empty means "use your own".
+    color: str = ""
+
+
 class ServerInfo(BaseModel):
     name: str
     # Optional operator welcome / rules text ("" = none).
@@ -176,6 +189,53 @@ class ServerInfo(BaseModel):
     #      capability flags follow.
     logo_version: str = ""
     capabilities: ServerCapabilities
+    #: The island's own words for its badges, keyed by kind.
+    #:
+    #: ⚠ PUBLIC on purpose, and needed before any account exists: a client
+    #: draws a badge on a stranger's card and in a room's member list, both of
+    #: which happen before you have anything to do with this island. The kinds
+    #: themselves are an open dictionary, so an island can mint "resident" or
+    #: "founder"; a client that has never heard of the slug renders whatever is
+    #: here, and falls back to a plain mark from this island when it is empty.
+    badges: dict[str, BadgeText] = {}
+
+
+log = logging.getLogger(__name__)
+
+_BADGE_KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
+
+
+def _badge_texts(raw: str) -> dict[str, BadgeText]:
+    """Parse the operator's badge JSON, forgivingly.
+
+    Forgiving because this is on the path every client takes to draw anything,
+    and an operator's typo in one badge must not blank the island's name. A
+    value that will not parse is logged and dropped; the clients then use their
+    own defaults, which is exactly what happens on an island that never set it.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("badge_labels must be an object keyed by kind")
+        out: dict[str, BadgeText] = {}
+        for kind, value in parsed.items():
+            if not isinstance(kind, str) or not _BADGE_KIND_RE.match(kind):
+                continue
+            if isinstance(value, str):
+                out[kind] = BadgeText(label=value[:64])
+            elif isinstance(value, dict):
+                out[kind] = BadgeText(
+                    label=str(value.get("label") or "")[:64],
+                    description=str(value.get("description") or "")[:280],
+                    color=str(value.get("color") or "")[:16],
+                )
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[server-info] badge_labels is not usable (%s); clients will use their own", exc)
+        return {}
 
 
 @router.get("/info", response_model=ServerInfo)
@@ -185,6 +245,7 @@ async def server_info() -> ServerInfo:
         name=await server_settings.island_name(),
         welcome=eff["welcome_text"],
         logo_version=await island_logo.version(),
+        badges=_badge_texts(eff["badge_labels"]),
         capabilities=ServerCapabilities(
             # ⚠ From the console like every other capability on this reply.
             # It alone read the .env constant, so an operator who opened their
