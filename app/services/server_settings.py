@@ -75,6 +75,18 @@ _reg(SettingSpec("reports_enabled", "bool", lambda: True, "features", "Reports",
                  "already filed stay readable to both sides."))
 
 # ── Limits & policy
+_reg(SettingSpec("closed_island", "bool", lambda: False, "limits",
+                 "Closed island",
+                 "A closed island withholds the key needed to write to its "
+                 "residents. Knowing somebody's number stops being enough: a "
+                 "stranger needs a card the resident handed out themselves, in "
+                 "a shared contact link or inside a first message the resident "
+                 "sent. Residents still write to each other by number. "
+                 "\u26a0 Turn this on together with an entry policy, or you get "
+                 "an island anyone may join and nobody may write into. "
+                 "Refusals look exactly like \"no such number\", on purpose: a "
+                 "closed island must not become a directory for guessing which "
+                 "numbers exist."))
 _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY, "limits",
                  "Registration", "Who may create an account on this island.",
                  choices=("open", "invite")))
