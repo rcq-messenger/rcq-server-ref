@@ -15,7 +15,7 @@ from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, sites, uin_shop, users, vault, ws
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, sites, uin_shop, users, vault, ws, guest_cards
 from app.routers import random as random_chat
 from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
@@ -413,6 +413,7 @@ app.include_router(deposit_auth.router)
 app.include_router(groups.router)
 app.include_router(messages.router)
 app.include_router(keys.router)
+app.include_router(guest_cards.router)
 app.include_router(media.router)
 app.include_router(presence.router)
 app.include_router(random_chat.router, dependencies=[Depends(require_feature("random_enabled"))])
