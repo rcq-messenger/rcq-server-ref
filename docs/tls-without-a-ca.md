@@ -42,7 +42,20 @@ carry, so the island builds its own:
    ⚠ The `COMPOSE_FILE` line is what keeps a plain `docker compose up -d`,
    and `deploy/rcq-update.sh`, on the built image. Without it they put the
    stock image back without a word, and the next renewal fails.
-3. In `deploy/Caddyfile.compose`, uncomment the `tls { dns ... }` block in
+3. Copy the Caddyfile and edit the copy:
+
+   ```bash
+   cp deploy/Caddyfile.compose deploy/Caddyfile.local
+   echo "RCQ_CADDYFILE=./deploy/Caddyfile.local" >> .env
+   ```
+
+   ⚠ **The copy, not `deploy/Caddyfile.compose` itself.** That file is tracked
+   by git, and a tracked file you have edited is one the next release can
+   collide with — until 06.09 it also made `deploy/rcq-update.sh` refuse to run
+   at all. `deploy/Caddyfile.local` is git-ignored and `RCQ_CADDYFILE` is what
+   the compose file reads, so the checkout stays clean.
+
+   In `deploy/Caddyfile.local`, uncomment the `tls { dns ... }` block in
    the site and name your provider:
 
    ```caddyfile
@@ -67,8 +80,9 @@ Any ACME authority works with the same Caddy. What differs between them is
 whether they hand out accounts freely:
 
 * **Buypass** (Norway) issues free 180-day certificates over ACME with nothing
-  but a contact email. The block in `deploy/Caddyfile.compose` is ready to
-  uncomment:
+  but a contact email. The block is ready to uncomment — in your
+  `deploy/Caddyfile.local` copy, as above, not in the tracked
+  `deploy/Caddyfile.compose`:
 
   ```caddyfile
   cert_issuer acme

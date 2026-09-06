@@ -1,4 +1,12 @@
 # Local environment
+#
+# ⚠ Everything an operator is told to change lives here or in one of the files
+# below, and NOTHING they are told to change is tracked. A tracked file an
+# operator has edited is a file the next release can collide with, and until
+# 06.09 it was a file that stopped `deploy/rcq-update.sh` outright.
+docker-compose.override.yml
+deploy/decoy.local/
+deploy/Caddyfile.local
 .env
 .env.local
 .env.production

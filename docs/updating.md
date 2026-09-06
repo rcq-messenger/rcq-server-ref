@@ -37,7 +37,44 @@ minutes for `/health` to answer. The result is written to
 database back, and doing that unattended is how a bad minute becomes lost data.
 You get the dump, the log line, and the old container still running.
 
+### If you have edited files in the checkout
+
+Your own edits are kept. A fast-forward carries an uncommitted change across
+untouched, so an island that changed something is updated like any other, and
+the log says which files it left alone.
+
+The one case it cannot resolve is a release that changes a file **you** changed.
+Then nothing is touched, `state/update-status.json` says
+
+```json
+{"updated": false, "blocked": "cannot fast-forward: this release changes a file you edited (…)"}
+```
+
+and you reconcile by hand (`git diff`, keep what you meant, `git checkout --`
+the rest, run the updater again).
+
+⚠ Until 06.09 this was much worse: **any** modified tracked file stopped the
+updater outright, on every run, for good — including the edits this project's
+own documentation asked for (the APNs mount, the TLS block, the masquerade
+decoy). If you followed those instructions before that date your island has not
+updated since. `git status` will show it. The docs now put every one of those
+in a file git does not track (`docker-compose.override.yml`,
+`deploy/Caddyfile.local`, `deploy/decoy.local/`); move your edits there,
+`git checkout --` the tracked file, and the updater runs again.
+
 ## Update on its own, daily
+
+```bash
+sudo bash /opt/rcq-server/deploy/rcq-update.sh --install-timer
+```
+
+That copies the two units, reloads systemd and enables the timer. Off again:
+
+```bash
+sudo bash /opt/rcq-server/deploy/rcq-update.sh --uninstall-timer
+```
+
+By hand, if you would rather see each step:
 
 ```bash
 cp /opt/rcq-server/deploy/rcq-update.{service,timer} /etc/systemd/system/

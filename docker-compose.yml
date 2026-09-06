@@ -51,6 +51,17 @@ services:
       # install.sh ran without a domain (RCQ_CADDYFILE in .env); a masquerade
       # one the same way. docs/tls-without-a-ca.md.
       - ${RCQ_CADDYFILE:-./deploy/Caddyfile.compose}:/etc/caddy/Caddyfile:ro
+      # The masquerade decoy page, served to every untokened request when
+      # RCQ_CADDYFILE points at the masquerade config. Mounted in EVERY mode,
+      # like the certificate directory above and for the same reason: turning
+      # masquerade on has to be a .env edit and a restart.
+      #
+      # ⚠⚠ It used to be an edit to THIS FILE, and README.md said so. That made
+      # every masquerading island — the deployment whose operator is under the
+      # most pressure — modify a tracked file, which until today permanently
+      # refused `deploy/rcq-update.sh`. Point RCQ_DECOY_DIR at your own copy
+      # (deploy/decoy.local/ is git-ignored) and leave the checkout clean.
+      - ${RCQ_DECOY_DIR:-./deploy/decoy}:/srv/decoy:ro
       # The island's own certificate, fingerprint mode. Mounted in every mode
       # so switching is a .env edit and a restart; in CA mode the directory
       # is empty (certs/.gitkeep keeps it in the checkout so the mount works).

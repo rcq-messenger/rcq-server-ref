@@ -90,22 +90,34 @@ accidentally commit it. Treat the key like a production credential
 anyway — anyone with it can push notifications to any user of any app
 under your Team ID.
 
-### 5b. Uncomment the volume mount
+### 5b. Mount the key
 
-Open `docker-compose.yml`, find the `app:` service `volumes:` block,
-and uncomment this line:
-
-```yaml
-# - ./apns.p8:/keys/apns.p8:ro
-```
-
-so it becomes:
+Create `docker-compose.override.yml` next to `docker-compose.yml`:
 
 ```yaml
-- ./apns.p8:/keys/apns.p8:ro
+services:
+  app:
+    volumes:
+      - ./apns.p8:/keys/apns.p8:ro
 ```
 
-The `:ro` suffix mounts it read-only inside the container.
+Docker Compose reads that file automatically and merges it, so
+`docker compose up -d` needs no extra flags. The `:ro` suffix mounts the key
+read-only inside the container.
+
+⚠ **In the override file, not in `docker-compose.yml`.** This step used to say
+"uncomment the line in `docker-compose.yml`", and that made every island with
+iOS push a checkout with a modified tracked file — which until 06.09 made
+`deploy/rcq-update.sh` refuse to run, on every invocation, for good. If you
+followed the old instructions, move the line into the override file and put
+`docker-compose.yml` back:
+
+```bash
+git checkout -- docker-compose.yml
+```
+
+The commented-out line is still in `docker-compose.yml` as documentation of
+where the mount goes; leave it commented.
 
 ### 5c. Fill in `.env`
 

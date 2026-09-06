@@ -776,6 +776,10 @@ async function loadServer() {
       } else if (u && u.update_available) {
         ver = `<span class="mono">${u.current}</span> &nbsp;<span class="pill">${u.latest} available</span>`
             + ` &nbsp;<a href="${u.repo_url}" target="_blank" rel="noopener" style="color:var(--acc)">what changed</a>`;
+      } else if (u && u.reachable === false) {
+        ver = `<span class="mono">${u.current}</span> &nbsp;<span class="pill">could not check</span>`
+            + ` &nbsp;<span style="color:var(--mut)">this island could not reach the release list; check again later or`
+            + ` <a href="${u.repo_url}" target="_blank" rel="noopener" style="color:var(--acc)">look yourself</a></span>`;
       } else if (u) {
         ver = `<span class="mono">${u.current}</span> &nbsp;<span class="pill green">up to date</span>`;
       }
@@ -1487,10 +1491,16 @@ async function checkUpdate() {
     // screenshot), and it told operators to `git pull` by hand — the updater
     // that dumps the database first, rebuilds and health-checks has been there
     // since 2026-08-16.
-    bar.innerHTML = '🔔 Доступно обновление RCQ-сервера: <b>'+u.latest+'</b> (у вас '+u.current+'). '
-      + 'Обновить: <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px">sudo bash deploy/rcq-update.sh</code> '
-      + '(снимет дамп базы, соберёт и проверит здоровье). '
-      + '<a href="'+u.repo_url+'" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">Что изменилось</a>';
+    // ⚠ In English, like every other string in this console. It was the one
+    // Russian sentence in an English page: a self-hoster who does not read
+    // Russian got a red bar of characters they could not parse, at the top of
+    // the screen, on the day a fix they needed shipped. The operators of this
+    // island are not necessarily us.
+    bar.innerHTML = '🔔 A new RCQ server release is out: <b>'+u.latest+'</b> (you are on '+u.current+'). '
+      + 'To update: <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px">sudo bash deploy/rcq-update.sh</code> '
+      + '(dumps the database first, rebuilds, then health-checks). '
+      + 'Daily, on its own: <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px">sudo bash deploy/rcq-update.sh --install-timer</code>. '
+      + '<a href="'+u.repo_url+'" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">What changed</a>';
     bar.style.display='block';
     document.body.style.paddingTop='46px';
   } catch(e) {}

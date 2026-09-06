@@ -234,21 +234,25 @@ To enable:
    echo "RCQ_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
    ```
 
-2. Drop your decoy `index.html` into `./deploy/decoy/`. The shipped
-   stub is a generic "Coming soon" page — replace it with a personal
-   blog, generic SaaS landing, or anything that doesn't look like RCQ.
+2. Put your decoy page in a directory of your own. The shipped
+   `deploy/decoy/index.html` is a generic "Coming soon" stub — copy it
+   somewhere git does not track and make it a personal blog, a generic SaaS
+   landing, anything that does not look like RCQ.
 
-3. Point the caddy service at the masquerade config and mount the
-   decoy directory, both in `docker-compose.yml`. (`RCQ_CADDYFILE=./deploy/Caddyfile.masquerade.compose`
-   in `.env` covers the Caddyfile line alone; the decoy mount has no `.env`
-   switch, and without it every untokened request gets Caddy's bare 404
-   instead of the decoy page, so the compose edit happens either way.)
+   ```bash
+   cp -r deploy/decoy deploy/decoy.local
+   $EDITOR deploy/decoy.local/index.html
+   ```
 
-   ```yaml
-   caddy:
-     volumes:
-       - ./deploy/Caddyfile.masquerade.compose:/etc/caddy/Caddyfile:ro
-       - ./deploy/decoy:/srv/decoy:ro
+   ⚠ Edit the COPY, not `deploy/decoy/`. `deploy/decoy.local/` is git-ignored;
+   the shipped one is tracked, and a tracked file you have changed is a file
+   the next release can collide with.
+
+3. Two lines in `.env`, and no edit to `docker-compose.yml` at all:
+
+   ```bash
+   RCQ_CADDYFILE=./deploy/Caddyfile.masquerade.compose
+   RCQ_DECOY_DIR=./deploy/decoy.local
    ```
 
 4. `docker compose up -d`

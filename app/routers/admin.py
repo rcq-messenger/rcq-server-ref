@@ -300,6 +300,14 @@ async def update_check() -> dict:
         # is genuinely higher; fall back to plain inequality for anything that
         # does not parse as dotted numbers.
         "update_available": bool(latest) and _is_newer(latest, current),
+        # ⚠ WHETHER THE CHECK GOT AN ANSWER AT ALL, which the console has to be
+        # able to tell apart from "checked, you are current". An island whose
+        # egress to raw.githubusercontent.com is blocked — that is, exactly the
+        # censored networks this project exists for, plus anything behind an
+        # egress firewall or with DNS trouble — got `latest: null` here and a
+        # green "up to date" badge on screen, on the day a fix for a
+        # 500-on-registration shipped. Silence is not currency.
+        "reachable": latest is not None,
     }
     _update_cache = (now + _UPDATE_TTL, result)
     return result
