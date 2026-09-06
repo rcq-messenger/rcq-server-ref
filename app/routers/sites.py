@@ -258,7 +258,14 @@ async def manifest(name: str, db: AsyncSession = Depends(get_db)) -> Response:
     the owner produced.
     """
     site = await _live(db, name)
-    return Response(content=site.manifest, media_type="application/json")
+    # Same `no-transform` reasoning as the file route below: the manifest is
+    # what every hash is checked against, so an intermediary rewriting it would
+    # break verification for the whole bundle rather than one file.
+    return Response(
+        content=site.manifest,
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=60, no-transform"},
+    )
 
 
 @router.get("/{name}")
@@ -297,7 +304,20 @@ async def file(name: str, path: str, db: AsyncSession = Depends(get_db)) -> File
             "X-Content-Type-Options": "nosniff",
             # The version is in the manifest; a bundle is replaced whole, so a
             # short cache is safe and saves the island the repeat traffic.
-            "Cache-Control": "public, max-age=300",
+            #
+            # ⚠⚠ `no-transform` is the load-bearing half. Every byte here is
+            # covered by the owner's signature, and the clients refuse a file
+            # whose hash does not match. Our own circumvention front routes
+            # through Cloudflare when the island is unreachable, and Cloudflare
+            # rewrites `text/html` bodies: it decodes them as UTF-8 and encodes
+            # them back, so a page saved in any other encoding comes out with
+            # replacement characters, a different length and a different hash.
+            # One production page (a Word export in windows-1251) failed
+            # verification for exactly this reason and told its own owner the
+            # file "does not match what the owner signed" (report #913).
+            # `no-transform` is the standard instruction to intermediaries not
+            # to touch the body, and Cloudflare honours it.
+            "Cache-Control": "public, max-age=300, no-transform",
         },
     )
 
