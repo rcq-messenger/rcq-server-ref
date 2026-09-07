@@ -129,6 +129,25 @@ class ReportAttachmentIn(BaseModel):
     size: int = Field(default=0, ge=0)
 
 
+class ReportAttachmentOut(BaseModel):
+    """The same tuple, handed back to the person who sent it.
+
+    ⚠ This travels only on `/reports/mine`, and only for rows whose author is
+    the caller. The `key` is the one the reporter minted when they uploaded the
+    blob, so returning it discloses nothing they did not already have; what it
+    buys is a "My reports" screen that shows the screenshot the person attached
+    rather than their bare text. Until today the write path stored attachments
+    and the read path had no field for them, so somebody who sent us three
+    screenshots saw three identical-looking messages and could not tell which
+    was which (report #934).
+    """
+
+    media_id: str
+    key: str
+    mime: str
+    size: int = 0
+
+
 class CreateReportIn(BaseModel):
     # ⚠ 0 means "no person": a report about a SITE or a GROUP whose owner the
     # client cannot name (a site with no published owner, a room whose owner
@@ -406,6 +425,10 @@ class MyReportOut(BaseModel):
     # The whole exchange, oldest first — what a client with a ticket screen
     # renders. Empty on a report nobody has answered and nobody has added to.
     thread: list[ReportTurnOut] = []
+    # What the reporter attached when they wrote it. Empty on a report with no
+    # blobs, which is most of them, and on every row written before the column
+    # existed. A client that predates the field ignores it.
+    attachments: list[ReportAttachmentOut] = []
 
 
 async def _thread_of(db: AsyncSession, report_ids: list[int]) -> dict[int, list[ReportTurnOut]]:
@@ -443,7 +466,31 @@ def _mine_out(report: Report, thread: list[ReportTurnOut]) -> MyReportOut:
         reply=report.reply_text or "",
         replied_at=report.replied_at,
         thread=thread,
+        # Stored as a JSON list of dicts by the write path above. Anything
+        # malformed in an old row is dropped rather than raising: a screenshot
+        # that cannot be described is not worth a 500 on somebody's ticket list.
+        attachments=[
+            a
+            for a in (
+                _attachment_out(x) for x in (report.attachments or [])
+            )
+            if a is not None
+        ],
     )
+
+
+def _attachment_out(raw: object) -> ReportAttachmentOut | None:
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return ReportAttachmentOut(
+            media_id=str(raw["media_id"]),
+            key=str(raw["key"]),
+            mime=str(raw.get("mime") or "application/octet-stream"),
+            size=int(raw.get("size") or 0),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 class AddTurnIn(BaseModel):
