@@ -172,6 +172,8 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # which is correct: nobody has paid yet, and an island that never
     # charges will keep it NULL for ever.
     ("resident_since", "TIMESTAMP WITH TIME ZONE"),
+    # Monotone counter, see models/user.py for why it is not a COUNT.
+    ("invites_minted", "INTEGER DEFAULT 0"),
     # Profile picture (see models/user.py). Additive: NULL on every existing
     # row means "no picture", which is exactly the old behaviour.
     ("avatar_media_id", "VARCHAR(64)"),

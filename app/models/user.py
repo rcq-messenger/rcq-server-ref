@@ -115,6 +115,15 @@ class User(Base):
     resident_since: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # How many invites this resident has ever minted. MONOTONE: it counts up
+    # and is never decremented, not even when an invite is revoked or expires.
+    #
+    # ⚠⚠ AND THAT IS WHY IT IS A COLUMN rather than `SELECT count(*) FROM
+    # invites WHERE created_by = me`. The retention sweep deletes exhausted
+    # invites ninety days after they are spent (services/credential_sweep.py),
+    # so a count of surviving rows quietly refills a resident's allowance every
+    # quarter and "five in total" becomes five per quarter, for ever, silently.
+    invites_minted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Hall of Fame. `hof_opt_in` is set by the user from their client (consent
     # to be considered). `hof_approved` is set by the founder from the admin

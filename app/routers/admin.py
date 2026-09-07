@@ -405,7 +405,11 @@ class BanIn(BaseModel):
 # console offers the kinds below, the server accepts any short slug, and a
 # client colours the kinds it knows and draws the rest neutral, so a new kind
 # is a string in three places rather than a migration in five.
-BADGE_KINDS = ("official", "tester", "special")
+# ⚠ "resident" is granted by the ISLAND, not by an operator: `/auth/register`
+# stamps it when an entry voucher is redeemed. It is listed here so the console
+# still offers it in the picker — an operator has to be able to give one by
+# hand to somebody who paid another way, and to take one back.
+BADGE_KINDS = ("official", "tester", "special", "resident")
 
 
 class BadgeIn(BaseModel):

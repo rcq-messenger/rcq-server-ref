@@ -112,6 +112,26 @@ _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY,
                  "out yourself \u2014 both arrive in the same field, and an invite "
                  "still works, so you can let somebody in without charging them.",
                  choices=("open", "invite", "paid")))
+_reg(SettingSpec("resident_invites_total", "int", lambda: 5, "limits",
+                 "Invites a resident may hand out",
+                 "How many people one paying resident can bring in, in total, "
+                 "for the life of their account. 0 turns the feature off. "
+                 "\u26a0 Only accounts that PAID have any: somebody who was "
+                 "already here when the island started charging, or who was let "
+                 "in on an invite, has none. That is the founder's call and the "
+                 "arithmetic behind it \u2014 handing five each to everybody "
+                 "already on the flagship would put more free entries into the "
+                 "world on day one than the paid plan expects to sell in years."))
+_reg(SettingSpec("resident_invites_period_days", "int", lambda: 30, "limits",
+                 "Days between invites",
+                 "A resident gets one invite now and one more every this many "
+                 "days, up to their total. A drip rather than a handful: five "
+                 "at once is a bulk credential, and the 2026-09-01 flood would "
+                 "have cost a sixth of what it did against a dripped one."))
+_reg(SettingSpec("resident_invites_ttl_days", "int", lambda: 30, "limits",
+                 "Days an unused invite stays good",
+                 "So a resident who mints five and forgets them is not leaving "
+                 "five permanent doors open."))
 _reg(SettingSpec("island_host", "str", lambda: "", "limits",
                  "This island's own address",
                  "The hostname people type to reach this island, e.g. "

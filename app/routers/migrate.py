@@ -165,6 +165,9 @@ async def _perform_migration(
         # Same reasoning as the line above: this is a fact about them, not
         # about the number they answered as.
         resident_since=user.resident_since,
+        # ⚠ And the counter with it, or a change of number is a free reset of
+        # the allowance: buy a short UIN, get five more invites.
+        invites_minted=user.invites_minted,
         #
         # Three fields left this list on 2026-08-22 with the columns behind
         # them: `trade_policy` (guarded a router that has not existed since the

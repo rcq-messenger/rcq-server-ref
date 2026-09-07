@@ -560,6 +560,12 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         # they were let in, they did not buy their way in, and the two are
         # different facts about the same person.
         resident_since=resident_at,
+        # ⚠ The mark comes with the money, and this is the ONLY path that
+        # grants one without an operator. It is a slug the clients have never
+        # heard of, which is deliberate and safe: every client draws an unknown
+        # kind from the island's own `badge_labels`, so naming and colouring it
+        # is an island setting rather than four client releases.
+        badge="resident" if resident_at else None,
     )
     db.add(user)
     await db.commit()
