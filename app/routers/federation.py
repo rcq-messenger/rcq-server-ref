@@ -17,7 +17,7 @@ import binascii
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -27,6 +27,7 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
+from app.services import door
 from app.models.federation import GossipRecord, HomeIslandRecord
 from app.models.user import User, card_openable_for_viewer
 
@@ -374,6 +375,7 @@ class PublicKeysOut(BaseModel):
 )
 async def get_public_keys(
     uin: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> PublicKeysOut:
     """Open, minimal public-key card for cross-island anchoring (federation §4).
@@ -388,6 +390,24 @@ async def get_public_keys(
     """
     u = await db.get(User, uin)
     if u is None or not u.identity_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # ⚠⚠ THE DOOR AN OUTSIDER ACTUALLY REACHES. This endpoint takes no session
+    # at all, which is what makes cross-island messaging work — and what makes
+    # it the only thing standing between a stranger and the key that seals an
+    # envelope to a resident. The gate on /users/{uin}/info cannot do this job:
+    # it requires a session, so everyone who gets there is already a resident.
+    #
+    # Refused with the SAME 404 and the same body as the check above, byte for
+    # byte, and AFTER it, so the two cost the same lookup. A distinguishable
+    # answer turns a closed island into a directory: ask about a number, learn
+    # whether it exists — and short numbers are what we sell.
+    #
+    # `caller_uin=None` is the honest description: no session, and no edge in
+    # this island's graph even if they are a contact on theirs. So the only way
+    # through is a card this resident handed out themselves.
+    if not await door.may_fetch_key(
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     # Optional profile bits only when the user keeps an open profile — same
     # gate /users/{uin}/info applies to outsiders. Nickname is always-visible

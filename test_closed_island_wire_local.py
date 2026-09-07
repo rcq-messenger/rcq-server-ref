@@ -187,12 +187,39 @@ async def main() -> None:
         check("and a made-up card changes nothing here, for the same reason",
               r.status_code == 200, str(r.status_code))
 
-        # ── the door that was NOT wired, and is deliberately still open ─────
+        # ── the doors an outsider can actually reach ───────────────────────
+        #
+        # These are the whole feature. /users/{uin}/info above cannot refuse
+        # anybody, because reaching it requires a session; these three take no
+        # session, which is what makes cross-island messaging work and what
+        # makes them the only thing between a stranger and a resident's key.
         r = await c.get(f"/federation/keys/{resident}")
-        check("⏭ door 1 (/federation/keys) is STILL OPEN, on purpose until the "
-              "clients ship — this check is here to fail the day it is closed, "
-              "so the change is deliberate",
-              r.status_code == 200, str(r.status_code))
+        check("door 1 refuses an anonymous stranger", r.status_code == 404, str(r.status_code))
+        check("and with the same 404 body as a number that does not exist",
+              r.text == gone.text, f"{r.text!r} vs {gone.text!r}")
+
+        r = await c.get(f"/federation/keys/{resident}", headers={"X-RCQ-Guest-Card": raw})
+        check("door 1 opens for the card its owner handed out",
+              r.status_code == 200 and bool(r.json().get("identity_key")), str(r.status_code))
+
+        r = await c.get(f"/federation/keys/{neighbour}", headers={"X-RCQ-Guest-Card": raw})
+        check("and that card opens ONE door: not the neighbour's",
+              r.status_code == 404, str(r.status_code))
+
+        r = await c.get(f"/keys/{resident}/bundle")
+        check("door 2 refuses an anonymous stranger too — leaving it open would "
+              "just move the hole one endpoint over, since a v=1 envelope seals "
+              "with the key it hands out",
+              r.status_code == 404, str(r.status_code))
+
+        r = await c.get(f"/keys/{resident}/bundle", headers=auth(ntok))
+        check("but a resident with a session passes door 2 untouched",
+              r.status_code in (200, 404), str(r.status_code))
+
+        info = (await c.get("/server/info")).json()
+        check("a closed island stops advertising anonymous key fetches: a door "
+              "that cannot tell a resident from an outsider is not a door",
+              info["capabilities"]["anon_keys"] is False)
 
         await set_setting("closed_island", "false")
         r = await c.get(f"/users/{resident}/info", headers=auth(otok))

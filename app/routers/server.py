@@ -128,6 +128,16 @@ class ServerCapabilities(BaseModel):
     # capability of this codebase, like `envelope_class`; whether the island
     # also ISSUES tokens is `deposit_auth` (without it a sender still gets the
     # signed prekey anonymously and the OPK only under its session token).
+    #
+    # ⚠⚠ TURNED OFF ON A CLOSED ISLAND, and that is a deliberate trade. A
+    # closed island has to be able to tell a resident from an outsider at the
+    # key doors, and an anonymous fetch names nobody by design — so either the
+    # door lets every anonymous caller through, which is no door at all, or it
+    # refuses residents using the anonymous path. Saying "not available here"
+    # is the only honest third answer. The cost is real: the island learns
+    # which resident asked about whom, metadata it does not learn on an open
+    # island. A closed island already knows its residents; an open one is where
+    # this feature earns its keep, and there it is untouched.
     anon_keys: bool = True
     # Stage 5 metadata cut: rooms are served from one log per room
     # (POST /messages/group-log/fetch + /ack) instead of a per-member copy of
@@ -275,6 +285,10 @@ async def server_info() -> ServerInfo:
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=eff["registration_policy"],
             closed_island=bool(eff["closed_island"]),
+            # See the field's own note: a closed island cannot offer anonymous
+            # key fetches, because a door that cannot tell a resident from an
+            # outsider is not a door.
+            anon_keys=not bool(eff["closed_island"]),
             # ⚠ Only on a CLOSED island. An open island that has a leftover
             # number in the setting must not quote a price for something
             # anybody can have for nothing.

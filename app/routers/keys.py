@@ -12,6 +12,7 @@ from app.core.db import engine, get_db
 from app.core.config import settings
 from app.core.rate_limit import rate_limit
 from app.core.security import current_device_id, current_uin, current_uin_optional
+from app.services import door
 from app.models.device import Device
 from app.models.prekey import OneTimePreKey
 from app.models.user import User, _as_aware
@@ -403,6 +404,25 @@ async def fetch_bundle(
     it shows a generic push and never lands in the chat. See `_claim_opk`."""
     user = await db.get(User, uin)
     if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # ⚠⚠ ANONYMOUS CALLERS ONLY, on a closed island. This endpoint takes
+    # `current_uin_optional`, so it is one of the three an outsider can reach
+    # at all, and gating it is not optional: a v=1 envelope seals with the key
+    # this hands out, so leaving it open while /federation/keys is closed just
+    # moves the hole one endpoint over.
+    #
+    # ⚠ A resident with a session passes untouched, so nothing about ordinary
+    # use changes. The anonymous path that a RESIDENT would otherwise take is
+    # withdrawn island-wide instead: /server/info stops advertising `anon_keys`
+    # when the island is closed, because a door that cannot tell a resident
+    # from an outsider is not a door. See the note on that field.
+    #
+    # The 404 here doubles as the sender's "fall back to v=1" signal, which is
+    # the right outcome: the fallback then asks /federation/keys, which refuses
+    # the same caller, so an outsider ends with no key rather than a downgrade.
+    if me is None and not await door.may_fetch_key(
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     # Multi-device: while a web session is linked to this account, withhold the
     # v=2 bundle so the sender falls back to v=1 (stateless → decryptable on
