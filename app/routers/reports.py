@@ -429,6 +429,10 @@ class MyReportOut(BaseModel):
     # blobs, which is most of them, and on every row written before the column
     # existed. A client that predates the field ignores it.
     attachments: list[ReportAttachmentOut] = []
+    # Whether DELETE would accept this row, so a client can hide the action
+    # rather than offer it and refuse (#941). Defaults true on a client that
+    # predates the field, which is exactly today's behaviour.
+    removable: bool = True
 
 
 async def _thread_of(db: AsyncSession, report_ids: list[int]) -> dict[int, list[ReportTurnOut]]:
@@ -452,6 +456,23 @@ async def _thread_of(db: AsyncSession, report_ids: list[int]) -> dict[int, list[
     return out
 
 
+def _removable(report: Report) -> bool:
+    """May the reporter take this row off their own list right now?
+
+    ⚠⚠ THE SAME EXPRESSION THE DELETE USES, and it lives here so the button and
+    the endpoint cannot disagree. Until today only the endpoint knew: the app
+    offered Delete on every row, asked "are you sure", and only then came back
+    with "you cannot". A tester filed exactly that (#941): if it is refused,
+    say so before asking.
+
+    The rule itself is in `delete_my_report`: a report ABOUT SOMEBODY ELSE that
+    is still open stays, because the reporter is a live party to that case and
+    the thread is the operator's only way to ask them anything. Everything else,
+    feedback and bug reports included, goes at once.
+    """
+    return not (report.target_uin != report.reporter_uin and report.status == "open")
+
+
 def _mine_out(report: Report, thread: list[ReportTurnOut]) -> MyReportOut:
     """One place that shapes a report for its own author. The list and the edit
     endpoint both return it, and building it twice by hand is how two callers
@@ -466,6 +487,7 @@ def _mine_out(report: Report, thread: list[ReportTurnOut]) -> MyReportOut:
         reply=report.reply_text or "",
         replied_at=report.replied_at,
         thread=thread,
+        removable=_removable(report),
         # Stored as a JSON list of dicts by the write path above. Anything
         # malformed in an old row is dropped rather than raising: a screenshot
         # that cannot be described is not worth a 500 on somebody's ticket list.
@@ -638,7 +660,7 @@ async def delete_my_report(
         # Same answer either way: a wrong id must not confirm that some other
         # user's report exists.
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
-    if report.target_uin != uin and report.status == "open":
+    if not _removable(report):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={"code": "under_review"},
