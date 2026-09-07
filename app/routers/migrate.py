@@ -434,7 +434,22 @@ async def migrate(
     device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> MigrateOut:
-    user = await db.get(User, uin)
+    # ⚠⚠ LOCK THE ROW, AND THAT IS NOT BELT-AND-BRACES. `db.get` let every
+    # concurrent request for the same account through: each allocated its own
+    # new number and each ran the whole swap at once. A tester who tapped "give
+    # me a random number" several times while the app was lagging ended up with
+    # TWO live accounts carrying the same profile and the same mark, his groups
+    # owned by the number he had left and his membership split across both, and
+    # the roster showing him twice ("меня теперь двое", 07.09). The rate limit
+    # above is five an HOUR, which is no defence at all against five in one
+    # second, and the cooldown is deliberately off in beta.
+    #
+    # `FOR UPDATE` serialises them on the account itself: the second request
+    # waits for the first to commit and then finds the row gone, which is a
+    # plain 404 the client already knows how to show. One tap, one migration.
+    user = (
+        await db.execute(select(User).where(User.uin == uin).with_for_update())
+    ).scalar_one_or_none()
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
     # A suspended account may not mint a fresh identity. `is_suspended` now
