@@ -91,8 +91,20 @@ _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY,
                  "Registration", "Who may create an account on this island.",
                  choices=("open", "invite")))
 _reg(SettingSpec("max_accounts_per_device", "int", lambda: 5, "limits",
-                 "Max accounts / device",
-                 "How many accounts one device may hold (advertised to clients, client-enforced).",
+                 "Accounts the app will hold",
+                 "How many accounts one INSTALL of the app keeps side by side. "
+                 "\u26a0\u26a0 A convenience, NOT a limit: the island cannot "
+                 "enforce it and never will. Registration receives a nickname "
+                 "and two public keys and nothing that identifies a device "
+                 "(routers/auth.py, RegisterIn), deliberately — a device "
+                 "identifier would let this island say \"these five accounts "
+                 "are one person\", which is the exact linkage the whole "
+                 "design refuses to hold. Somebody who wants more accounts "
+                 "reinstalls, or writes ten lines of script, and neither "
+                 "notices this number. The label used to read \"Max accounts / "
+                 "device\", which sounded like a wall. What actually prices a "
+                 "second account is the door: an invite, or whatever this "
+                 "island charges for entry.",
                  min=1, max=50))
 
 # ── Branding
