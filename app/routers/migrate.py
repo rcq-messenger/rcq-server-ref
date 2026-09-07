@@ -12,7 +12,7 @@ After commit:
   exceptions, both in step 2b: a collection already past the shop's cap, and a
   number somebody else turns out to be holding. In both the number goes back
   into the pool instead, which is what this route did before it kept anything
-- Old UIN's WebSocket sessions get an `account_burned` push so
+- Old UIN's WebSocket sessions get an `account_moved` push so
   multi-device clients tear down stale state
 - Every group the account belongs to gets a `group_membership_changed`, the
   same event any other roster change rides. Until 2026-08-23 the line above
@@ -352,11 +352,31 @@ async def _perform_migration(
     await cache_uin_epoch(old_uin, old_epoch)
 
     # Step 5: only NOW tell anyone still connected under old_uin that we're
-    # done — same `account_burned` event the burn flow uses. Multi-device
-    # clients hit it and tear down their local state, so it must not fire
-    # until the swap is durable: broadcasting before the commit meant a failed
-    # commit left clients wiping state for a migration that never happened.
-    await manager.broadcast([old_uin], {"type": "account_burned"})
+    # done. It must not fire until the swap is durable: broadcasting before the
+    # commit meant clients acting on a migration that never happened.
+    #
+    # ⚠⚠ `account_moved`, NOT `account_burned`, AND THAT IS A REAL BUG FIXED.
+    # This used to send the same event the burn flow uses, with the comment
+    # "multi-device clients hit it and tear down their local state" as if that
+    # were the intention. It is not: those are the OWNER'S OTHER DEVICES, and
+    # the account they tear down is alive. Somebody signed in on a laptop and
+    # two phones, who bought a shorter number on the laptop, watched both
+    # phones wipe themselves and then refuse to connect. Reported 07.09. The
+    # device doing the migrating never saw it, because all three clients carry
+    # a flag to suppress exactly this event on themselves.
+    #
+    # The rescue we already built is `moved_from` on /auth/refresh (03.09), and
+    # it only ever reached a device that was ASLEEP and asked afterwards. A
+    # device that was ONLINE never got that far: the socket event arrived first
+    # and it erased itself before it could ask.
+    #
+    # So the event says what happened now. A client that knows it re-runs the
+    # refresh it would have run on its next launch and follows the account to
+    # its new number; the uin rides along so it can tell that answer apart from
+    # somebody else's. A client too old to know the word gets nothing here and
+    # falls back to the same refresh on its next start, which is still better
+    # than today, because today it wipes.
+    await manager.broadcast([old_uin], {"type": "account_moved", "uin": target_uin})
 
     # Step 6: and tell the GROUPS. Until 2026-08-23 step 5 was the whole of the
     # socket traffic a migration produced, which meant the only people told

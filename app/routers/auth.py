@@ -937,6 +937,7 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
         #     them is how a device ends up in a stranger's account. Ambiguity
         #     goes to recovery, where a person is looking at the screen.
         still_there = await db.scalar(select(User.uin).where(User.uin == body.uin))
+        ambiguous = False
         if still_there is None:
             candidates = (
                 await db.execute(select(User.uin).where(User.signing_key == sk).limit(2))
@@ -944,8 +945,27 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
             if len(candidates) == 1:
                 owned = int(candidates[0])
                 moved_from = int(body.uin)
+            elif len(candidates) > 1:
+                # ⚠⚠ REFUSED, BUT NOT ABSENT, AND THE DIFFERENCE DECIDES WHETHER
+                # A LIVE ACCOUNT IS ERASED. This branch means the number is
+                # vacant AND this key answers for more than one account, so we
+                # will not pick a winner. Until today it left by the same door
+                # as "no such identity", and every client reads that one word
+                # as "the account was burned, wipe the local copy". A phone
+                # that was switched OFF while its owner moved to a new number
+                # therefore erased a living account on its next launch, and
+                # only for the people whose key is shared, who are exactly the
+                # people the guard exists to protect.
+                #
+                # Same 404, different word, so an older client is no worse off
+                # than it is today and a newer one can hold still and send its
+                # owner to recovery, where a person is looking at the screen.
+                ambiguous = True
     if owned is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"code": "identity_ambiguous" if ambiguous else "identity_not_found"},
+        )
     # ★ The whole point of report #607. Proving the signing key says WHO is
     # asking, never WHERE from, so this is the only thing standing between a
     # disconnected browser and a brand-new session for the same account.
