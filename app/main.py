@@ -19,6 +19,7 @@ from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth
 from app.routers import random as random_chat
 from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
+from app.services.inquiry_sweep import inquiry_sweep_loop
 from app.services.dead_account_sweep import dead_account_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
 
@@ -198,6 +199,10 @@ async def lifespan(_: FastAPI):
     dead_account_sweep_task = asyncio.create_task(dead_account_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.
     evidence_sweep_task = asyncio.create_task(evidence_sweep_loop())
+    # The two website forms are the only place we hold a way to reach a
+    # person, and until 07.09 they were held for ever. The privacy policy
+    # now says a year; this is what makes that true.
+    inquiry_sweep_task = asyncio.create_task(inquiry_sweep_loop())
     # Five-minute online samples for the hourly activity history. Every worker
     # runs one; the write is a max() into a shared Redis hash, so the extras
     # cost a SCARD each and change nothing.
@@ -258,6 +263,7 @@ async def lifespan(_: FastAPI):
         offline_queue_sweep_task.cancel()
         dead_account_sweep_task.cancel()
         evidence_sweep_task.cancel()
+        inquiry_sweep_task.cancel()
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
         media_sweep_task.cancel()
