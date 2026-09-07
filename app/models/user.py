@@ -88,9 +88,20 @@ class User(Base):
     # yes/no so the operator can tell an official account from a tester
     # from whatever comes next without a migration (founder, 05.09).
     # Granted and revoked from the admin console only; no client endpoint
-    # can set it. Not gated by any visibility setting: it is the island's
-    # statement about the person, not the person's about themselves.
+    # can set it.
     badge: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # ⚠ This column used to say the mark was "not gated by any visibility
+    # setting: it is the island's statement about the person, not the
+    # person's about themselves". That reasoning holds for who may GRANT a
+    # mark and no longer decides who may SEE one. Once a mark can mean "this
+    # account paid to be here", wearing it in public is a disclosure about
+    # the person, and whether to make it is theirs (founder, 06.09).
+    #
+    # The owner always sees their own mark, on every screen, whatever this
+    # says. Hiding is one-way and total: there is no "show it to contacts
+    # only" here, because the mark travels in list rows and roster payloads
+    # that no per-viewer rule reaches cheaply.
+    badge_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Hall of Fame. `hof_opt_in` is set by the user from their client (consent
     # to be considered). `hof_approved` is set by the founder from the admin
@@ -383,6 +394,19 @@ def effective_status(user: "User") -> str:
     if user.status in ("away", "dnd", "invisible"):
         return user.status
     return "online"
+
+
+def badge_for_viewer(u: User, *, viewer_uin: int | None) -> str | None:
+    """The mark to show `viewer_uin`, or None when its owner keeps it off.
+
+    Deliberately not viewer-graded beyond self/other: see `User.badge_hidden`.
+    Exported rather than private because contacts and group rosters serialise
+    the same mark and must answer the same way — a mark hidden on the profile
+    and drawn in the member list is not hidden.
+    """
+    if u.badge_hidden and viewer_uin != u.uin:
+        return None
+    return u.badge
 
 
 def visible_status(user: "User") -> str:

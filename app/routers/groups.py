@@ -312,6 +312,7 @@ async def _members_with_users(
                 GroupMember.permissions,
                 User.nickname,
                 User.badge,
+                User.badge_hidden,
                 User.status,
                 User.identity_key,
                 User.signing_key,
@@ -403,7 +404,9 @@ async def _members_with_users(
         out.append(GroupMemberOut(
             uin=r.uin,
             nickname=r.nickname,
-            badge=r.badge,
+            # A mark hidden on the profile and drawn in the member list is not
+            # hidden. `me` is already computed above for the same reason.
+            badge=(None if (r.badge_hidden and not me) else r.badge),
             avatar_media_id=r.avatar_media_id,
             avatar_media_key=r.avatar_media_key,
             role=r.role,

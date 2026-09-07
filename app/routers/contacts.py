@@ -46,7 +46,9 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.models.contact import Contact, ContactRequest
-from app.models.user import User, card_openable_for_viewer, visible_status, coarse_last_seen
+from app.models.user import (
+    User, badge_for_viewer, card_openable_for_viewer, visible_status, coarse_last_seen,
+)
 from app.services.apns import send_to_user as apns_send, should_push_for
 from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
@@ -185,7 +187,7 @@ async def list_contacts(
             ContactRow(
                 uin=u.uin,
                 nickname=u.nickname,
-                badge=u.badge,
+                badge=badge_for_viewer(u, viewer_uin=uin),
                 status=live_status,
                 status_message=u.status_message,
                 avatar_media_id=u.avatar_media_id,

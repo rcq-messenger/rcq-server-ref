@@ -164,6 +164,10 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # console (05.09). ⚠ A boolean `verified` column shipped for an hour the
     # same morning and may exist on the flagship; it is unmapped and unused.
     ("badge", "VARCHAR(16)"),
+    # Whether its owner wears the mark in public (06.09). FALSE on every
+    # existing row is the old behaviour exactly: everyone keeps wearing what
+    # they were given until they say otherwise.
+    ("badge_hidden", "BOOLEAN DEFAULT FALSE"),
     # Profile picture (see models/user.py). Additive: NULL on every existing
     # row means "no picture", which is exactly the old behaviour.
     ("avatar_media_id", "VARCHAR(64)"),

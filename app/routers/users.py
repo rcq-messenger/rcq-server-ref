@@ -19,7 +19,7 @@ from app.core.rate_limit import enforce_cost_budget, rate_limit
 from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
-from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen
+from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen, badge_for_viewer
 from app.services import door
 from app.services.connection_manager import manager
 from app.services.contact_source import mark_vault_device, unmark_vault_device
@@ -59,9 +59,13 @@ class PublicUser(BaseModel):
     uin: int
     nickname: str
     # The island's mark on this account: null, or a kind ("official",
-    # "tester", "special", more later). Not gated by any visibility setting:
-    # it is the island's statement, not the person's. A client colours the
-    # kinds it knows and draws the rest neutral.
+    # "tester", "special", more later). A client colours the kinds it knows
+    # and draws the rest neutral.
+    #
+    # ⚠ Null here is TWO different facts: no mark, and a mark its owner chose
+    # not to wear (`badge_hidden`). Deliberately indistinguishable — a
+    # "hidden" signal on the wire would answer the question the setting exists
+    # to refuse. The owner's own row is the exception and always carries it.
     badge: str | None = None
     first_name: str | None = None
     last_name: str | None = None
@@ -111,6 +115,11 @@ class PublicUser(BaseModel):
     # blind to the decision because the receipt envelope is
     # sealed-sender. Always null for third-party callers.
     read_receipts_visibility: str | None = None
+    # Owner-only mirror of "wear my mark where others can see it". A bool
+    # rather than the tri-state the fields around it use: the mark rides in
+    # list rows and rosters that are built once for many viewers, so
+    # "contacts only" would be a promise the serialisation cannot keep.
+    badge_hidden: bool | None = None
     # Owner-only mirror of the profile-card visibility setting.
     # Same tri-state as the others; null for third-party callers.
     profile_visibility: str | None = None
@@ -220,7 +229,7 @@ class PublicUser(BaseModel):
         return cls(
             uin=u.uin,
             nickname=u.nickname,
-            badge=u.badge,
+            badge=badge_for_viewer(u, viewer_uin=viewer_uin),
             avatar_media_id=u.avatar_media_id if avatar_ok else None,
             avatar_media_key=u.avatar_media_key if avatar_ok else None,
             first_name=u.first_name if profile_visible else None,
@@ -246,6 +255,7 @@ class PublicUser(BaseModel):
             signal_identity_key=u.signal_identity_key,
             signal_registration_id=u.signal_registration_id,
             last_seen=last_seen,
+            badge_hidden=(u.badge_hidden if owner_self else None),
             last_seen_visibility=(u.last_seen_visibility if owner_self else None),
             gender_visibility=(u.gender_visibility if owner_self else None),
             profile_visibility=(u.profile_visibility if owner_self else None),
@@ -293,7 +303,7 @@ class PublicUser(BaseModel):
         return cls(
             uin=u.uin,
             nickname=u.nickname,
-            badge=u.badge,
+            badge=badge_for_viewer(u, viewer_uin=viewer_uin),
             profile_openable=openable,
             first_name=u.first_name if visible else None,
             last_name=u.last_name if visible else None,
@@ -411,6 +421,9 @@ class ProfileUpdate(BaseModel):
     # `extra="forbid"` config on this model.
     # Hall-of-Fame consent toggle. User opts in; the founder approves
     # separately (admin-only). `hof_approved` is NOT settable here.
+    # "Wear my mark where others can see it", inverted: true hides it. Only
+    # this flag is the user's; the mark itself stays admin-only.
+    badge_hidden: bool | None = None
     hof_opt_in: bool | None = None
     # Optional public HoF avatar as a data-URI. Empty string clears it.
     # Validated (mime allow-list + base64 + size cap) in update_me.
@@ -865,7 +878,7 @@ async def lookup(
             LookupRow(
                 uin=u.uin,
                 nickname=u.nickname,
-                badge=u.badge,
+                badge=badge_for_viewer(u, viewer_uin=me),
                 status=visible_status(u),
                 status_message=u.status_message if profile_visible else None,
                 identity_key=u.identity_key,

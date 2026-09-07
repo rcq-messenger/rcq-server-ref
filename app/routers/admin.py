@@ -949,7 +949,10 @@ async def set_user_badge(
     admin = getattr(request.state, "admin", None) or "admin"
     log.info("badge %r on user %s by %s", body.badge, uin, admin)
     from app.routers.users import _announce_rename
-    await _announce_rename(db, uin, user.nickname, badge=user.badge)
+    # ⚠ This announcement goes to everyone who knows the user, so it obeys
+    # their choice: granting a mark to somebody who keeps marks off must not
+    # be the thing that shows it.
+    await _announce_rename(db, uin, user.nickname, badge=None if user.badge_hidden else user.badge)
     return await _summarize(db, user)
 
 
