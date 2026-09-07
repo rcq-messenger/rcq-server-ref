@@ -75,6 +75,24 @@ _reg(SettingSpec("reports_enabled", "bool", lambda: True, "features", "Reports",
                  "already filed stay readable to both sides."))
 
 # ── Limits & policy
+_reg(SettingSpec("entry_price_cents", "int", lambda: 0, "limits",
+                 "Price of entry",
+                 "What THIS island charges somebody to join, in US cents; 0 "
+                 "means entry is not sold and the apps show no price. Only "
+                 "meaningful on a closed island: on an open one anybody may "
+                 "register and there is nothing to charge for. \u26a0 Setting a "
+                 "number here makes the price VISIBLE in every client's island "
+                 "picker; it does not yet take money, and an island that "
+                 "quotes a price it cannot collect is worse than one that "
+                 "quotes nothing.",
+                 min=0, max=1000000))
+_reg(SettingSpec("entry_url", "str", lambda: "", "limits",
+                 "Where entry is bought",
+                 "The page that sells entry to this island. Shown beside the "
+                 "price in the clients that may show a link. \u26a0 Not shown "
+                 "on iPhone: Apple does not allow an app to point at a "
+                 "purchase it does not handle, so there the price stands alone "
+                 "with \"ask the operator\"."))
 _reg(SettingSpec("closed_island", "bool", lambda: False, "limits",
                  "Closed island",
                  "A closed island withholds the key needed to write to its "

@@ -56,6 +56,14 @@ class ServerCapabilities(BaseModel):
     # Defaults FALSE, so an island older than the field, and every open island,
     # is unchanged.
     closed_island: bool = False
+    #: What this island charges to join, in US cents; 0 = not sold. Published
+    #: so a person sees the price in the picker BEFORE they try to register and
+    #: are refused, rather than after.
+    entry_price_cents: int = 0
+    #: Where entry is bought, when the island wants to name a page. Never shown
+    #: on iOS: Apple does not allow an app to point at a purchase it does not
+    #: handle.
+    entry_url: str = ""
     # Operator-toggled optional features (admin console -> Features). Each
     # defaults True so old clients that ignore the field keep showing the tab;
     # a client that reads these hides the tab when the operator turns it off.
@@ -267,6 +275,11 @@ async def server_info() -> ServerInfo:
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=eff["registration_policy"],
             closed_island=bool(eff["closed_island"]),
+            # ⚠ Only on a CLOSED island. An open island that has a leftover
+            # number in the setting must not quote a price for something
+            # anybody can have for nothing.
+            entry_price_cents=(int(eff["entry_price_cents"]) if eff["closed_island"] else 0),
+            entry_url=(str(eff["entry_url"]) if eff["closed_island"] else ""),
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
