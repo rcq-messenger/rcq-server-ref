@@ -292,8 +292,19 @@ async def server_info() -> ServerInfo:
             # ⚠ Only on a CLOSED island. An open island that has a leftover
             # number in the setting must not quote a price for something
             # anybody can have for nothing.
-            entry_price_cents=(int(eff["entry_price_cents"]) if eff["closed_island"] else 0),
-            entry_url=(str(eff["entry_url"]) if eff["closed_island"] else ""),
+            # ⚠⚠ PUBLISHED WHENEVER ENTRY IS FOR SALE, not only when the door
+            # is locked. These were gated on `closed_island`, and the two are
+            # different facts: an island can sell residency — a mark, invites,
+            # a place — while still letting anybody in for free. The flagship is
+            # exactly that today.
+            #
+            # Gating them here had a price paid in real money: the till was
+            # selling entry codes, every client only draws the code field for an
+            # island that REFUSES it, so a buyer registered successfully without
+            # ever being asked for the code, and their payment bought nothing.
+            # Selling something a client cannot show a box for is the bug.
+            entry_price_cents=int(eff["entry_price_cents"]),
+            entry_url=str(eff["entry_url"]),
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
