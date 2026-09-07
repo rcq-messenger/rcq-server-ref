@@ -50,6 +50,20 @@ MAX_AGE_SECONDS = 7 * 24 * 3600
 VERSION = 1
 
 
+#: An ENTRY voucher lives far longer than one for a number, and the difference
+#: is what expiry costs the person holding it.
+#:
+#: ⚠⚠ A number voucher that lapses is an inconvenience: the buyer still has an
+#: account, and the number is still for sale. An ENTRY voucher that lapses is
+#: money that bought nothing. Somebody pays, does not get round to installing
+#: the app, opens it a fortnight later and finds their fifteen dollars gone,
+#: with no account to complain from — they never had one, that was the purchase.
+#: A week was inherited from the number shop without anybody asking what it
+#: was protecting, and the answer is: one row in `spent_vouchers` per redeemed
+#: code, which is nothing.
+ENTRY_MAX_AGE_SECONDS = 366 * 24 * 3600
+
+
 class VoucherError(Exception):
     """Refusal reason, in the client-visible `code` vocabulary."""
 
@@ -204,7 +218,7 @@ def verify_entry(voucher: str, *, expect_host: str, now: int | None = None) -> s
     seconds = int(time.time() if now is None else now)
     if exp <= seconds:
         raise VoucherError("voucher_expired")
-    if exp - seconds > MAX_AGE_SECONDS:
+    if exp - seconds > ENTRY_MAX_AGE_SECONDS:
         raise VoucherError("bad_voucher")
 
     from cryptography.exceptions import InvalidSignature
