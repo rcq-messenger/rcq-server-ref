@@ -391,7 +391,17 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # The voucher is tried FIRST and only when it looks like one, so a plain
     # invite never pays the cost of a signature check.
     resident_at: datetime | None = None
-    if policy == "paid" and code:
+    # ⚠⚠ NOT gated on the policy. A voucher is money that has already changed
+    # hands, so it is redeemed whenever one is presented and it verifies, even
+    # on an island whose door happens to be open. The alternative was tried on
+    # paper and is indefensible: somebody buys entry, the operator has not
+    # flipped the island to paid yet, and the island takes the voucher, records
+    # nothing, and lets them in as an ordinary stranger. They paid to be a
+    # resident and `resident_since` would be NULL for ever.
+    #
+    # The POLICY decides whether a voucher is REQUIRED. That is a different
+    # question and it is answered below.
+    if code:
         try:
             nonce = uin_voucher.verify_entry(
                 code, expect_host=str(await server_settings.get("island_host") or "")

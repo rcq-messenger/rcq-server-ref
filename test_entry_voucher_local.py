@@ -82,6 +82,16 @@ check("a redeemed nonce is recorded", "SpentVoucher(nonce=nonce)" in auth)
 check("a replay is a conflict, not a free account", 'code": "voucher_spent"' in auth)
 check("a spent voucher is not then spent again as an invite", 'code = ""' in auth)
 check("an invite still opens a paid island", 'policy in ("invite", "paid")' in auth)
+# ★ The money question, and the one that would have been silent: a voucher is
+# paid for BEFORE the operator necessarily closes the door, so redeeming it
+# must not depend on the door being closed. Otherwise somebody buys entry to an
+# open island and `resident_since` stays NULL for ever.
+import re as _re
+_body = auth[auth.index("resident_at: datetime | None = None"):]
+_body = _body[:_body.index("if policy in (")]
+check("a voucher is redeemed whatever the door policy says",
+      _re.search(r"^\s*if code:", _body, _re.M) is not None
+      and 'policy == "paid" and code' not in _body)
 check("residency is stamped on the account", "resident_since=resident_at" in auth)
 mig = pathlib.Path('app/routers/migrate.py').read_text()
 check("residency survives a change of number", "resident_since=user.resident_since" in mig)
