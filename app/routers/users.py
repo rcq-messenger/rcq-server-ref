@@ -313,8 +313,13 @@ class PublicUser(BaseModel):
             # The row keeps everything a person needs to recognise somebody and
             # press Add; it loses the three fields that let a stranger seal an
             # envelope to them.
+            # ⚠ EMPTY STRINGS, not None. `signing_key` is a required `str` on
+            # this model, so blanking it with None made /users/search answer
+            # 500 on a closed island — the endpoint that is the ONLY way the
+            # web can add a same-island contact. Caught by the HTTP-level test
+            # and by nothing else: the unit test never builds a response.
             identity_key=u.identity_key if with_keys else "",
-            signing_key=u.signing_key if with_keys else None,
+            signing_key=u.signing_key if with_keys else "",
             signal_identity_key=u.signal_identity_key if with_keys else None,
             signal_registration_id=u.signal_registration_id,
         )

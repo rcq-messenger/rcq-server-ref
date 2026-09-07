@@ -163,10 +163,30 @@ async def redeem_card(db: AsyncSession, *, target_uin: int, raw: str | None) -> 
 #: island) and door 1 (another island), and doors 2/3/7 answer exactly what
 #: door 6 would have answered for the same target.
 #:
-#: ⚠⚠ AS OF TODAY ONLY DOOR 6 IS ACTUALLY GATED. Door 1,
-#: `/federation/keys/{uin}`, still hands the identity key to any browser with
-#: no account at all, so a closed island is closed from the inside and open
-#: from the outside. This comment claimed both were done and it was wrong.
+#: ⚠⚠⚠ AND THE CONCLUSION ABOVE IS WRONG, found by an HTTP-level test on
+#: 2026-09-07 after the unit tests had passed for a day.
+#:
+#: `/users/{uin}/info` takes `Depends(current_uin)`, which 401s an anonymous
+#: caller. So EVERY caller of door 6 already holds an account on this island,
+#: `_is_resident` is therefore always true, and the gate on it can never refuse
+#: anybody. What shipped as "the first door closes" is inert. The card branch
+#: on that door is unreachable for the same reason: a stranger cannot
+#: authenticate to present one.
+#:
+#: The doors an outsider can actually reach are exactly the UNAUTHENTICATED
+#: ones — 1, 2 and 3 — which is the set this comment argued not to gate. The
+#: refusal-code reasoning below still holds (404 already means "fall back to
+#: v=1" on 2 and 3), but the sentence "they protect nothing" had it backwards:
+#: they are the only thing there is to protect.
+#:
+#: ⚠ The 403-retry that made a gate look self-defeating only helps somebody who
+#: HAS an account here: an outsider retrying with a token gets 401 and nothing.
+#: On a closed island, pushing bundle fetches onto the authenticated path costs
+#: anonymity the island already had, because it knows its own residents.
+#:
+#: So the work left is: gate doors 1, 2 and 3 on the card for callers with no
+#: session, and leave door 6 as it is — a resident looking up a colleague by
+#: number is the behaviour a company wants, and it is all that door can see.
 #:
 #: It is left open ON PURPOSE until the clients ship, and the order cannot be
 #: reversed: gating door 1 first would cut every cross-island conversation on
