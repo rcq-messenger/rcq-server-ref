@@ -168,6 +168,9 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # existing row is the old behaviour exactly: everyone keeps wearing what
     # they were given until they say otherwise.
     ("badge_hidden", "BOOLEAN DEFAULT FALSE"),
+    # Every mark held, comma-separated (07.09). NULL on existing rows and
+    # read as "just the one in `badge`", so nothing needed rewriting.
+    ("badges_earned", "TEXT"),
     # When the account paid to get in (07.09). NULL on every existing row,
     # which is correct: nobody has paid yet, and an island that never
     # charges will keep it NULL for ever.

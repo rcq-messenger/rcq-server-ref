@@ -102,6 +102,21 @@ class User(Base):
     # only" here, because the mark travels in list rows and roster payloads
     # that no per-viewer rule reaches cheaply.
     badge_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Every mark this account has EARNED, comma-separated, while `badge` above
+    # is the one it currently WEARS.
+    #
+    # ⚠⚠ Two columns rather than one, because they answer different questions
+    # and only one of them is the person's to change. A tester who later pays
+    # has two marks and can show either; an admin taking one away must take it
+    # from what they hold, not merely from what is on display. Until today the
+    # single column meant granting a mark SILENTLY DESTROYED the previous one,
+    # and the person had no way back to it.
+    #
+    # ⚠ Empty on every row that predates this, so `earned_badges` below reads
+    # a lone `badge` as the one thing held. No backfill: a migration that
+    # rewrites every account row to say what one other column already says is
+    # a risk taken for nothing.
+    badges_earned: Mapped[str | None] = mapped_column(Text, nullable=True)
     # When this account paid its way in, or NULL for everyone else \u2014 which
     # is everyone on an open island, and everyone who was already here when a
     # closed one started charging. It is not a flag: the DATE is what a drip of
@@ -416,6 +431,48 @@ def effective_status(user: "User") -> str:
     if user.status in ("away", "dnd", "invisible"):
         return user.status
     return "online"
+
+
+def earned_badges(u: User) -> list[str]:
+    """Every mark this account holds, worn or not.
+
+    Falls back to the single `badge` column for rows written before marks could
+    be held in the plural, which is why nothing had to be rewritten to add the
+    feature.
+    """
+    raw = (u.badges_earned or "").strip()
+    if raw:
+        out = [k for k in (p.strip() for p in raw.split(",")) if k]
+        # A worn mark that is somehow not in the list still belongs to them:
+        # trusting the list alone would let a bad write take a mark away.
+        if u.badge and u.badge not in out:
+            out.append(u.badge)
+        return out
+    return [u.badge] if u.badge else []
+
+
+def grant_badge(u: User, kind: str) -> None:
+    """Add a mark to what this account holds, and wear it if nothing is worn.
+
+    ⚠ Does NOT replace what is on display. Somebody who chose to show their
+    tester mark and then pays keeps showing the tester mark; the resident one
+    joins the set and waits to be picked. Overwriting the choice would be the
+    old behaviour wearing a new name.
+    """
+    held = earned_badges(u)
+    if kind not in held:
+        held.append(kind)
+    u.badges_earned = ",".join(held)
+    if not u.badge:
+        u.badge = kind
+
+
+def revoke_badge(u: User, kind: str) -> None:
+    """Take a mark away entirely: from the set, and from display if worn."""
+    held = [k for k in earned_badges(u) if k != kind]
+    u.badges_earned = ",".join(held)
+    if u.badge == kind:
+        u.badge = held[0] if held else None
 
 
 def badge_for_viewer(u: User, *, viewer_uin: int | None) -> str | None:

@@ -37,7 +37,7 @@ from app.models.relay_inquiry import RelayInquiry
 from app.models.report import Report
 from app.models.report_message import ReportMessage
 from app.models.group import Group, GroupMember
-from app.models.user import User, effective_status
+from app.models.user import User, effective_status, grant_badge, revoke_badge
 from app.services import island_logo, server_settings
 from app.services.apns import send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
@@ -947,7 +947,16 @@ async def set_user_badge(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-    user.badge = body.badge
+    # ⚠ Add or take away, never overwrite. Setting the column directly meant
+    # granting a second mark silently destroyed the first, and the person had
+    # no way back to it (founder, 07.09).
+    if body.badge:
+        grant_badge(user, body.badge)
+    else:
+        # A bare "clear" takes away whatever is on display, which is what the
+        # console's empty picker has always meant.
+        if user.badge:
+            revoke_badge(user, user.badge)
     await db.commit()
     await db.refresh(user)
     admin = getattr(request.state, "admin", None) or "admin"

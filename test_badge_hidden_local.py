@@ -60,6 +60,48 @@ users = (ROOT / 'users.py').read_text()
 check("the owner gets their own setting back", "badge_hidden=(u.badge_hidden if owner_self else None)" in users)
 check("the setting is writable from a client", "badge_hidden: bool | None = None" in users)
 
-bad = [n for n, c in checks if not c]
-print(f"\n{len(checks) - len(bad)}/{len(checks)} прошло")
-sys.exit(1 if bad else 0)
+
+# ── Несколько меток: что держат, что носят ────────────────────────────────
+from app.models.user import earned_badges, grant_badge, revoke_badge
+
+u = User(); u.uin = 5000; u.badge = None; u.badges_earned = None; u.badge_hidden = False
+check("an account with nothing holds nothing", earned_badges(u) == [])
+
+grant_badge(u, "tester")
+check("a first grant is both held and worn", earned_badges(u) == ["tester"] and u.badge == "tester")
+
+grant_badge(u, "resident")
+check("a second grant is HELD but does not replace what is worn",
+      earned_badges(u) == ["tester", "resident"] and u.badge == "tester")
+
+grant_badge(u, "tester")
+check("granting the same one twice does not duplicate it",
+      earned_badges(u) == ["tester", "resident"])
+
+u.badge = "resident"
+revoke_badge(u, "resident")
+check("revoking what is worn falls back to something still held",
+      earned_badges(u) == ["tester"] and u.badge == "tester")
+
+revoke_badge(u, "tester")
+check("revoking the last one leaves nothing worn", earned_badges(u) == [] and u.badge is None)
+
+old = User(); old.uin = 5001; old.badge = "official"; old.badges_earned = None
+check("a row from before the set existed reads its lone mark as the one held",
+      earned_badges(old) == ["official"])
+
+odd = User(); odd.uin = 5002; odd.badge = "official"; odd.badges_earned = "tester"
+check("a worn mark missing from the set is still counted as held",
+      set(earned_badges(odd)) == {"tester", "official"})
+
+users_src = pathlib.Path('app/routers/users.py').read_text()
+check("picking a mark is checked against what is held, not granted",
+      "badge_not_held" in users_src and "earned_badges(user)" in users_src)
+check("the set is owner-only on the wire",
+      "badges_earned=(earned_badges(u) if owner_self else [])" in users_src)
+admin_src = pathlib.Path('app/routers/admin.py').read_text()
+check("an admin grant adds instead of overwriting", "grant_badge(user, body.badge)" in admin_src)
+
+bad2 = [n for n, c in checks if not c]
+print(f"\nвсего {len(checks) - len(bad2)}/{len(checks)}")
+sys.exit(1 if bad2 else 0)

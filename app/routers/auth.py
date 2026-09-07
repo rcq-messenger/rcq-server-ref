@@ -565,7 +565,11 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         # heard of, which is deliberate and safe: every client draws an unknown
         # kind from the island's own `badge_labels`, so naming and colouring it
         # is an island setting rather than four client releases.
+        #
+        # Both columns: what they hold, and what they wear. A brand new account
+        # wears it because there is nothing else to wear.
         badge="resident" if resident_at else None,
+        badges_earned="resident" if resident_at else None,
     )
     db.add(user)
     await db.commit()

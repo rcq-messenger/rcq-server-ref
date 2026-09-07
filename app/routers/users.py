@@ -19,7 +19,7 @@ from app.core.rate_limit import enforce_cost_budget, rate_limit
 from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
-from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen, badge_for_viewer
+from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen, badge_for_viewer, earned_badges
 from app.services import door
 from app.services.connection_manager import manager
 from app.services.contact_source import mark_vault_device, unmark_vault_device
@@ -115,6 +115,10 @@ class PublicUser(BaseModel):
     # blind to the decision because the receipt envelope is
     # sealed-sender. Always null for third-party callers.
     read_receipts_visibility: str | None = None
+    #: Owner-only: every mark this account HOLDS, so a client can offer the
+    #: choice of which to wear. Empty for everybody else, and for an account
+    #: with nothing: a peer's collection is not a thing to publish.
+    badges_earned: list[str] = []
     # Owner-only mirror of "wear my mark where others can see it". A bool
     # rather than the tri-state the fields around it use: the mark rides in
     # list rows and rosters that are built once for many viewers, so
@@ -256,6 +260,7 @@ class PublicUser(BaseModel):
             signal_registration_id=u.signal_registration_id,
             last_seen=last_seen,
             badge_hidden=(u.badge_hidden if owner_self else None),
+            badges_earned=(earned_badges(u) if owner_self else []),
             last_seen_visibility=(u.last_seen_visibility if owner_self else None),
             gender_visibility=(u.gender_visibility if owner_self else None),
             profile_visibility=(u.profile_visibility if owner_self else None),
@@ -421,9 +426,13 @@ class ProfileUpdate(BaseModel):
     # `extra="forbid"` config on this model.
     # Hall-of-Fame consent toggle. User opts in; the founder approves
     # separately (admin-only). `hof_approved` is NOT settable here.
-    # "Wear my mark where others can see it", inverted: true hides it. Only
-    # this flag is the user's; the mark itself stays admin-only.
+    # "Wear my mark where others can see it", inverted: true hides it.
     badge_hidden: bool | None = None
+    # WHICH of the marks this account holds to wear. Not a way to award one:
+    # the value is checked against what they already hold, so the worst a
+    # client can do is pick something they earned. Empty string wears nothing
+    # while keeping the set.
+    badge: str | None = None
     hof_opt_in: bool | None = None
     # Optional public HoF avatar as a data-URI. Empty string clears it.
     # Validated (mime allow-list + base64 + size cap) in update_me.
@@ -1033,6 +1042,16 @@ async def update_me(
     if "gender" in data and data["gender"] is not None:
         if data["gender"] not in ("male", "female", "other"):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid gender")
+    if "badge" in data:
+        # ⚠⚠ CHECKED AGAINST WHAT THEY HOLD. This is the only client-writable
+        # field that touches a mark, and without the check it would be an
+        # endpoint for awarding yourself one — the island's own statement about
+        # a person, editable by that person.
+        wanted = (data["badge"] or "").strip()
+        held = earned_badges(user)
+        if wanted and wanted not in held:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "badge_not_held"})
+        data["badge"] = wanted or None
     if "hof_avatar" in data:
         # Empty/blank string clears the avatar; otherwise it must be a small
         # base64 image data-URI of an allowed type. Stored inline + served
