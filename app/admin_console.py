@@ -1360,7 +1360,12 @@ const CHAINS = [
 ];
 /* Nine down to four. Three-digit numbers are never sold (uin_shop.py), so the
  * row is not offered rather than offered and refused. */
-const PRICE_LENGTHS = [9, 8, 7, 6, 5, 4];
+/* ⚠ Three is in the list. The island has always priced three-digit numbers
+ * (the built-in ladder puts them at $999) and the shop has always been willing
+ * to sell one through the voucher door, but this editor did not offer the row,
+ * so an operator could neither see the price nor change it and the help text
+ * underneath claimed they were never sold (founder, 07.09). */
+const PRICE_LENGTHS = [9, 8, 7, 6, 5, 4, 3];
 const BADGE_SEED = ['official', 'tester', 'special'];
 
 function parseJSONSetting(v){
@@ -1402,8 +1407,9 @@ function pricesEditor(s){
     </div>`).join('');
   return `<div class="editor">${rows}
     <button class="btn sm" onclick="savePrices()">Save prices</button>
-    <div class="ehelp">A length you leave blank is one you do not sell. Three-digit
-      numbers are never sold.</div></div>`;
+    <div class="ehelp">A length you leave blank is one you do not sell. Shorter
+      numbers (six digits and under) are scarce stock: they are only ever handed
+      over against a paid voucher, never given away.</div></div>`;
 }
 function savePrices(){
   const out = {};

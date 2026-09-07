@@ -196,12 +196,27 @@ _reg(SettingSpec("uin_shop_enabled", "bool", lambda: _env.UIN_SHOP_ENABLED, "num
                  "are absent rather than merely quiet: an island that will never "
                  "sell must not quote a price, because that advertises somebody "
                  "else's shop. Handing numbers out by arrangement works either way."))
-_reg(SettingSpec("uin_prices", "str", lambda: os.environ.get("RCQ_UIN_PRICES", ""), "numbers",
+#: ⚠⚠ The DEFAULT here has to be the ladder the shop actually charges, not an
+#: empty string. It was empty, and `uin_shop._prices()` quietly fell back to a
+#: built-in ladder of its own, so the console drew every price field blank with
+#: "not sold" under it while the island was selling numbers at prices the
+#: operator could not see and had never agreed to (founder, 07.09). One source
+#: now: this default IS that ladder.
+def _default_uin_prices() -> str:
+    env = os.environ.get("RCQ_UIN_PRICES", "").strip()
+    if env:
+        return env
+    from app.routers.uin_shop import _DEFAULT_PRICES_CENTS  # local: avoid a cycle
+    return json.dumps({str(k): v for k, v in sorted(_DEFAULT_PRICES_CENTS.items())})
+
+
+_reg(SettingSpec("uin_prices", "str", _default_uin_prices, "numbers",
                  "Your prices",
-                 'What YOU charge for a number, by how many digits it has. Empty '
-                 'means the flagship\'s ladder, which is almost certainly not what '
-                 'you want when the money is yours. A length you leave blank is '
-                 'one you do not sell; three digits are never sold.',
+                 "What YOU charge for a number, by how many digits it has. What "
+                 "you see is what this island charges right now. A length you "
+                 "leave blank is one you do not sell, and six digits and under "
+                 "are scarce stock: those only ever change hands against a paid "
+                 "voucher, never for free.",
                  editor="prices"))
 _reg(SettingSpec("uin_till_url", "str", lambda: os.environ.get("RCQ_UIN_TILL_URL", ""), "numbers",
                  "Your checkout",
@@ -223,11 +238,11 @@ _reg(SettingSpec("uin_resale_enabled", "bool", lambda: False, "numbers",
 _reg(SettingSpec("uin_payout_addresses", "str",
                  lambda: os.environ.get("RCQ_UIN_PAYOUT_ADDRESSES", ""), "numbers",
                  "Your wallets",
-                 'Where buyers pay YOU for numbers this island sells, as JSON by '
-                 'chain: {"tron": "T...", "ton": "UQ..."}. Your till asks the island '
-                 'for these, so changing one here changes where the next invoice '
-                 'sends money. ⚠ An address you do not control is an invoice you '
-                 'cannot collect, and nothing here can undo a payment.',
+                 'Where buyers pay YOU for numbers this island sells, one '
+                 'address per chain. Your till asks the island for these, so '
+                 'changing one here changes where the next invoice sends money. '
+                 '⚠ An address you do not control is an invoice you cannot '
+                 'collect, and nothing here can undo a payment.',
                  editor="wallets"))
 _reg(SettingSpec("uin_voucher_pubkey", "str",
                  lambda: os.environ.get("RCQ_UIN_VOUCHER_PUBKEY", ""), "numbers",
@@ -238,9 +253,8 @@ _reg(SettingSpec("uin_voucher_pubkey", "str",
 
 _reg(SettingSpec("badge_labels", "str", lambda: "", "branding",
                  "Badge names and descriptions",
-                 'What your island calls its badges, as JSON keyed by kind: '
-                 '{"official": {"label": "Official", "description": "...", '
-                 '"color": "#3B9EE8"}}. Leave empty and the clients use their '
+                 'What your island calls its badges. Leave a kind alone and '
+                 'the clients use their '
                  'own translated defaults for the kinds they know. This is how '
                  'a badge becomes YOUR badge: the kind is a slug the island '
                  'chooses (a-z, digits, - and _, up to 16 characters), so an '
