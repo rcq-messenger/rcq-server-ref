@@ -694,6 +694,31 @@ class SuggestionOut(BaseModel):
     price_display: str
 
 
+class LadderOut(BaseModel):
+    """What this island charges, by digit length, and what it will not sell.
+
+    ⚠ Public and unauthenticated on purpose: the till draws its shop window
+    from this, and the till has no account here. Before it existed the window
+    came from a ladder compiled into the till itself, which meant an operator
+    who changed a price in the console changed what buyers were CHARGED and not
+    what they were SHOWN, and the two drifted apart with nobody watching. One
+    source now, and it is the island.
+    """
+
+    #: Cents by digit length, as strings because JSON object keys are strings.
+    #: A length that is absent is one this island does not sell.
+    prices_cents: dict[str, int]
+    #: The shortest and longest number this island will quote at all.
+    min_length: int = MIN_LEN
+    max_length: int = MAX_LEN
+
+
+@router.get("/ladder", response_model=LadderOut)
+async def ladder() -> LadderOut:
+    prices = await _prices()
+    return LadderOut(prices_cents={str(k): v for k, v in sorted(prices.items())})
+
+
 @router.get(
     "/suggestions",
     response_model=list[SuggestionOut],
