@@ -102,6 +102,19 @@ class User(Base):
     # only" here, because the mark travels in list rows and roster payloads
     # that no per-viewer rule reaches cheaply.
     badge_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    # When this account paid its way in, or NULL for everyone else \u2014 which
+    # is everyone on an open island, and everyone who was already here when a
+    # closed one started charging. It is not a flag: the DATE is what a drip of
+    # invites would later accrue from, and what an operator needs to answer
+    # "when did this person join us" without asking the account row, whose
+    # `created_at` does not survive a UIN migration.
+    #
+    # \u26a0 Set once, at registration, from a redeemed entry voucher. Nothing
+    # else writes it: an admin granting a badge is not a payment, and a client
+    # can never claim it.
+    resident_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Hall of Fame. `hof_opt_in` is set by the user from their client (consent
     # to be considered). `hof_approved` is set by the founder from the admin

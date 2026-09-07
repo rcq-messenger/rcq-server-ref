@@ -32,7 +32,10 @@ from app.core.security import (
     verify_recover_challenge,
 )
 from app.services import server_settings
+from sqlalchemy.exc import IntegrityError
 from app.models.invite import Invite, hash_invite_code
+from app.models.uin_sale import SpentVoucher
+from app.services import uin_voucher
 from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
 from app.models.queue_cursor import QueueCursor
@@ -372,9 +375,55 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         (Invite.used_count + 1 >= Invite.max_uses, datetime.now(timezone.utc)),
         else_=Invite.spent_at,
     )
-    if await server_settings.get("registration_policy") == "invite":
+    policy = await server_settings.get("registration_policy")
+    # ⚠⚠ PAID ENTRY RIDES THE INVITE FIELD, on purpose. An entry voucher and an
+    # invite answer the same question — "may this person have an account here"
+    # — and every client already has one box for that answer, on four
+    # platforms and in seven languages. Giving payment its own field would have
+    # meant a second box beside the first, asking people to know which of two
+    # credentials they are holding, which is exactly the confusion the gateway
+    # key was just renamed to avoid.
+    #
+    # An invite still works on a paid island, and that is deliberate: it is how
+    # the operator lets somebody in without charging them, and later how a
+    # resident spends one of their own.
+    #
+    # The voucher is tried FIRST and only when it looks like one, so a plain
+    # invite never pays the cost of a signature check.
+    resident_at: datetime | None = None
+    if policy == "paid" and code:
+        try:
+            nonce = uin_voucher.verify_entry(
+                code, expect_host=str(await server_settings.get("island_host") or "")
+            )
+        except uin_voucher.VoucherError as e:
+            # Not a voucher, or not one for us. A malformed string still has a
+            # chance of being an invite, so fall through and let the invite gate
+            # answer; anything that names another island or has been tampered
+            # with is refused here and now.
+            if e.code in ("voucher_other_island", "voucher_expired"):
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": e.code}) from None
+        else:
+            # Signed by the till. Now the second question, which the signature
+            # cannot answer: has it been redeemed already. One row, nonce as the
+            # primary key, exactly as a number sale does it.
+            db.add(SpentVoucher(nonce=nonce))
+            try:
+                await db.flush()
+            except IntegrityError:
+                await db.rollback()
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, detail={"code": "voucher_spent"}
+                ) from None
+            resident_at = datetime.now(timezone.utc)
+            code = ""  # spent as a voucher; do not also spend it as an invite
+
+    if policy in ("invite", "paid") and resident_at is None:
         if not code:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_required"})
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail={"code": "invite_required" if policy == "invite" else "entry_required"},
+            )
         consumed = await db.execute(
             update(Invite)
             .where(*invite_gates)
@@ -496,6 +545,11 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         nickname=body.nickname,
         identity_key=identity_key,
         signing_key=signing_key,
+        # NULL unless an entry voucher was redeemed a few dozen lines up. An
+        # invite, even on a paid island, does not make somebody a resident:
+        # they were let in, they did not buy their way in, and the two are
+        # different facts about the same person.
+        resident_since=resident_at,
     )
     db.add(user)
     await db.commit()

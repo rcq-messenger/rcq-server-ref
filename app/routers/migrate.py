@@ -159,6 +159,12 @@ async def _perform_migration(
         # row that predates the column reads NULL and falls back to
         # `created_at`, which for a number that never moved is the same moment.
         identity_created_at=user.identity_created_at or user.created_at,
+        # ⚠ Residency follows the PERSON. Somebody who paid to get in and then
+        # buys a short number has not stopped being a resident, and making them
+        # pay again for the privilege of spending money here would be absurd.
+        # Same reasoning as the line above: this is a fact about them, not
+        # about the number they answered as.
+        resident_since=user.resident_since,
         #
         # Three fields left this list on 2026-08-22 with the columns behind
         # them: `trade_policy` (guarded a router that has not existed since the

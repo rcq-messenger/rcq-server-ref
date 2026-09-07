@@ -139,6 +139,86 @@ def verify_resale(voucher: str, *, expect_uin: int, now: int | None = None) -> t
     return nonce, listing_id, price_cents
 
 
+def entry_signed_bytes(*, host: str, nonce: str, exp: int) -> bytes:
+    """The bytes the till signs for ENTRY to an island, not for a number.
+
+    ⚠ The host is inside the signature and it is the whole point. Every other
+    voucher kind is bound to a `uin`, a number that already exists on this
+    island. Entry is bought BEFORE there is an account, so there is no number
+    to bind to, and without the host a voucher paid for on one island would
+    open every island that trusts the same till. Federation makes that a real
+    attack rather than a theoretical one: a self-hoster who sells entry cheaply
+    would otherwise be selling entry to the flagship.
+    """
+    doc = {"v": VERSION, "kind": "entry", "host": str(host),
+           "nonce": str(nonce), "exp": int(exp)}
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+
+
+def verify_entry(voucher: str, *, expect_host: str, now: int | None = None) -> str:
+    """Check an entry voucher against THIS island's own name; return its nonce.
+
+    Same division of labour as `verify`: this proves the till signed it, and
+    the caller still has to record the nonce as spent. Both halves are needed
+    and neither is the other.
+
+    `expect_host` must come from the island's own configuration, never from a
+    request header. A header is attacker-controlled, and trusting one here
+    would let anybody redeem another island's voucher by claiming to be that
+    island while talking to us.
+    """
+    pub_b64 = public_key_b64()
+    if not pub_b64:
+        raise VoucherError("sales_disabled")
+    expect = (expect_host or "").strip().lower()
+    if not expect:
+        # An island that has not been told its own name cannot check the one
+        # field that matters. Refuse rather than accept anything.
+        raise VoucherError("sales_disabled")
+
+    try:
+        raw = base64.b64decode(voucher.strip(), validate=True)
+        doc = json.loads(raw)
+    except (ValueError, binascii.Error, TypeError):
+        raise VoucherError("bad_voucher") from None
+    if not isinstance(doc, dict) or doc.get("v") != VERSION or doc.get("kind") != "entry":
+        raise VoucherError("bad_voucher")
+    try:
+        # ⚠ Kept VERBATIM for the signature and normalised only for the
+        # comparison. Hostnames are case-insensitive, so a till that signs
+        # "API.RCQ.APP" is naming the same island as one that signs
+        # "api.rcq.app" — but the signature covers the bytes it was made over,
+        # and lowercasing before rebuilding them turns a good voucher into a
+        # forgery. Two different questions, two different values.
+        host_signed = str(doc["host"])
+        exp = int(doc["exp"])
+        nonce = str(doc["nonce"])
+        sig = base64.b64decode(str(doc["sig"]), validate=True)
+    except (KeyError, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+    if not (16 <= len(nonce) <= 128) or not nonce.isascii():
+        raise VoucherError("bad_voucher")
+    if host_signed.strip().lower() != expect:
+        raise VoucherError("voucher_other_island")
+
+    seconds = int(time.time() if now is None else now)
+    if exp <= seconds:
+        raise VoucherError("voucher_expired")
+    if exp - seconds > MAX_AGE_SECONDS:
+        raise VoucherError("bad_voucher")
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64, validate=True))
+        pub.verify(sig, entry_signed_bytes(host=host_signed, nonce=nonce, exp=exp))
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+
+    return nonce
+
+
 def public_key_b64() -> str | None:
     """The till's public half, from the environment. Absent means numbers are
     not for sale on this island, which is the right default for a self-hosted

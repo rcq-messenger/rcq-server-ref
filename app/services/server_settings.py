@@ -106,8 +106,23 @@ _reg(SettingSpec("closed_island", "bool", lambda: False, "limits",
                  "closed island must not become a directory for guessing which "
                  "numbers exist."))
 _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY, "limits",
-                 "Registration", "Who may create an account on this island.",
-                 choices=("open", "invite")))
+                 "Registration",
+                 "Who may create an account on this island. \u201cpaid\u201d takes "
+                 "an entry voucher bought from the till, or an invite you handed "
+                 "out yourself \u2014 both arrive in the same field, and an invite "
+                 "still works, so you can let somebody in without charging them.",
+                 choices=("open", "invite", "paid")))
+_reg(SettingSpec("island_host", "str", lambda: "", "limits",
+                 "This island's own address",
+                 "The hostname people type to reach this island, e.g. "
+                 "api.rcq.app. \u26a0\u26a0 REQUIRED before \u201cpaid\u201d "
+                 "registration will accept anything: an entry voucher carries "
+                 "the island it was bought for INSIDE its signature, and this "
+                 "is what it is checked against. It cannot be taken from the "
+                 "request instead \u2014 a header is written by whoever is "
+                 "calling, so trusting one would let a voucher bought for a "
+                 "cheap island open this one. Left empty, paid entry refuses "
+                 "everything rather than accepting anything."))
 _reg(SettingSpec("max_accounts_per_device", "int", lambda: 5, "limits",
                  "Accounts the app will hold",
                  "How many accounts one INSTALL of the app keeps side by side. "
