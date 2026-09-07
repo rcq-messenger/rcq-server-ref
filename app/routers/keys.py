@@ -636,12 +636,25 @@ async def register_device(
 )
 async def list_devices(
     uin: int,
+    request: Request,
     me: int | None = Depends(current_uin_optional),
     db: AsyncSession = Depends(get_db),
 ) -> DevicesOut:
     """Every device of `uin` a sender should fan out to: the primary device
     (deviceId 1) when the user has a libsignal bundle, plus each non-revoked
     secondary device."""
+    # ⚠⚠ THE CLOSED-ISLAND GATE, and it was missing here. Every row below
+    # carries a `signal_identity_key`, which is key material, and this door is
+    # `current_uin_optional` — so on a closed island an outsider who could not
+    # get a bundle from `/keys/{uin}/bundle` could still read one off the
+    # device list. A lock with a second door is not a lock. Same refusal as the
+    # gated door: 404 "no such user", indistinguishable from a number that does
+    # not exist.
+    if me is None and not await door.may_fetch_key(
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -688,7 +701,17 @@ async def fetch_device_bundle(
     """Per-device prekey bundle for X3DH against a SPECIFIC device of `uin`.
     deviceId 1 = the primary (phone) bundle on the User row (delegates to the
     legacy path); >= 2 = a secondary device. Consumes one OPK from THAT
-    device's pool."""
+    device's pool.
+
+    ⚠⚠ Gated like `fetch_bundle`, and it was not. The comment on that function
+    says this path "is NOT gated", meaning the multi-device withholding — but
+    the closed-island door lived there too, so an outsider refused at
+    `/keys/{uin}/bundle` got the very same primary bundle by asking for device
+    1 instead. The lock had a second door standing open."""
+    if me is None and not await door.may_fetch_key(
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     if device_id == PRIMARY_DEVICE_ID:
         return await _primary_bundle(uin, db, request, me)
 

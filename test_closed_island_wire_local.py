@@ -216,6 +216,31 @@ async def main() -> None:
         check("but a resident with a session passes door 2 untouched",
               r.status_code in (200, 404), str(r.status_code))
 
+        # ⚠⚠ THE DOORS THIS TEST DID NOT KNOW ABOUT, and that is exactly why
+        # they stayed open. `/keys/{uin}/bundle` was gated and its device-aware
+        # twin was not: asking for device 1 lands in the same primary bundle by
+        # another route, and the device LIST hands out a signal identity key per
+        # row. Both are current_uin_optional. A lock with a second door is not a
+        # lock, and a test that checks one door is not a test.
+        r = await c.get(f"/keys/{resident}/devices/1/bundle")
+        check("the device-aware door refuses a stranger too, or door 2 was "
+              "theatre: device 1 IS the primary bundle",
+              r.status_code == 404, str(r.status_code))
+
+        r = await c.get(f"/keys/{resident}/devices")
+        check("and the device LIST refuses one: every row in it carries key "
+              "material",
+              r.status_code == 404, str(r.status_code))
+
+        r = await c.get(f"/keys/{resident}/devices/1/bundle", headers={"X-RCQ-Guest-Card": raw})
+        check("a guest card opens the device door as well, or a stranger the "
+              "resident invited cannot reach a second device",
+              r.status_code in (200, 404), str(r.status_code))
+
+        r = await c.get(f"/keys/{resident}/devices", headers=auth(ntok))
+        check("a resident with a session passes both untouched",
+              r.status_code == 200, str(r.status_code))
+
         info = (await c.get("/server/info")).json()
         check("a closed island stops advertising anonymous key fetches: a door "
               "that cannot tell a resident from an outsider is not a door",
