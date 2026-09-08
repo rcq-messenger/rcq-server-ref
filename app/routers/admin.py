@@ -959,6 +959,18 @@ async def set_user_badge(
     # no way back to it (founder, 07.09).
     if body.badge:
         grant_badge(user, body.badge)
+        # ⚠⚠ THE MARK AND THE ENTITLEMENT TRAVEL TOGETHER, in this direction
+        # only. `resident` is in the operator's picker for the case named
+        # above the kind list: somebody paid another way and has to be let in
+        # by hand. But residency is read off `resident_since`, not off the
+        # mark - the invite door checks the column and answers `not_a_resident`
+        # - so the mark alone gave them the badge and none of what it means.
+        #
+        # Not reversed on revoke, deliberately: taking a mark away must not
+        # silently confiscate something that was paid for, and no path here
+        # gives money back.
+        if body.badge == "resident" and user.resident_since is None:
+            user.resident_since = datetime.now(timezone.utc)
     else:
         # A bare "clear" takes away whatever is on display, which is what the
         # console's empty picker has always meant.

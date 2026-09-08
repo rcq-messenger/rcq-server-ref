@@ -1426,7 +1426,21 @@ const CHAINS = [
  * so an operator could neither see the price nor change it and the help text
  * underneath claimed they were never sold (founder, 07.09). */
 const PRICE_LENGTHS = [9, 8, 7, 6, 5, 4, 3];
-const BADGE_SEED = ['official', 'tester', 'special'];
+/* ⚠ 'resident' is in the seed because the island grants it ITSELF the moment
+   somebody's entry voucher verifies (routers/auth.py). It was the one kind
+   an operator was never offered a row for, so nobody ever named or
+   coloured the only mark their island hands out on its own. */
+const BADGE_SEED = ['official', 'tester', 'special', 'resident'];
+/* The colour each client already draws a known kind in, so a row an operator
+   has not touched shows the mark as people actually see it instead of the same
+   blue for all four. Mirrors BadgeMark on iOS, badgeTintOf on Android and
+   COLOUR in the web client; anything else keeps the neutral blue. */
+const BADGE_DEFAULT_COLOR = {
+  official: '#3b9ee8',
+  tester: '#e0a21b',
+  special: '#e05068',
+  resident: '#f97316',
+};
 
 function parseJSONSetting(v){
   if (!v) return {};
@@ -1501,7 +1515,7 @@ function badgeRow(kind, v, i){
   return `<div class="brow" data-i="${i}">
     <input class="bkind" value="${escAttr(kind)}" placeholder="kind" style="width:110px" spellcheck="false">
     <input class="blabel" value="${escAttr(v.label||'')}" placeholder="name shown to people" style="width:160px">
-    <input class="bcolor" type="color" value="${/^#[0-9a-fA-F]{6}$/.test(v.color||'') ? v.color : '#3b9ee8'}" title="colour">
+    <input class="bcolor" type="color" value="${/^#[0-9a-fA-F]{6}$/.test(v.color||'') ? v.color : (BADGE_DEFAULT_COLOR[kind] || '#3b9ee8')}" title="colour">
     <input class="bdesc" value="${escAttr(v.description||'')}" placeholder="one sentence: what this mark means" style="flex:1;min-width:220px">
   </div>`;
 }
@@ -1568,11 +1582,11 @@ async function setFeature(key, value){
 
 let MOCK_SETTINGS = [
   {key:'random_enabled',type:'bool',group:'features',label:'Random Chat',help:'Anonymous roulette-style chat.',value:true,default:true,overridden:false,min:null,max:null,choices:null},
-  {key:'registration_policy',type:'str',group:'limits',label:'Registration',help:'Who may create an account on this island.',value:'open',default:'open',overridden:false,min:null,max:null,choices:['open','invite']},
+  {key:'registration_policy',type:'str',group:'limits',label:'Registration',help:'Who may create an account on this island.',value:'open',default:'open',overridden:false,min:null,max:null,choices:['open','invite','paid']},
   {key:'max_accounts_per_device',type:'int',group:'limits',label:'Max accounts / device',help:'How many accounts one device may hold.',value:5,default:5,overridden:false,min:1,max:50,choices:null},
   {key:'island_name',type:'str',group:'branding',label:'Island name',help:'Display name clients read from /server/info.',value:'Example Island',default:'RCQ Backend',overridden:true,min:null,max:null,choices:null},
   {key:'welcome_text',type:'str',group:'branding',label:'Welcome / rules',help:'Optional welcome or rules text shown in the app.',value:'',default:'',overridden:false,min:null,max:null,choices:null},
-  {key:'badge_labels',type:'str',group:'branding',label:'Badge names and descriptions',help:'What your island calls its badges. Leave a row blank and the apps use their own translated wording.',value:'{"official":{"label":"Official","description":"Confirmed by this island.","color":"#3b9ee8"},"resident":{"label":"Resident","description":"Holds residency on this island.","color":"#22c55e"}}',default:'',overridden:true,min:null,max:null,choices:null,editor:'badges'},
+  {key:'badge_labels',type:'str',group:'branding',label:'Badge names and descriptions',help:'What your island calls its badges. Leave a row blank and the apps use their own translated wording.',value:'{"official":{"label":"Official","description":"Confirmed by this island.","color":"#3b9ee8"},"resident":{"label":"Resident","description":"Holds residency on this island.","color":"#f97316"}}',default:'',overridden:true,min:null,max:null,choices:null,editor:'badges'},
   {key:'uin_payout_addresses',type:'str',group:'numbers',label:'Your wallets',help:'Where buyers pay YOU for numbers this island sells.',value:'{"tron":"TYj5rJMVSJ5LATG9kPgemEiaDH9ft1FqY5"}',default:'',overridden:true,min:null,max:null,choices:null,editor:'wallets'},
   {key:'uin_prices',type:'str',group:'numbers',label:'Your prices',help:'What YOU charge for a number, by how many digits it has.',value:'{"6":1499,"7":499}',default:'',overridden:true,min:null,max:null,choices:null,editor:'prices'},
 ];
