@@ -17,11 +17,16 @@ feature behind the lookup.
 import json
 import re
 import logging
+import time
 from fastapi import APIRouter, Header, status
 from fastapi.responses import Response as RawResponse
 from pydantic import BaseModel
 
+from sqlalchemy import func, select
+
 from app.core.config import settings
+from app.core.db import SessionLocal
+from app.models.user import User
 from app.routers import media, vault
 from app.services import island_logo, server_settings
 
@@ -64,6 +69,20 @@ class ServerCapabilities(BaseModel):
     #: on iOS: Apple does not allow an app to point at a purchase it does not
     #: handle.
     entry_url: str = ""
+    #: How many accounts live here. Published so the island picker can say it
+    #: on the card, beside the price: a number is what makes a closed club read
+    #: as a place rather than a paywall (founder, 09.09).
+    #:
+    #: ⚠ ON THIS REPLY RATHER THAN ITS OWN ENDPOINT, deliberately. The clients
+    #: already fetch /server/info for every card the reader looks at, so the
+    #: count costs no extra request and no extra island learns this device's
+    #: address. `/public/stats` still exists and still answers; this is the
+    #: same number where the callers already are.
+    #:
+    #: 0 means "not published" — an island older than this field, and the
+    #: window after a restart before the first count — so a client draws
+    #: nothing rather than claiming an empty island.
+    user_count: int = 0
     # Operator-toggled optional features (admin console -> Features). Each
     # defaults True so old clients that ignore the field keep showing the tab;
     # a client that reads these hides the tab when the operator turns it off.
@@ -267,6 +286,32 @@ def _badge_texts(raw: str) -> dict[str, BadgeText]:
         return {}
 
 
+#: `/server/info` is asked by every client on boot and by every island card a
+#: person swipes past, so the headcount behind it is counted at most once a
+#: minute and served from here in between. A minute-old number is right for a
+#: figure that moves by ones.
+_USER_COUNT: tuple[float, int] = (0.0, 0)
+_USER_COUNT_TTL = 60.0
+
+
+async def _user_count() -> int:
+    """Accounts on this island, cached. Returns 0 if the count cannot be taken:
+    the field's own contract is that 0 means "not published", and a card that
+    draws nothing is better than one that says an island is empty."""
+    global _USER_COUNT
+    at, value = _USER_COUNT
+    now = time.monotonic()
+    if value and now - at < _USER_COUNT_TTL:
+        return value
+    try:
+        async with SessionLocal() as db:
+            count = int(await db.scalar(select(func.count(User.uin))) or 0)
+    except Exception:
+        return value
+    _USER_COUNT = (now, count)
+    return count
+
+
 @router.get("/info", response_model=ServerInfo)
 async def server_info() -> ServerInfo:
     eff = await server_settings.effective()
@@ -305,6 +350,7 @@ async def server_info() -> ServerInfo:
             # Selling something a client cannot show a box for is the bug.
             entry_price_cents=int(eff["entry_price_cents"]),
             entry_url=str(eff["entry_url"]),
+            user_count=await _user_count(),
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
