@@ -101,7 +101,7 @@ with a reason; the nine that are accounted for elsewhere:
 
 from __future__ import annotations
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import UniqueConstraint, delete, func, select, text, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import LEGACY_POLL_TABLES
@@ -261,6 +261,115 @@ async def _move_sites(db: AsyncSession, old_uin: int, new_uin: int | None) -> No
             site.owner_uin = new_uin
 
 
+# Columns where the UIN names SOMEBODY ELSE'S row: a stranger's address-book
+# entry pointing at this number, or a request somebody sent to it. Everything
+# else in PER_UIN_COLUMNS names the row's own owner.
+#
+# The distinction decides what may be deleted when clearing the destination
+# below. A row the vacated account owned is dead the moment nobody answers as
+# that number; a row a LIVE third party owns is theirs, and the fact that it
+# happens to point at a number changing hands is not a reason to destroy it.
+_THIRD_PARTY_UIN_COLUMNS = {
+    (Contact, Contact.contact_uin.key),
+    (ContactRequest, ContactRequest.to_uin.key),
+}
+
+
+def _unique_keys_containing(model: type, column) -> list[list]:
+    """Every unique key on this table that contains `column`.
+
+    Primary key, UNIQUE constraints AND unique indexes: `offline_messages`
+    keys `(to_uin, seq)` as an Index rather than a constraint, and reading only
+    the constraints misses it. Structural on purpose — a table added to
+    PER_UIN_COLUMNS later is covered without anyone remembering to list it.
+    """
+    table = model.__table__
+    name = column.name
+    keys: list[list] = []
+    pk = list(table.primary_key.columns)
+    if pk and name in {c.name for c in pk}:
+        keys.append(pk)
+    for constraint in table.constraints:
+        if not isinstance(constraint, UniqueConstraint):
+            continue
+        cols = list(constraint.columns)
+        if name in {c.name for c in cols}:
+            keys.append(cols)
+    for index in table.indexes:
+        if index.unique and name in {c.name for c in index.columns}:
+            keys.append(list(index.columns))
+    return keys
+
+
+async def _clear_destination(db: AsyncSession, model: type, column, old_uin: int, new_uin: int) -> None:
+    """Make room at `new_uin` so the UPDATE that follows cannot collide.
+
+    ⚠⚠ WHY THIS EXISTS. The re-key below is a blind
+    `UPDATE t SET uin = new WHERE uin = old`, and twelve of these columns sit
+    inside a primary key or a unique index. If ANY row is already keyed to the
+    target number, that UPDATE raises a unique violation, the whole migration
+    aborts, and the person is shown a raw `HTTP 500 {"detail":"internal_error"}`
+    with no way forward: the number is in their collection and can never be
+    switched to again. A tester hit exactly that on `group_log_readers`
+    (PK `uin, device_id`) and pressed the button thirty times (08.09.2026).
+    One stranded row poisons a number permanently.
+
+    Rows CAN be sitting at the target, and not only through a repair gone
+    wrong: `_perform_migration` bumps the vacated number's epoch and writes it
+    through to Redis only AFTER the commit, so a device of the account's own,
+    still holding a token for the old number, can write a cursor or a reader
+    row under it in that window. Nothing expires those rows afterwards.
+
+    What is safe to delete: the caller has just flushed the `users` row for
+    `new_uin` and 409s if it already existed, so at this point the target
+    number has no other owner and every row keyed to it belongs to a holder who
+    is gone. Inheriting that is the exact harm this module was written to stop
+    (see the header: a queue cursor inherited from the previous holder skips
+    the new one's own messages). The exception is a column that names a third
+    party, where only the genuinely colliding row may go.
+    """
+    if not _unique_keys_containing(model, column):
+        return
+
+    if (model, column.key) in _THIRD_PARTY_UIN_COLUMNS:
+        # Somebody who holds BOTH numbers in their list. Their row for the old
+        # number is about to become a row for the new one, so their row for the
+        # new number is the duplicate and the only thing that may go. Everyone
+        # else keeps theirs untouched.
+        for key_cols in _unique_keys_containing(model, column):
+            others = [c for c in key_cols if c.name != column.name]
+            if not others:
+                continue
+            rest = others[0] if len(others) == 1 else tuple_(*others)
+            await db.execute(
+                delete(model).where(
+                    column == new_uin,
+                    rest.in_(select(*others).where(column == old_uin)),
+                )
+            )
+        return
+
+    # The counter must never go backwards: `mailbox_seq` hands out the next
+    # `offline_messages.seq` for a mailbox and is deliberately never reseeded
+    # from MAX(seq), because a value below a device's stored cursor is silent
+    # permanent loss (models/mailbox_seq.py). If both numbers carry a counter,
+    # the surviving row takes the higher of the two before the loser is dropped.
+    if model is MailboxSeq:
+        highest = await db.scalar(
+            select(func.max(MailboxSeq.next_seq)).where(
+                MailboxSeq.to_uin.in_([old_uin, new_uin])
+            )
+        )
+        if highest is not None:
+            await db.execute(
+                update(MailboxSeq)
+                .where(MailboxSeq.to_uin == old_uin)
+                .values(next_seq=highest)
+            )
+
+    await db.execute(delete(model).where(column == new_uin))
+
+
 async def rekey_uin_rows(db: AsyncSession, old_uin: int, new_uin: int) -> None:
     """Move every per-UIN row from `old_uin` to `new_uin`.
 
@@ -269,6 +378,10 @@ async def rekey_uin_rows(db: AsyncSession, old_uin: int, new_uin: int) -> None:
     """
     await _move_sites(db, old_uin, new_uin)
     for model, column in PER_UIN_COLUMNS:
+        # ⚠ Clear the destination FIRST. Without this the statement below is a
+        # blind UPDATE onto a key that may already be taken; see
+        # `_clear_destination` for what that cost.
+        await _clear_destination(db, model, column, old_uin, new_uin)
         await db.execute(
             update(model).where(column == old_uin).values({column.key: new_uin})
         )

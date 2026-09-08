@@ -85,6 +85,25 @@ async def _perform_migration(
 
     old_uin = user.uin
 
+    # ⚠⚠ Step 0: LOCK THE ROW WE ARE MOVING, here rather than at each caller.
+    # `/account/migrate` learned this on 07.09 after a tester tapped "give me a
+    # random number" several times through a lag and ended up with two live
+    # accounts ("меня теперь двое"), and it locked at its own call site. But
+    # four paths reach this function - /account/migrate, /uin/activate,
+    # /uin/purchase and /uin/redeem (twice, including a paid resale) - and only
+    # the first one locked. Three of them are the shop, and two of those carry
+    # no rate limit at all, so the same double-tap raced here unguarded. The
+    # lock belongs where the migration is, not where somebody remembered.
+    #
+    # A second waiter finds the row gone (the first migration deleted it) and
+    # is refused rather than allowed to build a second account from a profile
+    # that no longer exists.
+    locked = (
+        await db.execute(select(User).where(User.uin == old_uin).with_for_update())
+    ).scalar_one_or_none()
+    if locked is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+
     # Step 1: stand up the new User row with the OLD profile + identity
     # keys copied verbatim. Reusing identity_key + signing_key keeps
     # peers' libsignal sessions valid (they cache by identity key, not
@@ -376,7 +395,15 @@ async def _perform_migration(
     # somebody else's. A client too old to know the word gets nothing here and
     # falls back to the same refresh on its next start, which is still better
     # than today, because today it wipes.
-    await manager.broadcast([old_uin], {"type": "account_moved", "uin": target_uin})
+    # ⚠ Wrapped, like step 6 below and for the same reason: the migration is
+    # ALREADY COMMITTED here. A socket nudge that throws would hand the caller
+    # a 500 for work that succeeded, and the client would be left believing it
+    # still answers as a number that no longer exists. Clients that miss the
+    # nudge recover on their own through /auth/refresh and `moved_from`.
+    try:
+        await manager.broadcast([old_uin], {"type": "account_moved", "uin": target_uin})
+    except Exception:  # noqa: BLE001
+        log.exception("[migrate] telling the old sockets failed; clients recover via /auth/refresh")
 
     # Step 6: and tell the GROUPS. Until 2026-08-23 step 5 was the whole of the
     # socket traffic a migration produced, which meant the only people told

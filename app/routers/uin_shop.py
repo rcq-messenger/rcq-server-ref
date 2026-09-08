@@ -891,8 +891,9 @@ async def release(
 ) -> MyUinsOut:
     """Give a held number back. Collecting numbers you did not choose is a side
     effect of the vault: activating one puts the previous one in the collection
-    whether you wanted it or not, and the long number the network handed you at
-    signup is usually the first thing you stop wanting (user request).
+    when it is scarce or bought (an ordinary one is a loan and goes back to the
+    pool, see `activate`), and a number you did not pick is usually the first
+    thing you stop wanting (user request).
 
     The number returns to the pool, so somebody else may end up with it. That is
     the point, and it is why this is a separate deliberate call rather than a
@@ -934,9 +935,16 @@ async def activate(
     device_id: str = Depends(current_device_id),
     db: AsyncSession = Depends(get_db),
 ) -> PurchaseOut:
-    """Answer as a number you already hold. Your current number goes into the
-    collection rather than back into the pool, so switching between your own
-    numbers is reversible and never loses one.
+    """Answer as a number you already hold.
+
+    ⚠ What happens to the number you LEAVE depends on what it is, and this
+    paragraph used to say otherwise. A scarce or bought number follows its
+    holder into the collection, so switching between your own numbers is
+    reversible; an ORDINARY one is a loan and goes back into the pool. That
+    stopped being a promise on 01.09.2026 and deliberately: while `/uin/purchase`
+    is free the cheapest way to collect numbers is to keep moving, and 161 of
+    them ended up parked in 54 collections while the shelf everyone picks from
+    emptied (routers/migrate.py, step 2b, has the four branches).
 
     Separate from `/purchase` on purpose: buying and changing who you are were
     the same button, which is a bad thing to be one tap away from.
