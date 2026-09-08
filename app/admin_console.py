@@ -68,7 +68,13 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .navlink .badge.on { display:inline-flex; }
   aside .foot { margin-top:auto; padding:10px 8px 0; color:var(--dim); font-size:11px; line-height:1.5; }
 
-  main { padding:32px 32px 64px; max-width:1216px; margin-inline:auto; }
+  /* ⚠ width:100% is load-bearing. `main` is a GRID ITEM, and an auto inline
+     margin on a grid item cancels the stretch and sizes it to its content:
+     without this the whole console shrank to about a third of the window and
+     sat in the middle of it. With an explicit width the column fills the area
+     until the cap binds, and only then centres, which is what the panel's
+     `mx-auto max-w-6xl` does. */
+  main { padding:32px 32px 64px; width:100%; max-width:1216px; margin-inline:auto; }
   .view { display:none; }
   .view.active { display:block; animation:fade .18s ease; }
   @keyframes fade { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
