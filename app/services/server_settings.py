@@ -15,6 +15,7 @@ pub/sub invalidation.
 """
 import time as _time
 import json
+import re
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -362,6 +363,20 @@ async def island_name() -> str:
 
 
 
+#: What an address looks like on each chain the till knows, and an example to
+#: show when it does not. Deliberately loose: these catch a truncated paste, a
+#: pasted URL, or an address from the wrong chain, which is what actually
+#: happens. They are not checksum validation and are not meant to be.
+_ADDRESS_SHAPES: dict[str, tuple[re.Pattern[str], str]] = {
+    "tron": (re.compile(r"T[1-9A-HJ-NP-Za-km-z]{33}"), "T… (34 characters)"),
+    "ton": (re.compile(r"[A-Za-z0-9_-]{48}"), "UQ… or EQ… (48 characters)"),
+    "btc": (re.compile(r"(bc1[a-z0-9]{25,87}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})"), "bc1…"),
+    # One EVM address serves USDT and both USDCs: a wallet there is per chain,
+    # not per token.
+    "polygon": (re.compile(r"0x[0-9a-fA-F]{40}"), "0x… (42 characters)"),
+}
+
+
 def _check_json_map(key: str, raw: str) -> None:
     """A setting whose value is JSON is checked HERE, when it is saved.
 
@@ -385,8 +400,17 @@ def _check_json_map(key: str, raw: str) -> None:
             if not str(k).isdigit() or not isinstance(v, int) or v < 0:
                 raise ValueError('uin_prices looks like {"4": 25000}: digits to whole cents')
         else:
-            if not str(v).strip():
+            addr = str(v).strip()
+            if not addr:
                 raise ValueError("an empty address is an invoice nobody can pay")
+            # ⚠ The SHAPE, for the chains we know. A mistyped address is not a
+            # failed save, it is money paid into a wallet nobody holds, and
+            # nothing here can undo a payment. Only the chains the till knows
+            # are checked; an id it does not know is left alone so a chain
+            # added there is not blocked here first.
+            want = _ADDRESS_SHAPES.get(str(k).lower())
+            if want and not want[0].fullmatch(addr):
+                raise ValueError(f"{k}: an address there looks like {want[1]}")
 
 
 def validate(updates: dict[str, Any]) -> dict[str, str]:
