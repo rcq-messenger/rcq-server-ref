@@ -60,15 +60,15 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .brand .name { font-weight:600; font-size:16px; line-height:1.25; color:var(--ink); letter-spacing:-.01em; }
   .brand .host { font:11px/1.3 ui-monospace,monospace; color:var(--dim); }
   nav.side { display:flex; flex-direction:column; gap:2px; }
-  .navlink { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:var(--radius-sm); color:var(--fg-2); font-weight:500; cursor:pointer; transition:background .12s,color .12s; }
+  .navlink { display:flex; align-items:center; gap:12px; padding:8px 12px; border-radius:var(--radius-sm); color:var(--fg-2); font-weight:500; cursor:pointer; transition:background .12s,color .12s; }
   .navlink:hover { background:var(--line-2); color:var(--fg); }
   .navlink.active { background:var(--acc-soft); color:var(--acc); }
-  .navlink svg { width:17px; height:17px; flex:none; }
-  .navlink .badge { margin-left:auto; min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:rgba(220,38,38,.12); color:var(--red); font-size:11px; font-weight:500; display:none; align-items:center; justify-content:center; }
+  .navlink svg { width:16px; height:16px; flex:none; stroke-width:2.4; }
+  .navlink .badge { margin-left:auto; min-width:18px; height:18px; padding:0 6px; border-radius:999px; background:rgba(244,63,94,.15); color:var(--red); font-size:10px; font-weight:500; display:none; align-items:center; justify-content:center; }
   .navlink .badge.on { display:inline-flex; }
   aside .foot { margin-top:auto; padding:10px 8px 0; color:var(--dim); font-size:11px; line-height:1.5; }
 
-  main { padding:32px 32px 64px; max-width:1152px; margin-inline:auto; }
+  main { padding:32px 32px 64px; max-width:1216px; margin-inline:auto; }
   .view { display:none; }
   .view.active { display:block; animation:fade .18s ease; }
   @keyframes fade { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
@@ -100,7 +100,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .chart { display:flex; align-items:flex-end; gap:3px; height:84px; margin-top:6px; }
   .chart .bar { flex:1; background:var(--acc-soft); border:1px solid var(--acc-line); border-bottom:0; border-radius:4px 4px 0 0; min-height:2px; position:relative; transition:background .12s; }
   .chart .bar:hover { background:var(--acc-line); }
-  .chart-x { display:flex; justify-content:space-between; color:var(--dim); font-size:11px; margin-top:6px; }
+  .chart-x { display:flex; justify-content:space-between; color:var(--mut); font-size:11px; margin-top:6px; }
 
   /* table */
   table { width:100%; border-collapse:collapse; font-size:14px; line-height:20px; }
@@ -136,7 +136,7 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .frow.first { border-top:none; padding-top:2px; }
   .frow .finfo { flex:1; min-width:0; }
   .frow .flabel { font-weight:500; font-size:14px; line-height:20px; display:flex; align-items:center; gap:8px; }
-  .frow .fhelp { color:var(--mut); font-size:12px; margin-top:2px; }
+  .frow .fhelp { color:var(--mut); font-size:12px; line-height:16px; margin-top:2px; }
   .frow .fctl { flex:none; display:flex; gap:8px; align-items:center; }
   /* The island's logo preview, and the lettered tile a client draws when there
      is none. Rounded square, not a circle: a person is a circle and a group is
