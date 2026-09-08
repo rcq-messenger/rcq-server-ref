@@ -85,7 +85,7 @@ async def hit(identity: str, rule: str, limit: int, window: int) -> bool:
 async def live_keys() -> list[str]:
     redis = await get_redis()
     out = []
-    for pattern in ("rl:*", "rlc:*", "wsrate:*", "gslowfree:*"):
+    for pattern in ("rl:*", "rlc:*", "wsrate:*", "gslowfree:*", "gslowbatch:*"):
         async for key in redis.scan_iter(match=pattern):
             out.append(key)
     return out
@@ -95,6 +95,8 @@ async def wipe() -> None:
     await reset_buckets()
     redis = await get_redis()
     async for key in redis.scan_iter(match="gslowfree:*"):
+        await redis.delete(key)
+    async for key in redis.scan_iter(match="gslowbatch:*"):
         await redis.delete(key)
 
 
@@ -175,6 +177,8 @@ async def main() -> None:
         db.add(Group(id=41, name="slowmode room", owner_uin=999999, slowmode_sec=60))
         db.add(GroupMember(group_id=41, uin=UIN_A, role="member", permissions=""))
         db.add(GroupMember(group_id=41, uin=UIN_B, role="member", permissions=""))
+        # A third member whose slot nothing above has touched, for the album case.
+        db.add(GroupMember(group_id=41, uin=777_777, role="member", permissions=""))
         await db.commit()
         g = await db.get(Group, 41)
 
@@ -202,9 +206,33 @@ async def main() -> None:
         other = await post(UIN_B, "broadcast")
         check("another member's slot is independent", other)
 
+        # An ALBUM (#950): three items on one token buy one slot, a fourth
+        # post with no token is refused, and a token used past twice its
+        # declared size is spent.
+        async def post_batch(caller: int, token: str, size: int) -> bool:
+            try:
+                await _enforce_group_slowmode(db, g, caller, "message", "broadcast", batch=token, batch_size=size)
+                return True
+            except HTTPException as exc:
+                assert exc.status_code == 429, exc.status_code
+                return False
+
+        album = [await post_batch(777_777, "albumtoken-1234", 3) for _ in range(3)]
+        check("★ three album items ride one slowmode slot", all(album), str(album))
+        check("a fourth post with no token still has to buy a slot", not await post(777_777, "broadcast"))
+        spent = [await post_batch(777_777, "albumtoken-1234", 3) for _ in range(4)]
+        check("the token is good for twice its size and then spent",
+              spent[:3] == [True, True, True] and spent[3] is False, str(spent))
+
+        # And a token whose FIRST item was refused is dropped, so the rest of
+        # that album is refused too rather than arriving without its first
+        # picture: UIN_B's slot is spent from above, so its album dies whole.
+        dead = [await post_batch(UIN_B, "albumtoken-dead", 3) for _ in range(3)]
+        check("an album whose first item is refused is refused whole", dead == [False, False, False], str(dead))
+
         keys = await live_keys()
-        leaks = [k for k in keys if str(UIN_A) in k or str(UIN_B) in k or ":41:" in k]
-        check("no slowmode key names the poster or the room", not leaks, f"leaked: {leaks}")
+        leaks = [k for k in keys if str(UIN_A) in k or str(UIN_B) in k or "777777" in k or ":41:" in k or "albumtoken" in k]
+        check("no slowmode key names the poster, the room or the album", not leaks, f"leaked: {leaks}")
         check("the (group, member) bucket is per pair",
               _slowmode_identity(41, UIN_A) != _slowmode_identity(41, UIN_B)
               and _slowmode_identity(41, UIN_A) != _slowmode_identity(42, UIN_A))

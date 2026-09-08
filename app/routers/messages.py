@@ -686,6 +686,10 @@ def _keep_for(
 # members + one legacy sealed tail) is one logical post issued back-to-back;
 # 30s covers a slow uplink without opening a real second-message window.
 _SLOWMODE_PAIR_GRACE_SEC = 30
+# How long an ALBUM's items may keep arriving on one slowmode slot. A ten-clip
+# album uploads item by item, and each upload can take tens of seconds on a
+# bad line; five minutes covers it without opening a real second window.
+_SLOWMODE_BATCH_GRACE_SEC = 300
 
 
 def _slowmode_identity(group_id: int, caller: int) -> str:
@@ -725,7 +729,8 @@ def _slowmode_free_key(path: str, group_id: int, caller: int) -> str:
 
 
 async def _enforce_group_slowmode(
-    db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str, path: str
+    db: AsyncSession, g: Group | None, caller: int | None, envelope_type: str, path: str,
+    batch: str | None = None, batch_size: int = 1,
 ) -> None:
     """Group slowmode: one *message* per `g.slowmode_sec` window per
     identified non-moderator member (same phase-1 trust shape as owner_only —
@@ -738,7 +743,21 @@ async def _enforce_group_slowmode(
     would 429 the legacy tail and cut the non-capable members out of the
     conversation. So only the half that actually consumed the slot arms a
     short-lived free pass for the OTHER path; the freed half arms nothing,
-    which keeps two same-path posts from ever sharing one slot."""
+    which keeps two same-path posts from ever sharing one slot.
+
+    ⚠⚠ An ALBUM is one post too, and slowmode charged it N times (#950). The
+    clients send an album as N media messages, one envelope and one POST each,
+    in sequence; in a room with slowmode the first item bought the slot and
+    items 2..N were refused with 429, so "I cannot send several pictures into a
+    group, I have to send them one at a time" was literally the rule working.
+    `batch` is a random token the client mints per album and `batch_size` how
+    many items it holds: the first item buys the slot as before and arms the
+    token, the rest ride it, up to twice the declared size (the dual-send tail
+    of each item needs a pass too) and for five minutes. The token is
+    deliberately NOT the album id inside the sealed envelope: the island learns
+    only that N posts within a few minutes belong together, which their timing
+    tells it already, and it is hashed into the key like everything else here.
+    """
     if envelope_type != "message" or g is None or (g.slowmode_sec or 0) <= 0:
         return
     if caller is None or caller == g.owner_uin:
@@ -760,8 +779,33 @@ async def _enforce_group_slowmode(
         from app.core.redis import get_redis
 
         redis = await get_redis()
+        if batch and batch_size > 1:
+            bkey = f"gslowbatch:{bucket_name(f'g{g.id}:uin:{caller}:{batch}')}"
+            n = await redis.incr(bkey)
+            if n == 1:
+                await redis.expire(bkey, _SLOWMODE_BATCH_GRACE_SEC)
+                # The first item buys the slot like any post. If it cannot,
+                # the token must not stay armed: items 2..N would then sail
+                # through and the person would get an album missing its first
+                # picture, which is worse than an album refused whole.
+                try:
+                    await enforce_rate_limit(_slowmode_identity(g.id, caller), "group_slowmode", 1, g.slowmode_sec)
+                except HTTPException:
+                    with contextlib.suppress(Exception):
+                        await redis.delete(bkey)
+                    raise
+                other = "sealed" if path == "broadcast" else "broadcast"
+                with contextlib.suppress(Exception):
+                    await redis.set(_slowmode_free_key(other, g.id, caller), "1", ex=_SLOWMODE_PAIR_GRACE_SEC)
+                return
+            if n <= 2 * batch_size:
+                return  # an item of an album whose first item already paid
+            # Past twice the declared size the token is spent: a client that
+            # keeps sending on it is not sending an album any more.
         if await redis.getdel(_slowmode_free_key(path, g.id, caller)):
             return
+    except HTTPException:
+        raise
     except Exception:  # noqa: BLE001 — fail-soft, like the limiter itself
         redis = None
     await enforce_rate_limit(_slowmode_identity(g.id, caller), "group_slowmode", 1, g.slowmode_sec)
@@ -849,6 +893,11 @@ class GroupSealedSendIn(BaseModel):
     # ciphertext to the right recipient. The list shape replaces the old
     # single-payload schema — every iOS Stage-1 client sends this version.
     payloads: list[GroupRecipientPayload] = Field(max_length=_MAX_GROUP_PAYLOADS)
+    # An album (#950): N media messages picked in one go share one random
+    # token and declare their count, and slowmode charges the batch ONE slot.
+    # See _enforce_group_slowmode. 10 is the pickers' cap.
+    batch: str | None = Field(default=None, min_length=8, max_length=64)
+    batch_size: int = Field(default=1, ge=1, le=10)
 
 
 @router.post(
@@ -940,7 +989,7 @@ async def send_group_sealed(
     members = {uin for uin, _ in member_rows}
     queueable = _queueable(member_rows)
 
-    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="sealed")
+    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="sealed", batch=body.batch, batch_size=body.batch_size)
     await _enforce_account_age_gate(db, g, caller, body.envelope_type)
 
     now = datetime.now(timezone.utc)
@@ -1113,6 +1162,9 @@ class GroupBroadcastIn(BaseModel):
     # per-member path for now). Drives the owner_only gate + pushability;
     # the queued/WS envelope itself always rides as type "gmsg".
     envelope_type: str = Field(default="message")
+    # Same album token as GroupSealedSendIn; both halves of a dual-send carry it.
+    batch: str | None = Field(default=None, min_length=8, max_length=64)
+    batch_size: int = Field(default=1, ge=1, le=10)
     # base64 of the sender-keys wire JSON {v, kid, e, i, n, ct}: ONE
     # ChaCha20-Poly1305 ciphertext under the sender's current group message
     # key. The server cannot read it and cannot tell who sent it — `kid` is
@@ -1177,7 +1229,7 @@ async def send_group_broadcast(
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "owner_only: only the group owner may post")
 
-    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="broadcast")
+    await _enforce_group_slowmode(db, g, caller, body.envelope_type, path="broadcast", batch=body.batch, batch_size=body.batch_size)
     await _enforce_account_age_gate(db, g, caller, body.envelope_type)
 
     recipient_rows = (
