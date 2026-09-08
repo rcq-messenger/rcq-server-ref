@@ -140,10 +140,28 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   /* features tab rows */
   .frow { display:flex; align-items:flex-start; gap:14px; padding:12px 0; border-top:1px solid var(--line-2); }
   .frow.first { border-top:none; padding-top:2px; }
-  .frow .finfo { flex:1; min-width:0; }
+  /* ⚠⚠ The control column MUST be allowed to shrink and wrap. It was
+     `flex:none`, which is fine for a field and a button and fatal for the
+     structured editors (prices, wallets, badges): one long help line inside
+     them gave the column its full max-content width, the label column beside
+     it collapsed to one word per line, and the row ran off the card and off
+     the window. The editors shipped on 03-05.09 with NO styles of their own
+     while the console itself was dead, so nobody saw it (founder, 08.09). */
+  .frow .finfo { flex:1 1 280px; min-width:0; }
   .frow .flabel { font-weight:500; font-size:14px; line-height:20px; display:flex; align-items:center; gap:8px; }
   .frow .fhelp { color:var(--mut); font-size:12px; line-height:16px; margin-top:2px; }
-  .frow .fctl { flex:none; display:flex; gap:8px; align-items:center; }
+  .frow .fctl { flex:0 1 auto; min-width:0; max-width:min(64%,760px); display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:flex-end; }
+  /* The structured editors on the Features tab. */
+  .editor { display:flex; flex-direction:column; gap:8px; min-width:0; width:100%; }
+  .editor .erow { display:flex; align-items:center; gap:8px; min-width:0; }
+  .editor .erow label { flex:none; min-width:96px; color:var(--mut); font-size:13px; }
+  .editor .erow input { flex:1 1 auto; min-width:0; }
+  .editor .erow input[type=number] { flex:0 0 auto; }
+  .editor .ehint { color:var(--mut); font-size:12px; }
+  .editor .ehelp { color:var(--mut); font-size:12px; line-height:16px; white-space:normal; }
+  .editor .brow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+  .editor .brow input[type=color] { flex:none; width:36px; height:36px; padding:2px; }
+  .editor > button { align-self:flex-start; }
   /* The island's logo preview, and the lettered tile a client draws when there
      is none. Rounded square, not a circle: a person is a circle and a group is
      a circle, and an island is neither (same shape iOS IslandAvatarView draws). */
