@@ -685,7 +685,7 @@ async function loadReports() {
       <td>${rp.id}</td>
       <td class="mono">${rp.target_uin?rp.target_uin:'—'}${rp.target_nickname?' <span style="color:var(--dim)">('+esc(rp.target_nickname)+')</span>':''}${siteOf(rp)?' <span style="color:var(--dim)">'+esc(siteOf(rp))+'</span>':''}</td>
       <td style="white-space:normal;overflow-wrap:anywhere">${esc(rp.reason||'')}${rp.has_evidence?' <span class="pill" style="cursor:pointer" onclick="viewEvidence('+rp.id+')">evidence</span>':''}${rp.replied_at?' <span class="pill" title="'+esc(rp.reply_text||'')+'">answered</span>':''}</td><td><span class="pill">${esc(contextLabel(rp.context))}</span></td>
-      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> ${siteOf(rp)?'<button class="btn danger sm" onclick="freezeReportedSite('+rp.id+', \''+esc(siteOf(rp))+'\')">Freeze site</button> ':''}${isAbuse(rp)?'<button class="btn danger sm" onclick="resolve('+rp.id+',true)">Ban</button>':''}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" onclick="reply(${rp.id})">Reply</button> <button class="btn ghost sm" onclick="resolve(${rp.id},false)">Dismiss</button> ${siteOf(rp)?'<button class="btn danger sm" onclick="freezeReportedSite('+rp.id+', \\''+esc(siteOf(rp))+'\\')">Freeze site</button> ':''}${isAbuse(rp)?'<button class="btn danger sm" onclick="resolve('+rp.id+',true)">Ban</button>':''}</td>
     </tr>`).join('') || '<tr><td colspan="5" class="empty">No open reports.</td></tr>';
   } catch(e){ $('reports').innerHTML='<tr><td colspan="5" class="err">'+e.message+'</td></tr>'; }
 }
