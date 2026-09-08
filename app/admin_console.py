@@ -23,56 +23,76 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
 <title>RCQ Server Admin</title>
 <style>
   :root {
-    --bg:#ffffff; --shell:#fafafa; --card:#ffffff; --line:#ececec; --line-2:#f3f3f3;
-    --ink:#0c0d0e; --fg:#1c1e22; --mut:#6b7280; --dim:#9aa1ab;
-    --acc:#16a34a; --acc-dim:#15803d; --acc-soft:#f0fdf4; --acc-line:#bbf7d0;
-    --red:#e5484d; --red-soft:#fef2f2; --amber:#d97706;
+    /* ⚠ These are the PANEL'S tokens, value for value (web-admin
+       tailwind.config.cjs + src/index.css). The panel's light theme was itself
+       a redesign to match this console (12.06.2026) and the two then drifted
+       apart again; the founder asked for one look, so the console now takes
+       the panel's numbers rather than the other way round. The `ink` scale
+       there is deliberately inverted - high rungs are surfaces, low rungs are
+       text - and the names below say which rung each one is. */
+    --bg:#ffffff; --shell:#f6f7f8; --card:#ffffff; --line:#e4e7eb; --line-2:#f3f4f6;
+    --ink:#0c0d0e; --fg:#0c0d0e; --fg-2:#4b5563; --mut:#6b7280; --dim:#9aa1ab;
+    /* Neutral control fill, ink-700 with its ink-600 hover. */
+    --btn:#eceef1; --btn-hover:#e4e7eb;
+    --acc:#16a34a; --acc-dim:#15803d; --acc-soft:rgba(22,163,74,.10); --acc-line:#bbf7d0;
+    /* Status colours are DARKENED for a light surface, exactly as the panel
+       darkens rose/amber/emerald for the same reason. */
+    --red:#dc2626; --red-soft:rgba(220,38,38,.10); --amber:#b45309; --green:#047857;
     --flower:#ef3e36;
-    --radius:14px; --shadow:0 1px 2px rgba(12,13,14,.04), 0 4px 16px rgba(12,13,14,.04);
+    --radius:12px; --radius-sm:6px; --shadow:0 1px 2px rgba(12,13,14,.05), 0 4px 16px rgba(12,13,14,.05);
   }
   * { box-sizing:border-box; }
   html,body { height:100%; }
   body { margin:0; background:var(--shell); color:var(--fg);
-    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased; }
+    font:14px/20px -apple-system,BlinkMacSystemFont,"Inter","SF Pro Text","Segoe UI",Roboto,system-ui,sans-serif;
+    /* Inter and SF Pro Text are named but never FETCHED: the page loads zero
+       external resources and must keep doing so, so these are used only when
+       the reader already has them, exactly as the panel does it. */
+    font-feature-settings:'cv11','ss01';
+    -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; }
   a { color:var(--acc); text-decoration:none; }
-  .mono { font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .mono { font:12px/16px ui-monospace,SFMono-Regular,Menlo,monospace; }
 
   /* shell */
-  .layout { display:grid; grid-template-columns:236px 1fr; min-height:100vh; }
+  .layout { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
   aside { background:var(--bg); border-right:1px solid var(--line); padding:18px 14px; display:flex; flex-direction:column; gap:4px; position:sticky; top:0; height:100vh; }
   .brand { display:flex; align-items:center; gap:10px; padding:6px 8px 16px; }
-  .brand .name { font-weight:650; font-size:15px; color:var(--ink); letter-spacing:-.01em; }
+  .brand .name { font-weight:600; font-size:16px; line-height:1.25; color:var(--ink); letter-spacing:-.01em; }
   .brand .host { font:11px/1.3 ui-monospace,monospace; color:var(--dim); }
   nav.side { display:flex; flex-direction:column; gap:2px; }
-  .navlink { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; color:var(--mut); font-weight:500; cursor:pointer; transition:background .12s,color .12s; }
+  .navlink { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:var(--radius-sm); color:var(--fg-2); font-weight:500; cursor:pointer; transition:background .12s,color .12s; }
   .navlink:hover { background:var(--line-2); color:var(--fg); }
-  .navlink.active { background:var(--acc-soft); color:var(--acc-dim); }
+  .navlink.active { background:var(--acc-soft); color:var(--acc); }
   .navlink svg { width:17px; height:17px; flex:none; }
-  .navlink .badge { margin-left:auto; min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:var(--red); color:#fff; font-size:11px; font-weight:600; display:none; align-items:center; justify-content:center; }
+  .navlink .badge { margin-left:auto; min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:rgba(220,38,38,.12); color:var(--red); font-size:11px; font-weight:500; display:none; align-items:center; justify-content:center; }
   .navlink .badge.on { display:inline-flex; }
   aside .foot { margin-top:auto; padding:10px 8px 0; color:var(--dim); font-size:11px; line-height:1.5; }
 
-  main { padding:30px 34px 64px; max-width:1080px; }
+  main { padding:32px 32px 64px; max-width:1152px; margin-inline:auto; }
   .view { display:none; }
   .view.active { display:block; animation:fade .18s ease; }
   @keyframes fade { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
   .head { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:22px; }
-  .head h1 { font-size:23px; font-weight:660; letter-spacing:-.02em; color:var(--ink); margin:0; }
-  .head p { margin:4px 0 0; color:var(--mut); font-size:13.5px; }
+  .head h1 { font-size:24px; line-height:32px; font-weight:600; letter-spacing:-.02em; color:var(--ink); margin:0; }
+  .head p { margin:4px 0 0; color:var(--mut); font-size:14px; line-height:20px; }
 
   /* cards */
   .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); }
-  .card.pad { padding:18px 20px; }
+  .card.pad { padding:20px; }
   .card + .card, .stack > * + * { margin-top:16px; }
-  .card h3 { font-size:13px; font-weight:600; color:var(--ink); margin:0 0 2px; }
-  .card .sub { color:var(--mut); font-size:12.5px; margin:0 0 14px; }
+  .card h3 { font-size:16px; line-height:24px; font-weight:600; color:var(--ink); margin:0 0 2px; }
+  .card .sub { color:var(--mut); font-size:12px; line-height:16px; margin:0 0 14px; }
 
   /* stats */
-  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; }
-  .stat { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:15px 16px; box-shadow:var(--shadow); }
-  .stat .n { font-size:26px; font-weight:680; letter-spacing:-.02em; color:var(--ink); line-height:1.1; }
-  .stat .l { color:var(--mut); font-size:12.5px; margin-top:3px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:16px; }
+  /* ⚠ column-reverse, and it is not a trick: the panel's KpiCard writes the
+     label first and the number under it, and the markup here is the other way
+     round. Reversing in CSS matches the panel without touching the script that
+     builds these tiles. */
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:20px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column-reverse; gap:6px; align-items:flex-start; }
+  .stat .n { font-size:30px; font-weight:600; letter-spacing:0; color:var(--ink); line-height:1; }
+  .stat .l { color:var(--mut); font-size:11px; text-transform:uppercase; letter-spacing:.05em; margin-top:0; }
   .stat .n .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--acc); margin-right:7px; vertical-align:middle; }
   .stat.warn .n { color:var(--amber); }
 
@@ -83,32 +103,39 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .chart-x { display:flex; justify-content:space-between; color:var(--dim); font-size:11px; margin-top:6px; }
 
   /* table */
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { text-align:left; padding:10px 10px; border-bottom:1px solid var(--line-2); vertical-align:middle; }
-  th { color:var(--mut); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+  table { width:100%; border-collapse:collapse; font-size:14px; line-height:20px; }
+  th,td { text-align:left; padding:12px 16px; border-bottom:1px solid var(--line-2); vertical-align:middle; }
+  /* ⚠ NOT uppercase, and that is the panel: its table heads are plain 14px
+     medium in muted ink over a full-strength rule (NumbersPanel.tsx:159-164).
+     The small-caps head here was the console's own idea. */
+  th { color:var(--mut); font-weight:500; font-size:14px; border-bottom-color:var(--line); }
   tr:last-child td { border-bottom:0; }
   tbody tr:hover { background:var(--line-2); }
   td.mono { color:var(--fg); }
 
   /* controls */
-  input,select,textarea { background:var(--bg); border:1px solid var(--line); color:var(--fg); border-radius:10px; padding:9px 11px; font-size:13px; outline:none; transition:border .12s,box-shadow .12s; font-family:inherit; }
-  input:focus,select:focus { border-color:var(--acc); box-shadow:0 0 0 3px var(--acc-soft); }
-  input::placeholder { color:var(--dim); }
+  input,select,textarea { background:var(--bg); border:1px solid var(--line); color:var(--ink); border-radius:var(--radius-sm); padding:8px 14px; font-size:14px; line-height:20px; outline:none; transition:border .12s,box-shadow .12s; font-family:inherit; }
+  /* The panel's field is a 1px inset ring that TURNS accent on focus, with no
+     halo around it. */
+  input:focus,select:focus,textarea:focus { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc); }
+  input::placeholder,textarea::placeholder { color:var(--mut); }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  button { font:inherit; font-size:13px; font-weight:600; border:0; border-radius:10px; padding:9px 15px; cursor:pointer; transition:background .12s,opacity .12s,border-color .12s; }
-  .btn { background:var(--acc); color:#fff; }
+  /* A transparent border in the base rule, so a filled button and an outlined
+     one are the same height. */
+  button { font:inherit; font-size:14px; line-height:20px; font-weight:500; border:1px solid transparent; border-radius:var(--radius-sm); padding:8px 14px; cursor:pointer; transition:background .12s,opacity .12s,border-color .12s; }
+  .btn { background:var(--acc); color:#fff; box-shadow:0 1px 2px rgba(0,0,0,.05); }
   .btn:hover { background:var(--acc-dim); }
-  .btn.ghost { background:var(--bg); border:1px solid var(--line); color:var(--fg); }
-  .btn.ghost:hover { border-color:var(--dim); }
-  .btn.danger { background:var(--bg); border:1px solid var(--line); color:var(--red); }
-  .btn.danger:hover { background:var(--red-soft); border-color:var(--red); }
-  .btn.sm { padding:6px 11px; font-size:12.5px; }
-  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .btn.ghost { background:var(--btn); border-color:transparent; color:var(--ink); }
+  .btn.ghost:hover { background:var(--btn-hover); }
+  .btn.danger { background:rgba(220,38,38,.12); border-color:transparent; color:var(--red); }
+  .btn.danger:hover { background:rgba(220,38,38,.22); }
+  .btn.sm { padding:6px 12px; font-size:13px; }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
   /* features tab rows */
   .frow { display:flex; align-items:flex-start; gap:14px; padding:12px 0; border-top:1px solid var(--line-2); }
   .frow.first { border-top:none; padding-top:2px; }
   .frow .finfo { flex:1; min-width:0; }
-  .frow .flabel { font-weight:600; font-size:13.5px; display:flex; align-items:center; gap:8px; }
+  .frow .flabel { font-weight:500; font-size:14px; line-height:20px; display:flex; align-items:center; gap:8px; }
   .frow .fhelp { color:var(--mut); font-size:12px; margin-top:2px; }
   .frow .fctl { flex:none; display:flex; gap:8px; align-items:center; }
   /* The island's logo preview, and the lettered tile a client draws when there
@@ -118,19 +145,21 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .logoimg { object-fit:cover; background:var(--line-2); }
   .logotile { display:flex; align-items:center; justify-content:center;
     color:#fff; font-weight:700; font-size:20px; line-height:1; }
-  .ftitle { font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin:0 0 8px; font-weight:600; }
+  .ftitle { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 8px; font-weight:500; }
 
-  .seg { display:inline-flex; background:var(--line-2); border-radius:10px; padding:3px; gap:2px; }
-  .seg button { background:transparent; color:var(--mut); padding:6px 14px; border-radius:8px; }
+  .seg { display:inline-flex; background:var(--line-2); border-radius:8px; padding:3px; gap:2px; }
+  .seg button { background:transparent; color:var(--mut); padding:6px 14px; border-radius:var(--radius-sm); }
   .seg button.on { background:var(--bg); color:var(--ink); box-shadow:var(--shadow); }
 
-  .pill { display:inline-flex; align-items:center; gap:5px; padding:2px 9px; border-radius:999px; font-size:11.5px; font-weight:500; border:1px solid var(--line); color:var(--mut); }
-  .pill.green { color:var(--acc-dim); border-color:var(--acc-line); background:var(--acc-soft); }
-  .pill.red { color:var(--red); border-color:#fecaca; background:var(--red-soft); }
-  .pill.vanity { color:var(--acc-dim); border-color:var(--acc-line); background:var(--acc-soft); }
+  /* Filled, not outlined: the panel's pills carry their meaning in the fill
+     (src/index.css, .pill and friends). */
+  .pill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px; font-size:11px; font-weight:500; border:0; background:var(--btn); color:#374151; }
+  .pill.green { color:var(--green); background:rgba(16,185,129,.10); }
+  .pill.red { color:var(--red); background:var(--red-soft); }
+  .pill.vanity { color:var(--acc); background:var(--acc-soft); }
 
-  .err { color:var(--red); font-size:13px; margin-top:8px; }
-  .empty { color:var(--dim); padding:18px 4px; font-size:13px; }
+  .err { color:var(--red); font-size:14px; line-height:20px; margin-top:8px; }
+  .empty { color:var(--mut); padding:18px 4px; font-size:14px; line-height:20px; }
   .link { color:var(--acc); cursor:pointer; }
   .kv { display:grid; grid-template-columns:160px 1fr; gap:10px 16px; font-size:13.5px; }
   .kv dt { color:var(--mut); }
@@ -156,10 +185,10 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
   .scrim { display:none; }            /* never a grid item on desktop */
   @media (max-width:820px) {
     .layout { grid-template-columns:1fr; }
-    aside { position:fixed; z-index:40; width:236px; left:0; top:0; transform:translateX(-100%); transition:transform .2s; box-shadow:var(--shadow); }
+    aside { position:fixed; z-index:40; width:240px; left:0; top:0; transform:translateX(-100%); transition:transform .2s; box-shadow:var(--shadow); }
     aside.open { transform:none; }
     .menubtn { display:inline-flex; }
-    main { padding:18px 16px 56px; }
+    main { padding:20px 16px 56px; }
     .scrim { display:none; position:fixed; inset:0; background:rgba(12,13,14,.25); z-index:30; }
     .scrim.on { display:block; }
   }
@@ -171,6 +200,13 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     table { min-width:520px; }
     th, td { white-space:nowrap; }
     td:nth-child(3) { white-space:normal; min-width:200px; }  /* the reason/long cell wraps within its own width */
+  }
+  /* iOS zooms the whole page when a focused field's text is under 16px and
+     leaves the reader scrolled sideways in a layout that fitted a moment ago.
+     There is no opt-out that does not also kill pinch zoom, so the field grows
+     instead - the same trade the panel makes in src/index.css. */
+  @media (max-width:1023px) {
+    input,select,textarea { font-size:16px; }
   }
 </style>
 </head>
