@@ -389,6 +389,13 @@ class UserSummary(BaseModel):
     badge: str | None = None
     status: str
     last_seen: datetime
+    # ⚠⚠ WHEN THE PERSON JOINED, NOT WHEN THIS NUMBER WAS BORN. A migration
+    # writes a brand new `users` row, so `created_at` restarts every time
+    # somebody changes their number: an operator looking at a three-month
+    # member saw "joined today" and had no way to tell them apart from a
+    # stranger. `identity_created_at` is the one that follows the person
+    # across a move (see routers/migrate), and it falls back to `created_at`
+    # for a number that never moved, which is the same moment.
     created_at: datetime
     reports_against: int
 
@@ -1060,7 +1067,7 @@ async def _summarize(db: AsyncSession, user: User) -> UserSummary:
         badge=user.badge,
         status=effective_status(user),
         last_seen=user.last_seen,
-        created_at=user.created_at,
+        created_at=user.identity_created_at or user.created_at,
         reports_against=int(reports_against),
     )
 
@@ -1136,7 +1143,7 @@ async def hof_candidates(db: AsyncSession = Depends(get_db)) -> HofListOut:
                 nickname=u.nickname,
                 opt_in=u.hof_opt_in,
                 approved=u.hof_approved,
-                created_at=u.created_at,
+                created_at=u.identity_created_at or u.created_at,
                 last_seen=u.last_seen,
                 avatar=u.hof_avatar,
                 tier=(u.hof_tier or "gold"),
@@ -1196,7 +1203,7 @@ async def hof_set_approved(uin: int, body: HofApproveIn, db: AsyncSession = Depe
         nickname=user.nickname,
         opt_in=user.hof_opt_in,
         approved=user.hof_approved,
-        created_at=user.created_at,
+        created_at=user.identity_created_at or user.created_at,
         last_seen=user.last_seen,
         avatar=user.hof_avatar,
         tier=(user.hof_tier or "gold"),
