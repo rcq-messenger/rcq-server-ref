@@ -256,6 +256,23 @@ def _ip_block(ip: str) -> str:
     return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False).network_address)
 
 
+# ⏭ MISSING, and operators ask for it: a way to find out whether YOUR relay is
+# being handed out right now. The broker knows; the person running the box has
+# no way to ask, so a healthy relay that has been disabled server-side, or one
+# the canary dropped, looks exactly like a working one from the operator's
+# side. Today the only self-service answer is the end-to-end dial in
+# docs/relay-operator-guide.md, which proves the relay works and says nothing
+# about whether it is in rotation.
+#
+# The shape is already here and needs no new secret: `/register` below is
+# authenticated by an Ed25519 signature over the descriptor, so
+# `POST /broker/status` with the same `{key, sig, ts}` envelope would answer
+# "enabled / live / last probed / tier" for that one key and nothing else.
+# ⚠ It must answer for ONE key at a time and never list, or it becomes the
+# relay enumeration that `/bridges` exists to prevent.
+#
+# Not critical: a dead relay costs the network nothing by design, which is why
+# this has waited (founder, 09.09: "write it down, we will do it later").
 @router.post(
     "/register",
     dependencies=[Depends(rate_limit("broker_register", 10, 60))],
