@@ -684,6 +684,25 @@ async def init_db() -> None:
         except Exception:
             pass
 
+    # #973: one row per person per room. Same story as the index above:
+    # `create_all` never touches the live `group_members`, so the unique key
+    # declared on the model is issued by hand. The dedupe first, keeping the
+    # oldest row, because an island that already lists somebody twice (is2
+    # did, after a number move) cannot take the key until it does not.
+    # Idempotent, and NOT IN (SELECT MIN(id) …) is plain SQL on both engines.
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "DELETE FROM group_members WHERE id NOT IN "
+                "(SELECT MIN(id) FROM group_members GROUP BY group_id, uin)"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_group_members_group_uin "
+                "ON group_members (group_id, uin)"
+            ))
+        except Exception:
+            pass
+
     # ── One-shot 2026-08-22: hash the invite codes in place ────────────────
     #
     # `invites.code` held the raw entry credential, so a dump of an

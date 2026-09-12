@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import LargeBinary, BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text
+from sqlalchemy import LargeBinary, BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -112,6 +112,15 @@ class Group(Base):
 
 class GroupMember(Base):
     __tablename__ = "group_members"
+    # ⚠ ONE ROW PER PERSON PER ROOM, enforced. Without this, three paths could
+    # list somebody twice: a join racing an add (both check-then-insert), and
+    # the number move, whose `_clear_destination` only clears a destination it
+    # can see a unique key for — and with no key it saw nothing, so a member
+    # holding both numbers ended up listed twice. is2 did exactly that, and
+    # Android's member list, keyed on the uin, crashed on open (report #973).
+    # The key also lets the rekey helper do its job here from now on.
+    # Existing islands get the index by hand in core/db.py, after a dedupe.
+    __table_args__ = (UniqueConstraint("group_id", "uin", name="uq_group_members_group_uin"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     group_id: Mapped[int] = mapped_column(ForeignKey("groups.id", ondelete="CASCADE"), index=True)

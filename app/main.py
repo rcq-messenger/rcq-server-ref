@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.core.config import settings
 from app.core.db import engine, init_db
@@ -452,3 +452,15 @@ app.include_router(ws.router)
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "app": settings.APP_NAME, "version": settings.SERVER_VERSION}
+
+
+# Nothing on an island is for a search engine. `.rcq` sites are served without
+# a login on purpose (the island must not be able to log who read what), which
+# means anyone holding the address can fetch one — and without this file that
+# "anyone" quietly included crawlers, so a page somebody published for the
+# people in one chat was on its way into a web index (report #976, 12.09).
+# A single Disallow keeps the design and removes the surprise. The same answer
+# for every path: an API host has no page that wants indexing.
+@app.get("/robots.txt", include_in_schema=False)
+async def robots() -> PlainTextResponse:
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
