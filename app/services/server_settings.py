@@ -219,7 +219,7 @@ _reg(SettingSpec("free_invites_min_age_days", "int", lambda: 30, "limits",
                  "2026-09-01 would each have had to wait a month, look like a "
                  "person and come back a day later before earning one.",
                  min=0, max=3650))
-_reg(SettingSpec("island_host", "str", lambda: "", "limits",
+_reg(SettingSpec("island_host", "str", lambda: os.environ.get("RCQ_ISLAND_HOST", ""), "limits",
                  "This island's own address",
                  "The hostname people type to reach this island, e.g. "
                  "api.rcq.app. \u26a0\u26a0 REQUIRED before \u201cpaid\u201d "
@@ -568,6 +568,20 @@ def validate(updates: dict[str, Any]) -> dict[str, str]:
                 raise ValueError(f"'{key}' must be one of {list(spec.choices)}")
             if key in ("uin_prices", "uin_payout_addresses"):
                 _check_json_map(key, value)
+            if key == "island_host" and value:
+                # ⚠ A BARE HOST, because that is what it is compared against.
+                # The till signs the host it was configured with and
+                # `verify_entry_payout` compares the two verbatim (strip and
+                # lower-case, nothing else), so "https://api.rcq.app" or a
+                # trailing slash here does not mismatch loudly: entry simply
+                # stops selling while /server/info keeps advertising a price
+                # and the clients keep drawing the gateway. One regex here is
+                # the difference between a typo and a dead shop nobody can see.
+                if not re.fullmatch(r"[A-Za-z0-9.\-]+(:[0-9]{1,5})?", value):
+                    raise ValueError(
+                        f"'{key}' must be a bare hostname such as api.rcq.app "
+                        "(no scheme, no slash, no space), optionally with :port"
+                    )
             if key == "free_invites_before" and value:
                 try:
                     parse_instant(value)

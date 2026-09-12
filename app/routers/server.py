@@ -394,9 +394,6 @@ async def server_info() -> ServerInfo:
                 bool(eff["closed_island"])
                 and bool(eff["federation_refuse_strangers"])
             ),
-            # ⚠ Only on a CLOSED island. An open island that has a leftover
-            # number in the setting must not quote a price for something
-            # anybody can have for nothing.
             # ⚠⚠ PUBLISHED WHENEVER ENTRY IS FOR SALE, not only when the door
             # is locked. These were gated on `closed_island`, and the two are
             # different facts: an island can sell residency — a mark, invites,
