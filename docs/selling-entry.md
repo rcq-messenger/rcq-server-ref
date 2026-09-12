@@ -35,10 +35,13 @@ Everything is in the admin console (`https://<host>/admin/console`), with the
 | Limits → This island's own address | `island_host` | The bare hostname people type to reach you, `api.rcq.app` shaped. It is what a voucher's signature is checked against, so it must equal your till's `ENTRY_HOSTS` exactly. **Empty sells nothing**, silently: the island answers your till `sales_disabled` while `/server/info` keeps advertising the price. |
 
 Then deploy your till with `UIN_ISLAND_API` and `ENTRY_HOSTS` both set to your
-host, and `UIN_VOUCHER_PRIVKEY` as its secret. Its README walks through the
-whole thing: the D1 database and its migrations, generating the keypair (the
-two halves are in different encodings, and it gives both), and the one-line
-deploy.
+host, and `UIN_VOUCHER_PRIVKEY` as its secret. Its
+[README](https://github.com/rcq-messenger/rcq-till#running-this-till-for-your-own-island)
+walks through the whole thing: the D1 database and its migrations, generating
+the keypair (the two halves are in different encodings, and it gives both), and
+the one-line deploy. Nothing in it points at us: a till with no
+`UIN_ISLAND_API` refuses to sell rather than asking our island, and its wallet
+addresses are yours or empty.
 
 ## What the buyer sees
 
