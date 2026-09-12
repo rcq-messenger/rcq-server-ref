@@ -272,6 +272,8 @@ secret), use `deploy/Caddyfile.masquerade-tokens.compose` instead — see
 **[docs/private-island.md](docs/private-island.md)**. Closed islands are
 native-only (iOS/Android/desktop).
 
+Selling entry to your island (price, wallets, your own till, who the seller is): **[docs/selling-entry.md](docs/selling-entry.md)**.
+
 ## TLS without a certificate authority
 
 Let's Encrypt is a policy, not a protocol: if it stops issuing to your
