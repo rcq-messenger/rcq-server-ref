@@ -323,6 +323,8 @@ HOLD_MAX_AGE_SECONDS = 600
 # asking the island a question about ONE number, signed, short-lived, and
 # worthless to replay. It carries no hold id, so `verify_hold` would reject it
 # on the field set alone, which is the domain separation working as intended.
+# "entry_payout" is the same question about the island's door instead of a
+# number (`entry_payout_signed_bytes` below), under the same clock.
 _HOLD_KINDS = ("hold", "release")
 
 
@@ -369,6 +371,80 @@ def verify_payout(request: str, *, now: int | None = None) -> int:
     except (InvalidSignature, ValueError, TypeError, binascii.Error):
         raise VoucherError("bad_voucher") from None
     return uin
+
+
+def entry_payout_signed_bytes(*, host: str, exp: int) -> bytes:
+    """The bytes the till signs to ask WHAT ENTRY COSTS on `host` and WHERE it
+    is paid. The entry counterpart of `payout_signed_bytes`.
+
+    The host is inside the signature for the same reason it is inside an
+    entry voucher's: there is no number to bind to, and the answer names an
+    island's price and an island's wallets. A till whose `UIN_ISLAND_API`
+    points at the wrong island then gets a refusal instead of writing invoices
+    in that island's name and watching money arrive at the wrong door.
+
+    Its own `kind`, so it can never be read as a payout question about a
+    number, nor as an entry voucher: the field sets differ and the verifier
+    checks the kind before anything else.
+    """
+    doc = {"v": VERSION, "kind": "entry_payout", "host": str(host), "exp": int(exp)}
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+
+
+def verify_entry_payout(request: str, *, expect_host: str, now: int | None = None) -> str:
+    """Check a signed entry payout question against THIS island's own name;
+    return the host it asks about, exactly as the till spelled it.
+
+    `expect_host` comes from the island's own configuration, never from a
+    header, for the reason `verify_entry` gives. A till asking about some
+    other island is refused with `voucher_other_island`, the same word a
+    voucher for the wrong island gets, so a client never learns two.
+    """
+    pub_b64 = public_key_b64()
+    if not pub_b64:
+        raise VoucherError("sales_disabled")
+    expect = (expect_host or "").strip().lower()
+    if not expect:
+        # An island that has not been told its own name cannot check the one
+        # field that matters. Refuse rather than answer for anybody.
+        raise VoucherError("sales_disabled")
+    try:
+        doc = json.loads(base64.b64decode(request.strip(), validate=True))
+    except (ValueError, binascii.Error, TypeError):
+        raise VoucherError("bad_voucher") from None
+    if not isinstance(doc, dict) or doc.get("v") != VERSION or doc.get("kind") != "entry_payout":
+        raise VoucherError("bad_voucher")
+    try:
+        # Verbatim for the signature, normalised only for the comparison, as
+        # `verify_entry` does and for the same reason.
+        host_signed = str(doc["host"])
+        exp = int(doc["exp"])
+        sig = base64.b64decode(str(doc["sig"]), validate=True)
+    except (KeyError, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+    if not (1 <= len(host_signed) <= 253) or not host_signed.isascii():
+        raise VoucherError("bad_voucher")
+
+    seconds = int(time.time() if now is None else now)
+    if exp <= seconds or exp - seconds > HOLD_MAX_AGE_SECONDS:
+        raise VoucherError("voucher_expired")
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64, validate=True))
+        pub.verify(sig, entry_payout_signed_bytes(host=host_signed, exp=exp))
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise VoucherError("bad_voucher") from None
+
+    # ⚠ After the signature, not before: a refusal that named the reason for
+    # an unsigned document would let anyone learn which host this island
+    # answers to by sending guesses. Signed by our till and still the wrong
+    # island is the one case this word is for.
+    if host_signed.strip().lower() != expect:
+        raise VoucherError("voucher_other_island")
+    return host_signed
 
 
 def hold_signed_bytes(*, kind: str, uin: int, hold_id: str, exp: int) -> bytes:

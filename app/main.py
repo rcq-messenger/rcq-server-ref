@@ -15,7 +15,7 @@ from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
 from app.core.transport import classify as transport_of
-from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, sites, uin_shop, users, vault, ws, guest_cards, invites, residency
+from app.routers import admin, audio_rooms, auth, broker, contacts, deposit_auth, devices, entry, federation, gate, groups, keys, link, media, messages, migrate, news, polls, presence, public, reports, server, sites, uin_shop, users, vault, ws, guest_cards, invites, residency
 from app.routers import random as random_chat
 from app.services.connection_manager import manager
 from app.services.evidence_sweep import evidence_sweep_loop
@@ -441,6 +441,9 @@ app.include_router(sites.admin_router)
 app.include_router(admin.router)
 app.include_router(migrate.router)
 app.include_router(uin_shop.router)
+# The till's one question about entry (price + wallets), signed. Not gated on
+# the number shop: residency sells with the shop closed (routers/entry.py).
+app.include_router(entry.router)
 app.include_router(public.router)
 app.include_router(server.router)
 app.include_router(link.router)

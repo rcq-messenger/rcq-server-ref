@@ -78,6 +78,30 @@ class ServerCapabilities(BaseModel):
     #: on iOS: Apple does not allow an app to point at a purchase it does not
     #: handle.
     entry_url: str = ""
+    #: This island's own till (the checkout worker, deploy/console-worker),
+    #: https only, from the same `uin_till_url` setting that sells numbers: one
+    #: till per island serves numbers, resale and entry, and there is no second
+    #: URL to keep in step with it.
+    #:
+    #: THE RULE: a client renders the in-app entry gateway ONLY when the island
+    #: names `till_url` here. There is no built-in fallback for entry in any
+    #: client, on any platform, ever. The number shop needed `X-RCQ-Checkout`
+    #: (routers/uin_shop.py) because shipped clients carried OUR till compiled
+    #: in and would send a self-hoster's customer to pay us; entry avoids that
+    #: by construction. Nothing older than this field draws the gateway, and an
+    #: island with no till gets today's `entry_url` link or nothing at all.
+    #:
+    #: Defaults "" so every shipped client ignores it.
+    till_url: str = ""
+    #: The operator's own terms of sale and refund page, when they name one.
+    #: A client that sells entry from inside the app links it beside the
+    #: payment, because on a self-hosted island the OPERATOR is the seller and
+    #: their terms apply; the RCQ team's terms at rcq.app cover the flagship
+    #: only and must never be linked for somebody else's sale. Empty means the
+    #: client says instead that refunds are the operator's decision.
+    #:
+    #: Defaults "" so every shipped client ignores it.
+    terms_url: str = ""
     #: How many accounts live here. Published so the island picker can say it
     #: on the card, beside the price: a number is what makes a closed club read
     #: as a place rather than a paywall (founder, 09.09).
@@ -295,6 +319,23 @@ def _badge_texts(raw: str) -> dict[str, BadgeText]:
         return {}
 
 
+def _https_only(raw: object) -> str:
+    """A URL a client may send MONEY through, or "". Only https: a till named
+    over plain http would hand every buyer's invoice to whoever sits on the
+    wire, and "" makes every client draw no gateway at all, which is the safe
+    answer. Trailing slashes are dropped so the clients can append paths."""
+    value = str(raw or "").strip().rstrip("/")
+    return value if value.lower().startswith("https://") else ""
+
+
+def _http_or_https(raw: object) -> str:
+    """A URL a client may OPEN, or "". A terms page is a link, not a payment
+    path, so plain http is tolerated (a LAN island may have no certificate);
+    anything without a web scheme is dropped rather than handed to a browser."""
+    value = str(raw or "").strip()
+    return value if value.lower().startswith(("https://", "http://")) else ""
+
+
 #: `/server/info` is asked by every client on boot and by every island card a
 #: person swipes past, so the headcount behind it is counted at most once a
 #: minute and served from here in between. A minute-old number is right for a
@@ -369,6 +410,8 @@ async def server_info() -> ServerInfo:
             # Selling something a client cannot show a box for is the bug.
             entry_price_cents=int(eff["entry_price_cents"]),
             entry_url=str(eff["entry_url"]),
+            till_url=_https_only(eff["uin_till_url"]),
+            terms_url=_http_or_https(eff["terms_url"]),
             user_count=await _user_count(),
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],

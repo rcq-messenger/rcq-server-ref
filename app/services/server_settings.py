@@ -80,13 +80,17 @@ _reg(SettingSpec("reports_enabled", "bool", lambda: True, "features", "Reports",
 _reg(SettingSpec("entry_price_cents", "int", lambda: 0, "limits",
                  "Price of entry",
                  "What THIS island charges somebody to join, in US cents; 0 "
-                 "means entry is not sold and the apps show no price. Only "
-                 "meaningful on a closed island: on an open one anybody may "
-                 "register and there is nothing to charge for. \u26a0 Setting a "
-                 "number here makes the price VISIBLE in every client's island "
-                 "picker; it does not yet take money, and an island that "
-                 "quotes a price it cannot collect is worse than one that "
-                 "quotes nothing.",
+                 "means entry is not sold and the apps show no price. Sold "
+                 "whatever the door policy says: on an open island a buyer "
+                 "gets residency (the mark, invites) and anybody else still "
+                 "walks in free; with the policy on \u201cpaid\u201d the code "
+                 "is what opens the door. Your till asks THIS island for the "
+                 "price and for your wallets when it writes an entry invoice, "
+                 "so this number is what buyers are charged, and it changes "
+                 "live from here. \u26a0 A price with no till behind it "
+                 "(\u201cYour checkout\u201d below empty, or no wallets) is "
+                 "shown in every island picker and cannot be collected, which "
+                 "is worse than quoting nothing.",
                  min=0, max=1000000))
 _reg(SettingSpec("entry_url", "str", lambda: "", "limits",
                  "Where entry is bought",
@@ -321,8 +325,9 @@ _reg(SettingSpec("uin_resale_enabled", "bool", lambda: False, "numbers",
 _reg(SettingSpec("uin_payout_addresses", "str",
                  lambda: os.environ.get("RCQ_UIN_PAYOUT_ADDRESSES", ""), "numbers",
                  "Your wallets",
-                 'Where buyers pay YOU for numbers this island sells, one '
-                 'address per chain. Your till asks the island for these, so '
+                 'Where buyers pay YOU, one address per chain, for numbers '
+                 'this island sells AND for entry to it (the price of entry '
+                 'is under Limits). Your till asks the island for these, so '
                  'changing one here changes where the next invoice sends money. '
                  '⚠ An address you do not control is an invoice you cannot '
                  'collect, and nothing here can undo a payment.',
@@ -358,6 +363,16 @@ _reg(SettingSpec("welcome_text", "str", lambda: "", "branding",
                  "Shown on the confirm before somebody joins this island, "
                  "which is the one moment house rules get read, and under the "
                  "island card in Settings. Leave empty for none."))
+_reg(SettingSpec("terms_url", "str", lambda: "", "branding",
+                 "Your terms and refund page",
+                 "The address of YOUR terms of sale, refund policy included. "
+                 "A client that sells entry to this island from inside the "
+                 "app links it beside the payment, and a self-hosted island "
+                 "is its own seller: the RCQ team's terms cover the flagship "
+                 "and nothing else. Leave it empty and the clients say "
+                 "instead that refunds are the operator's decision and to ask "
+                 "before paying. Published on /server/info as `terms_url`; "
+                 "the flagship sets https://rcq.app/terms#refunds."))
 
 
 def parse_instant(raw: str | None) -> Optional[datetime]:
