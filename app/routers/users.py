@@ -119,6 +119,15 @@ class PublicUser(BaseModel):
     #: choice of which to wear. Empty for everybody else, and for an account
     #: with nothing: a peer's collection is not a thing to publish.
     badges_earned: list[str] = []
+    #: Owner-only: when this account paid its way in, or null. A client draws
+    #: the "become a resident" affordance off this and nothing else, so a
+    #: resident is not sold residency twice. Null for third parties: whether
+    #: a peer paid is not a thing to publish either.
+    resident_since: datetime | None = None
+    #: Owner-only: how the account got in, "voucher" | "invite" | "open", or
+    #: null on a row older than the column (models/user.py). Null for third
+    #: parties.
+    entered_via: str | None = None
     # Owner-only mirror of "wear my mark where others can see it". A bool
     # rather than the tri-state the fields around it use: the mark rides in
     # list rows and rosters that are built once for many viewers, so
@@ -261,6 +270,8 @@ class PublicUser(BaseModel):
             last_seen=last_seen,
             badge_hidden=(u.badge_hidden if owner_self else None),
             badges_earned=(earned_badges(u) if owner_self else []),
+            resident_since=(u.resident_since if owner_self else None),
+            entered_via=(u.entered_via if owner_self else None),
             last_seen_visibility=(u.last_seen_visibility if owner_self else None),
             gender_visibility=(u.gender_visibility if owner_self else None),
             profile_visibility=(u.profile_visibility if owner_self else None),

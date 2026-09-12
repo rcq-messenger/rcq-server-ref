@@ -187,6 +187,11 @@ async def _perform_migration(
         # ⚠ And the counter with it, or a change of number is a free reset of
         # the allowance: buy a short UIN, get five more invites.
         invites_minted=user.invites_minted,
+        # How they got in is also a fact about them, and a NULL here is what
+        # the free invite drip reads as "was here before entry was sold". A
+        # move that dropped it would turn a legacy account into a fresh
+        # walk-in, or the reverse, depending on which way the default fell.
+        entered_via=user.entered_via,
         # The set of marks travels with the person for the same reason
         # the worn one does: they earned them, not the number.
         badges_earned=user.badges_earned,

@@ -175,6 +175,11 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # which is correct: nobody has paid yet, and an island that never
     # charges will keep it NULL for ever.
     ("resident_since", "TIMESTAMP WITH TIME ZONE"),
+    # How the account got in (12.09): "voucher" | "invite" | "open". NULL on
+    # every existing row and READ AS "before the column existed", which is how
+    # the free invite drip tells a legacy account from a recent walk-in. No
+    # backfill, see models/user.py.
+    ("entered_via", "VARCHAR(16)"),
     # Monotone counter, see models/user.py for why it is not a COUNT.
     ("invites_minted", "INTEGER DEFAULT 0"),
     # Profile picture (see models/user.py). Additive: NULL on every existing

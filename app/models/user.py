@@ -130,6 +130,19 @@ class User(Base):
     resident_since: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # How this account got in: "voucher" (paid at the door), "invite" (an
+    # invite row was consumed), "open" (walked in while the door was open).
+    #
+    # ⚠⚠ NULL MEANS "BEFORE THIS COLUMN EXISTED", and that is the
+    # whole point of it. The free invite drip (routers/invites.py) is for the
+    # people who were already here when entry went on sale on 2026-09-07, and
+    # nothing else on the row can tell them apart from somebody who was let in
+    # on a friend's invite last week: `resident_since` is NULL for both. So
+    # this is stamped on every registration from now on, and NULL is legacy by
+    # construction. No backfill, deliberately: guessing "open" for 2626
+    # existing rows would make every one of them look like a fresh walk-in and
+    # cost exactly the people the drip exists for.
+    entered_via: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # How many invites this resident has ever minted. MONOTONE: it counts up
     # and is never decremented, not even when an invite is revoked or expires.
     #

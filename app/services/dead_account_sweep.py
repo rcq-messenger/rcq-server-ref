@@ -25,7 +25,11 @@ would delete somebody real:
   * no device and no push token — a registered install is a person holding a
     phone;
   * no contact edge in either direction, no room membership, no room of their
-    own, no site, no collection row, no report filed or received.
+    own, no site, no collection row, no report filed or received;
+  * and never a resident. Somebody who PAID to be here is not junk however
+    empty the account looks, and this is what "resident" should mean: a
+    person the island keeps. A flood does not buy vouchers, so the clause
+    costs the sweep nothing against the thing it was written for.
 
 A lurker who reads a room they were added to keeps their membership row and is
 therefore never touched. An account that only ever received one message is
@@ -77,6 +81,7 @@ _CANDIDATES = text("""
     SELECT u.uin, u.created_at, u.last_seen
     FROM users u
     WHERE u.created_at < :cutoff
+      AND u.resident_since IS NULL
       AND u.nickname LIKE 'user-%'
       AND u.avatar_media_id IS NULL
       AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.uin = u.uin)

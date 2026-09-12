@@ -391,6 +391,13 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # The voucher is tried FIRST and only when it looks like one, so a plain
     # invite never pays the cost of a signature check.
     resident_at: datetime | None = None
+    # How this account is getting in, for `users.entered_via`. Starts as a
+    # walk-in and is overwritten by whichever credential actually opens the
+    # door below. ⚠ Stamped on EVERY registration, including on an open
+    # island, because NULL in that column means "registered before the column
+    # existed" and the free invite drip (routers/invites.py) reads it that
+    # way: a fresh walk-in left NULL would look like a legacy account.
+    entered_via = "open"
     # ⚠⚠ NOT gated on the policy. A voucher is money that has already changed
     # hands, so it is redeemed whenever one is presented and it verifies, even
     # on an island whose door happens to be open. The alternative was tried on
@@ -426,6 +433,7 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
                     status.HTTP_409_CONFLICT, detail={"code": "voucher_spent"}
                 ) from None
             resident_at = datetime.now(timezone.utc)
+            entered_via = "voucher"
             code = ""  # spent as a voucher; do not also spend it as an invite
 
     if policy in ("invite", "paid") and resident_at is None:
@@ -441,6 +449,7 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         )
         if consumed.rowcount == 0:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_invalid"})
+        entered_via = "invite"
         reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code_hash))
     elif code:
         # Open server, but a reserved-UIN invite was supplied → consume it so the
@@ -452,6 +461,9 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
             .values(used_count=Invite.used_count + 1, spent_at=_spent_now)
         )
         if consumed.rowcount > 0:
+            # A row was spent, so this is an invited entry even though the door
+            # was open: it is the consumed ROW that decides, not the policy.
+            entered_via = "invite"
             reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code_hash))
 
     # A reserved vanity UIN wins when it's still free; then a best-effort
@@ -560,8 +572,13 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         # they were let in, they did not buy their way in, and the two are
         # different facts about the same person.
         resident_since=resident_at,
-        # ⚠ The mark comes with the money, and this is the ONLY path that
-        # grants one without an operator. It is a slug the clients have never
+        # Which credential opened the door, decided above. Never NULL from
+        # here on: NULL is reserved for rows older than the column.
+        entered_via=entered_via,
+        # ⚠ The mark comes with the money. Two paths grant one without an
+        # operator, this one and `POST /residency/redeem` for an account that
+        # already exists, and both do it off a spent voucher and nothing else.
+        # It is a slug the clients have never
         # heard of, which is deliberate and safe: every client draws an unknown
         # kind from the island's own `badge_labels`, so naming and colouring it
         # is an island setting rather than four client releases.

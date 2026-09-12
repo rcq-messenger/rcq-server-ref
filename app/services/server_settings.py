@@ -18,6 +18,7 @@ import json
 import re
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from sqlalchemy import select
@@ -166,6 +167,54 @@ _reg(SettingSpec("resident_invites_ttl_days", "int", lambda: 30, "limits",
                  "Days an unused invite stays good",
                  "So a resident who mints five and forgets them is not leaving "
                  "five permanent doors open."))
+# ── The free drip: for the people who were here before entry was sold.
+#
+# The block above says only a payer has invites, and the arithmetic behind
+# that (13,130 free entries on day one) was about handing FIVE AT ONCE to
+# every legacy row. What ships instead is smaller on every axis: fewer in
+# total, one at a time, only after the account has been around a while, and
+# only to a row that looks like a person (services/account_signal.py). A row
+# that walked in on somebody's invite gets none: `users.entered_via` says
+# how each account got in, and only NULL, which means "registered before the
+# column existed", qualifies. Period and TTL are the resident settings above,
+# on purpose: two drips with two clocks is a support question waiting to be
+# asked.
+_reg(SettingSpec("free_invites_total", "int", lambda: 3, "limits",
+                 "Free invites for accounts that predate paid entry",
+                 "How many people one account that was ALREADY HERE when "
+                 "entry went on sale may bring in, for the life of the "
+                 "account. 0 turns the drip off. Fewer than a resident gets, "
+                 "because nobody paid for these; and only for accounts that "
+                 "registered before the cutoff below, without a voucher and "
+                 "without an invite, that have been here at least the minimum "
+                 "age, and that look like a person rather than a script's "
+                 "leftovers. One now and one more every "
+                 "“Days between invites”, the same clock as a "
+                 "resident's. Spent ones carry over if the account later "
+                 "buys residency: nothing is ever reset, a reset would be a "
+                 "free reroll.",
+                 min=0, max=100))
+_reg(SettingSpec("free_invites_before", "str", lambda: "", "limits",
+                 "Free invites: registered before",
+                 "THE CUTOFF. An ISO-8601 instant, e.g. 2026-09-07T00:00:00Z: "
+                 "only accounts that registered BEFORE this moment get the "
+                 "free drip, and the first one lands on this day or when the "
+                 "account reaches the minimum age, whichever is later. Empty "
+                 "means the drip is off. ⚠ The flagship should set the "
+                 "day entry went on sale, 2026-09-07T00:00:00Z, and a "
+                 "self-hosted island the day it switched its own door to "
+                 "paid. Setting it to a moment in the future would hand free "
+                 "invites to everyone who registers between now and then, "
+                 "which is a door, not a thank-you."))
+_reg(SettingSpec("free_invites_min_age_days", "int", lambda: 30, "limits",
+                 "Free invites: minimum account age",
+                 "Days an account has to have existed before its first free "
+                 "invite lands. ⚠ Counted from when the PERSON joined, "
+                 "so a change of number does not restart it. The floor that "
+                 "makes a flood worthless: 552 accounts opened by a script on "
+                 "2026-09-01 would each have had to wait a month, look like a "
+                 "person and come back a day later before earning one.",
+                 min=0, max=3650))
 _reg(SettingSpec("island_host", "str", lambda: "", "limits",
                  "This island's own address",
                  "The hostname people type to reach this island, e.g. "
@@ -309,6 +358,31 @@ _reg(SettingSpec("welcome_text", "str", lambda: "", "branding",
                  "Shown on the confirm before somebody joins this island, "
                  "which is the one moment house rules get read, and under the "
                  "island card in Settings. Leave empty for none."))
+
+
+def parse_instant(raw: str | None) -> Optional[datetime]:
+    """An ISO-8601 instant from a string setting, or None when it is empty.
+
+    Written for `free_invites_before` and used by both ends of it: `validate`
+    refuses a value this cannot read, so the console cannot save a cutoff the
+    island would silently treat as "off", and `routers/invites.py` reads the
+    saved value back through the same function. A naive instant is taken as
+    UTC, and the `Z` suffix is accepted because that is how the help text
+    spells the example and how every client will paste it.
+
+    Raises ValueError on anything else, deliberately: the caller that saves
+    turns it into a 400, and the caller that reads treats the exception as
+    "not set" rather than guessing a date.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    when = datetime.fromisoformat(text)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when
 
 
 def _parse(spec: SettingSpec, raw: str) -> Any:
@@ -479,6 +553,13 @@ def validate(updates: dict[str, Any]) -> dict[str, str]:
                 raise ValueError(f"'{key}' must be one of {list(spec.choices)}")
             if key in ("uin_prices", "uin_payout_addresses"):
                 _check_json_map(key, value)
+            if key == "free_invites_before" and value:
+                try:
+                    parse_instant(value)
+                except ValueError:
+                    raise ValueError(
+                        f"'{key}' must be an ISO-8601 instant such as 2026-09-07T00:00:00Z"
+                    ) from None
             out[key] = value[:2048]
     return out
 
