@@ -388,6 +388,17 @@ async def get_public_keys(
     a dumb mailbox serves for its residents so other islands can reach them. IP
     rate-limited to bound UIN enumeration.
     """
+    # ⚠⚠ THE POLICY IS DECIDED BEFORE THE NUMBER IS LOOKED UP, on purpose. An
+    # island that refuses strangers answers every caller the same way whether
+    # the number exists or not, so a refusal is a statement about the island and
+    # never an answer about a person. Reversing these two lines turns a closed
+    # island into a directory for guessing which numbers exist, and short
+    # numbers are what we sell.
+    mode = await door.open_card_mode(
+        db, target_uin=uin, card=door.card_from(request)
+    )
+    if mode == door.CARD_REFUSED:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "island_closed")
     u = await db.get(User, uin)
     if u is None or not u.identity_key:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -397,18 +408,11 @@ async def get_public_keys(
     # envelope to a resident. The gate on /users/{uin}/info cannot do this job:
     # it requires a session, so everyone who gets there is already a resident.
     #
-    # Refused with the SAME 404 and the same body as the check above, byte for
-    # byte, and AFTER it, so the two cost the same lookup. A distinguishable
-    # answer turns a closed island into a directory: ask about a number, learn
-    # whether it exists — and short numbers are what we sell.
-    #
-    # `caller_uin=None` is the honest description: no session, and no edge in
-    # this island's graph even if they are a contact on theirs. So the only way
-    # through is a card this resident handed out themselves.
-    if not await door.may_fetch_key(
-        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
-    ):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # ⚠ It used to REFUSE here, and that was the bug: refusing this door does
+    # not close an island, it unplugs it from every other one (see the long
+    # note above `open_card_mode` in services/door.py). A stranger on a closed
+    # island now gets the seal keys and nothing that describes a person.
+    seal_only = mode == door.CARD_SEAL_ONLY
     # Optional profile bits only when the user keeps an open profile — same
     # gate /users/{uin}/info applies to outsiders. Nickname is always-visible
     # identity and ships regardless.
@@ -419,12 +423,20 @@ async def get_public_keys(
     # "contacts" and "nobody" both close the optional fields here.
     card_open = card_openable_for_viewer(u, viewer_uin=None, is_contact=False)
     profile_open = profile_open and card_open
+    # A closed island tells a stranger nothing ABOUT anybody. The three keys go
+    # out because an envelope cannot be sealed without them; the nickname does
+    # not, because a nickname is how you check that the number you typed is the
+    # person you meant, and that is precisely the confirmation a closed island
+    # is refusing to give.
+    if seal_only:
+        profile_open = False
+        card_open = False
     return PublicKeysOut(
         uin=u.uin,
         identity_key=u.identity_key,
         signing_key=u.signing_key,
         signal_identity_key=u.signal_identity_key,
-        nickname=u.nickname,
+        nickname=None if seal_only else u.nickname,
         gender=u.gender if (profile_open and (u.gender_visibility or "nobody") == "everyone") else None,
         status_message=u.status_message if profile_open else None,
         profile_openable=card_open,

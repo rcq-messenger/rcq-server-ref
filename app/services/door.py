@@ -194,6 +194,62 @@ async def redeem_card(db: AsyncSession, *, target_uin: int, raw: str | None) -> 
 #: first, then this.
 
 
+## What door 1 hands a stranger. Not a yes/no, because a yes/no was wrong.
+##
+## ⚠⚠ REFUSING `GET /federation/keys/{uin}` DOES NOT CLOSE AN ISLAND, IT
+## UNPLUGS IT. That endpoint is the first step of every cross-island contact
+## request: a person on another island has no account here, so `may_fetch_key`
+## sees a stranger with no card and says no, and then nothing works. No request
+## reaches a resident from outside, and worse, ACCEPT breaks too, because the
+## accepting client re-fetches the same card before it answers. The flagship
+## ran that way for hours on 2026-09-09 and the only visible symptom was
+## "cannot add people from other islands".
+##
+## No released client presents a guest card on this door, so there is no way
+## around it from the other side either. Until they do, the three keys have to
+## go out or federation does not exist for a closed island.
+##
+## So the answer has three values instead of two. A stranger on a closed island
+## gets the SEAL keys and nothing else: enough to seal one envelope to a number
+## they already knew, and not a nickname, not a profile, not a hint that the
+## number is worth anything. An operator who genuinely wants the island off the
+## network sets `federation_refuse_strangers` and gets the old behaviour, named
+## honestly this time.
+CARD_FULL = "full"
+CARD_SEAL_ONLY = "seal"
+CARD_REFUSED = "refused"
+
+
+async def open_card_mode(
+    db: AsyncSession,
+    *,
+    target_uin: int,
+    card: str | None,
+    closed: bool | None = None,
+) -> str:
+    """How much of the open key card a caller with no session may have.
+
+    ⚠ Deliberately NOT `may_fetch_key`. That one still guards doors 2, 3 and 7
+    (the authenticated bundle, the OPK, the rekey), where a refusal costs a
+    stranger a session they never had and costs nobody else anything. This one
+    guards the door that federation itself walks through.
+    """
+    if closed is None:
+        closed = await island_is_closed()
+    # An open island is unchanged, and that is most islands.
+    if not closed:
+        return CARD_FULL
+    # A card the resident handed out themselves buys the whole card, exactly as
+    # before: this is the invited stranger, and nothing about them changed.
+    if await redeem_card(db, target_uin=target_uin, raw=card):
+        return CARD_FULL
+    from app.services import server_settings
+
+    if await server_settings.get_bool("federation_refuse_strangers"):
+        return CARD_REFUSED
+    return CARD_SEAL_ONLY
+
+
 async def may_fetch_key(
     db: AsyncSession,
     *,

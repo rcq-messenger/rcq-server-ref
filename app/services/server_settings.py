@@ -119,6 +119,26 @@ _reg(SettingSpec("closed_island", "bool", lambda: False, "limits",
                  "Refusals look exactly like \"no such number\", on purpose: a "
                  "closed island must not become a directory for guessing which "
                  "numbers exist."))
+_reg(SettingSpec("federation_refuse_strangers", "bool", lambda: False, "limits",
+                 "Refuse strangers entirely",
+                 "Only meaningful on a closed island, and off by default. A "
+                 "closed island already withholds everything that describes a "
+                 "resident from a stranger: no nickname, no profile, nothing "
+                 "that confirms the number you typed belongs to who you meant. "
+                 "It still hands out the three keys an envelope has to be "
+                 "sealed with, because without them a person on another island "
+                 "cannot write the first word and this island is not on the "
+                 "network at all. "
+                 "\u26a0\u26a0 TURNING THIS ON REMOVES THE ISLAND FROM "
+                 "CROSS-ISLAND MESSAGING. No contact request arrives from "
+                 "outside, no acceptance leaves, and people already talking "
+                 "across islands stop being able to start anything new. That "
+                 "is the point of it, and it is the right setting for an "
+                 "island that is meant to be a room rather than an address. "
+                 "It is the wrong setting for everyone else. "
+                 "Refusals are the same answer for every number, existing or "
+                 "not, so this never becomes a directory for guessing which "
+                 "numbers are real."))
 _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY, "limits",
                  "Registration",
                  "Who may create an account on this island. \u201cpaid\u201d takes "

@@ -61,6 +61,15 @@ class ServerCapabilities(BaseModel):
     # Defaults FALSE, so an island older than the field, and every open island,
     # is unchanged.
     closed_island: bool = False
+    #: Whether a person on ANOTHER island can start a conversation with someone
+    #: here. A closed island answers yes: it withholds every word that
+    #: describes a resident but still hands out the keys an envelope is sealed
+    #: with, because without them it is not on the network at all. Only an
+    #: operator who sets `federation_refuse_strangers` turns this off, and then
+    #: the client can say so instead of showing a failure it cannot explain.
+    #:
+    #: Defaults TRUE, which is what every island older than this field does.
+    cross_island: bool = True
     #: What this island charges to join, in US cents; 0 = not sold. Published
     #: so a person sees the price in the picker BEFORE they try to register and
     #: are refused, rather than after.
@@ -330,10 +339,20 @@ async def server_info() -> ServerInfo:
             hall_of_fame=settings.HALL_OF_FAME_ENABLED,
             registration_policy=eff["registration_policy"],
             closed_island=bool(eff["closed_island"]),
-            # See the field's own note: a closed island cannot offer anonymous
-            # key fetches, because a door that cannot tell a resident from an
-            # outsider is not a door.
-            anon_keys=not bool(eff["closed_island"]),
+            # ⚠ A CLOSED ISLAND DOES SERVE ANONYMOUS KEY FETCHES, and saying
+            # otherwise here was part of the same mistake as refusing them:
+            # what a closed island withholds is everything that DESCRIBES a
+            # resident, not the three keys an envelope cannot be sealed
+            # without. Only an operator who has explicitly asked to be off the
+            # network answers no.
+            anon_keys=not (
+                bool(eff["closed_island"])
+                and bool(eff["federation_refuse_strangers"])
+            ),
+            cross_island=not (
+                bool(eff["closed_island"])
+                and bool(eff["federation_refuse_strangers"])
+            ),
             # ⚠ Only on a CLOSED island. An open island that has a leftover
             # number in the setting must not quote a price for something
             # anybody can have for nothing.
