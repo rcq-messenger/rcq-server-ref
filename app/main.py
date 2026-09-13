@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import re
+import secrets
 import time
+
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.core.config import settings
 from app.core.db import engine, init_db
@@ -401,7 +404,38 @@ async def cors_aware_internal_error(request: Request, exc: Exception):
     already get CORS via the inner handler; this only covers true unhandled
     exceptions. We still log the traceback so it stays visible in the logs.
     Mirrors CORSMiddleware's allow_origins=["*"].
+
+    ⚠⚠ One exception is answered differently, and the difference is the whole
+    point: running out of POOLED CONNECTIONS is not a bug in this request, it is
+    the island being too busy to take it right now. On 13.09.2026 that arrived as
+    `QueuePool limit of size 5 overflow 5 reached, connection timed out, timeout
+    20.00` and every one of them became a 500 — which every client read as "the
+    server is broken", retried immediately, and so made the queue longer. Peak
+    was 435 of them in a minute while the box itself was 86% idle.
+
+    A 503 with Retry-After says the true thing, and it says it in the one
+    vocabulary every HTTP client already understands: come back, not "give up"
+    and not "hammer me". The twenty seconds the request already spent waiting is
+    not charged to the person again; the header asks for a short, jittered wait,
+    and the jitter is deliberate, because a fixed number turns a crowd into a
+    metronome and brings the same wave back in unison.
     """
+    if isinstance(exc, SQLAlchemyTimeoutError):
+        # Not `exception`: a busy minute would write hundreds of identical
+        # tracebacks, and the one that matters is the pool gauge, not the stack.
+        in_use, ceiling = _pool_gauge()
+        _log.warning(
+            "Pool exhausted on %s %s (%s/%s checked out)",
+            request.method, request.url.path, in_use, ceiling,
+        )
+        return JSONResponse(
+            {"detail": "island_busy"},
+            status_code=503,
+            headers={
+                "Retry-After": str(2 + secrets.randbelow(6)),
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
     _log.exception("Unhandled error on %s %s", request.method, request.url.path)
     return JSONResponse(
         {"detail": "internal_error"},
