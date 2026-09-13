@@ -25,6 +25,7 @@ from app.services.evidence_sweep import evidence_sweep_loop
 from app.services.inquiry_sweep import inquiry_sweep_loop
 from app.services.dead_account_sweep import dead_account_sweep_loop
 from app.services.offline_queue_sweep import offline_queue_sweep_loop
+from app.services.stale_reader_sweep import stale_reader_sweep_loop
 
 
 class _RedactSecretsInLogs(logging.Filter):
@@ -202,6 +203,11 @@ async def lifespan(_: FastAPI):
     dead_account_sweep_task = asyncio.create_task(dead_account_sweep_loop())
     # Retention for decrypted report evidence — see evidence_sweep's docstring.
     evidence_sweep_task = asyncio.create_task(evidence_sweep_loop())
+    # A device that read the group log once and then stopped used to keep its
+    # whole account off the legacy queue for ever, which on 13.09 was nine
+    # people between 41 and 2011 messages behind their rooms while online. See
+    # stale_reader_sweep's docstring.
+    stale_reader_sweep_task = asyncio.create_task(stale_reader_sweep_loop())
     # The two website forms are the only place we hold a way to reach a
     # person, and until 07.09 they were held for ever. The privacy policy
     # now says a year; this is what makes that true.
@@ -266,6 +272,7 @@ async def lifespan(_: FastAPI):
         offline_queue_sweep_task.cancel()
         dead_account_sweep_task.cancel()
         evidence_sweep_task.cancel()
+        stale_reader_sweep_task.cancel()
         inquiry_sweep_task.cancel()
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
