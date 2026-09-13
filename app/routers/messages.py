@@ -1738,6 +1738,29 @@ class GroupLogRoomIn(BaseModel):
     after: int | None = None
 
 
+#: Payload bytes in ONE /messages/group-log/fetch page, on top of the caller's
+#: `limit` in rows.
+#:
+#: ⚠⚠ WHY BYTES AND NOT JUST ROWS. A row is not a fixed size. 500 rows of room
+#: 21 is 558 KB of JSON, about 335 KB gzipped, and on 13.09.2026 Caddy's log had
+#: clients walking away from bodies that big mid-transfer: 45056 bytes written
+#: with a duration of 1010 seconds (RCQ/0.170, five times over) and 217088 bytes
+#: with a duration of 0 (RCQ/0.189). Android buffers the whole body inside a
+#: 30-second call timeout, so on a slow mobile link the read never finishes.
+#:
+#: A body that is never fully read is a page that is never acked. The island
+#: moves the cursor only on an ack, so the NEXT fetch builds the identical page
+#: from the identical cursor: a starvation loop, and worst for whoever has the
+#: most to catch up on. Measured the same day, one account was 1491 rows and
+#: thirteen days behind its room while fetching every few hours. That is the
+#: second half of report #981, and the first half of the comment on the rate
+#: ceiling above describes the same shape one layer up (#864).
+#:
+#: Charged on the payload, which is about 99% of the body. No client needs to
+#: know: `more` already means "ask again", every client already loops on it, and
+#: a page cut here is indistinguishable from one cut by `limit`.
+GROUP_LOG_PAGE_BYTES = 128 * 1024
+
 class GroupLogFetchIn(BaseModel):
     # Omitted = every room the account is a member of. Batched on purpose:
     # a client with thirty rooms makes one round trip, not thirty.
@@ -1847,6 +1870,10 @@ async def fetch_group_log(
     heads: dict[int, int] = {}
     cur_out: dict[int, int] = {}
     budget = body.limit
+    # ⚠ AND a budget in bytes; see GROUP_LOG_PAGE_BYTES for the starvation loop
+    # this closes. Spent across every room in the one call, because the body the
+    # client has to read is the whole answer and not one room's share of it.
+    byte_budget = GROUP_LOG_PAGE_BYTES
     more = False
     for gid, after in wanted:
         head = await _group_head(db, gid)
@@ -1859,7 +1886,7 @@ async def fetch_group_log(
             cursors[gid] = cursor
         cur_out[gid] = cursor.last_seq
         start = after if after is not None else cursor.last_seq
-        if budget <= 0:
+        if budget <= 0 or byte_budget <= 0:
             if head > start:
                 more = True
             continue
@@ -1876,13 +1903,41 @@ async def fetch_group_log(
         if len(rows) > budget:
             more = True
             rows = rows[:budget]
-        budget -= len(rows)
+        emitted = 0
         for r in rows:
             out_rows.append(GroupLogRow(
                 gid=gid, seq=r.seq, envelope_type=r.envelope_type, cls=r.cls,
                 payload=r.payload, received_at=r.received_at,
             ))
-    await _mark_group_log_reader(db, uin, device_id)
+            emitted += 1
+            # ⚠ Charged AFTER the row is in, never before. A single row larger
+            # than the whole budget still goes out on its own, or it could never
+            # be served at all and would pin its room for ever by itself.
+            byte_budget -= len(r.payload)
+            if byte_budget <= 0:
+                break
+        budget -= emitted
+        # Cut by bytes rather than by `limit`: there is more of this room left.
+        if emitted < len(rows):
+            more = True
+    # ⚠⚠ THE MARK IS EARNED BY AN ACK, NOT BY ASKING, except when there was
+    # nothing to ack.
+    #
+    # This mark is what stops the island writing an account legacy queue rows,
+    # so it is a statement that the device is RECEIVING, and a fetch does not
+    # say that. On 13.09.2026 an account sat 1491 rows and thirteen days behind
+    # its room while fetching every few hours: its body was too big to finish
+    # reading on a mobile link, so it never acked, the cursor never moved, and
+    # the next fetch rebuilt the identical page. The mark was refreshed every
+    # single time, which made the starvation invisible to
+    # `services/stale_reader_sweep` and kept the legacy path shut.
+    #
+    # An EMPTY answer still marks: a device level with every room has nothing to
+    # ack and would otherwise never qualify at all. So "I asked and there was
+    # nothing" counts, "I asked and was given rows" does not, and the ack that
+    # follows those rows does (see ack_group_log).
+    if not out_rows:
+        await _mark_group_log_reader(db, uin, device_id)
     try:
         await db.commit()
     except IntegrityError:
@@ -1925,6 +1980,9 @@ async def ack_group_log(
             cursor.last_seq = r.upto
             cursor.updated_at = now
             moved += 1
+    # Proof that this device is actually receiving, which is what the reader
+    # mark is for. See the long note at the other call site in fetch_group_log.
+    await _mark_group_log_reader(db, uin, device_id)
     try:
         await db.commit()
     except IntegrityError:
