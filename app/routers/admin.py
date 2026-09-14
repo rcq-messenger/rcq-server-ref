@@ -476,6 +476,15 @@ class StatsOut(BaseModel):
     broker_public_relays: int = 0
     # Of those, how many the liveness gate would actually serve right now.
     broker_public_live: int = 0
+    # Paid Team tenants riding the shared pool because their own pool has no
+    # enabled node yet: one open `team-paid` inquiry each, written by the
+    # island itself at mint or sync and closed by the island once the pool
+    # applies. The monitor mails this number; it is money already taken for
+    # nodes not yet raised.
+    pools_needing_nodes: int = 0
+    # Pools whose every enabled node is outside the liveness window: a paying
+    # customer with a key that answers `ok` and routes through nothing.
+    pools_dark: int = 0
 
 
 # ── Reports ─────────────────────────────────────────────────────────
@@ -1379,17 +1388,18 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
     ) or 0
 
     # The public bridge pool, counted the way `/broker/bridges` itself filters:
-    # enabled, and NOT bound to a tenant (a tenant's node is never disclosed
-    # publicly). `live` additionally applies the canary liveness window, which
-    # is what actually gates a community relay from being served.
+    # enabled, and bound to neither a tenant nor a pool (a paid node is never
+    # disclosed publicly). `live` additionally applies the canary liveness
+    # window, which is what actually gates a community relay from being served.
     from app.models.broker import BrokerRelay
-    from app.routers.broker import _LIVENESS_WINDOW
+    from app.routers.broker import _LIVENESS_WINDOW, _TEAM_PAID_TIER
 
     public_rows = (
         await db.execute(
             select(BrokerRelay).where(
                 BrokerRelay.enabled.is_(True),
                 BrokerRelay.tenant_id.is_(None),
+                BrokerRelay.pool_id.is_(None),
             )
         )
     ).scalars().all()
@@ -1400,10 +1410,34 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
         if r.tier == "trusted"
         or (r.last_ok is not None and now_epoch - r.last_ok <= _LIVENESS_WINDOW)
     )
+    # The island files one `team-paid` inquiry per paid Team without nodes and
+    # closes it itself when the pool applies, so the open ones ARE the count.
+    pools_needing_nodes = await db.scalar(
+        select(func.count()).select_from(RelayInquiry).where(
+            RelayInquiry.status == "open", RelayInquiry.tier == _TEAM_PAID_TIER,
+        )
+    ) or 0
+    # A pool is dark when none of its enabled rows has answered a probe within
+    # the window. Parked rows do not count either way: they serve nobody, and
+    # a pool of only parked rows is a pool with no nodes, not a dark one.
+    pool_rows = (
+        await db.execute(
+            select(BrokerRelay.pool_id, BrokerRelay.last_ok).where(
+                BrokerRelay.enabled.is_(True), BrokerRelay.pool_id.isnot(None),
+            )
+        )
+    ).all()
+    pool_alive: dict[str, bool] = {}
+    for pool_id, last_ok in pool_rows:
+        fresh = last_ok is not None and now_epoch - last_ok <= _LIVENESS_WINDOW
+        pool_alive[pool_id] = pool_alive.get(pool_id, False) or fresh
+    pools_dark = sum(1 for alive in pool_alive.values() if not alive)
 
     return StatsOut(
         broker_public_relays=len(public_rows),
         broker_public_live=int(broker_public_live),
+        pools_needing_nodes=int(pools_needing_nodes),
+        pools_dark=int(pools_dark),
         total_users=int(total_users),
         suspended_users=int(suspended_users),
         new_users_24h=int(new_users_24h),

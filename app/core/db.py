@@ -221,6 +221,17 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
 # free fleet is unchanged by the column's arrival.
 _BROKER_RELAY_COLUMNS: list[tuple[str, str]] = [
     ("tenant_id", "TEXT"),
+    # Pool membership (`shared` / `team-<id>`). NULL, like tenant_id, means
+    # public; the column arriving changes nothing for existing rows.
+    ("pool_id", "TEXT"),
+]
+
+# Additive on `relay_tenants` — which pool a tenant is served from, and the
+# console's id for the double-mint guard. Both NULL on every existing row,
+# which reads as "direct rows only", exactly what those tenants had.
+_RELAY_TENANT_COLUMNS: list[tuple[str, str]] = [
+    ("pool_id", "TEXT"),
+    ("ext_id", "TEXT"),
 ]
 
 _ONE_TIME_PREKEY_COLUMNS: list[tuple[str, str]] = [
@@ -449,6 +460,7 @@ async def init_db() -> None:
         ("devices", _DEVICE_COLUMNS),
         ("queue_cursors", _QUEUE_CURSOR_COLUMNS),
         ("broker_relays", _BROKER_RELAY_COLUMNS),
+        ("relay_tenants", _RELAY_TENANT_COLUMNS),
         ("contact_requests", _CONTACT_REQUEST_COLUMNS),
         ("gossip_records", _GOSSIP_RECORD_COLUMNS),
         ("sites", _SITE_COLUMNS),

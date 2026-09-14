@@ -49,7 +49,23 @@ class BrokerRelay(Base):
     # distribution path would sell the product and destroy it in the same
     # request. See `_serve` in routers/broker.py.
     tenant_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
-    # Admin kill switch — a disabled relay is never distributed.
+    # The POOL this endpoint belongs to: `shared` (every Personal buyer) or
+    # `team-<id>` (one organisation's own nodes). NULL, like tenant_id NULL,
+    # is the public pool. A tenant reaches these rows through its own
+    # `pool_id` rather than a per-row assignment, so filling a pool is one
+    # assign per node instead of one per customer.
+    #
+    # ⚠⚠ Same rule as tenant_id, for the same reason: a row with a pool is
+    # NEVER in the public answer, whatever its tier or liveness. `_serve` in
+    # routers/broker.py denies on either column.
+    #
+    # `index=True` only shapes a fresh database (create_all). Production got
+    # this as a plain nullable column through the add-list in core/db.py,
+    # and a handful of rows do not need an index anyway.
+    pool_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    # Admin kill switch — a disabled relay is never distributed. Also how a
+    # node registered with `private: true` waits: parked dark until the
+    # founder assigns it to a pool, so it is never served publicly even once.
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Issued-at (Unix seconds) from the signed registration, for anti-rollback.
     ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -93,6 +109,19 @@ class RelayTenant(Base):
     # or the endpoints being touched: a lapsed customer who pays again keeps
     # the same key and the same nodes.
     paid_until: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Which pool of endpoints this tenant is served, as a label rather than a
+    # foreign key: there is no pools table, a pool exists the moment a relay
+    # row carries the label. `shared` is the one pool every Personal buyer
+    # shares; `team-<tnt_id>` is a Team's own pool, named by the console's
+    # tenant id so the cabinet and the island agree without a lookup; NULL is
+    # no relays at all (a Supporter, or a legacy tenant with direct rows
+    # only). A Team rides `shared` until its own pool has an enabled node.
+    pool_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The console's `tnt_` id. The cron and the cabinet can both try to mint
+    # the same customer in the same second; this is what lets the second
+    # caller be refused instead of a second key being issued. Also what
+    # matches this row to its invoices in the console.
+    ext_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
     )

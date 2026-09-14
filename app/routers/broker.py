@@ -11,6 +11,7 @@ actor learns the whole pool without controlling many networks (slow + costly).
   GET  /broker/admin/list    (admin)                      full pool
   POST /broker/admin/set     (admin)                      set tier / enabled
   DELETE /broker/admin/{tag} (admin)                      remove a relay
+  POST /broker/admin/tenants[/set|/rotate|/assign] (admin) paid tenancy + pools
 
 Anti-enumeration is enforced SERVER-SIDE (security review 2026-06-13): the bucket
 is derived from the requester IP block + a daily epoch + a server secret (NOT a
@@ -36,19 +37,26 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.db import get_db
+from app.core.db import engine, get_db
 from app.core.rate_limit import _client_ip, rate_limit
 from app.core.redis import get_redis
 from app.core.security import require_admin
-from app.core.transport import fleet_endpoints, set_broker_addresses
+# ⚠ relay_addresses is cached for the life of the process (transport.py): a
+# node added to the signed config after boot is not refused by `assign` until
+# the next restart. Acceptable, since assigning a fleet node is a founder
+# mistake, not an attack, and the fleet changes by deploy anyway.
+from app.core.transport import fleet_endpoints, relay_addresses, set_broker_addresses
 from app.models.broker import BrokerRelay, RelayTenant
+from app.models.relay_inquiry import RelayInquiry
 from app.services.geoip import country_of
 
 router = APIRouter(prefix="/broker", tags=["broker"])
@@ -63,6 +71,23 @@ _BUCKET_PERIOD = 86400         # ring reshuffles daily
 # registered a relay in the evening and fixes it in the morning, short enough
 # that a wrong (or someone else's) address is not probed forever.
 _DEAD_AFTER_FAILS = 144
+# Parked rows (registered `private`, never assigned) are the one kind of row
+# the island neither probes nor sweeps on its own: the canary skips disabled
+# rows, and the liveness sweep above only sees reported failures. Left
+# uncapped, one IP at the register rate limit could fill the whole pool with
+# parked junk in about two hours and hold it for a week, refusing every real
+# operator's registration without costing the canary a single probe. Parked
+# rows are the founder's own nodes, raised a couple at a time, so the caps
+# are small: a stranger who fills them blocks parking only, never public
+# registration, and the rows are one DELETE each in the admin.
+_MAX_PARKED_ROWS = 16          # parked, never assigned, island-wide
+_MAX_PARKED_PER_KEY = 2        # one bootstrap key parks one node; two allows a port change
+# A parked row nobody assigned within this long is deleted by the liveness
+# call, so the island does not depend on the canary's 30-day prune to shed
+# junk. The runbook assigns a node in the same sitting it is raised; a week
+# is generous for that, and a node raised and forgotten re-registers in one
+# command.
+_PARKED_TTL = 7 * 86400
 log = logging.getLogger(__name__)
 
 _LIVENESS_WINDOW = 2700        # a community relay is served only if probed-alive within this many seconds (canary runs ~every 10 min)
@@ -88,6 +113,28 @@ _TRANSPORT_OUTCOMES = frozenset({
     "direct_ok",       # never needed the tunnel
 })
 _TRANSPORT_RETENTION = 45 * 86400
+
+# A pool label: `shared`, `team-<tnt id>`. Lowercase, digits, dashes, and
+# short, because it is written by the console worker from its tenant id and
+# read back in the admin and the canary line; nothing else is ever a valid
+# pool and a typo must not create one.
+#
+# No underscore, on purpose. A console id is `tnt_<hex>`, and the worker
+# spells its pool with the underscore as a dash (`team-tnt-<hex>`, `poolFor`
+# in console-worker/tenants.js, pinned by its own test against this exact
+# grammar). Admitting the underscore here would give every Team pool two
+# spellings: the founder assigns nodes to `team-tnt_x` off the cabinet id,
+# the minute sync keeps offering `team-tnt-x`, and the pool never applies
+# with nothing saying why. One spelling, and the other one is a 400 the
+# founder sees at once. The inquiry names the pool as the worker spelled it.
+_POOL_RE = re.compile(r"^[a-z0-9\-]{1,64}$")
+# The label of every Personal buyer's pool. A Team rides it until its own
+# `team-<id>` pool has an enabled node.
+_SHARED_POOL = "shared"
+# The inquiry tier the island writes for itself when a PAID team has no pool
+# yet. Counted by /admin/stats as `pools_needing_nodes` and mailed by the
+# monitor; closed by the founder or by the island once the pool applies.
+_TEAM_PAID_TIER = "team-paid"
 
 # Per-proto descriptor schema: required + optional keys, each with a charset.
 _RE = {
@@ -237,6 +284,42 @@ def _verify_status_sig(ts: int, canon_key_b64: str, sig_b64: str) -> bool:
         return False
 
 
+def _parked_where():
+    """The WHERE of a parked row still waiting for the founder: registered
+    `private` (so disabled and never probed) and assigned to nobody. One
+    definition for the register caps, the sweep and the assign guard, so the
+    three cannot drift apart. A row the founder disabled after it was live
+    has a `last_ok` and is not parked; a parked row given a pool is a
+    customer's node and is not parked either."""
+    return (
+        BrokerRelay.enabled.is_(False),
+        BrokerRelay.tenant_id.is_(None),
+        BrokerRelay.pool_id.is_(None),
+        BrokerRelay.last_ok.is_(None),
+    )
+
+
+async def _sweep_stale_parked(db: AsyncSession) -> int:
+    """Delete parked rows nobody assigned within _PARKED_TTL, by created_at:
+    a parked row never answers a probe, so `last_ok` gives nothing to
+    measure from. Never a pool's or a tenant's row (`_parked_where` excludes
+    both), never a row that was live once. Returns how many went; the caller
+    commits."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_PARKED_TTL)
+    where = (*_parked_where(), BrokerRelay.created_at < cutoff)
+    n = int(await db.scalar(select(func.count()).select_from(BrokerRelay).where(*where)) or 0)
+    if n:
+        # `fetch`, not the default `evaluate`: that one re-runs the WHERE in
+        # Python against rows already loaded in this session (a liveness
+        # report can name a parked row), and on SQLite those come back with
+        # a naive `created_at` that cannot be compared to the aware cutoff.
+        await db.execute(
+            delete(BrokerRelay).where(*where).execution_options(synchronize_session="fetch")
+        )
+        log.warning("[broker] swept %d parked relay(s) nobody assigned in %d days", n, _PARKED_TTL // 86400)
+    return n
+
+
 def _relay_tag(canon_key_b64: str, server: str, port: int) -> str:
     """Stable, un-squattable id from the CANONICAL operator key + endpoint. A
     different key yields a different row; the same operator re-registering the
@@ -299,6 +382,17 @@ async def register_relay(
     key_b64 = _canon_key(raw_key)
     if key_b64 is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid operator key")
+    # A node meant for a paid pool. It lands PARKED (enabled=False): dark to
+    # /bridges, to the canary and to every public answer, until the founder
+    # assigns it to a pool. The alternative, landing it enabled and hoping to
+    # assign it within the ten minutes before the canary's first OK gets it
+    # served, would burn the address on a slow morning. Outside the signed
+    # envelope on purpose: it changes only where the operator's OWN row
+    # starts, never what it says, and a stranger sending it parks nothing but
+    # their own relay.
+    private = body.get("private", False)
+    if not isinstance(private, bool):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "private must be a boolean")
     descriptor = _validate_descriptor(body.get("descriptor"))
     if not _verify_reg_sig(descriptor, ts, key_b64, sig_b64):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "bad signature")
@@ -327,13 +421,36 @@ async def register_relay(
     total = (await db.execute(select(func.count()).select_from(BrokerRelay))).scalar_one()
     if total >= _MAX_TOTAL_ROWS:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "broker pool full")
+    if private:
+        # The parked caps (see _MAX_PARKED_ROWS). Only rows still waiting for
+        # an assignment count: a parked node the founder has pooled is a
+        # customer's node, not a slot, and leaves the count the moment it is
+        # assigned, whether or not it is lit yet.
+        parked_key = (
+            await db.execute(
+                select(func.count()).select_from(BrokerRelay)
+                .where(*_parked_where(), BrokerRelay.operator_key == key_b64)
+            )
+        ).scalar_one()
+        if parked_key >= _MAX_PARKED_PER_KEY:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "per-key parked limit reached")
+        parked_total = (
+            await db.execute(select(func.count()).select_from(BrokerRelay).where(*_parked_where()))
+        ).scalar_one()
+        if parked_total >= _MAX_PARKED_ROWS:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "parked pool full")
     # Self-serve гидра: a community relay lands ENABLED (no founder approval). The
     # brakes are (a) /bridges' liveness gate — a community relay isn't SERVED until
     # the canary verifies it e2e — plus (b) the admin kill switch (enabled=False)
     # and (c) the per-key (8) + global (1000) registration caps above.
-    db.add(BrokerRelay(tag=tag, descriptor=raw, operator_key=key_b64, tier="community", enabled=True, ts=ts))
+    # A `private` registration is the one exception: it lands parked, and the
+    # refresh path above leaves `enabled` alone, so re-running bootstrap
+    # neither parks nor un-parks a row.
+    db.add(BrokerRelay(
+        tag=tag, descriptor=raw, operator_key=key_b64, tier="community", enabled=not private, ts=ts,
+    ))
     await db.commit()
-    return {"ok": True, "tag": tag, "enabled": True}
+    return {"ok": True, "tag": tag, "enabled": not private}
 
 
 def _disclosure_cap(pool: int, requested: int) -> int:
@@ -490,12 +607,13 @@ async def get_bridges(
         pass  # Redis hiccup: fall back to the canary-only gate below.
 
     def _serve(r: BrokerRelay) -> bool:
-        # ⚠⚠ A tenant's endpoint is never in the public answer. Not ranked
-        # lower, not "only to trusted buckets" — never. What is sold is that
-        # the address is absent from the public list, so handing it out here
-        # once would sell the product and destroy it in the same request.
-        # These rows are added below, and only for the key that owns them.
-        if r.tenant_id:
+        # ⚠⚠ A tenant's OR a pool's endpoint is never in the public answer.
+        # Not ranked lower, not "only to trusted buckets" — never. What is
+        # sold is that the address is absent from the public list, so handing
+        # it out here once would sell the product and destroy it in the same
+        # request. These rows are added below, and only for the key that
+        # owns them, whether by direct assignment or by pool membership.
+        if r.tenant_id or r.pool_id:
             return False
         # Trusted (admin-set, signed-config canary-monitored): always served.
         if r.tier == "trusted":
@@ -511,10 +629,14 @@ async def get_bridges(
 
     # Theirs, in full and unbucketed. Bucketing exists so no single requester
     # learns the whole PUBLIC pool; a tenant is supposed to know their own
-    # endpoints, and there are three of them.
+    # endpoints, and there are three of them. Two ways to own a row: the
+    # legacy direct assignment (`tenant_id`), and membership of the tenant's
+    # pool. A tenant with no pool (Supporter) gets only its direct rows, which
+    # for a Supporter is none.
     mine = [
         r for r in all_rows
-        if tenant is not None and r.tenant_id == tenant.id
+        if r.tenant_id == tenant.id
+        or (tenant.pool_id is not None and r.pool_id == tenant.pool_id)
     ] if tenant is not None else []
 
     rows = [r for r in all_rows if _serve(r)]
@@ -635,6 +757,13 @@ async def report_reachability(
                 if (not isinstance(server, str) or not isinstance(port, int)
                         or isinstance(port, bool) or not isinstance(ok, bool)):
                     continue
+                # ⚠ Counted BEFORE the pool check, so `accepted` says "well
+                # formed", not "matched". The pool now holds private
+                # addresses, and a reply that counted matches would confirm
+                # any of them at 25 guesses per unauthenticated request.
+                # Votes for a private node are still recorded: they are the
+                # founder's only in-region view of it (/admin/reachability).
+                accepted += 1
                 sp = f"{server}:{port}"
                 if sp not in known:
                     continue
@@ -642,7 +771,6 @@ async def report_reachability(
                 pipe.zadd(key, {net: now})
                 pipe.zremrangebyscore(key, 0, now - _REACH_WINDOW)
                 pipe.expire(key, _REACH_WINDOW)
-                accepted += 1
             await pipe.execute()
     except Exception:
         pass
@@ -773,6 +901,10 @@ async def admin_list(db: AsyncSession = Depends(get_db)) -> dict:
             # is never handed to anybody but that customer, and "Promote to
             # trusted" on it would be a category error rather than an action.
             "tenant_id": r.tenant_id,
+            # Which pool, if any. The canary reads it to skip these rows in
+            # its prune and to alert on them by name; the admin pill reads it
+            # to show a pooled node as not-public.
+            "pool_id": r.pool_id,
             # Server-side registration time, in unix seconds like last_ok. The
             # canary's prune step needs it to judge a row that has NEVER
             # answered, where last_ok gives it nothing to measure from.
@@ -894,6 +1026,13 @@ class AdminSet(BaseModel):
     tag: str
     tier: str | None = None
     enabled: bool | None = None
+    # Enable a PARKED row anyway. A row that registered `private`, has never
+    # answered a probe and belongs to no pool is a node somebody meant to
+    # sell; the web-admin toggle and the self-host console would otherwise
+    # publish it with one click. `force` is for the other case that looks
+    # identical from here: a community relay the founder disabled before it
+    # ever went live and now wants back.
+    force: bool = False
 
 
 @router.post("/admin/set", dependencies=[Depends(require_admin)])
@@ -908,6 +1047,18 @@ async def admin_set(body: AdminSet, db: AsyncSession = Depends(get_db)) -> dict:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "tier must be community or trusted")
         row.tier = body.tier
     if body.enabled is not None:
+        if (
+            body.enabled is True
+            and not row.enabled
+            and row.last_ok is None
+            and row.tenant_id is None
+            and row.pool_id is None
+            and not body.force
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "parked relay: assign it to a pool (tenants/assign) or pass force",
+            )
         row.enabled = body.enabled
     await db.commit()
     return {"ok": True, "tag": row.tag, "tier": row.tier, "enabled": row.enabled}
@@ -915,22 +1066,138 @@ async def admin_set(body: AdminSet, db: AsyncSession = Depends(get_db)) -> dict:
 
 # ── tenants (founder) ────────────────────────────────────────────────────
 
+def _pool_or_400(pool: str | None) -> str | None:
+    """A pool label as the console or the founder typed it, or None. An empty
+    string is None too, which is how `tenants/set` clears a pool."""
+    if pool is None or pool == "":
+        return None
+    if not _POOL_RE.match(pool):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "pool must match [a-z0-9-]{1,64}")
+    return pool
+
+
+def _inquiry_contact(tenant: RelayTenant) -> str:
+    """The `contact` under which the island files its own team-paid inquiry
+    for this tenant. The console's id when there is one, else ours; the same
+    value on write, on dedupe and on close, so the three agree."""
+    return f"cabinet:{tenant.ext_id or tenant.id}"
+
+
+async def _apply_pool(db: AsyncSession, tenant: RelayTenant, pool: str | None) -> bool:
+    """Put `tenant` on `pool` if the pool can serve, and say whether it did.
+
+    `shared` and None are applied as given: the shared pool exists by
+    definition (empty or not), and None is "no relays", which is a
+    Supporter. A `team-*` pool is applied only once it has an ENABLED node;
+    until then a Team buyer is left where they are (a fresh mint starts them
+    on `shared` before calling this, so "where they are" is the shared pool;
+    a later `set` never moves them sideways) and the island files a
+    `team-paid` inquiry against their contact, once, so the founder sees a
+    paid pool that needs nodes. The console's minute sync offers the pool
+    again every tick, which is why the inquiry is deduped here and not left
+    to the caller.
+
+    When a team pool DOES apply, every open inquiry filed for this tenant is
+    closed by the island itself, so `pools_needing_nodes` drops without a
+    click. Nothing here commits; the caller's one commit covers it.
+    """
+    if pool is None or pool == _SHARED_POOL:
+        tenant.pool_id = pool
+        return True
+    has_node = (
+        await db.execute(
+            select(BrokerRelay.tag)
+            .where(BrokerRelay.pool_id == pool, BrokerRelay.enabled.is_(True))
+            .limit(1)
+        )
+    ).first()
+    contact = _inquiry_contact(tenant)
+    if has_node is None:
+        already = (
+            await db.execute(
+                select(RelayInquiry.id)
+                .where(RelayInquiry.status == "open", RelayInquiry.contact == contact)
+                .limit(1)
+            )
+        ).first()
+        if already is None:
+            db.add(RelayInquiry(
+                tier=_TEAM_PAID_TIER,
+                contact=contact,
+                about=(
+                    f"PAID team tenant {tenant.id} ({tenant.ext_id}) rides {tenant.pool_id} "
+                    f"until pool {pool} has enabled nodes; paid_until {tenant.paid_until}"
+                ),
+                lang="",
+                country="",
+            ))
+            log.warning("[broker] paid team tenant %s waits for pool %s", tenant.id, pool)
+        return False
+    tenant.pool_id = pool
+    stamp = int(time.time())
+    for row in (
+        await db.execute(
+            select(RelayInquiry)
+            .where(RelayInquiry.status == "open", RelayInquiry.contact == contact)
+        )
+    ).scalars().all():
+        row.status = "closed"
+        row.note = f"pool applied {pool} {stamp}"
+    return True
+
+
 class TenantCreate(BaseModel):
     name: str | None = None
     # Days of access. Renewal is calling this again on an existing tenant,
     # which extends rather than restarts — same rule as the console's crypto
     # gateway, and for the same reason: paying early must not cost time.
     days: int = Field(default=31, ge=1, le=3660)
+    # An absolute end (unix seconds) wins over `days`. The console knows the
+    # exact end it sold; `days` is kept for the hand-minted trial.
+    paid_until: int | None = Field(default=None, ge=0)
+    # `shared`, `team-<id>`, or None for a Supporter. See _apply_pool.
+    pool: str | None = None
+    # The console's `tnt_` id: the double-mint guard below keys on it.
+    ext_id: str | None = None
 
 
 @router.post("/admin/tenants", dependencies=[Depends(require_admin)])
-async def admin_create_tenant(body: TenantCreate, db: AsyncSession = Depends(get_db)) -> dict:
+async def admin_create_tenant(body: TenantCreate, db: AsyncSession = Depends(get_db)):
     """Mint a tenant and hand back their key ONCE.
 
     Only the hash is stored, so this response is the only time the key exists
     anywhere we control. Losing it means issuing a new one, not recovering the
     old one — the same contract as the island owner token.
+
+    With `ext_id`, minting is idempotent per console tenant: the cron and the
+    cabinet can both arrive in the same second, and the second gets 409 with
+    the existing id and NO key, so it goes and reads the key the first one
+    stored rather than issuing a second one that would silently replace it.
     """
+    pool = _pool_or_400(body.pool)
+    if body.ext_id:
+        # Two mints for one console id can be in flight on two uvicorn
+        # workers at once (the minute cron and a cabinet opened in the same
+        # second), and the existence check alone lets both see nothing and
+        # both insert. On Postgres, hold a per-id advisory lock for this
+        # transaction, the same primitive init_db uses to serialise workers:
+        # the second racer waits here, and its check then sees the row the
+        # first one committed. Released with the commit below. SQLite has no
+        # analogue and serialises writers itself; _settle_double_mint after
+        # the commit covers what is left there.
+        if engine.dialect.name == "postgresql":
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:ext_id))"), {"ext_id": body.ext_id},
+            )
+        existing = (
+            await db.execute(
+                select(RelayTenant)
+                .where(RelayTenant.ext_id == body.ext_id, RelayTenant.status == "active")
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"id": existing.id})
     key = secrets.token_urlsafe(24)
     now = int(time.time())
     tenant = RelayTenant(
@@ -938,11 +1205,55 @@ async def admin_create_tenant(body: TenantCreate, db: AsyncSession = Depends(get
         key_hash=hashlib.sha256(key.encode("utf-8")).hexdigest(),
         name=(body.name or None),
         status="active",
-        paid_until=now + body.days * 86400,
+        paid_until=body.paid_until if body.paid_until is not None else now + body.days * 86400,
+        ext_id=(body.ext_id or None),
+        # A buyer of any pool starts on `shared`, so a Team whose own pool has
+        # no nodes yet rides the shared nodes rather than nothing; _apply_pool
+        # moves them the moment their pool can serve. No pool asked = no
+        # relays (a Supporter).
+        pool_id=_SHARED_POOL if pool is not None else None,
     )
     db.add(tenant)
+    pool_applied = await _apply_pool(db, tenant, pool)
     await db.commit()
-    return {"id": tenant.id, "key": key, "paid_until": tenant.paid_until, "name": tenant.name}
+    if tenant.ext_id:
+        winner = await _settle_double_mint(db, tenant)
+        if winner is not None:
+            return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"id": winner.id})
+    return {
+        "id": tenant.id, "key": key, "paid_until": tenant.paid_until, "name": tenant.name,
+        "pool_id": tenant.pool_id, "pool_applied": pool_applied, "ext_id": tenant.ext_id,
+    }
+
+
+async def _settle_double_mint(db: AsyncSession, tenant: RelayTenant) -> RelayTenant | None:
+    """The belt under the advisory lock, for dialects without one.
+
+    After `tenant` is committed, read every ACTIVE tenant with its `ext_id`.
+    If another one sorts first by (created_at, id), OURS is the duplicate:
+    disable it and return the winner, so the caller answers 409 `{id}` with
+    no key, exactly as if the existence check had caught it, and the worker
+    goes and reads the key the winner's request stored. Both racers order
+    the same rows the same way, so whenever the later committer sees both
+    rows at most one 200 survives. The one window this cannot close is the
+    later committer having built its row first (then it sorts first and
+    keeps its 200 while the other already answered); that is what the
+    Postgres lock is for, and on Postgres this never finds a second row.
+    Only ever disables the row this request created, never anybody else's.
+    """
+    rows = (
+        await db.execute(
+            select(RelayTenant)
+            .where(RelayTenant.ext_id == tenant.ext_id, RelayTenant.status == "active")
+            .order_by(RelayTenant.created_at, RelayTenant.id)
+        )
+    ).scalars().all()
+    if not rows or rows[0].id == tenant.id:
+        return None
+    tenant.status = "disabled"
+    await db.commit()
+    log.warning("[broker] double mint for %s: %s yields to %s", tenant.ext_id, tenant.id, rows[0].id)
+    return rows[0]
 
 
 class TenantSet(BaseModel):
@@ -952,6 +1263,13 @@ class TenantSet(BaseModel):
     # adds to what is left, and paying after a lapse does not backdate a term
     # into the past and expire on arrival.
     add_days: int | None = Field(default=None, ge=1, le=3660)
+    # The absolute end, for the console's sync: idempotent, so a retried or a
+    # repeated push lands on the same value, where `add_days` would have
+    # stacked. An upgrade with credit restarts the term from today, and only
+    # an absolute value can say that.
+    paid_until: int | None = Field(default=None, ge=0)
+    # Move the tenant to a pool; empty string clears it. See _apply_pool.
+    pool: str | None = None
 
 
 @router.post("/admin/tenants/set", dependencies=[Depends(require_admin)])
@@ -965,23 +1283,74 @@ async def admin_set_tenant(body: TenantSet, db: AsyncSession = Depends(get_db)) 
         if body.status not in ("active", "disabled"):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "status must be active or disabled")
         tenant.status = body.status
+    if body.paid_until is not None:
+        tenant.paid_until = body.paid_until
     if body.add_days is not None:
         base = max(int(time.time()), tenant.paid_until or 0)
         tenant.paid_until = base + body.add_days * 86400
+    # Echoed as True when no pool was asked for: the console's guard reads
+    # `pool_applied !== false`, and a term-only push must count as synced.
+    pool_applied = True
+    if body.pool is not None:
+        pool_applied = await _apply_pool(db, tenant, _pool_or_400(body.pool))
     await db.commit()
-    return {"id": tenant.id, "status": tenant.status, "paid_until": tenant.paid_until}
+    return {
+        "id": tenant.id, "status": tenant.status, "paid_until": tenant.paid_until,
+        "pool_id": tenant.pool_id, "pool_applied": pool_applied,
+    }
+
+
+class TenantRotate(BaseModel):
+    id: str
+
+
+@router.post("/admin/tenants/rotate", dependencies=[Depends(require_admin)])
+async def admin_rotate_tenant(body: TenantRotate, db: AsyncSession = Depends(get_db)) -> dict:
+    """Replace a tenant's key in place: same id, same pool, same direct rows,
+    same term. The old key answers `unknown` from the tenant's next poll.
+
+    In place rather than mint-and-disable, because the id is what the pool,
+    the direct rows and the console's ledger all point at; a new id would
+    mean re-attaching every one of them. Show-once, like create.
+    """
+    tenant = (
+        await db.execute(select(RelayTenant).where(RelayTenant.id == body.id))
+    ).scalar_one_or_none()
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such tenant")
+    key = secrets.token_urlsafe(24)
+    tenant.key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    await db.commit()
+    return {"id": tenant.id, "key": key, "paid_until": tenant.paid_until, "pool_id": tenant.pool_id}
 
 
 @router.get("/admin/tenants", dependencies=[Depends(require_admin)])
 async def admin_list_tenants(db: AsyncSession = Depends(get_db)) -> dict:
+    now = int(time.time())
     rows = (await db.execute(select(RelayTenant))).scalars().all()
     counts: dict[str, int] = {}
     for r in (await db.execute(select(BrokerRelay).where(BrokerRelay.tenant_id.isnot(None)))).scalars().all():
         counts[r.tenant_id] = counts.get(r.tenant_id, 0) + 1
+    # Pool rows count for every tenant on that pool. Only ENABLED ones, since
+    # a parked node is not serving anybody yet; `pool_live` is the number the
+    # customer actually has right now, by the same window /bridges uses.
+    pool_counts: dict[str, int] = {}
+    pool_live: dict[str, int] = {}
+    for r in (
+        await db.execute(
+            select(BrokerRelay).where(BrokerRelay.pool_id.isnot(None), BrokerRelay.enabled.is_(True))
+        )
+    ).scalars().all():
+        pool_counts[r.pool_id] = pool_counts.get(r.pool_id, 0) + 1
+        if r.last_ok is not None and now - r.last_ok <= _LIVENESS_WINDOW:
+            pool_live[r.pool_id] = pool_live.get(r.pool_id, 0) + 1
     return {"tenants": [
         {
             "id": t.id, "name": t.name, "status": t.status,
-            "paid_until": t.paid_until, "relays": counts.get(t.id, 0),
+            "paid_until": t.paid_until,
+            "pool_id": t.pool_id, "ext_id": t.ext_id,
+            "relays": counts.get(t.id, 0) + (pool_counts.get(t.pool_id, 0) if t.pool_id else 0),
+            "pool_live": pool_live.get(t.pool_id, 0) if t.pool_id else 0,
             "created_at": int(t.created_at.timestamp()) if t.created_at else None,
         }
         for t in rows
@@ -990,20 +1359,41 @@ async def admin_list_tenants(db: AsyncSession = Depends(get_db)) -> dict:
 
 class TenantAssign(BaseModel):
     tag: str
-    # None releases the endpoint back to the public pool.
+    # One of the two, or neither. Ownership moves only when the body NAMES
+    # one of them: pydantic cannot tell an absent field from a null one, and
+    # a body that only toggles `enabled` (the founder darking a pool node for
+    # a reboot) must not also hand the node to the public pool as a side
+    # effect, where it would be served to strangers the moment it came back.
+    # A release is therefore explicit, both named and both null (delete the
+    # row instead when the node is retired: a released address becomes
+    # public, and a burned one must not be pooled again).
     tenant_id: str | None = None
+    pool_id: str | None = None
+    # Applied in the same commit as the assignment, so a parked node is
+    # pooled and lit atomically and never spends a moment enabled and public.
+    enabled: bool | None = None
 
 
 @router.post("/admin/tenants/assign", dependencies=[Depends(require_admin)])
 async def admin_assign_relay(body: TenantAssign, db: AsyncSession = Depends(get_db)) -> dict:
-    """Give an endpoint to a tenant, or hand it back to the public pool.
+    """Give an endpoint to a tenant or a pool, or hand it back to the public pool.
 
     ⚠ Assigning REMOVES the endpoint from public distribution immediately. That
     is the point, and it is also why an endpoint already published in the
-    signed config should not be assigned: its address is out there, and
-    charging for the privacy of an address that is already public would be
-    selling something we cannot deliver. Stand up a new node instead.
+    signed config is REFUSED (409): its address is out there, and charging
+    for the privacy of an address that is already public would be selling
+    something we cannot deliver. Stand up a new node instead.
     """
+    pool_id = _pool_or_400(body.pool_id)
+    if body.tenant_id is not None and pool_id is not None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "one of tenant_id or pool_id, not both")
+    # Which ownership fields the body actually carried (see TenantAssign).
+    touch = body.model_fields_set & {"tenant_id", "pool_id"}
+    if touch and body.tenant_id is None and pool_id is None and touch != {"tenant_id", "pool_id"}:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "to release a relay to the public pool name both tenant_id and pool_id as null",
+        )
     relay = (
         await db.execute(select(BrokerRelay).where(BrokerRelay.tag == body.tag))
     ).scalar_one_or_none()
@@ -1015,9 +1405,45 @@ async def admin_assign_relay(body: TenantAssign, db: AsyncSession = Depends(get_
         ).scalar_one_or_none()
         if tenant is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such tenant")
-    relay.tenant_id = body.tenant_id
+    if body.tenant_id is not None or pool_id is not None:
+        try:
+            server = json.loads(relay.descriptor).get("server")
+        except (ValueError, AttributeError):
+            server = None
+        if server and server in relay_addresses():
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "already published in the signed config: its address is public, stand up a new node",
+            )
+    # The same guard admin_set has, on the state this call would leave
+    # behind: a parked row (never probed, owned by nobody) lit without a pool
+    # or a tenant becomes an enabled community row, and the canary's first OK
+    # puts the address every buyer was promised is unlisted into a public
+    # answer. This route exists to pool and light in one commit; lighting
+    # alone is admin/set, where `force` says the founder means it.
+    next_tenant = body.tenant_id if touch else relay.tenant_id
+    next_pool = pool_id if touch else relay.pool_id
+    if (
+        body.enabled is True
+        and not relay.enabled
+        and relay.last_ok is None
+        and next_tenant is None
+        and next_pool is None
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "parked relay: give it a pool or a tenant to enable it (admin/set force for a community relay)",
+        )
+    if touch:
+        relay.tenant_id = body.tenant_id
+        relay.pool_id = pool_id
+    if body.enabled is not None:
+        relay.enabled = body.enabled
     await db.commit()
-    return {"tag": relay.tag, "tenant_id": relay.tenant_id}
+    return {
+        "tag": relay.tag, "tenant_id": relay.tenant_id,
+        "pool_id": relay.pool_id, "enabled": relay.enabled,
+    }
 
 
 class LivenessResult(BaseModel):
@@ -1067,9 +1493,15 @@ async def admin_liveness(body: LivenessReport, db: AsyncSession = Depends(get_db
             # SOMEBODY ELSE's IP turns our prober into a knock every ten
             # minutes. It never reaches users (the liveness gate in /bridges
             # sees to that), but it should not outlive a day either.
+            #
+            # Never a tenant's or a pool's row: those were placed by the
+            # founder, not self-registered, and a paid node that is down is
+            # an alert (the canary pushes one), not dead weight to sweep.
             if (
                 row.tier == "community"
                 and row.last_ok is None
+                and row.tenant_id is None
+                and row.pool_id is None
                 and (row.fail_count or 0) >= _DEAD_AFTER_FAILS
             ):
                 await db.delete(row)
@@ -1078,6 +1510,13 @@ async def admin_liveness(body: LivenessReport, db: AsyncSession = Depends(get_db
                 )
         updated += 1
     await db.commit()
+    # Parked rows nobody assigned in a week go here too: the canary is the
+    # one caller that arrives on a schedule, and these rows are exactly the
+    # ones it never probes, so nothing else would ever look at them. After
+    # the commit above, so a row a report touched and the sweep deletes is
+    # never flushed twice.
+    if await _sweep_stale_parked(db):
+        await db.commit()
     # The canary is the one caller that touches these rows on a schedule, so
     # it is also the cheapest place to keep the classifier's set current.
     await refresh_broker_transport_set(db)

@@ -69,6 +69,15 @@ def _relay_addresses() -> frozenset[str]:
     return frozenset(out)
 
 
+def relay_addresses() -> frozenset[str]:
+    """The signed-config fleet's host addresses, for callers outside this
+    module. The broker refuses to assign one of these to a paying tenant: an
+    address in the published config is already public, and the privacy of a
+    public address cannot be sold. Same per-process cache as
+    [_relay_addresses], so a fleet change shows up here after a restart."""
+    return _relay_addresses()
+
+
 @lru_cache(maxsize=1)
 def fleet_endpoints() -> frozenset[str]:
     """`server:port` for every signed-config relay endpoint.
