@@ -180,6 +180,18 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     # the free invite drip tells a legacy account from a recent walk-in. No
     # backfill, see models/user.py.
     ("entered_via", "VARCHAR(16)"),
+    # Guest copies through a paid or invite door (spec 2026-09-15, section 2).
+    # NULL on every existing row, and that is the decision rather than an
+    # accident: every copy that exists today walked in through an open door and
+    # stays a native account. Both nullable with no default, so on Postgres the
+    # ADD COLUMN is metadata-only and never rewrites the table.
+    ("guest_status", "VARCHAR(16)"),
+    ("guest_since", "TIMESTAMP WITH TIME ZONE"),
+    # Set when a reissue moves a guest row onto a new signing key, cleared by
+    # the first proof of that key (models/user.py). Nullable, no default:
+    # metadata-only on Postgres, and NULL on every existing row is correct,
+    # because no guest row exists before this release.
+    ("key_unproven_since", "TIMESTAMP WITH TIME ZONE"),
     # Monotone counter, see models/user.py for why it is not a COUNT.
     ("invites_minted", "INTEGER DEFAULT 0"),
     # Profile picture (see models/user.py). Additive: NULL on every existing
@@ -319,6 +331,10 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     ("badge", "VARCHAR(16)"),
     ("state_blob", "BYTEA"),
     ("state_ver", "BIGINT DEFAULT 0"),
+    # Owner switch for guests from other islands (spec 2026-09-15, 2.2). A
+    # constant DEFAULT is metadata-only on Postgres 11+, and every existing
+    # room keeps today's behaviour: people from elsewhere may come in.
+    ("allow_guests", "BOOLEAN DEFAULT TRUE"),
 ]
 
 # Additive on `group_members` — granular moderator capabilities the owner

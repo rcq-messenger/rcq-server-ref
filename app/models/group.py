@@ -39,6 +39,15 @@ class Group(Base):
     # 403s). Defaults False — pre-existing groups remain open so
     # the toggle is purely additive.
     is_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    #: Owner switch. False: no new guest may enter this room (self-join, owner-add
+    #: by a plain member). Guests already inside stay. NULL reads as True.
+    #:
+    #: Nullable on purpose, and every reader must spell the check as
+    #: `allow_guests is False` rather than `not allow_guests`: a row that
+    #: somehow carries NULL (a Postgres ADD COLUMN racing a writer, a restore
+    #: from an older dump) keeps the default meaning instead of silently
+    #: closing the room to everybody from elsewhere.
+    allow_guests: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=True)
     # When true, the member roster is hidden from Group Info for
     # everyone except the owner. The `members` array is still sent on
     # the wire — actual members need each other's keys to encrypt

@@ -76,6 +76,9 @@ async def active_testers(
         select(User.nickname)
         .where(
             User.is_suspended.is_(False),
+            # Testers of THIS island. A polling guest copy is stamped recent
+            # (spec 2026-09-15, 8.3) and would otherwise land on the wall.
+            User.guest_status.is_(None),
             User.last_seen >= active_since,
             User.last_seen >= User.created_at + RETURN_THRESHOLD,
         )
@@ -134,6 +137,10 @@ async def hall_of_fame(
             User.hof_approved.is_(True),
             User.hof_opt_in.is_(True),
             User.is_suspended.is_(False),
+            # This island's people only (spec 2026-09-15, 6.2). A guest cannot
+            # opt in (PUT /users/me drops the field), but an approval set from
+            # the console before a row became a guest must not publish it.
+            User.guest_status.is_(None),
         )
     )
     rows = (await db.execute(stmt)).all()
@@ -225,8 +232,10 @@ async def stats(
     """Public headline stats. `user_count` = registered
     accounts — surfaced in the iOS About sheet as a "X people on RCQ"
     badge. Cached 2 min; the number moves slowly enough."""
+    # Residents only, like /server/info: a guest copy lives on another island
+    # (spec 2026-09-15, 6.2).
     count = await db.scalar(
-        select(func.count(User.uin))
+        select(func.count(User.uin)).where(User.guest_status.is_(None))
     )
     response.headers["Cache-Control"] = "public, max-age=120"
     return StatsResponse(user_count=int(count or 0))

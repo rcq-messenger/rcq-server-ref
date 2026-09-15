@@ -48,6 +48,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import carry_device_id, current_device_id, current_uin, issue_token, uin_epoch
 from app.models.owned_uin import OwnedUin
 from app.models.uin_listing import UinListing
@@ -529,6 +531,7 @@ async def delete_listing(
 
 @router.get("/listings", response_model=list[ListingOut],
             dependencies=[Depends(require_shop_open), Depends(require_resale_open)])
+@guest(RULE)
 async def listings(
     count: int = Query(12, ge=1, le=50),
     me: int = Depends(current_uin),
@@ -544,6 +547,11 @@ async def listings(
     Your own listings are not in it. You know what you are selling, and the
     place that shows it is your own collection.
     """
+    # Numbers are what the door sells, and a guest copy can buy none (spec
+    # 2026-09-15, 6.2). Empty rather than 403 so a copy signed in as an
+    # account draws an empty shelf instead of an error.
+    if await guest_policy.is_guest(me):
+        return []
     rows = (
         await db.execute(
             select(UinListing)
@@ -724,6 +732,7 @@ async def ladder() -> LadderOut:
     response_model=list[SuggestionOut],
     dependencies=[Depends(require_shop_open), Depends(rate_limit("uin_suggestions", 20, 60))],
 )
+@guest(RULE)
 async def suggestions(
     count: int = Query(6, ge=1, le=20),
     me: int = Depends(current_uin),
@@ -738,6 +747,9 @@ async def suggestions(
     Availability is a point-in-time snapshot and nothing here reserves a
     number: a suggestion can be registered by someone else a moment
     later. Fulfilment re-checks when the operator mints the invite."""
+    # Empty for a guest copy, like `/uin/listings`.
+    if await guest_policy.is_guest(me):
+        return []
     # ⚠ Was [4,5,5,6,6,7,7,8] — the interesting middle, which is now exactly
     # the reserved stock. Suggesting a number the next endpoint refuses is
     # worse than suggesting a plainer one, so the carousel starts where the
@@ -836,6 +848,7 @@ async def _owned_uins(db: AsyncSession, owner: int) -> list[int]:
 
 
 @router.get("/mine", response_model=MyUinsOut)
+@guest(ALLOW)
 async def my_uins(
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),

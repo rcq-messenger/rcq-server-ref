@@ -34,7 +34,11 @@ _KEY_PREFIX = "act:h:"
 # quiet hour" apart from "an hour before this feature shipped".
 _SINCE_KEY = "act:since"
 
-FIELDS = ("msg", "gmsg", "reg", "ws", "call")
+#: `guest` counts guest copies minted by `POST /auth/guest` (spec 2026-09-15,
+#: 4.4 step 11). Kept apart from `reg` on purpose: `reg` is people coming
+#: through the door, which is the number the paid door is judged by, and a
+#: busy open room must not make it look alive.
+FIELDS = ("msg", "gmsg", "reg", "ws", "call", "guest")
 
 
 def hour_key(dt: datetime | None = None) -> str:

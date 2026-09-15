@@ -42,12 +42,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_uin
 from app.models.uin_sale import SpentVoucher
 from app.models.user import User, earned_badges, grant_badge
 from app.routers.invites import InvitesOut, invites_out
 from app.routers.users import _announce_rename
-from app.services import server_settings, uin_voucher
+from app.services import guest_accounts, server_settings, uin_voucher
 
 router = APIRouter(prefix="/residency", tags=["residency"])
 
@@ -68,6 +69,10 @@ class RedeemOut(BaseModel):
     #: The invites answer as of this moment, so the client redraws in one
     #: round trip rather than following up with GET /invites.
     invites: InvitesOut
+    #: Always false after a redeem: a guest copy that redeems is converted in
+    #: the same commit (spec 2026-09-15, 9.3). Sent so a client holding a copy
+    #: can drop its guest restrictions without a second request.
+    guest: bool = False
 
 
 @router.post(
@@ -79,6 +84,7 @@ class RedeemOut(BaseModel):
     # like this does not get the fail-soft default.
     dependencies=[Depends(rate_limit("residency_redeem", 10, 3600, fail_closed=True))],
 )
+@guest(ALLOW)
 async def redeem(
     body: RedeemIn,
     uin: int = Depends(current_uin),
@@ -127,7 +133,13 @@ async def redeem(
     # Added to what they hold; worn only if nothing is. `entered_via` and
     # `invites_minted` are deliberately not touched, see the module docstring.
     grant_badge(user, "resident")
+    # A guest copy that pays becomes a resident of THIS row, in the same commit
+    # as the voucher (spec 2026-09-15, 9.3). A paid resident who is still
+    # restricted to rooms would be the worst of both.
+    was_guest = guest_accounts.clear_guest_columns(user)
     await db.commit()
+    if was_guest:
+        await guest_accounts.after_conversion(db, uin)
 
     # Everyone holding this person as a contact repaints the mark at once,
     # the way an operator's grant does (routers/admin.py), and with the same

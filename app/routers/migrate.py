@@ -192,6 +192,18 @@ async def _perform_migration(
         # move that dropped it would turn a legacy account into a fresh
         # walk-in, or the reverse, depending on which way the default fell.
         entered_via=user.entered_via,
+        # ⚠⚠ Guestness follows the row too, and it is listed here even though a
+        # guest session cannot reach this endpoint (spec 2026-09-15, section 5).
+        # This function copies columns by name, so a column left out is a
+        # column CLEARED on the new number: a guest moved by any present or
+        # future path (an operator tool, a later caller) would come out the
+        # other side as a full native account with nobody having decided that.
+        guest_status=user.guest_status,
+        guest_since=user.guest_since,
+        # And the "rotated, not proven since" flag: dropping it on a move would
+        # let bearers minted by whoever rotated the row outlive the key
+        # holder's first proof on the new number.
+        key_unproven_since=user.key_unproven_since,
         # The set of marks travels with the person for the same reason
         # the worn one does: they earned them, not the number.
         badges_earned=user.badges_earned,

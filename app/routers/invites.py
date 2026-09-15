@@ -60,6 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_uin
 from app.models.invite import Invite, hash_invite_code
 from app.models.user import User
@@ -259,6 +260,7 @@ async def invites_out(db: AsyncSession, user: User, *, now: datetime | None = No
 
 
 @router.get("", response_model=InvitesOut)
+@guest(ALLOW)
 async def my_invites(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -348,6 +350,7 @@ async def mint(
 
 
 @router.delete("/{invite_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@guest(ALLOW)
 async def revoke(
     invite_id: str,
     uin: int = Depends(current_uin),

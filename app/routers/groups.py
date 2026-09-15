@@ -31,13 +31,19 @@ import base64
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.rate_limit import rate_limit
+from app.core import guest_policy
+from app.core.config import settings as app_settings
+from app.core.rate_limit import island_ceiling, rate_limit
+from app.services import guest_accounts
+from app.services.reissue_proof import decode_key32
+from app.services.uin import allocate_uin
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.contact import Contact
@@ -93,6 +99,11 @@ class GroupOut(BaseModel):
     # owner-initiated invite inserts membership. Open groups
     # (default) keep the self-join + invite-link flow.
     is_closed: bool = False
+    # Owner switch for people from other islands (spec 2026-09-15, 2.2).
+    # False: no new guest enters (self-join by link, or an add by a plain
+    # member); guests already inside stay. A stored NULL is served as True, so
+    # a client never has to know the column is nullable.
+    allow_guests: bool = True
     # When true, iOS hides the member roster in Group Info from
     # everyone but the owner. Display-only — `members` still ships.
     members_hidden: bool = False
@@ -165,6 +176,18 @@ class GroupMemberOut(BaseModel):
     # broadcast + skdm distribution). Senders seal SKDMs to capable members
     # and keep the legacy per-member fan-out for the rest (dual-send).
     sender_keys: bool = False
+    # This member is a guest copy from another island (spec 2026-09-15, 2.3):
+    # true for a proven guest and for an unclaimed seat alike. Clients hide
+    # Message and Call for such a row and route Add through a request to the
+    # copy instead.
+    #
+    # ⚠ It says "not from here" and NEVER which island. Nothing on this island
+    # records a guest's home, and the roster is the last place that should
+    # start: every member of the room reads it, keys included.
+    guest: bool = False
+    # A seat a member put in the room with somebody's PUBLIC keys, which
+    # nobody holding the private key has opened yet. Always implies `guest`.
+    invited: bool = False
     # May the caller open THIS member's profile card (founder item 22)? A
     # member list is the first surface the setting names, and it is the one
     # place where the answer cannot simply be "hide the row".
@@ -203,6 +226,30 @@ class AddMemberIn(BaseModel):
     uin: int
 
 
+class GuestAddIn(BaseModel):
+    """A contact from another island, by their PUBLIC card (spec 2026-09-15,
+    section 5). No home host and no home uin: nothing about where the person
+    lives is sent to this island or stored on it."""
+
+    identity_key: str = Field(max_length=128)
+    signing_key: str = Field(max_length=128)
+    # Accepted a little long and trimmed to the column's 64, because it comes
+    # from a card another island wrote and a client should not have to police
+    # someone else's limit before it can add a friend.
+    nickname: str = Field(min_length=1, max_length=256)
+
+
+class GuestAddOut(GroupOut):
+    """The room as `POST /members` returns it, plus which row the key landed
+    on. ⚠ There is no token here and there must never be one: the adder holds
+    only public keys, and a session for somebody else's copy is exactly what
+    the legacy `/auth/register` of foreign keys used to hand them."""
+
+    added_uin: int
+    #: True when this request minted an unclaimed seat for the key.
+    created: bool
+
+
 # The slowmode picker every client shows: off, 5s, 10s, 30s, 1min, 5min, 1h.
 # 300 and 3600 joined on 29.08: Android 0.151 shipped them in its picker while
 # this set still ended at 60, so the two big steps 422'd silently (#809). The
@@ -223,6 +270,9 @@ class GroupPatchIn(BaseModel):
     description: str | None = Field(default=None, max_length=500)
     post_policy: str | None = Field(default=None, pattern="^(all|owner_only)$")
     is_closed: bool | None = None
+    # Let people from other islands in (spec 2026-09-15, 2.2). Owner-only, the
+    # same gate as `is_closed`: both decide who may walk into the room.
+    allow_guests: bool | None = None
     members_hidden: bool | None = None
     # Owner-only content policy toggles (clients honor them; the server
     # can't see inside sealed envelopes).
@@ -320,6 +370,10 @@ async def _members_with_users(
                 User.avatar_media_id,
                 User.avatar_media_key,
                 User.profile_card_policy,
+                # Read from the row, never from the guest cache: this builds a
+                # payload many people read, and a Redis blip must not flip a
+                # resident into "from another island" in everybody's list.
+                User.guest_status,
             )
             .join(User, User.uin == GroupMember.uin)
             .where(GroupMember.group_id == group_id)
@@ -416,6 +470,8 @@ async def _members_with_users(
             signing_key=r.signing_key,
             signal_identity_key=r.signal_identity_key,
             sender_keys=r.uin in capable,
+            guest=r.guest_status is not None,
+            invited=r.guest_status == "added",
             profile_openable=(
                 None if viewer_uin is None
                 else card_openable_fields(
@@ -767,6 +823,8 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
         avatar_seed=g.avatar_seed,
         post_policy=g.post_policy,
         is_closed=g.is_closed,
+        # `is not False`, so a NULL column keeps its documented meaning (True).
+        allow_guests=g.allow_guests is not False,
         members_hidden=g.members_hidden,
         links_allowed=g.links_allowed,
         files_allowed=g.files_allowed,
@@ -799,6 +857,7 @@ def _serialize(g: Group, members: list[GroupMemberOut], member_count: int | None
     response_model=list[GroupOut],
     dependencies=[Depends(rate_limit("groups_list", 60, 60))],
 )
+@guest(ALLOW)
 async def list_groups(
     uin: int = Depends(current_uin),
     members: bool = True,
@@ -883,6 +942,7 @@ class GroupPreviewOut(BaseModel):
     # for closed groups; see the note in the module docstring.
     dependencies=[Depends(rate_limit("group_preview", 30, 60))],
 )
+@guest(ALLOW)
 async def preview_group(
     group_id: int,
     # The unguessable half of the share link (`.../g/<id>?k=<token>`). Supplied
@@ -981,6 +1041,7 @@ async def preview_group(
     response_model=list[GroupPreviewOut],
     dependencies=[Depends(rate_limit("groups_discover", 30, 60))],
 )
+@guest(RULE)
 async def discover_groups(
     limit: int = 12,
     viewer_uin: int = Depends(current_uin),
@@ -994,6 +1055,10 @@ async def discover_groups(
     Same shape and same ghost-member join as `/search`: the count that
     orders the list is the count the row shows, or the third-biggest room
     would sit above the second."""
+    # The island's room directory. A guest copy gets an empty one (spec
+    # 2026-09-15, 6.2); it still joins a room by that room's link.
+    if await guest_policy.is_guest(viewer_uin):
+        return []
     capped = max(1, min(limit, 50))
     own_group_ids = (
         await db.execute(
@@ -1049,6 +1114,7 @@ async def discover_groups(
     response_model=list[GroupPreviewOut],
     dependencies=[Depends(rate_limit("groups_search", 60, 60))],
 )
+@guest(RULE)
 async def search_groups(
     q: str,
     limit: int = 20,
@@ -1061,6 +1127,9 @@ async def search_groups(
     the rendered row + tap-into-JoinGroupSheet flow doesn't have to
     branch on lookup mode. Caller's own groups are filtered out
     server-side."""
+    # A directory, so empty for a guest copy, like `/discover` above.
+    if await guest_policy.is_guest(viewer_uin):
+        return []
     needle = q.strip()
     if len(needle) < 2:
         return []
@@ -1152,6 +1221,7 @@ async def search_groups(
 
 
 @router.get("/{group_id}", response_model=GroupOut)
+@guest(ALLOW)
 async def get_group(
     group_id: int,
     uin: int = Depends(current_uin),
@@ -1196,6 +1266,7 @@ async def get_group(
     # legitimate "tap join, sheet errored, tap again" loop.
     dependencies=[Depends(rate_limit("groups_join", 30, 3600))],
 )
+@guest(RULE)
 async def join_group(
     group_id: int,
     uin: int = Depends(current_uin),
@@ -1226,6 +1297,19 @@ async def join_group(
             detail={"code": "group_closed"},
         )
 
+    # A guest copy walking into ANOTHER room here (spec 2026-09-15, 6.2): the
+    # same room rules as the mint in `/auth/guest`, plus the per-guest room
+    # cap. The existing-member short-circuit above comes first on purpose,
+    # because every client calls this right after `/auth/guest` already put
+    # the guest in the room. The room budget is spent last, so a refusal for
+    # any other reason does not use up the room's day.
+    if await guest_policy.is_guest(uin):
+        if g.allow_guests is False:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_room_closed"})
+        await guest_accounts.refuse_full_room(db, g)
+        await guest_accounts.refuse_group_limit(db, uin)
+        await guest_accounts.spend_room_budget(group_id)
+
     db.add(GroupMember(
         group_id=group_id, uin=uin, role="member", joined_at=_armed_join_stamp(g),
     ))
@@ -1239,24 +1323,15 @@ async def join_group(
     return payload
 
 
-@router.post("/{group_id}/members", response_model=GroupOut)
-async def add_member(
-    group_id: int,
-    body: AddMemberIn,
-    uin: int = Depends(current_uin),
-    db: AsyncSession = Depends(get_db),
-) -> GroupOut:
-    # Any current member can pull in friends — admin gate would make tiny groups
-    # feel locked in. Owner still controls the block list, which is enforced below.
-    await _ensure_member(db, group_id, uin)
-    g = await _load_group(db, group_id)
-    user = await db.get(User, body.uin)
-    if user is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-
+async def _native_add_checks(
+    db: AsyncSession, g: Group, inviter_uin: int, user: User
+) -> None:
+    """`add_member`'s rules for a native target, with its existing English
+    strings (shipped clients match on them): the owner's block list, then the
+    invitee's own group-invite policy."""
     # If the group's owner has blocked this user, nobody — not even another
     # admin — can re-introduce them. Mirrors the contact-list block semantics.
-    blocked = await _filter_blocked(db, owner_uin=g.owner_uin, candidates={body.uin})
+    blocked = await _filter_blocked(db, owner_uin=g.owner_uin, candidates={user.uin})
     if blocked:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -1269,7 +1344,7 @@ async def add_member(
     # blocks all unsolicited adds. The inviter still has the option
     # of asking the invitee to add themselves later — the policy is
     # only about *unsolicited* drops into a group.
-    if not await _can_invite_to_group(db, inviter_uin=uin, invitee=user):
+    if not await _can_invite_to_group(db, inviter_uin=inviter_uin, invitee=user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "this user only accepts group invites from their contacts"
@@ -1277,11 +1352,99 @@ async def add_member(
             else "this user does not accept group invites",
         )
 
+
+async def _guest_target_checks(
+    db: AsyncSession,
+    g: Group,
+    me: GroupMember,
+    target: User,
+    *,
+    already_member: bool,
+    spend_budget: bool = True,
+) -> None:
+    """Rules for adding a GUEST row (a proven guest or an unclaimed seat) to a
+    room, whoever calls and through whichever route (spec 2026-09-15, section
+    5 step 6). `POST /members` applies them too: otherwise the legacy route
+    would be a way around every one of them.
+
+    Structured codes, because these refusals are new and no shipped client
+    matches on their text:
+      * the owner's block list: `blocked`;
+      * the room switch, for a plain member: `guest_room_closed`;
+      * an unclaimed seat: at most three rooms, `guest_add_limit` scope seat.
+        No invite policy: nobody holding the key has expressed one;
+      * a proven guest: its `group_invite_policy`, where "contacts" is read as
+        "shares a room here with the adder". A guest has no contact edges on
+        this island, so the literal reading could never pass, and a shared
+        room is the relationship the island can actually see. Then the
+        per-guest room cap, `guest_group_limit`;
+      * then the room's own guest ceiling and daily budget, because a guest
+        entering a room by an add is a guest entering the room (section 3.1).
+    """
+    blocked = await _filter_blocked(db, owner_uin=g.owner_uin, candidates={target.uin})
+    if blocked:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={"code": "blocked", "message": "the group owner has blocked this user"},
+        )
+    if already_member:
+        return
+    if g.allow_guests is False and me.role not in ("owner", "admin"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_room_closed"})
+    if target.guest_status == guest_policy.STATUS_ADDED:
+        if await guest_accounts.rooms_held(db, target.uin) >= guest_accounts.SEAT_MAX_ROOMS:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={"code": "guest_add_limit", "scope": "seat"},
+            )
+    else:
+        policy = (target.group_invite_policy or "everyone").lower()
+        if policy == "nobody":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail={"code": "invite_nobody", "message": "this user does not accept group invites"},
+            )
+        if policy == "contacts" and not await guest_policy.shares_room(db, me.uin, target.uin):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "invite_contacts_only",
+                    "message": "this user only accepts group invites from their contacts",
+                },
+            )
+        await guest_accounts.refuse_group_limit(db, target.uin)
+    await guest_accounts.refuse_full_room(db, g)
+    if spend_budget:
+        await guest_accounts.spend_room_budget(g.id)
+
+
+@router.post("/{group_id}/members", response_model=GroupOut)
+async def add_member(
+    group_id: int,
+    body: AddMemberIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> GroupOut:
+    # Any current member can pull in friends — admin gate would make tiny groups
+    # feel locked in. Owner still controls the block list, which is enforced below.
+    me = await _ensure_member(db, group_id, uin)
+    g = await _load_group(db, group_id)
+    user = await db.get(User, body.uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+
     existing = await db.scalar(
         select(GroupMember).where(
             and_(GroupMember.group_id == group_id, GroupMember.uin == body.uin)
         )
     )
+    # A guest TARGET follows the guest rules for every caller (read from the
+    # row, not the cache: this decides about somebody else's account).
+    if user.guest_status is not None:
+        await _guest_target_checks(db, g, me, user, already_member=existing is not None)
+    else:
+        await _native_add_checks(db, g, uin, user)
+
     if existing is None:
         db.add(GroupMember(
             group_id=group_id, uin=body.uin, role="member",
@@ -1298,7 +1461,178 @@ async def add_member(
     return payload
 
 
+#: The island-wide owner-add ceiling (section 5). Its own bucket, so owner-adds
+#: cannot starve self-joins or registrations.
+#:
+#: ⚠⚠ CALLED FROM INSIDE `add_guest`, NEVER LISTED IN THE ROUTE'S
+#: `dependencies`. FastAPI resolves a route's `dependencies` before the
+#: endpoint's own parameters, so as a dependency it ran before `current_uin`:
+#: anonymous calls (401), guest tokens (403 guest_restricted), non-members and
+#: malformed keys all spent the island's allowance. The only thing in front of
+#: it was the per-caller bucket, keyed by IP when there is no token, so about
+#: sixty addresses an hour could hold every legitimate owner-add on the island
+#: at 503 island_busy (review 2026-09-15). A cap on the whole island may only be
+#: charged by callers who have already shown they could have used it.
+_guest_add_ceiling = island_ceiling(
+    "guest_add",
+    lambda: app_settings.GUEST_ADD_CEILING_PER_MINUTE,
+    lambda: app_settings.GUEST_ADD_CEILING_PER_HOUR,
+)
+
+
+@router.post(
+    "/{group_id}/guests",
+    response_model=GuestAddOut,
+    # Keyed by the ADDER's bearer: the adder is accountable, the person being
+    # added gave no proof. Per caller, so they are safe to run before the
+    # session is checked (a caller only spends its own bucket). All fail
+    # closed: this mints rows. The island ceiling is NOT here; see
+    # `_guest_add_ceiling`.
+    dependencies=[
+        Depends(rate_limit("groups_guest_add", 20, 86400, fail_closed=True)),
+        Depends(rate_limit("groups_guest_add_burst", 10, 3600, fail_closed=True)),
+    ],
+)
+async def add_guest(
+    group_id: int,
+    body: GuestAddIn,
+    request: Request,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> GuestAddOut:
+    """Put a contact from another island in this room by their public keys
+    (spec 2026-09-15, section 5).
+
+    Replaces the legacy `uin-for-key` -> `/auth/register` -> `/members` chain
+    on islands that advertise `guest_accounts_v1`. That chain handed the adder
+    a full session token for somebody else's copy, and on a paid island it
+    stopped at the door. Here the key resolves to the one row it already has,
+    or to a new UNCLAIMED seat minted together with its membership. The seat
+    has no token; the person claims it by proving the key (`/auth/guest`,
+    `/auth/recover` or `/auth/refresh`).
+    """
+    from app.routers.auth import _pubkey32, _rotated_account  # local: auth imports this module
+
+    # 1. A guest adds nobody: it shares the link instead. Checked here as well
+    # as by the route policy, because this route mints rows.
+    if await guest_policy.is_guest(uin):
+        await guest_policy.bump_stat("guest_restricted")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_restricted"})
+    # 2.
+    identity_key = _pubkey32(body.identity_key, "identity_key")
+    signing_key = _pubkey32(body.signing_key, "signing_key")
+    nickname = body.nickname.strip()[:64]
+    if not nickname:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "nickname is empty")
+    sk_raw = decode_key32(signing_key)
+    # 3. Any member may add, as in `add_member`.
+    me = await _ensure_member(db, group_id, uin)
+    g = await _load_group(db, group_id)
+    # 4. The owner's switch binds plain members; the owner and admins decided it.
+    if g.allow_guests is False and me.role not in ("owner", "admin"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_room_closed"})
+    # 5.
+    if not await guest_policy.admission_open():
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_closed"})
+    # 5b. The island ceiling, only now: an authenticated resident, a member of
+    # this room, allowed by its switch, on an island that admits guests. See
+    # `_guest_add_ceiling` for why this is not a route dependency.
+    await _guest_add_ceiling(request)
+
+    # 6. Resolve the key to its row, as recover would.
+    created = False
+    budget_spent = False
+    lock = None
+    try:
+        row = await guest_accounts.row_for_key(db, sk_raw)
+        if row is None:
+            # ⚠ A key this island retired in a rotation is refused, not
+            # minted. A seat from a stale card would be recoverable by whoever
+            # holds the OLD seed; the adder learns only that their card is
+            # stale, which the contact's own home card already says.
+            if await _rotated_account(db, signing_key) is not None:
+                raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "guest_key_retired"})
+            await guest_accounts.refuse_full_room(db, g)
+            await guest_accounts.spend_group_add_budget(g.id)
+            await guest_accounts.spend_room_budget(g.id)
+            budget_spent = True
+            lock = await guest_accounts.acquire_create_lock(sk_raw)
+            row = await guest_accounts.row_for_key(db, sk_raw)
+
+        if row is None:
+            now = datetime.now(timezone.utc)
+            added_uin = await allocate_uin(db)
+            db.add(User(
+                uin=added_uin,
+                nickname=nickname,
+                identity_key=identity_key,
+                signing_key=signing_key,
+                entered_via="guest",
+                guest_status=guest_policy.STATUS_ADDED,
+                guest_since=now,
+                # Far past the dormant window: a seat stores no group content
+                # until somebody claims it (section 8.3).
+                last_seen=now - guest_policy.added_backdate(),
+            ))
+            await db.flush()
+            db.add(GroupMember(
+                group_id=group_id, uin=added_uin, role="member",
+                joined_at=_armed_join_stamp(g),
+            ))
+            await db.flush()
+            await seed_cursors_on_join(db, group_id, added_uin)
+            try:
+                await guest_policy.mark_guest(added_uin)
+            except guest_policy.GuestCacheUnavailable:
+                await db.rollback()
+                raise guest_policy.guest_unavailable_error() from None
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                await guest_policy.unmark_guest(added_uin)
+                raise
+            created = True
+        else:
+            added_uin = row.uin
+            target = await db.get(User, added_uin)
+            existing = await db.scalar(
+                select(GroupMember).where(
+                    and_(GroupMember.group_id == group_id, GroupMember.uin == added_uin)
+                )
+            )
+            if target.guest_status is None:
+                # Exactly `add_member` for a native account.
+                await _native_add_checks(db, g, uin, target)
+            else:
+                await _guest_target_checks(
+                    db, g, me, target,
+                    already_member=existing is not None,
+                    spend_budget=not budget_spent,
+                )
+            if existing is None:
+                db.add(GroupMember(
+                    group_id=group_id, uin=added_uin, role="member",
+                    joined_at=_armed_join_stamp(g),
+                ))
+                await db.flush()
+                await seed_cursors_on_join(db, group_id, added_uin)
+                await db.commit()
+    finally:
+        await guest_accounts.release_create_lock(lock)
+
+    # 7.
+    g = await _load_group(db, group_id)
+    members = await _members_with_users(db, group_id)
+    payload = _serialize(g, members)
+    await _broadcast_membership(group_id, members, payload)
+    # 8.
+    await guest_policy.bump_stat("guest_add_mint" if created else "guest_add_existing")
+    return GuestAddOut(**payload.model_dump(), added_uin=added_uin, created=created)
+
+
 @router.delete("/{group_id}/members/{member_uin}")
+@guest(ALLOW)
 async def remove_member(
     group_id: int,
     member_uin: int,
@@ -1377,10 +1711,21 @@ async def remove_member(
         # alternative is deleting a room whose members may be back tomorrow;
         # only a room with NO live account left is deleted, which is what
         # "everyone is gone" means once the ghosts are discounted.
+        #
+        # ⚠⚠ AND NEVER A GUEST COPY (spec 2026-09-15, 8.1). A room on this
+        # island is somebody living here; a guest or an unclaimed seat holding
+        # every owner lever while living on another island is the paid door
+        # opened from the inside, and a seat nobody has claimed cannot use a
+        # lever at all. Read from the row (`guest_status`), not the guest
+        # cache: this decides who owns a room, and a Redis blip must not
+        # decide it. Applies to the suspended fallback too, so a room whose
+        # only residents left are suspended goes to one of them, never to a
+        # guest.
         eligible = (
             select(GroupMember)
             .join(User, User.uin == GroupMember.uin)
             .where(GroupMember.group_id == group_id)
+            .where(User.guest_status.is_(None))
             .order_by(GroupMember.id.asc())
         )
         next_owner = await db.scalar(
@@ -1414,8 +1759,38 @@ async def remove_member(
             )
             await db.commit()
         else:
+            # Nobody who lives here is left. The room is DELETED, for the
+            # guests still in it too (founder, 2026-09-15, question 1: delete
+            # after warning the leaver, rather than an ownerless frozen state
+            # every client would have to learn). Clients warn the last
+            # resident before they leave (spec 12.1, group.leave.last_resident).
+            #
+            # The same cleanup `DELETE /groups/{id}` does: the room's log, its
+            # cursors and its counter go with it, or they would sit keyed on a
+            # group id nothing points at.
+            remaining = (
+                await db.execute(select(GroupMember.uin).where(GroupMember.group_id == group_id))
+            ).scalars().all()
+            await db.execute(delete(GroupLog).where(GroupLog.group_id == group_id))
+            await db.execute(delete(GroupLogCursor).where(GroupLogCursor.group_id == group_id))
+            await db.execute(delete(GroupSeq).where(GroupSeq.group_id == group_id))
+            # The guests' membership rows, explicitly. Postgres would cascade
+            # them off the group's foreign key, but a guest's room count
+            # (`guest_max_groups`, the three-room seat cap) reads these rows,
+            # and an island database without enforced foreign keys would keep
+            # counting a room that no longer exists.
+            await db.execute(delete(GroupMember).where(GroupMember.group_id == group_id))
             await db.delete(g)
             await db.commit()
+            # Told AFTER the commit, unlike a burn (which tells first because
+            # its membership rows vanish with the account): the uins were read
+            # above, and a room must not disappear from anybody's list on a
+            # delete that then failed. `no_resident` lets a guest's client say
+            # why its room is gone instead of reading it as the owner's burn.
+            for muin in remaining:
+                await manager.send(
+                    muin, {"type": "group_deleted", "group_id": group_id, "reason": "no_resident"}
+                )
             return {"deleted": True}
 
     members = await _members_with_users(db, group_id)
@@ -1438,6 +1813,7 @@ async def remove_member(
 
 
 @router.patch("/{group_id}", response_model=GroupOut)
+@guest(ALLOW)
 async def patch_group(
     group_id: int,
     body: GroupPatchIn,
@@ -1474,6 +1850,13 @@ async def patch_group(
         if g.owner_uin != uin:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
         g.is_closed = body.is_closed
+    if body.allow_guests is not None:
+        # Behind the `is_closed` gate on purpose. A moderator the owner trusted
+        # with names and pins should not be able to open a room the owner
+        # closed to strangers, or close it on guests the owner let in.
+        if g.owner_uin != uin:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
+        g.allow_guests = body.allow_guests
     if body.members_hidden is not None:
         if g.owner_uin != uin:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "owner only")
@@ -1556,6 +1939,7 @@ _STATE_BLOB_CAP = 64 * 1024
 
 
 @router.patch("/{group_id}/state", response_model=GroupOut)
+@guest(ALLOW)
 async def patch_group_state(
     group_id: int,
     body: GroupStateIn,
@@ -1600,6 +1984,7 @@ async def patch_group_state(
 
 
 @router.post("/{group_id}/members/{member_uin}/permissions", response_model=GroupOut)
+@guest(ALLOW)
 async def set_member_permissions(
     group_id: int,
     member_uin: int,
@@ -1648,6 +2033,7 @@ class TransferOwnerIn(BaseModel):
     # a human: nobody hands a group over ten times in an hour.
     dependencies=[Depends(rate_limit("groups_transfer_owner", 10, 3600))],
 )
+@guest(RULE)
 async def transfer_owner(
     group_id: int,
     body: TransferOwnerIn,
@@ -1713,6 +2099,8 @@ async def transfer_owner(
       404 {"code": "no_such_user"}     target has no account on this island
       409 {"code": "target_suspended"} target cannot authenticate at all,
                                        so the room would end up unmanageable
+      409 {"code": "target_guest"}     target is a guest copy or an unclaimed
+                                       seat, which never owns a room here
     """
     g = await _load_group(db, group_id)
     if g.owner_uin != uin:
@@ -1744,6 +2132,14 @@ async def transfer_owner(
         # The group would have an owner who cannot act and no path back.
         raise HTTPException(
             status.HTTP_409_CONFLICT, detail={"code": "target_suspended"}
+        )
+    if target_user.guest_status is not None:
+        # A guest copy or an unclaimed seat never owns a room (spec 2026-09-15,
+        # 8.1): a room on this island is somebody living here, and a guest
+        # would hold every owner lever while living somewhere else. Read from
+        # the row, like `is_suspended` above.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "target_guest"}
         )
 
     outgoing = await db.scalar(
@@ -1810,6 +2206,7 @@ async def transfer_owner(
 
 
 @router.delete("/{group_id}")
+@guest(ALLOW)
 async def delete_group(
     group_id: int,
     uin: int = Depends(current_uin),

@@ -229,6 +229,12 @@ async def lifespan(_: FastAPI):
     from app.services.retired_key_sweep import retired_key_sweep_loop
 
     retired_key_sweep_task = asyncio.create_task(retired_key_sweep_loop())
+    # Lifetimes of guest copies from other islands: unclaimed seats after a
+    # week, guests that never polled after a week, idle guests after 60 days.
+    # See guest_sweep's docstring (spec 2026-09-15, 8.4).
+    from app.services.guest_sweep import guest_sweep_loop
+
+    guest_sweep_task = asyncio.create_task(guest_sweep_loop())
     # Retention for the encrypted media store — see media_sweep's docstring
     # (30-day age sweep that spares avatars and report evidence).
     from app.services.media_sweep import media_sweep_loop
@@ -283,6 +289,7 @@ async def lifespan(_: FastAPI):
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
         retired_key_sweep_task.cancel()
+        guest_sweep_task.cancel()
         media_sweep_task.cancel()
         for task in retention_tasks:
             task.cancel()

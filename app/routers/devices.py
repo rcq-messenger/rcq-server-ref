@@ -45,6 +45,7 @@ from app.core.config import log_identity
 from app.core.db import get_db
 from app.core.redis import get_redis
 from app.core.redis_keys import DEV_REVOKED_PREFIX, DEVICES_PREFIX, account_key
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_device_id, current_uin, issue_device_token, uin_epoch
 from app.models.queue_cursor import QueueCursor
 from app.services.connection_manager import manager
@@ -221,6 +222,7 @@ class DeviceOut(BaseModel):
 
 
 @router.get("", response_model=list[DeviceOut])
+@guest(ALLOW)
 async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
     redis = await get_redis()
     raw = await redis.hgetall(_devices_key(uin))
@@ -255,6 +257,7 @@ async def list_devices(uin: int = Depends(current_uin)) -> list[DeviceOut]:
 
 
 @router.delete("/me")
+@guest(ALLOW)
 async def revoke_own_device(
     uin: int = Depends(current_uin),
     device_id: str = Depends(current_device_id),
@@ -286,6 +289,7 @@ async def revoke_own_device(
 
 
 @router.delete("/{device_id}")
+@guest(ALLOW)
 async def revoke_device(
     device_id: str,
     uin: int = Depends(current_uin),

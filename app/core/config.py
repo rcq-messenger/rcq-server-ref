@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     #: an operator running an onboarding day legitimately needs more.
     REGISTER_CEILING_PER_MINUTE: int = 40
     REGISTER_CEILING_PER_HOUR: int = 400
+    #: The same kind of island-wide ceiling for guest copies (spec 2026-09-15,
+    #: section 3.1), and deliberately NOT the register one. Sharing a bucket
+    #: would let a flood of free guest mints 429 the people standing at the
+    #: door with a paid voucher in hand. GUEST_* prices self-join
+    #: (POST /auth/guest); GUEST_ADD_* prices owner-add
+    #: (POST /groups/{id}/guests).
+    GUEST_CEILING_PER_MINUTE: int = 30
+    GUEST_CEILING_PER_HOUR: int = 600
+    GUEST_ADD_CEILING_PER_MINUTE: int = 30
+    GUEST_ADD_CEILING_PER_HOUR: int = 600
 
     UIN_MIN: int = 100_000
     UIN_MAX: int = 999_999_999

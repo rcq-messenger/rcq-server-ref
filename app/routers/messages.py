@@ -20,6 +20,8 @@ from app.core.rate_limit import (
     enforce_rate_limit,
     rate_limit,
 )
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
@@ -432,6 +434,8 @@ async def send_sealed(
     target = await db.get(User, body.to_uin)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    # Read now, before the commit below expires the row.
+    target_is_guest = target.guest_status is not None
 
     # F3 deposit-auth (anonymous delivery-token rate limiting). A token, when
     # present, is verified + atomically consumed (single-use, double-spend
@@ -536,7 +540,16 @@ async def send_sealed(
     # Endpoints that predate device-aware registration carry no device id; when
     # something IS connected they are skipped, exactly as before, since they
     # might belong to that connected device.
-    if ring:
+    if target_is_guest:
+        # A guest copy is never woken (spec 2026-09-15, 6.2 and 6.3). The row is
+        # queued above like any other and reaches the copy on its next poll;
+        # what it does not get is a push, because being reachable on a phone
+        # is what the door sells and anybody may deposit here anonymously.
+        # Guest rows hold no push tokens (POST /users/me/push-token stores
+        # nothing for them); this covers a token that reached the table some
+        # other way, and a ring to a copy.
+        pass
+    elif ring:
         # §5d cross-island call. The live-socket send above already happened and
         # is byte-identical to a "message" deposit, so a call to somebody whose
         # app is in the foreground is completely unchanged by this branch. What
@@ -839,9 +852,14 @@ async def _enforce_account_age_gate(
     Same phase-1 trust shape as owner_only and slowmode: an anonymous poster
     stays on the client-side gate (sealed sender hides who they are), and the
     owner, an admin and any member holding a granted cap are exempt, matching
-    the composer. A caller with no local User row is a cross-island guest:
-    their age lives on their home island where we cannot read it, so phase 1
-    lets them through rather than muting every guest.
+    the composer. Somebody from another island who posts without a token is
+    anonymous here like anybody else: their age lives on their home island
+    where we cannot read it, so phase 1 lets them through rather than muting
+    every such poster. ⚠ This is NOT a control on guest copies (spec
+    2026-09-15, 6.2): a guest copy has a local row, but it can post without
+    its token too, and then nothing here binds it. (This paragraph used to say
+    that a caller with no local User row is a cross-island guest. Since guest
+    copies exist that is no longer what a guest is.)
     """
     if envelope_type != "message" or g is None or (g.min_account_age_hours or 0) <= 0:
         return
@@ -909,6 +927,7 @@ class GroupSealedSendIn(BaseModel):
     # in a few groups stays well under.
     dependencies=[Depends(rate_limit("messages_group_send", 60, 60))],
 )
+@guest(ALLOW)
 async def send_group_sealed(
     request: Request,
     body: GroupSealedSendIn,
@@ -1182,6 +1201,7 @@ class GroupBroadcastIn(BaseModel):
     # because every call carried N payloads).
     dependencies=[Depends(rate_limit("messages_broadcast", 120, 60))],
 )
+@guest(ALLOW)
 async def send_group_broadcast(
     request: Request,
     body: GroupBroadcastIn,
@@ -1564,6 +1584,7 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
 
 
 @router.get("/queue", response_model=list[HistoryRow])
+@guest(ALLOW)
 async def fetch_queue(
     ack: bool = False,
     dev: int = 1,
@@ -1592,6 +1613,10 @@ async def fetch_queue(
     # for the same cycle reason auth.py notes.
     from app.routers.devices import mark_device_seen
     await mark_device_seen(uin, device_id)
+    # A guest copy that only polls stays inside the dormant window, so its
+    # rooms keep queueing for it (spec 2026-09-15, 8.3). Best effort, one
+    # UPDATE per guest per six hours at most, and nothing at all for residents.
+    await guest_policy.touch_poll(db, uin)
 
     # ⚠ A device we have never seen starts where this account's furthest device
     # already got to — NOT at zero. See app/services/queue_drain.py.
@@ -1694,6 +1719,7 @@ async def fetch_queue(
 
 
 @router.post("/queue/ack", response_model=AckOut)
+@guest(ALLOW)
 async def ack_queue(
     body: AckIn,
     dev: int = 1,
@@ -1822,6 +1848,7 @@ class GroupLogAckIn(BaseModel):
     # ack per page and so must not be the tighter of the two.
     dependencies=[Depends(rate_limit("group_log_fetch", 480, 60))],
 )
+@guest(ALLOW)
 async def fetch_group_log(
     body: GroupLogFetchIn,
     uin: int = Depends(current_uin),
@@ -1844,6 +1871,8 @@ async def fetch_group_log(
     """
     from app.routers.devices import mark_device_seen
     await mark_device_seen(uin, device_id)
+    # Same poll stamp as GET /messages/queue (spec 2026-09-15, 8.3).
+    await guest_policy.touch_poll(db, uin)
 
     # Which rooms. The island keeps the roster in this stage, so "all my
     # rooms" is one query; a named room the caller is not in is skipped, not
@@ -1955,6 +1984,7 @@ async def fetch_group_log(
     # leaves the cursor behind and the room re-delivers the same rows.
     dependencies=[Depends(rate_limit("group_log_ack", 480, 60))],
 )
+@guest(ALLOW)
 async def ack_group_log(
     body: GroupLogAckIn,
     uin: int = Depends(current_uin),

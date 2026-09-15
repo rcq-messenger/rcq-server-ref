@@ -95,6 +95,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import enforce_cost_budget, rate_limit
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_device_id, current_uin
 from app.models.vault import VaultSlot
 from app.services.connection_manager import manager
@@ -207,6 +208,7 @@ async def _nudge(uin: int, slot: str, version: int, writer: str) -> None:
 
 
 @router.get("", response_model=VaultListOut, dependencies=[Depends(rate_limit("vault_list", 600, 3600))])
+@guest(ALLOW)
 async def list_slots(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -222,6 +224,7 @@ async def list_slots(
 
 
 @router.get("/{slot}", response_model=VaultSlotOut, dependencies=[Depends(rate_limit("vault_get", 1200, 3600))])
+@guest(ALLOW)
 async def get_slot(
     slot: str = _slot_path,
     uin: int = Depends(current_uin),
@@ -289,6 +292,7 @@ async def put_slot(
 
 
 @router.delete("/{slot}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(rate_limit("vault_delete", 60, 3600))])
+@guest(ALLOW)
 async def delete_slot(
     slot: str = _slot_path,
     version: int = Query(ge=1, le=MAX_VERSION, description="the version this delete is based on"),

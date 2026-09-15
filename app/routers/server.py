@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.core.db import SessionLocal
+from app.core.guest_policy import admission_open
 from app.models.user import User
 from app.routers import media, vault
 from app.services import island_logo, server_settings
@@ -231,6 +232,18 @@ class ServerCapabilities(BaseModel):
     # omits it must hide the row locally and must NOT decline instead: a
     # decline is an answer the requester sees, a withdraw is not.
     contact_pending_withdraw: bool = True
+    #: POST /auth/guest/challenge, /auth/guest, /auth/guest/settle and
+    #: /groups/{id}/guests exist AND this island admits new guests right now
+    #: (spec 2026-09-15, section 3.3). ABSENT or false: clients use the legacy
+    #: recover-first/register paths.
+    #:
+    #: ⚠ Not a permanent capability of this codebase like `envelope_class`,
+    #: and that is the point of it. It follows the operator's settings
+    #: (`guest_policy.admission_open`), so an open island, an invite or closed
+    #: island left on `auto`, and an island that pulled the brake all say
+    #: false, and a client on any of them behaves exactly as it did before
+    #: guests existed. The restrictions on existing guests do not depend on it.
+    guest_accounts_v1: bool = False
     # /auth/reissue understands the optional `rcq-reissue-v1` proof, answers
     # `identity_rotated` from /auth/refresh and /auth/recover for a retired
     # key, and bumps the epoch on a signed key change (spec 2026-09-15, F3).
@@ -377,7 +390,16 @@ async def _user_count() -> int:
         return value
     try:
         async with SessionLocal() as db:
-            count = int(await db.scalar(select(func.count(User.uin))) or 0)
+            # People who live here. A guest copy is somebody from another
+            # island sitting in a room (spec 2026-09-15, 6.2), and counting it
+            # would let a busy open room inflate the number every island card
+            # shows.
+            count = int(
+                await db.scalar(
+                    select(func.count(User.uin)).where(User.guest_status.is_(None))
+                )
+                or 0
+            )
     except Exception:
         return value
     _USER_COUNT = (now, count)
@@ -430,6 +452,7 @@ async def server_info() -> ServerInfo:
             entry_price_cents=int(eff["entry_price_cents"]),
             entry_url=str(eff["entry_url"]),
             till_url=_https_only(eff["uin_till_url"]),
+            guest_accounts_v1=await admission_open(),
             terms_url=_http_or_https(eff["terms_url"]),
             user_count=await _user_count(),
             random_chat=eff["random_enabled"],

@@ -190,14 +190,27 @@ def _identity(request: Request, creds: HTTPAuthorizationCredentials | None) -> s
 
 
 async def enforce_rate_limit(
-    identity: str, rule: str, limit: int, window_seconds: int
+    identity: str,
+    rule: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    fail_closed: bool = False,
 ) -> None:
     """The limiter as a plain call, for routes whose budget depends on
     something only the handler can see (e.g. a report's `context`, which
     lives in the request body and so is not available to a dependency).
 
     `identity` is the already-built identity string, usually `f"uin:{uin}"`.
-    Same fail-soft, same 429 shape as the dependency below.
+    Same 429 shape as the dependency below, and the same choice of failure
+    direction: fail-soft by default, and `fail_closed=True` keeps a cap in
+    this process when Redis is gone (see `_local_allow`).
+
+    ⚠ Pass `fail_closed=True` for any budget that stands between a stranger
+    and a new identity or a new seat in somebody's room. The guest limits
+    (spec 2026-09-15, section 13) all do: a per-room guest budget that turns
+    itself off whenever Redis blinks is the 2026-09-01 flood again, one room
+    at a time.
     """
     key = f"rl:{rule}:{bucket_name(identity)}"
     now = time.time()
@@ -205,8 +218,18 @@ async def enforce_rate_limit(
         redis = await get_redis()
         result = await redis.eval(_LIMITER_SCRIPT, 1, key, now, window_seconds, limit)
     except Exception as exc:  # noqa: BLE001
-        log.warning("[rate_limit] redis unavailable, allowing: %s", exc)
-        return
+        if not fail_closed:
+            log.warning("[rate_limit] redis unavailable, allowing: %s", exc)
+            return
+        log.warning("[rate_limit] redis unavailable, local window for %s: %s", rule, exc)
+        allowed, retry_after = _local_allow(key, limit, window_seconds, now)
+        if allowed:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limited", "retry_after": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
     if int(result[0]) == 1:
         return
     retry_after = int(result[1]) if len(result) > 1 else 1

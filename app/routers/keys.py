@@ -11,6 +11,8 @@ from app.core.config import log_identity
 from app.core.db import engine, get_db
 from app.core.config import settings
 from app.core.rate_limit import rate_limit
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import current_device_id, current_uin, current_uin_optional
 from app.services import door
 from app.models.device import Device
@@ -248,6 +250,7 @@ def _announce_device_event(
 
 
 @router.post("/bundle", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def upload_bundle(
     body: BundleIn,
     uin: int = Depends(current_uin),
@@ -299,6 +302,7 @@ async def upload_bundle(
 
 
 @router.post("/prekeys", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def replenish_prekeys(
     body: PreKeysIn,
     uin: int = Depends(current_uin),
@@ -380,11 +384,44 @@ async def _may_take_opk(request: Request, me: int | None) -> bool:
     return me is not None
 
 
+async def _guest_key_caller(
+    db: AsyncSession, request: Request, me: int | None, uin: int
+) -> tuple[int | None, bool]:
+    """The key rule for a GUEST session (spec 2026-09-15, 6.2).
+
+    Returns `(me, door_checked)` for the handler to carry on with. A resident
+    or an anonymous caller comes back untouched. A guest comes back as
+    ANONYMOUS, once this has decided whether it may see `uin`'s keys at all:
+
+      * sharing a room with `uin` is enough. The roster already hands both of
+        them each other's keys (services/door.py docstring), so this opens
+        nothing new;
+      * otherwise the guest is a stranger, and the closed-island door decides
+        exactly as for a caller with no session (a card still works);
+      * a refusal is the same 404 as a number that does not exist.
+
+    ⚠⚠ WHY THE SESSION IS DROPPED. These handlers run the door only when
+    `me is None`, and `_may_take_opk` hands a one-time prekey to ANY session.
+    Kept as a session, a free guest token would walk every number on a closed
+    island and drain residents' OPK pools one fetch at a time. As anonymous, a
+    guest gets a bundle without an OPK unless it presents a deposit token,
+    which is what any stranger gets.
+    """
+    if me is None or not await guest_policy.is_guest(me):
+        return me, False
+    if not await guest_policy.shares_room(db, me, uin) and not await door.may_fetch_key(
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    return None, True
+
+
 @router.get(
     "/{uin}/bundle",
     response_model=BundleOut,
     dependencies=[Depends(rate_limit("keys_bundle", 300, 60))],
 )
+@guest(RULE)
 async def fetch_bundle(
     uin: int,
     request: Request,
@@ -420,7 +457,8 @@ async def fetch_bundle(
     # The 404 here doubles as the sender's "fall back to v=1" signal, which is
     # the right outcome: the fallback then asks /federation/keys, which refuses
     # the same caller, so an outsider ends with no key rather than a downgrade.
-    if me is None and not await door.may_fetch_key(
+    me, door_checked = await _guest_key_caller(db, request, me, uin)
+    if me is None and not door_checked and not await door.may_fetch_key(
         db, target_uin=uin, caller_uin=None, card=door.card_from(request)
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -491,6 +529,7 @@ async def _primary_bundle(uin: int, db: AsyncSession, request: Request | None = 
 
 
 @router.get("/me/status", response_model=StatusOut)
+@guest(ALLOW)
 async def my_status(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -573,6 +612,7 @@ class DevicesOut(BaseModel):
 
 
 @router.post("/devices", response_model=DeviceRegisterOut, status_code=status.HTTP_201_CREATED)
+@guest(ALLOW)
 async def register_device(
     body: DeviceRegisterIn,
     uin: int = Depends(current_uin),
@@ -634,6 +674,7 @@ async def register_device(
     response_model=DevicesOut,
     dependencies=[Depends(rate_limit("keys_devices", 600, 60))],
 )
+@guest(RULE)
 async def list_devices(
     uin: int,
     request: Request,
@@ -650,7 +691,8 @@ async def list_devices(
     # device list. A lock with a second door is not a lock. Same refusal as the
     # gated door: 404 "no such user", indistinguishable from a number that does
     # not exist.
-    if me is None and not await door.may_fetch_key(
+    me, door_checked = await _guest_key_caller(db, request, me, uin)
+    if me is None and not door_checked and not await door.may_fetch_key(
         db, target_uin=uin, caller_uin=None, card=door.card_from(request)
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -691,6 +733,7 @@ async def list_devices(
     response_model=BundleOut,
     dependencies=[Depends(rate_limit("keys_bundle", 300, 60))],
 )
+@guest(RULE)
 async def fetch_device_bundle(
     uin: int,
     device_id: int,
@@ -708,7 +751,8 @@ async def fetch_device_bundle(
     the closed-island door lived there too, so an outsider refused at
     `/keys/{uin}/bundle` got the very same primary bundle by asking for device
     1 instead. The lock had a second door standing open."""
-    if me is None and not await door.may_fetch_key(
+    me, door_checked = await _guest_key_caller(db, request, me, uin)
+    if me is None and not door_checked and not await door.may_fetch_key(
         db, target_uin=uin, caller_uin=None, card=door.card_from(request)
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -793,6 +837,7 @@ def _strip_revoked_device(device: Device, now: datetime) -> None:
 
 
 @router.post("/devices/{device_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def revoke_device_slot(
     device_id: int,
     uin: int = Depends(current_uin),
@@ -867,6 +912,7 @@ async def revoke_device_slot(
 
 
 @router.post("/devices/{device_id}/prekeys", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def replenish_device_prekeys(
     device_id: int,
     body: PreKeysIn,

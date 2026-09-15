@@ -33,6 +33,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.redis import get_redis
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import current_uin
 from app.models.audio_room import AudioRoom, AudioRoomMembership
 
@@ -230,10 +232,16 @@ async def create_room(
 
 
 @router.get("", response_model=list[AudioRoomOut])
+@guest(RULE)
 async def list_rooms(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> list[AudioRoomOut]:
+    # A guest copy holds no audio rooms (it can neither create nor join one,
+    # spec 2026-09-15, 6.2), so its list is empty by construction. Answered
+    # before the query so that stays true for a row left from any older path.
+    if await guest_policy.is_guest(uin):
+        return []
     rows = (
         await db.execute(
             select(AudioRoom)
@@ -281,6 +289,7 @@ async def join_by_key(
 
 
 @router.delete("/{room_id}/membership")
+@guest(ALLOW)
 async def leave_my_list(
     room_id: int,
     uin: int = Depends(current_uin),

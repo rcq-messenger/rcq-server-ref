@@ -6,7 +6,7 @@ import os
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, or_, select, update
@@ -20,6 +20,7 @@ from base64 import b64decode
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import (
     _bearer,
     bump_uin_epoch,
@@ -43,14 +44,21 @@ from app.services import uin_voucher
 from app.models.group import Group, GroupMember
 from app.models.device_token import DeviceToken
 from app.models.queue_cursor import QueueCursor
-from app.models.user import User
+from app.models.user import User, earned_badges, grant_badge
 from app.models.vault import VaultSlot
+from app.core import guest_policy
 from app.routers.groups import (
     SNAPSHOT_BROADCAST_LIMIT,
+    _armed_join_stamp,
+    _broadcast_membership,
     _load_group,
     _members_with_users,
     _serialize,
 )
+from app.services import guest_accounts, guest_proof
+from app.services.account_delete import purge_account
+from app.services.group_log import seed_cursors_on_join
+from app.services.island_hosts import island_hosts
 from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
 from app.services.key_owner import uin_for_signing_key
@@ -188,6 +196,13 @@ class RegisterIn(BaseModel):
 class RegisterOut(BaseModel):
     uin: int
     token: str
+    #: True when the account this token opens is a guest copy (spec
+    #: 2026-09-15): it takes part in rooms here and nothing else. A client
+    #: that sees it on its own primary session hides contacts, calls and the
+    #: rest, and must never adopt the island as a backup home on the strength
+    #: of such a reply. Defaults False, so every reply older than guests, and
+    #: every native account, reads exactly as before. `RefreshOut` inherits it.
+    guest: bool = False
 
 
 class SessionOut(BaseModel):
@@ -242,6 +257,28 @@ async def _owns_uin_elsewhere(
         return names_it(json.loads(raw))
     except (ValueError, TypeError):
         return False
+
+
+def _invite_gates(code_hash: str) -> tuple:
+    """WHERE clauses for "this invite can still be spent". Used inside the one
+    atomic UPDATE that spends a use, by registration and by guest settle
+    alike, so the two doors cannot disagree about what a live invite is."""
+    return (
+        Invite.code == code_hash,
+        Invite.used_count < Invite.max_uses,
+        or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
+    )
+
+
+def _invite_spent_now():
+    """The `spent_at` value for that UPDATE. Stamped in the same statement that
+    spends the use, so an invite whose LAST use this is gets its retention
+    clock started without a second statement that could lose the race.
+    Anything short of the last use leaves the column alone."""
+    return case(
+        (Invite.used_count + 1 >= Invite.max_uses, datetime.now(timezone.utc)),
+        else_=Invite.spent_at,
+    )
 
 
 class RegisterChallengeIn(BaseModel):
@@ -369,19 +406,8 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # A redeemed invite may carry a reserved (vanity) UIN; capture it so the
     # holder gets exactly that number below.
     reserved_uin: int | None = None
-    invite_gates = (
-        Invite.code == code_hash,
-        Invite.used_count < Invite.max_uses,
-        or_(Invite.expires_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)),
-    )
-    # Stamped in the same atomic UPDATE that spends the use, so an invite whose
-    # LAST use this is gets its retention clock started without a second
-    # statement that could lose the race. Anything short of the last use leaves
-    # the column alone.
-    _spent_now = case(
-        (Invite.used_count + 1 >= Invite.max_uses, datetime.now(timezone.utc)),
-        else_=Invite.spent_at,
-    )
+    invite_gates = _invite_gates(code_hash)
+    _spent_now = _invite_spent_now()
     policy = await server_settings.get("registration_policy")
     # ⚠⚠ PAID ENTRY RIDES THE INVITE FIELD, on purpose. An entry voucher and an
     # invite answer the same question — "may this person have an account here"
@@ -472,6 +498,30 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
             # was open: it is the consumed ROW that decides, not the policy.
             entered_via = "invite"
             reserved_uin = await db.scalar(select(Invite.uin).where(Invite.code == code_hash))
+
+    # ⚠⚠ A KEY THAT ALREADY HOLDS A GUEST ROW HERE BECOMES THAT ROW, NEVER A
+    # SECOND ONE (spec 2026-09-15, 9.2). The door has just said yes (voucher,
+    # invite or open), so this person may live here, and they already have an
+    # account here: the guest copy, with its number and its rooms. Inserting a
+    # new row instead would leave two rows for one key, and recovery follows
+    # the OLDER claim, so their own phrase would land in the guest copy and
+    # never reach the account they paid for. A hostile member could arrange
+    # that on purpose by owner-adding somebody's public key before they buy
+    # entry. Only under `proven`: an unproven registration for a key that is
+    # taken was already refused above with `key_proof_required`.
+    if proven:
+        guest_row = await guest_accounts.row_for_key(
+            db, reissue_proof.decode_key32(signing_key), guests_only=True
+        )
+        if guest_row is not None:
+            return await _convert_guest_on_register(
+                db,
+                uin=guest_row.uin,
+                identity_key=identity_key,
+                resident_at=resident_at,
+                reserved_uin=reserved_uin,
+                device_id=body.device_id,
+            )
 
     # A reserved vanity UIN wins when it's still free; then a best-effort
     # desired UIN (multihoming "same number on every island"); otherwise fall
@@ -667,6 +717,60 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
 
 
+async def _convert_guest_on_register(
+    db: AsyncSession,
+    *,
+    uin: int,
+    identity_key: str,
+    resident_at: datetime | None,
+    reserved_uin: int | None,
+    device_id: str | None,
+) -> RegisterOut:
+    """The in-place conversion of section 9.2, after the door said yes.
+
+    ⚠ Nothing is committed before the refusals below. The voucher nonce (flushed)
+    and the invite use (UPDATE) are still inside this transaction, so a refusal
+    rolls both back and the person keeps their code.
+    """
+    if reserved_uin is not None:
+        # An invite that carries its own number cannot be applied to a row that
+        # already has one, and quietly spending it on the guest's number would
+        # throw away what the invite was for.
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "invite_has_number"})
+    # A plain registration mints a new account, which no install can have been
+    # disconnected from. This hands out a session for an EXISTING one, so it is
+    # a mint in the #607 sense and asks the denylist like recover does.
+    try:
+        await _refuse_revoked_device(uin, device_id)
+    except Exception:
+        await db.rollback()
+        raise
+    user = await db.get(User, uin)
+    guest_accounts.clear_guest_columns(user)
+    # The key holder's own request, proven by the signature above; an adder's
+    # guess at their identity key is replaced here.
+    user.identity_key = identity_key
+    if resident_at is not None:
+        user.resident_since = resident_at
+        grant_badge(user, "resident")
+    user.last_seen = datetime.now(timezone.utc)
+    # ⚠⚠ EVERY BEARER MINTED BEFORE THIS REQUEST DIES, in the same commit as
+    # the conversion (review 2026-09-15). This hands a resident's session to
+    # whoever proved the key, and nobody showed a bearer. A guest row can reach
+    # a key by rotation without anyone proving the new private key (see
+    # `retire_bearers_before_proof`): a free copy parked on the payer's public
+    # key would otherwise become a paid resident its rotator is still signed
+    # into. An honest guest's other devices re-prove the key once.
+    epoch = await guest_accounts.retire_bearers_before_proof(db, uin, always=True)
+    await db.commit()
+    await guest_accounts.bearers_retired(uin, epoch)
+    await guest_accounts.after_conversion(db, uin)
+    # No founder edge, no inviter edge, no beta room: this is not a new
+    # account, and it already has the rooms it chose.
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), device_id), guest=False)
+
+
 async def _refuse_revoked_device(uin: int, device_id: str | None) -> None:
     """Guard for every endpoint below that MINTS a session token.
 
@@ -688,6 +792,7 @@ async def _refuse_revoked_device(uin: int, device_id: str | None) -> None:
 
 
 @router.post("/session", response_model=SessionOut)
+@guest(ALLOW)
 async def session(
     uin: int = Depends(current_uin),
     device_id: str = Depends(current_device_id),
@@ -705,6 +810,7 @@ class ClaimDeviceIn(BaseModel):
 
 
 @router.post("/device", response_model=SessionOut)
+@guest(ALLOW)
 async def claim_device(
     body: ClaimDeviceIn,
     uin: int = Depends(current_uin),
@@ -872,7 +978,51 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     # through it either. A genuine re-install carries a device id the account has
     # never revoked (or none at all) and is unaffected.
     await _refuse_revoked_device(uin, body.device_id)
-    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
+    guest = await _claim_seat_on_proof(db, uin)
+    return RegisterOut(
+        uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id), guest=guest
+    )
+
+
+async def _claim_seat_on_proof(db: AsyncSession, uin: int) -> bool:
+    """Section 4.5: a proof of the signing key opens an unclaimed seat, and the
+    reply says whether the account is a guest. Returns that flag.
+
+    ⚠ Recover and refresh DO claim seats, although they prove only the signing
+    key and cannot repair a wrong identity key the adder supplied. Refusing
+    would make every owner-add unusable for every client that predates
+    `/auth/guest` (critic disposition, section 18); new clients call
+    `/auth/guest` first, which repairs the key.
+
+    One primary-key read for a native account, which is every recovery on an
+    island without guests. The UPDATE runs only for a seat.
+
+    ⚠⚠ The same read carries `key_unproven_since`: when a reissue moved a guest
+    row onto this key and nobody has proven it since, this proof is the first,
+    and every bearer minted before it dies here, BEFORE the caller mints its
+    own token (`guest_accounts.retire_bearers_before_proof`, review
+    2026-09-15). Without it the key holder would share the row with whoever
+    rotated it.
+    """
+    row = (
+        await db.execute(
+            select(User.guest_status, User.key_unproven_since).where(User.uin == uin)
+        )
+    ).first()
+    status_now = row.guest_status if row is not None else None
+    if row is not None and row.key_unproven_since is not None:
+        epoch = await guest_accounts.retire_bearers_before_proof(db, uin)
+        if epoch is not None:
+            await db.commit()
+            await guest_accounts.bearers_retired(uin, epoch)
+    if status_now == guest_policy.STATUS_ADDED:
+        # No `mark_guest`: a seat is in the guest set already, and stays there.
+        if await guest_accounts.claim_seat(db, uin):
+            await db.commit()
+            await guest_accounts.announce_rooms(db, uin)
+            await guest_policy.bump_stat("guest_claim")
+        status_now = await db.scalar(select(User.guest_status).where(User.uin == uin))
+    return status_now is not None
 
 
 # ── session token re-issue (no stored token) ────────────────────────────────
@@ -1021,10 +1171,12 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
                 updated_at=datetime.now(timezone.utc),
             ))
             await db.commit()
+    guest = await _claim_seat_on_proof(db, owned)
     return RefreshOut(
         uin=owned,
         token=issue_token(owned, await uin_epoch(owned), body.device_id),
         moved_from=moved_from,
+        guest=guest,
     )
 
 
@@ -1131,29 +1283,10 @@ async def _release_reissue_nonce(key: str) -> None:
         pass
 
 
-async def _reissue_hosts(request: Request) -> tuple[set[str], bool]:
-    """The hosts a proof may be bound to on THIS island, and whether the set had
-    to come from the request's Host header.
-
-    The island's own name (`island_host`) plus the fronts that proxy to it
-    (FRONT_ALIAS_HOSTS: a client reaching the flagship through cdn.rcq.app
-    signs the host it dialled). When `island_host` is empty, which is the
-    default on a self-hosted island, the Host header is used instead of
-    skipping the check (critic 11): skipping made a proof for island A good on
-    any island C where the same key happened to sit on the same number. A
-    header is written by the caller, so this is weaker than a configured name,
-    and it is counted so an operator can see it happening.
-    """
-    own = reissue_proof.canonical_host(str(await server_settings.get("island_host") or ""))
-    from_header = False
-    if not own:
-        own = reissue_proof.canonical_host(request.headers.get("host", ""))
-        from_header = True
-    allowed = {own} if own else set()
-    allowed |= {
-        reissue_proof.canonical_host(h) for h in settings.FRONT_ALIAS_HOSTS.split(",") if h.strip()
-    }
-    return allowed, from_header
+# The host set a proof may name moved to `services/island_hosts.py` when the
+# guest proof (`rcq-guest-v1`) needed the same answer: two proofs that bind
+# "this island" must agree on what this island is called.
+_reissue_hosts = island_hosts
 
 
 def _key_bytes_or_none(value: str | None) -> bytes | None:
@@ -1234,6 +1367,7 @@ async def _retire_signing_key(db: AsyncSession, old_raw: bytes, uin: int, signed
     response_model=RegisterOut,
     dependencies=[Depends(rate_limit("auth_reissue", 10, 3600))],
 )
+@guest(ALLOW)
 async def reissue(
     body: ReissueIn,
     request: Request,
@@ -1410,6 +1544,20 @@ async def reissue(
     retired_raw = _key_bytes_or_none(user.signing_key)
     user.identity_key = ik
     user.signing_key = sk
+    # ⚠⚠ A GUEST row moved onto a new signing key is marked "not proven since".
+    # Nothing above proves the NEW private key, and `_signing_key_taken_by`
+    # refuses only keys another row already holds, so a free guest copy can be
+    # parked on a stranger's public key before that stranger ever comes here.
+    # The first request that proves the key clears the mark and bumps the
+    # epoch (`guest_accounts.retire_bearers_before_proof`), so the rotator's
+    # bearers, this reply's included, die at that moment (review 2026-09-15).
+    # An honest rotator holds the key and simply re-proves it once.
+    #
+    # ⏭ Native rows are not marked. The same parking works with a native row
+    # on an open island and predates guest copies; guest copies only made it
+    # free on paid islands, where the conversion made it worth money.
+    if user.guest_status is not None and retired_raw != new_sk_raw:
+        user.key_unproven_since = datetime.now(timezone.utc)
     # The vault (stage 4a) is sealed under, and its slots named by, keys the
     # first-party clients derive from the identity being retired here. Every
     # slot would be unreachable under the new derivation, and ciphertext
@@ -1511,95 +1659,439 @@ async def reissue(
 
 
 @router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def delete_account(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    user = await db.get(User, uin)
-    if user is None:
+    # The whole sequence (tell this account's other sessions, delete the rooms
+    # it owns, leave the rest, every per-UIN row, the gossip mirror, the push
+    # tokens, the epoch bump, the row, and the guest mark after the commit)
+    # lives in `services/account_delete.py` since 2026-09-15, because the guest
+    # sweep, the operator's "Delete guest copy" and the rollback hold have to
+    # delete a row exactly the way a burn does (spec 2026-09-15, 8.4). A burn
+    # is the one caller that announces `account_burned`: the person asked for
+    # it, so their other devices wipe and go back to login.
+    if await purge_account(db, uin, "owner_burned", announce_burn=True) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
-    # Tell every other session connected under this UIN (iOS, web,
-    # multi-device) that the account just got burned, so they can
-    # wipe local identity and bounce back to login. Without this
-    # the second device keeps using a stale token / cached state
-    # until next app launch — the user reported this exact bug
-    # after burning from web while iOS was open. Fan-out happens
-    # *before* the row delete so the WS auth (token still valid)
-    # doesn't trip the disconnect path inside the burn itself.
-    await manager.broadcast([uin], {"type": "account_burned"})
 
-    # Find groups the user owns + groups they're a member of.
-    # Owned groups need to be deleted entirely (burn = total nuke,
-    # per founder decision). Member-only groups just need this
-    # user's GroupMember row removed so the roster stays clean.
-    owned_group_ids: list[int] = (
-        await db.execute(
-            select(Group.id).where(Group.owner_uin == uin)
+
+# ── guest copies (spec 2026-09-15, sections 4 and 9.1) ──────────────────────
+# A person whose account lives on another island takes part in a room here
+# without coming through the door. Their copy is a row with `guest_status` set,
+# created ONLY together with its first membership, and restricted to rooms (see
+# app/core/guest_policy.py). Nothing about their home island is sent or stored.
+#
+# Two requests: a challenge, then a proof over the island, the room, both keys
+# and that challenge (`rcq-guest-v1`, services/guest_proof.py). A key that
+# already has a row here gets a session for THAT row whatever the admission
+# settings say, so turning admission off never locks out existing copies.
+class GuestChallengeIn(BaseModel):
+    signing_key: str = Field(max_length=128)
+
+
+class GuestChallengeOut(BaseModel):
+    challenge: str
+
+
+@router.post(
+    "/guest/challenge",
+    response_model=GuestChallengeOut,
+    dependencies=[
+        Depends(rate_limit("auth_guest_challenge", 60, 3600, fail_closed=True)),
+        Depends(rate_limit("auth_guest_challenge_net", 240, 3600, fail_closed=True, by_subnet=True)),
+    ],
+)
+async def guest_challenge(body: GuestChallengeIn) -> GuestChallengeOut:
+    """A 120 s challenge for a guest proof, bound to `typ="guest"` and to the
+    key exactly as sent. The typ keeps it apart from the register and recover
+    challenges in both directions. Says nothing about whether the key or any
+    account exists."""
+    return GuestChallengeOut(challenge=issue_key_challenge(body.signing_key.strip(), "guest"))
+
+
+class GuestIn(BaseModel):
+    #: Proof layout version. Anything but 1 is 400 `guest_proof_version`, not a
+    #: 422, so a client from the future can tell "update the island" apart
+    #: from "my request is broken".
+    v: int
+    #: The island as the client dialled it; canonicalised, then checked against
+    #: this island's own names (`island_hosts`), never trusted.
+    host: str = Field(min_length=1, max_length=253)
+    #: The room on THIS island, never a client-side alias.
+    group_id: int = Field(gt=0)
+    nickname: str = Field(min_length=1, max_length=64)
+    identity_key: str = Field(max_length=128)
+    signing_key: str = Field(max_length=128)
+    challenge: str = Field(max_length=2048)
+    #: Ed25519 over `guest_proof.proof_bytes`, standard base64.
+    signature: str = Field(max_length=128)
+    device_id: str | None = Field(default=None, max_length=64)
+
+
+class GuestOut(BaseModel):
+    uin: int
+    token: str
+    #: False only when the key resolved to a NATIVE account here (a backup
+    #: home, or a copy made while the door was open): the caller gets that
+    #: account, unrestricted.
+    guest: bool
+    #: True when this request created the row (201). False for an existing row
+    #: (200), claimed or not.
+    created: bool
+
+
+@router.post(
+    "/guest",
+    response_model=GuestOut,
+    status_code=status.HTTP_201_CREATED,
+    # Its own buckets and its own island ceiling, NOT `auth_register`'s: a
+    # flood of free guest mints must not 429 the people standing at the door
+    # with a paid voucher (section 4.4). All fail closed, because this mints
+    # identities.
+    dependencies=[
+        Depends(rate_limit("auth_guest", 10, 3600, fail_closed=True)),
+        Depends(rate_limit("auth_guest_day", 30, 86400, fail_closed=True)),
+        Depends(rate_limit("auth_guest_net", 30, 3600, fail_closed=True, by_subnet=True)),
+        Depends(island_ceiling(
+            "guest_mint",
+            lambda: settings.GUEST_CEILING_PER_MINUTE,
+            lambda: settings.GUEST_CEILING_PER_HOUR,
+        )),
+    ],
+)
+async def guest_join(
+    body: GuestIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> GuestOut:
+    """Section 4.4, in its order. The order is the design: everything that can
+    be refused without state is refused first, the challenge is spent before
+    any token exists, existing rows are answered before the admission switch
+    is read, and the room is checked before anything is written."""
+    # 1. Shape.
+    if body.v != guest_proof.VERSION:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "guest_proof_version"})
+    identity_key = _pubkey32(body.identity_key, "identity_key")
+    signing_key = _pubkey32(body.signing_key, "signing_key")
+    ik_raw = reissue_proof.decode_key32(identity_key)
+    sk_raw = reissue_proof.decode_key32(signing_key)
+    try:
+        sig_raw = reissue_proof.decode_signature(body.signature)
+    except ValueError:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail={"code": "guest_proof_malformed"}
+        ) from None
+
+    # 2. A guest challenge for this key, unexpired. A register or recover
+    # challenge fails here by its typ.
+    if not verify_key_challenge(body.challenge, signing_key, "guest"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_challenge"})
+
+    # 3. This island.
+    host = reissue_proof.canonical_host(body.host)
+    allowed, from_header = await island_hosts(request)
+    if from_header:
+        await guest_policy.bump_stat("guest_host_from_header")
+    if not host or host not in allowed:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "guest_wrong_host"})
+
+    # 4. The signature over island, room, both keys and challenge. A request
+    # whose ik or group_id was swapped after signing fails HERE, as a bad
+    # signature, which is exactly what it is.
+    try:
+        signed = guest_proof.proof_bytes(host, body.group_id, ik_raw, sk_raw, body.challenge)
+        Ed25519PublicKey.from_public_bytes(sk_raw).verify(sig_raw, signed)
+    except (InvalidSignature, ValueError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"}) from None
+
+    # 5. Single use, before any token. Given back only when a commit fails.
+    guard = await guest_accounts.claim_challenge(body.challenge)
+
+    # 6. Rows that already exist for this key.
+    existing = await guest_accounts.row_for_key(db, sk_raw)
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        return await _guest_existing_row(
+            db, existing, identity_key=identity_key, ik_raw=ik_raw,
+            device_id=body.device_id, guard=guard,
         )
-    ).scalars().all()
+    rotated = await _rotated_account(db, signing_key)
+    if rotated is not None:
+        # The same answer recover gives, and clients must never wipe on it.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail={"code": "identity_rotated", "uin": rotated}
+        )
 
-    # Notify members of every owned group so their clients drop the
-    # cached group + clear unread + don't render a ghost. Done before
-    # delete so we still have GroupMember rows to enumerate.
-    for gid in owned_group_ids:
-        member_uins = (
-            await db.execute(
-                select(GroupMember.uin)
-                .where(GroupMember.group_id == gid)
-                .where(GroupMember.uin != uin)
+    # 7. Only now the operator's switch: it governs NEW rows.
+    if not await guest_policy.admission_open():
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_closed"})
+
+    # 8. The room, before any write.
+    g = await db.get(Group, body.group_id)
+    if g is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "group_not_found"})
+    if g.is_closed:
+        # The existing code and meaning: a closed room needs an add by a member.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "group_closed"})
+    if g.allow_guests is False:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_room_closed"})
+    await guest_accounts.refuse_full_room(db, g)
+    await guest_accounts.spend_room_budget(g.id)
+
+    # 9. Create lock, and resolve again under it: a concurrent request for the
+    # same key may have inserted between step 6 and here.
+    lock = await guest_accounts.acquire_create_lock(sk_raw)
+    try:
+        existing = await guest_accounts.row_for_key(db, sk_raw)
+        if existing is not None:
+            response.status_code = status.HTTP_200_OK
+            return await _guest_existing_row(
+                db, existing, identity_key=identity_key, ik_raw=ik_raw,
+                device_id=body.device_id, guard=guard,
             )
-        ).scalars().all()
-        for muin in member_uins:
-            await manager.send(muin, {
-                "type": "group_deleted",
-                "group_id": gid,
-                "reason": "owner_burned",
-            })
 
-    # Delete owned groups. CASCADE on GroupMember.group_id removes those rows
-    # automatically. (`polls.group_id` used to be named here too. Polls were
-    # removed on 2026-08-23; the orphaned table still carries its physical FK
-    # on Postgres, so it keeps cascading, but nothing in the app depends on
-    # that either way. See the block in core/db.py.)
-    if owned_group_ids:
-        await db.execute(
-            delete(Group).where(Group.id.in_(owned_group_ids))
-        )
+        # 10. The row and its first membership, in ONE transaction. There is no
+        # such thing as a guest row without a room: nothing to sweep later.
+        now = datetime.now(timezone.utc)
+        uin = await allocate_uin(db)
+        db.add(User(
+            uin=uin,
+            nickname=body.nickname,
+            identity_key=identity_key,
+            signing_key=signing_key,
+            entered_via="guest",
+            guest_status=guest_policy.STATUS_PROVEN,
+            guest_since=now,
+            # Backdated to one day short of the dormant window: content is
+            # stored for about a day before the first poll (section 8.3).
+            last_seen=now - guest_policy.mint_backdate(),
+            resident_since=None,
+            badge=None,
+        ))
+        await db.flush()
+        db.add(GroupMember(
+            group_id=g.id, uin=uin, role="member", joined_at=_armed_join_stamp(g),
+        ))
+        await db.flush()
+        await seed_cursors_on_join(db, g.id, uin)
+        try:
+            # BEFORE the commit, and not best effort (guest_policy docstring).
+            await guest_policy.mark_guest(uin)
+        except guest_policy.GuestCacheUnavailable:
+            await db.rollback()
+            await guest_accounts.release_key(guard)
+            raise guest_policy.guest_unavailable_error() from None
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            await guest_policy.unmark_guest(uin)
+            await guest_accounts.release_key(guard)
+            raise
+    finally:
+        await guest_accounts.release_create_lock(lock)
 
-    # Remove user from groups where they were just a member.
-    await db.execute(
-        delete(GroupMember).where(GroupMember.uin == uin)
+    # 11. After the commit. Deliberately NOT here: the founder edge, the
+    # inviter edge and the beta-room auto-join a registration gets. A guest
+    # has no relationships on this island and no rooms it did not choose.
+    g = await _load_group(db, g.id)
+    members = await _members_with_users(db, g.id)
+    await _broadcast_membership(g.id, members, _serialize(g, members))
+    await guest_policy.bump_stat("guest_mint")
+    from app.services.activity_rollup import bump_bg as activity_bump
+
+    activity_bump("guest")
+    # 12.
+    return GuestOut(
+        uin=uin,
+        token=issue_token(uin, await uin_epoch(uin), body.device_id),
+        guest=True,
+        created=True,
     )
 
-    # Wipe every other per-UIN row so a RECYCLED UIN (re-registered, or
-    # re-registered after a burn) never inherits the burned owner's data.
-    # one_time_prekeys and devices ON DELETE CASCADE off the user row, but a
-    # long tail of tables key on UIN with no FK cascade.
-    #
-    # The list lives in `app/services/uin_rows.py`, shared with the migration
-    # path so the two can no longer drift: this block and that one were both
-    # hand-maintained and both had gaps (queued GROUP ciphertext, the queue
-    # drain cursor, capabilities and the signed federation record were missed
-    # here, along with several per-feature tables that have since been
-    # deleted outright).
-    await purge_uin_rows(db, uin)
-    # ⚠ The one row `purge_uin_rows` structurally cannot reach, and it needs
-    # the KEY rather than the number. `gossip_records` is this island's MIRROR
-    # of some identity's signed home-island record, keyed by the global Ed25519
-    # `sk`; anybody may write one, and for a burned account it kept serving
-    # "this identity lives at these islands under these numbers" forever. The
-    # key is `user.signing_key` on the row about to be deleted, so it has to be
-    # read HERE, before `db.delete(user)` below. Mirrors of the same record on
-    # OTHER islands are out of reach from here; `services/gossip_sweep` ages
-    # those out on demand.
-    await purge_gossip_mirror(db, user.signing_key)
-    await db.execute(delete(DeviceToken).where(DeviceToken.uin == uin))
 
-    # The number goes back into circulation, so retire every token minted for
-    # THIS holder: otherwise a saved bearer keeps authenticating as whoever
-    # gets the number next (see app/models/uin_epoch.py).
-    new_epoch = await bump_uin_epoch(db, uin)
+async def _guest_existing_row(
+    db: AsyncSession,
+    row: "guest_accounts.KeyRow",
+    *,
+    identity_key: str,
+    ik_raw: bytes,
+    device_id: str | None,
+    guard: str,
+) -> GuestOut:
+    """Section 4.4 step 6: a proof for a key that already has a row here.
 
-    await db.delete(user)
+    * native: a session for it, and nothing else changes. This is every backup
+      home and every copy that walked in while the door was open.
+    * unclaimed seat: claimed, and its identity key set to the proven one,
+      because the adder's copy of it may be stale or wrong.
+    * proven guest: a session, and the identity key repaired if it differs.
+      An identity-key-only change proven by the same signing key.
+    """
+    await _refuse_revoked_device(row.uin, device_id)
+    # ⚠⚠ First, and for every kind of row: when a reissue parked this row on the
+    # key and nobody has proven it since, this proof kills every bearer minted
+    # before it (review 2026-09-15). "Bump when the claim changes something"
+    # would not do: the rotator chooses the identity key too, and sets it to
+    # the holder's own, so nothing below changes. A row settled after the
+    # rotation is native by now and still carries the mark, hence before the
+    # native branch.
+    epoch = await guest_accounts.retire_bearers_before_proof(db, row.uin)
+    if epoch is not None:
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            await guest_accounts.release_key(guard)
+            raise
+        await guest_accounts.bearers_retired(row.uin, epoch)
+    if row.guest_status is None:
+        return GuestOut(
+            uin=row.uin,
+            token=issue_token(row.uin, await uin_epoch(row.uin), device_id),
+            guest=False,
+            created=False,
+        )
+    changed = claimed = False
+    if row.guest_status == guest_policy.STATUS_ADDED:
+        try:
+            await guest_policy.mark_guest(row.uin)
+        except guest_policy.GuestCacheUnavailable:
+            await guest_accounts.release_key(guard)
+            raise guest_policy.guest_unavailable_error() from None
+        claimed = changed = await guest_accounts.claim_seat(db, row.uin, identity_key=identity_key)
+    if not claimed and _key_bytes_or_none(row.identity_key) != ik_raw:
+        result = await db.execute(
+            update(User)
+            .where(User.uin == row.uin, User.guest_status.is_not(None))
+            .values(identity_key=identity_key)
+            .execution_options(synchronize_session=False)
+        )
+        changed = (result.rowcount or 0) == 1
+    if changed:
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            await guest_accounts.release_key(guard)
+            raise
+        # Senders re-read keys and re-issue sender keys to the new identity key.
+        await guest_accounts.announce_rooms(db, row.uin)
+        if claimed:
+            await guest_policy.bump_stat("guest_claim")
+    # Read back rather than assumed: a settle racing this request may have made
+    # the row native a moment ago, and the reply must not call it a guest.
+    status_now = await db.scalar(select(User.guest_status).where(User.uin == row.uin))
+    return GuestOut(
+        uin=row.uin,
+        token=issue_token(row.uin, await uin_epoch(row.uin), device_id),
+        guest=status_now is not None,
+        created=False,
+    )
+
+
+class GuestSettleIn(BaseModel):
+    #: An entry voucher or an invite, in the one box every client already has.
+    #: Absent on an open island, where settling is free.
+    code: str | None = Field(default=None, max_length=512)
+
+
+class GuestSettleOut(BaseModel):
+    uin: int
+    #: Set only when a voucher paid for it. An invite lets somebody live here
+    #: without making them a resident, exactly as at registration.
+    resident_since: datetime | None = None
+    badge: str | None = None
+    badges_earned: list[str] = []
+
+
+@router.post(
+    "/guest/settle",
+    response_model=GuestSettleOut,
+    dependencies=[Depends(rate_limit("guest_settle", 10, 3600, fail_closed=True))],
+)
+@guest(ALLOW)
+async def guest_settle(
+    body: GuestSettleIn,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> GuestSettleOut:
+    """Section 9.1: a guest becomes a resident of THIS row, with its number and
+    its rooms. The token does not change, because guestness is never in it.
+
+    Suspended accounts never get here: `authorize_session` refuses them.
+    """
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found"})
+    if user.guest_status is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_a_guest"})
+    badge_before = user.badge
+    now = datetime.now(timezone.utc)
+    code = (body.code or "").strip()
+    if code:
+        # Tried exactly as registration tries it: a voucher first, and only
+        # when it looks like one; a voucher naming another island or expired
+        # is refused outright; anything else may still be an invite.
+        nonce: str | None = None
+        try:
+            nonce = uin_voucher.verify_entry(
+                code, expect_host=str(await server_settings.get("island_host") or "")
+            )
+        except uin_voucher.VoucherError as e:
+            if e.code in ("voucher_other_island", "voucher_expired"):
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": e.code}) from None
+        if nonce is not None:
+            db.add(SpentVoucher(nonce=nonce))
+            try:
+                await db.flush()
+            except IntegrityError:
+                await db.rollback()
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, detail={"code": "voucher_spent"}
+                ) from None
+            user.resident_since = now
+            grant_badge(user, "resident")
+        else:
+            code_hash = hash_invite_code(code)
+            # ⚠ BEFORE anything is consumed. An invite that reserves a number
+            # is a promise of that number, and a guest row already has one.
+            if await db.scalar(select(Invite.uin).where(Invite.code == code_hash)) is not None:
+                raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "invite_has_number"})
+            consumed = await db.execute(
+                update(Invite)
+                .where(*_invite_gates(code_hash))
+                .values(used_count=Invite.used_count + 1, spent_at=_invite_spent_now())
+            )
+            if consumed.rowcount == 0:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "invite_invalid"})
+    else:
+        # ⚠⚠ STRICT, and it is the difference between a paid island and a free
+        # one for a few seconds after a worker boots. `get` on a cold worker
+        # whose database blinked serves the CODE default, which is "open", and
+        # this branch would then settle a guest for nothing on a paid island.
+        # Refusing with 503 costs one retry.
+        try:
+            policy = await server_settings.get_strict("registration_policy")
+        except server_settings.SettingsUnavailable:
+            raise guest_policy.guest_unavailable_error() from None
+        if policy != "open":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail={"code": "invite_required" if policy == "invite" else "entry_required"},
+            )
+    guest_accounts.clear_guest_columns(user)
     await db.commit()
-    await cache_uin_epoch(uin, new_epoch)
+    await guest_accounts.after_conversion(db, uin)
+    if user.badge != badge_before:
+        from app.routers.users import _announce_rename  # local: users imports widely
+
+        await _announce_rename(db, uin, user.nickname, badge=None if user.badge_hidden else user.badge)
+    return GuestSettleOut(
+        uin=uin,
+        resident_since=user.resident_since,
+        badge=user.badge,
+        badges_earned=earned_badges(user),
+    )

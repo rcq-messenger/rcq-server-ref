@@ -332,6 +332,14 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
     <section class="view active" id="v-overview">
       <div class="head"><div><h1 data-i18n="ov.h1">Overview</h1><p data-i18n="ov.sub">Your server at a glance.</p></div></div>
       <div class="stats" id="stats"><span class="empty" data-i18n="common.loading">Loading…</span></div>
+      <!-- Guests from other islands (spec 2026-09-15, section 14). Hidden on an
+           island that has never admitted one: most never will, and an empty
+           table of zeros is noise on the first screen. -->
+      <div class="card pad" id="guests-card" style="margin-top:16px;display:none">
+        <h3 data-i18n="ov.guests.h">Guests from other islands</h3>
+        <p class="sub" data-i18n="ov.guests.sub">People whose account lives on another island and who hold a seat in rooms here. Numbers only, never names or numbers of accounts.</p>
+        <div id="guests"></div>
+      </div>
       <div class="card pad" style="margin-top:16px">
         <h3 data-i18n="ov.signups.h">New users · last 30 days</h3>
         <p class="sub" data-i18n="ov.signups.sub">Signups per day.</p>
@@ -423,6 +431,14 @@ ADMIN_CONSOLE_HTML = """<!doctype html>
       <div class="card pad">
         <div class="row">
           <input id="u_q" placeholder="Search by UIN, nickname or group name" data-i18n-ph="usr.ph.q" style="flex:1" onkeydown="if(event.key==='Enter')searchUsers()">
+          <!-- Which kind of account. With a kind picked the search box may stay
+               empty, which lists that kind, newest first. -->
+          <select id="u_kind" style="width:auto" onchange="searchUsers()">
+            <option value="" data-i18n="usr.kind.all">Everyone</option>
+            <option value="native" data-i18n="usr.kind.native">Live here</option>
+            <option value="guest" data-i18n="usr.kind.guest">Guests from other islands</option>
+            <option value="invited" data-i18n="usr.kind.invited">Unopened invites</option>
+          </select>
           <button class="btn ghost" data-i18n="usr.search" onclick="searchUsers()">Search</button>
         </div>
         <p class="hint" style="margin:8px 0 0" data-i18n="usr.hint">A badge is your island vouching for an account in front of everyone on it. It shows next to the name in every client. Nothing outside this island can grant one, and nothing outside it will believe yours.</p>
@@ -730,6 +746,31 @@ const EN = {
   'usr.group_n': 'Group {id}',
   'usr.empty.none': 'No matches.',
   'usr.groups.none': 'No groups match.',
+  'usr.guest': 'guest',
+  'usr.invited': 'invite not opened',
+  'usr.settle': 'Make resident',
+  'usr.settle_confirm': 'Let {nick} live on this island? They keep their number and their rooms and lose the guest restrictions. No payment is recorded.',
+  'usr.delguest': 'Delete copy',
+  'usr.delguest_confirm': 'Delete the guest copy {nick}? It leaves every room on this island. Their account on their own island is not touched.',
+  'usr.no_guests': 'no guests',
+  'usr.guest_n': '{n} guests',
+  'ov.stat.guests': 'Guests',
+  'ov.stat.seats': 'Unopened invites',
+  'ov.guests.admitting': 'This island admits new guests right now.',
+  'ov.guests.closed': 'This island admits no new guests right now. Guests already here keep their seats.',
+  'ov.guests.th.what': 'What happened',
+  'ov.guests.th.today': 'Today',
+  'ov.guests.th.week': '7 days',
+  'ov.guests.th.month': '30 days',
+  'ov.guests.c.guest_mint': 'Joined a room by link',
+  'ov.guests.c.guest_claim': 'Opened an invite',
+  'ov.guests.c.guest_add_mint': 'Added by a member',
+  'ov.guests.c.guest_add_existing': 'Added by a member, already here',
+  'ov.guests.c.guest_restricted': 'Refused something only residents may do',
+  'ov.guests.c.guest_settle': 'Became residents',
+  'ov.guests.c.guest_swept_a': 'Removed: invite never opened',
+  'ov.guests.c.guest_swept_b': 'Removed: never checked for messages',
+  'ov.guests.c.guest_swept_c': 'Removed: idle',
 
   'rep.evidence': 'evidence',
   'rep.answered': 'answered',
@@ -1033,6 +1074,43 @@ const I18N = {
   'usr.group_n': 'Группа {id}',
   'usr.empty.none': 'Никого не нашлось.',
   'usr.groups.none': 'Групп не нашлось.',
+  'usr.guest': 'гость',
+  'usr.invited': 'приглашение не открыто',
+  'usr.settle': 'Сделать жителем',
+  'usr.settle_confirm': 'Разрешить {nick} жить на этом острове? Номер и группы останутся, ограничения гостя снимутся. Оплата при этом не записывается.',
+  'usr.delguest': 'Удалить копию',
+  'usr.delguest_confirm': 'Удалить гостевую копию {nick}? Она выйдет из всех групп на этом острове. Аккаунт на своём острове это не затронет.',
+  'usr.no_guests': 'без гостей',
+  'usr.guest_n': 'гостей: {n}',
+  'ov.stat.guests': 'Гости',
+  'ov.stat.seats': 'Неоткрытые приглашения',
+  'ov.guests.h': 'Гости с других островов',
+  'ov.guests.sub': 'Люди, чей аккаунт живёт на другом острове, а место в группах есть здесь. Только числа, без имён и номеров.',
+  'ov.guests.admitting': 'Сейчас остров принимает новых гостей.',
+  'ov.guests.closed': 'Сейчас остров не принимает новых гостей. Те, кто уже здесь, остаются в своих группах.',
+  'ov.guests.th.what': 'Что произошло',
+  'ov.guests.th.today': 'Сегодня',
+  'ov.guests.th.week': '7 дней',
+  'ov.guests.th.month': '30 дней',
+  'ov.guests.c.guest_mint': 'Вошли в группу по ссылке',
+  'ov.guests.c.guest_claim': 'Открыли приглашение',
+  'ov.guests.c.guest_add_mint': 'Добавлены участником',
+  'ov.guests.c.guest_add_existing': 'Добавлены участником, уже были здесь',
+  'ov.guests.c.guest_restricted': 'Отказ в том, что можно только жителям',
+  'ov.guests.c.guest_settle': 'Стали жителями',
+  'ov.guests.c.guest_swept_a': 'Удалены: приглашение так и не открыли',
+  'ov.guests.c.guest_swept_b': 'Удалены: ни разу не проверяли сообщения',
+  'ov.guests.c.guest_swept_c': 'Удалены: давно не заходили',
+  'usr.kind.all': 'Все',
+  'usr.kind.native': 'Живут здесь',
+  'usr.kind.guest': 'Гости с других островов',
+  'usr.kind.invited': 'Неоткрытые приглашения',
+  'set.guest_admission': 'Гости с других островов',
+  'set.guest_room_joins_per_day': 'Новых гостей в группу за день',
+  'set.guest_room_member_ceiling': 'Группы такого размера не принимают гостей',
+  'set.guest_max_groups': 'В скольких группах может быть один гость',
+  'set.guest_added_ttl_days': 'Сколько дней ждёт неоткрытое приглашение',
+  'set.guest_idle_days': 'Через сколько дней удаляется неактивный гость',
 
   'rep.h1': 'Жалобы',
   'rep.sub': 'Что вам написали люди: жалобы на других и сообщения о поломках самого острова. Ответьте, потом отклоните или заблокируйте. Ответ приходит человеку в приложение, так что писать его стоит даже когда вы отклоняете.',
@@ -1397,6 +1475,43 @@ const I18N = {
   'usr.group_n': '群组 {id}',
   'usr.empty.none': '没有匹配。',
   'usr.groups.none': '没有匹配的群组。',
+  'usr.guest': '访客',
+  'usr.invited': '邀请未打开',
+  'usr.settle': '设为居民',
+  'usr.settle_confirm': '允许 {nick} 在这个岛上居住？号码和群组保留，访客限制取消。不会记录付款。',
+  'usr.delguest': '删除副本',
+  'usr.delguest_confirm': '删除访客副本 {nick}？它会退出这个岛上的所有群组。对方在自己岛上的账号不受影响。',
+  'usr.no_guests': '不收访客',
+  'usr.guest_n': '访客 {n} 人',
+  'ov.stat.guests': '访客',
+  'ov.stat.seats': '未打开的邀请',
+  'ov.guests.h': '来自其他岛屿的访客',
+  'ov.guests.sub': '账号在别的岛屿、在这里的群组里有位置的人。只有数字，没有名字和号码。',
+  'ov.guests.admitting': '这个岛屿目前接受新访客。',
+  'ov.guests.closed': '这个岛屿目前不接受新访客。已经在这里的访客保留他们的群组。',
+  'ov.guests.th.what': '发生了什么',
+  'ov.guests.th.today': '今天',
+  'ov.guests.th.week': '7 天',
+  'ov.guests.th.month': '30 天',
+  'ov.guests.c.guest_mint': '通过链接加入群组',
+  'ov.guests.c.guest_claim': '打开了邀请',
+  'ov.guests.c.guest_add_mint': '被成员添加',
+  'ov.guests.c.guest_add_existing': '被成员添加，之前已在这里',
+  'ov.guests.c.guest_restricted': '尝试了只有居民能做的事而被拒绝',
+  'ov.guests.c.guest_settle': '成为居民',
+  'ov.guests.c.guest_swept_a': '已删除：邀请始终未打开',
+  'ov.guests.c.guest_swept_b': '已删除：从未查看消息',
+  'ov.guests.c.guest_swept_c': '已删除：长期不活跃',
+  'usr.kind.all': '所有人',
+  'usr.kind.native': '住在这里',
+  'usr.kind.guest': '来自其他岛屿的访客',
+  'usr.kind.invited': '未打开的邀请',
+  'set.guest_admission': '来自其他岛屿的访客',
+  'set.guest_room_joins_per_day': '每个群组每天的新访客数',
+  'set.guest_room_member_ceiling': '达到此人数的群组不接受访客',
+  'set.guest_max_groups': '一个访客最多加入的群组数',
+  'set.guest_added_ttl_days': '未打开的邀请保留天数',
+  'set.guest_idle_days': '不活跃访客多少天后删除',
 
   'rep.h1': '举报',
   'rep.sub': '用户发给你的东西：对其他成员的举报，以及关于岛屿本身的故障反馈。先回复，再驳回或封禁。你的回复会在应用里送到举报人手上，所以就算要驳回，也值得写一句。',
@@ -1700,9 +1815,41 @@ async function loadStats() {
       ['ov.stat.new24', s.new_users_24h], ['ov.stat.new7', s.new_users_7d],
       ['ov.stat.reports', s.open_reports, s.open_reports>0],
     ];
+    /* Guests from other islands are counted beside the people who live here,
+       never inside "Users" (the island leaves them out of total_users). Two
+       more tiles only where there is something to show. */
+    if ((s.guest_users||0) + (s.guest_seats||0) > 0) {
+      cells.push(['ov.stat.guests', s.guest_users||0], ['ov.stat.seats', s.guest_seats||0]);
+    }
     $('stats').innerHTML = cells.map(c => `<div class="stat${c[2]?' warn':''}"><div class="n">${typeof c[1]==='number'?num(c[1]):c[1]}</div><div class="l">${t(c[0])}</div></div>`).join('');
     openReports = s.open_reports||0; reportsBadge();
   } catch (e) { $('stats').innerHTML = '<span class="err">'+t('ov.err_auth',{err:e.message})+'</span>'; }
+  loadGuests();
+}
+/* The guest counters: what happened to guests today, this week, this month.
+   Counts only; the island keeps no list of who. The card stays hidden on an
+   island that does not admit guests and never had any. */
+const GUEST_COUNTERS = ['guest_mint','guest_claim','guest_add_mint','guest_add_existing','guest_restricted','guest_settle','guest_swept_a','guest_swept_b','guest_swept_c'];
+async function loadGuests() {
+  const card = $('guests-card');
+  try {
+    const g = await api('GET','/guests?days=30');
+    if (!g || !g.series) { card.style.display='none'; return; }
+    const byName = {}; g.series.forEach(x => { byName[x.name] = x; });
+    const sum = (x, n) => (x ? x.points.slice(-n).reduce((a,p)=>a+(p.count||0),0) : 0);
+    const any = g.series.some(x => x.total > 0);
+    if (!g.admission_open && !any && !(g.guest_users||0) && !(g.guest_seats||0)) { card.style.display='none'; return; }
+    const rows = GUEST_COUNTERS.map(name => {
+      const x = byName[name];
+      return `<tr><td>${escAttr(tOpt('ov.guests.c.'+name) || name)}</td>
+        <td style="text-align:right">${num(sum(x,1))}</td>
+        <td style="text-align:right">${num(sum(x,7))}</td>
+        <td style="text-align:right">${num(sum(x,30))}</td></tr>`;
+    }).join('');
+    $('guests').innerHTML = `<p class="hint" style="margin:0 0 10px">${t(g.admission_open?'ov.guests.admitting':'ov.guests.closed')}</p>
+      <table><thead><tr><th>${t('ov.guests.th.what')}</th><th style="text-align:right">${t('ov.guests.th.today')}</th><th style="text-align:right">${t('ov.guests.th.week')}</th><th style="text-align:right">${t('ov.guests.th.month')}</th></tr></thead><tbody>${rows}</tbody></table>`;
+    card.style.display = '';
+  } catch (e) { card.style.display = 'none'; }
 }
 async function loadChart() {
   try {
@@ -1884,30 +2031,60 @@ function badgePicker(kinds, current, onchange) {
   if (current && kinds.indexOf(current) < 0) opts.push(`<option value="${escAttr(current)}" selected>${escAttr(current)}</option>`);
   return `<select style="width:130px" onchange="${onchange}">${opts.join('')}</select>`;
 }
+/* The rows of the last search, by uin, so an action can name the account in
+   its confirmation without carrying a nickname through an onclick string. */
+let USERS_SHOWN = {};
 async function searchUsers() {
-  const q=$('u_q').value.trim(); if(!q) return;
+  const q=$('u_q').value.trim();
+  const kind=$('u_kind').value;
+  if(!q && !kind) return;
   const kinds = await badgeKinds();
   try {
-    const r = await api('GET','/users?q='+encodeURIComponent(q));
-    $('users').innerHTML = (r.items||[]).map(u=>`<tr>
-      <td class="mono">${u.uin}</td><td>${escAttr(u.nickname||'')}</td>
+    const qs = (q?'q='+encodeURIComponent(q):'') + (kind?(q?'&':'')+'kind='+encodeURIComponent(kind)+'&limit=100':'');
+    const r = await api('GET','/users?'+qs);
+    USERS_SHOWN = {}; (r.items||[]).forEach(u => { USERS_SHOWN[u.uin] = u; });
+    $('users').innerHTML = (r.items||[]).map(u=>{
+      /* A guest copy says so next to its name, and gets the two guest actions:
+         let it live here, or delete it. A native account never shows them. */
+      const gs = u.guest_status||'';
+      const tag = gs==='proven' ? ' <span class="pill">'+t('usr.guest')+'</span>' : gs==='added' ? ' <span class="pill">'+t('usr.invited')+'</span>' : '';
+      const guestActions = gs ? `<button class="btn ghost sm" onclick="settleGuest(${u.uin})">${t('usr.settle')}</button> <button class="btn danger sm" onclick="deleteGuest(${u.uin})">${t('usr.delguest')}</button> ` : '';
+      return `<tr>
+      <td class="mono">${u.uin}</td><td>${escAttr(u.nickname||'')}${tag}</td>
       <td>${u.is_suspended?'<span class="pill red">'+t('usr.suspended')+'</span>':'<span style="color:var(--mut)">'+escAttr(statusLabel(u.status||'active'))+'</span>'}</td>
       <td>${num(u.reports_against)}</td>
       <td>${badgePicker(kinds, u.badge||'', 'setUserBadge('+u.uin+', this.value, this)')}</td>
-      <td style="text-align:right"><button class="btn ${u.is_suspended?'ghost':'danger'} sm" onclick="ban(${u.uin},${!u.is_suspended})">${u.is_suspended?t('usr.unban'):t('usr.ban')}</button></td>
-    </tr>`).join('') || `<tr><td colspan="6" class="empty">${t('usr.empty.none')}</td></tr>`;
+      <td style="text-align:right;white-space:nowrap">${guestActions}<button class="btn ${u.is_suspended?'ghost':'danger'} sm" onclick="ban(${u.uin},${!u.is_suspended})">${u.is_suspended?t('usr.unban'):t('usr.ban')}</button></td>
+    </tr>`;
+    }).join('') || `<tr><td colspan="6" class="empty">${t('usr.empty.none')}</td></tr>`;
   } catch(e){ $('users').innerHTML='<tr><td colspan="6" class="err">'+e.message+'</td></tr>'; }
   /* Groups are searched with the same words. A closed group still shows: the
-     operator has to be able to reach one to badge or inspect it. */
+     operator has to be able to reach one to badge or inspect it. A kind with no
+     words lists accounts only. */
+  if (!q) { $('ugroups').innerHTML = `<tr><td colspan="4" class="empty">${t('usr.groups.none')}</td></tr>`; return; }
   try {
     const g = await api('GET','/groups?q='+encodeURIComponent(q));
     $('ugroups').innerHTML = (g.items||[]).map(x=>`<tr>
-      <td>${escAttr(x.name||t('usr.group_n',{id:x.id}))}${x.is_closed?' <span class="pill">'+t('usr.closed')+'</span>':''}<div class="mono" style="color:var(--dim);font-size:11px">id ${x.id}</div></td>
+      <td>${escAttr(x.name||t('usr.group_n',{id:x.id}))}${x.is_closed?' <span class="pill">'+t('usr.closed')+'</span>':''}${x.allow_guests===false?' <span class="pill">'+t('usr.no_guests')+'</span>':''}<div class="mono" style="color:var(--dim);font-size:11px">id ${x.id}</div></td>
       <td class="mono">${x.owner_uin}${x.owner_nickname?' <span style="color:var(--mut)">'+escAttr(x.owner_nickname)+'</span>':''}</td>
-      <td>${num(x.member_count)}</td>
+      <td>${num(x.member_count)}${x.guest_count?' <span style="color:var(--mut)">· '+t('usr.guest_n',{n:num(x.guest_count)})+'</span>':''}</td>
       <td>${badgePicker(kinds, x.badge||'', 'setGroupBadge('+x.id+', this.value, this)')}</td>
     </tr>`).join('') || `<tr><td colspan="4" class="empty">${t('usr.groups.none')}</td></tr>`;
   } catch(e){ $('ugroups').innerHTML='<tr><td colspan="4" class="err">'+e.message+'</td></tr>'; }
+}
+/* "Make resident": the same row, number and rooms, without the guest limits.
+   No payment is recorded; the badge picker is still how a paid resident is
+   marked. "Delete copy": removed like a burn, from every room here. Both ask
+   first, naming the account. */
+async function settleGuest(uin){
+  const u = USERS_SHOWN[uin] || {};
+  if (!confirm(t('usr.settle_confirm',{nick:u.nickname||String(uin)}))) return;
+  try { await api('POST','/users/'+uin+'/settle'); searchUsers(); loadStats(); } catch(e){ alert(e.message); }
+}
+async function deleteGuest(uin){
+  const u = USERS_SHOWN[uin] || {};
+  if (!confirm(t('usr.delguest_confirm',{nick:u.nickname||String(uin)}))) return;
+  try { await api('DELETE','/users/'+uin+'/guest'); searchUsers(); loadStats(); } catch(e){ alert(e.message); }
 }
 /* The select is the source of truth while the request is in flight: disable it
    so a second change cannot race the first, and put the old value back if the
@@ -2864,7 +3041,12 @@ function mock(method, path, body) {
   ]};
   if (path.startsWith('/broker/admin/set')) return {ok:true};
   if (path.startsWith('/broker/admin/') && method==='DELETE') return {ok:true};
-  if (path==='/stats') return {total_users:1284, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
+  if (path==='/stats') return {total_users:1284, guest_users:37, guest_seats:4, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
+  if (path.startsWith('/guests')) return {admission_open:true, guest_users:37, guest_seats:4, days:30,
+    series:['guest_mint','guest_claim','guest_add_mint','guest_add_existing','guest_restricted','guest_settle','guest_swept_a','guest_swept_b','guest_swept_c'].map((name,k)=>{
+      const points = Array.from({length:30},(_,i)=>({date:new Date(Date.UTC(2026,7,17+i)).toISOString().slice(0,10), count:Math.max(0, Math.round((9-k)*Math.abs(Math.sin((i+k)/5)))-2)}));
+      return {name, points, total:points.reduce((a,p)=>a+p.count,0)};
+    })};
   if (path==='/presence/online-count') return {online:48};
   if (path.startsWith('/timeseries/signups')) return {points:Array.from({length:30},(_,i)=>{const d=new Date(Date.UTC(2026,4,14+i));return {date:d.toISOString().slice(0,10), count:Math.round(8+14*Math.abs(Math.sin(i/3))+ (i%5===0?10:0))}})};
   if (path.startsWith('/activity')) return [

@@ -169,6 +169,79 @@ _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY,
                  "out yourself \u2014 both arrive in the same field, and an invite "
                  "still works, so you can let somebody in without charging them.",
                  choices=("open", "invite", "paid")))
+
+
+def _default_guest_admission() -> str:
+    # A typo in the environment must not open anything. Anything but the three
+    # words reads as "auto", which is off everywhere except a paid, non-closed
+    # island, and there it is the published default anyway.
+    raw = os.environ.get("RCQ_GUEST_ADMISSION", "").strip().lower()
+    return raw if raw in ("auto", "on", "off") else "auto"
+
+
+# ── Guest copies (spec 2026-09-15, section 3.1) ───────────────────────────
+#
+# A guest is somebody whose account lives on another island and who holds a
+# seat in a room here without having come through the door. How these six
+# combine is `app/core/guest_policy.py admission_open()`; the restrictions a
+# guest lives under read the account row, never these settings.
+_reg(SettingSpec("guest_admission", "str", _default_guest_admission, "limits",
+                 "Guests from other islands",
+                 "Whether a person whose account lives on another island may "
+                 "take a seat in a room here without paying or bringing an "
+                 "invite. A guest takes part in the rooms they were let into "
+                 "and in nothing else: no contacts here, no calls, no numbers, "
+                 "no invites, no search, and no rooms of their own. "
+                 "“auto” admits guests only when registration is "
+                 "“paid” and the island is not closed. “on” "
+                 "admits them on an invite-only or closed island as well, so a "
+                 "company island never starts letting outsiders into its rooms "
+                 "because it updated. “off” admits no new guests and "
+                 "stops members adding people from other islands; guests who "
+                 "are already here keep their seats and their restrictions. An "
+                 "open island ignores this, because anyone may register there. "
+                 "⚠ “Refuse strangers entirely” on a closed island "
+                 "wins over “on”. Takes effect within seconds, which "
+                 "makes “off” the emergency brake. Self-hosted islands "
+                 "can set RCQ_GUEST_ADMISSION instead.",
+                 choices=("auto", "on", "off")))
+_reg(SettingSpec("guest_room_joins_per_day", "int", lambda: 200, "limits",
+                 "New guests per room per day",
+                 "How many people from other islands may enter one room in any "
+                 "24 hours, counting both joins by link and members adding "
+                 "them. The next one is told to try again tomorrow. Residents "
+                 "joining a room are never counted. Keep it low enough that a "
+                 "script cannot fill a room overnight.",
+                 min=1, max=100000))
+_reg(SettingSpec("guest_room_member_ceiling", "int", lambda: 3500, "limits",
+                 "Rooms this big take no guests",
+                 "A room with at least this many members takes no new guests. "
+                 "⚠ Capped at 4096 on purpose: a group post carries one "
+                 "sealed copy per member and this island refuses a post with "
+                 "more copies than that, so a room pushed past it would stop "
+                 "working for everybody in it, residents included.",
+                 min=2, max=4096))
+_reg(SettingSpec("guest_max_groups", "int", lambda: 50, "limits",
+                 "Rooms one guest may be in",
+                 "How many rooms on this island one guest copy may belong to. A "
+                 "seat nobody has claimed yet is held to three rooms whatever "
+                 "this says.",
+                 min=1, max=1000))
+_reg(SettingSpec("guest_added_ttl_days", "int", lambda: 7, "limits",
+                 "Days an unopened room invite waits",
+                 "When a member adds somebody from another island, a seat is "
+                 "kept for them until they open the invite. A seat nobody "
+                 "claimed in this many days is deleted, and leaves every room it "
+                 "was added to. No messages are kept for a seat before it is "
+                 "claimed.",
+                 min=1, max=90))
+_reg(SettingSpec("guest_idle_days", "int", lambda: 60, "limits",
+                 "Days before an idle guest is removed",
+                 "A guest copy that has not checked for messages in this many "
+                 "days is removed from its rooms and deleted. The person keeps "
+                 "their account at home; opening a room link again gives them a "
+                 "new guest copy.",
+                 min=14, max=3650))
 _reg(SettingSpec("resident_invites_total", "int", lambda: 5, "limits",
                  "Invites a resident may hand out",
                  "How many people one paying resident can bring in, in total, "
@@ -432,6 +505,18 @@ def _parse(spec: SettingSpec, raw: str) -> Any:
 class _Cache:
     rows: dict[str, str] = {}
     at: float = -1e9
+    #: True once the override rows have been read from the database at least
+    #: once in this worker. It never goes back to False: after a successful
+    #: read, a later DB blip serves the last-known rows, which are real
+    #: decisions an operator made. Before one, `rows` is an empty dict that
+    #: means "never looked", not "no overrides", and `get_strict` is how a
+    #: caller refuses to act on that difference.
+    loaded: bool = False
+
+
+class SettingsUnavailable(RuntimeError):
+    """The override rows have never been read in this worker, so the effective
+    value of a setting is unknown. Raised by `get_strict` only."""
 
 
 _cache = _Cache()
@@ -452,6 +537,7 @@ async def _overrides() -> dict[str, str]:
         return _cache.rows
     _cache.rows = {k: v for k, v in rows}
     _cache.at = now
+    _cache.loaded = True
     return _cache.rows
 
 
@@ -486,6 +572,24 @@ async def get(key: str) -> Any:
 
 async def get_bool(key: str) -> bool:
     return bool(await get(key))
+
+
+async def get_strict(key: str) -> Any:
+    """`get`, except that it refuses to guess on a worker that has never read
+    the override rows. Raises `SettingsUnavailable` in that window.
+
+    ⚠⚠ For decisions where the CODE default is the dangerous answer. `get` on
+    a cold worker whose database is unreachable returns the default, and for
+    `registration_policy` the default is "open": a guest settling as a
+    resident for free on a paid island because one worker booted during a DB
+    blip (spec 2026-09-15, 9.1). Everything that can be wrong for a few
+    seconds without harm keeps using `get`.
+    """
+    spec = REGISTRY[key]
+    ov = await _overrides()
+    if not _cache.loaded:
+        raise SettingsUnavailable(key)
+    return _parse(spec, ov[key]) if key in ov else spec.default()
 
 
 async def island_name() -> str:

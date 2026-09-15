@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select, update
 
-from app.core import metrics
+from app.core import guest_policy, metrics
 from app.core.config import log_identity
 from app.core.db import SessionLocal
 from app.core.rate_limit import allow_ws_connect
@@ -340,12 +340,32 @@ async def _clear_answered_mark(call_id: str) -> None:
     await redis.delete(f"{_ANSWERED_KEY_PREFIX}{call_id}")
 
 
+async def _guest_pair(a: int, b: int) -> bool:
+    """Is either end of a 1:1 frame a guest copy (spec 2026-09-15, 6.2)?
+
+    Fails CLOSED like `guest_policy.is_guest`, which raises only when neither
+    Redis nor the database can answer: the frame is dropped then. A typing dot
+    or a call leg lost during a total outage costs nothing that outage has not
+    already cost."""
+    try:
+        return await guest_policy.is_guest(a) or await guest_policy.is_guest(b)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 async def _caller_allowed(caller_uin: int, callee_uin: int) -> bool:
     """Does the CALLEE's `call_policy` let `caller_uin` ring them? This is the
     authoritative gate: the caller's own policy is irrelevant (it only governs
     who may call THEM). `everyone` → yes; `nobody` → no; `contacts` → only a
     mutual contact. Enforced server-side so a `nobody` policy holds no matter
-    what the caller's client shows."""
+    what the caller's client shows.
+
+    Also False when either side is a guest copy (spec 2026-09-15, 6.2):
+    calls are a relationship primitive the paid door sells, and a guest has
+    none here. The frame dispatcher refuses those pairs before this runs; this
+    is the floor under a future caller that forgets to."""
+    if await _guest_pair(caller_uin, callee_uin):
+        return False
     async with SessionLocal() as db:
         callee = await db.get(User, callee_uin)
         policy = (callee.call_policy if callee else None) or "everyone"
@@ -714,7 +734,10 @@ async def _handle_client_message(
         return healed
     if kind == "typing":
         target = int(msg.get("to_uin", 0))
-        if target:
+        # Not to or from a guest copy (spec 2026-09-15, 6.2): typing is a 1:1
+        # signal between people with a relationship here, and a guest has
+        # none. Dropped in silence, as an unknown kind is.
+        if target and not await _guest_pair(uin, target):
             await manager.send(target, {"type": "typing", "from_uin": uin, "active": bool(msg.get("active", True))})
         return healed
     # Call signalling — server is a dumb relay for SDP / ICE / hangups,
@@ -745,6 +768,17 @@ async def _handle_client_message(
         if not target:
             return healed
         call_id = str(msg.get("call_id", ""))
+
+        # ⚠⚠ Guest copies (spec 2026-09-15, 6.2). Every kind but the offer is
+        # relayed below with `sdp`, `candidate`, `media` and `reason` copied
+        # straight through, and nothing checks that a call was ever set up, so
+        # a guest allowed ANY of them would hold an open text channel to any
+        # number, and any number to it. Dropped in silence when either end is
+        # a guest. The offer goes on to `_caller_allowed`, which refuses guest
+        # pairs: a resident calling a copy sees the call end as `unavailable`
+        # at once, and nothing reaches the other end.
+        if kind != "call_offer" and await _guest_pair(uin, target):
+            return healed
 
         # Concurrency guard fires only on call_offer. Answer/ICE/end can't
         # establish a new pair on their own and are no-ops if the call

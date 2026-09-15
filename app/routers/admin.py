@@ -38,6 +38,7 @@ from app.models.report import Report
 from app.models.report_message import ReportMessage
 from app.models.group import Group, GroupMember
 from app.models.user import User, effective_status, grant_badge, revoke_badge
+from app.services import guest_accounts
 from app.services import island_logo, server_settings
 from app.services.apns import send_to_user as apns_send
 from app.services.unifiedpush import send_to_user as up_send
@@ -398,6 +399,14 @@ class UserSummary(BaseModel):
     # for a number that never moved, which is the same moment.
     created_at: datetime
     reports_against: int
+    # Guest copies (spec 2026-09-15, section 14). NULL for every native account;
+    # "proven" for a guest from another island, "added" for a seat a member put
+    # in a room that nobody has claimed yet. Additive, so an older panel keeps
+    # parsing. ⚠ Nothing here says which island a guest comes from or who
+    # added a seat: the island does not know, on purpose.
+    guest_status: str | None = None
+    # When the row became a seat or a guest. The sweeps count from it.
+    guest_since: datetime | None = None
 
 
 class UserSearchOut(BaseModel):
@@ -434,6 +443,11 @@ class GroupSummary(BaseModel):
     is_closed: bool = False
     badge: str | None = None
     created_at: datetime | None = None
+    # The owner's switch for people from other islands, and how many of the
+    # members are guest copies or unclaimed seats (spec 2026-09-15, section
+    # 14). Additive defaults, so an older panel keeps parsing.
+    allow_guests: bool = True
+    guest_count: int = 0
 
 
 class GroupSearchOut(BaseModel):
@@ -441,10 +455,22 @@ class GroupSearchOut(BaseModel):
 
 
 class StatsOut(BaseModel):
+    # ⚠ PEOPLE WHO LIVE HERE, since guest copies exist (spec 2026-09-15,
+    # section 14): `total_users`, `new_users_24h` and `new_users_7d` leave
+    # guest copies and unclaimed seats out, and so do the signups and DAU
+    # charts. A guest mint is not somebody coming through the door, and the
+    # door's numbers are how a paid island is judged: one busy open room would
+    # otherwise read as an island full of new people. The guests are counted
+    # beside them instead, so rows in the table = total_users + guest_users +
+    # guest_seats. `suspended_users` still counts every row.
     total_users: int
     suspended_users: int
     new_users_24h: int
     new_users_7d: int
+    # Guests from other islands whose key was proven, and seats members put in
+    # rooms that nobody has opened yet. Additive defaults for older panels.
+    guest_users: int = 0
+    guest_seats: int = 0
     # Human reports only — auto crash reports are counted in open_crashes
     # (additive default so older admin SPAs keep parsing).
     open_reports: int
@@ -905,21 +931,40 @@ async def get_report_evidence(
 
 @router.get("/users", response_model=UserSearchOut)
 async def search_users(
-    q: str = Query(..., min_length=1, max_length=64),
+    q: str | None = Query(None, min_length=1, max_length=64),
     limit: int = Query(20, le=100),
+    # Guest copies (spec 2026-09-15, section 14). The three kinds partition
+    # the table: `native` is every account that lives here, `guest` a proven
+    # guest from another island, `invited` a seat nobody has opened yet.
+    kind: str | None = Query(None, pattern="^(native|guest|invited)$"),
     db: AsyncSession = Depends(get_db),
 ) -> UserSearchOut:
-    """`q` matches uin (when digits) OR nickname (case-insensitive)."""
-    needle = q.strip()
+    """`q` matches uin (when digits) OR nickname (case-insensitive). `kind`
+    narrows to one kind of account, and may be given without `q` to list them
+    (newest first); at least one of the two is required, as `q` alone was."""
+    if q is None and kind is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "q or kind is required")
     query = select(User).limit(limit)
-    if needle.isdigit():
-        try:
-            uin_val = int(needle)
-            query = query.where(or_(User.uin == uin_val, User.nickname.ilike(f"%{needle}%")))
-        except ValueError:
+    if q is not None:
+        needle = q.strip()
+        if needle.isdigit():
+            try:
+                uin_val = int(needle)
+                query = query.where(or_(User.uin == uin_val, User.nickname.ilike(f"%{needle}%")))
+            except ValueError:
+                query = query.where(User.nickname.ilike(f"%{needle}%"))
+        else:
             query = query.where(User.nickname.ilike(f"%{needle}%"))
-    else:
-        query = query.where(User.nickname.ilike(f"%{needle}%"))
+    if kind == "native":
+        query = query.where(User.guest_status.is_(None))
+    elif kind == "guest":
+        query = query.where(User.guest_status == "proven")
+    elif kind == "invited":
+        query = query.where(User.guest_status == "added")
+    if q is None:
+        # A bare kind listing: the most recent first, which is what an
+        # operator looking at "who came in from outside" wants to see.
+        query = query.order_by(User.created_at.desc())
     users = (await db.execute(query)).scalars().all()
 
     out: list[UserSummary] = []
@@ -963,6 +1008,7 @@ async def set_user_badge(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    converted = False
     # ⚠ Add or take away, never overwrite. Setting the column directly meant
     # granting a second mark silently destroyed the first, and the person had
     # no way back to it (founder, 07.09).
@@ -980,6 +1026,12 @@ async def set_user_badge(
         # gives money back.
         if body.badge == "resident" and user.resident_since is None:
             user.resident_since = datetime.now(timezone.utc)
+        # The same direction for a guest copy (spec 2026-09-15, 9.4): an
+        # operator marking somebody a resident is letting them live here, and
+        # a "resident" still restricted to rooms would be the mark without the
+        # meaning again.
+        if body.badge == "resident":
+            converted = guest_accounts.clear_guest_columns(user)
     else:
         # A bare "clear" takes away whatever is on display, which is what the
         # console's empty picker has always meant.
@@ -987,6 +1039,8 @@ async def set_user_badge(
             revoke_badge(user, user.badge)
     await db.commit()
     await db.refresh(user)
+    if converted:
+        await guest_accounts.after_conversion(db, uin)
     admin = getattr(request.state, "admin", None) or "admin"
     log.info("badge %r on user %s by %s", body.badge, uin, admin)
     from app.routers.users import _announce_rename
@@ -995,6 +1049,158 @@ async def set_user_badge(
     # be the thing that shows it.
     await _announce_rename(db, uin, user.nickname, badge=None if user.badge_hidden else user.badge)
     return await _summarize(db, user)
+
+
+@router.post("/users/{uin}/settle", response_model=UserSummary)
+async def settle_user(uin: int, request: Request, db: AsyncSession = Depends(get_db)) -> UserSummary:
+    """"Make resident" for a guest copy (spec 2026-09-15, 9.4): the operator
+    lets this person live here without a voucher or an invite.
+
+    Clears the guest columns on the SAME row, so the number, the rooms and the
+    person's recovery all stay where they are. Nothing else changes:
+    `resident_since` and the resident mark still mean "paid", and an operator
+    who wants to record that uses the badge picker, which converts too.
+
+    409 `not_a_guest` for a native account, so a double click in the console
+    reads as "already done" instead of silently succeeding twice.
+    """
+    user = await db.get(User, uin)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    if user.guest_status is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_a_guest"})
+    guest_accounts.clear_guest_columns(user)
+    await db.commit()
+    await db.refresh(user)
+    await guest_accounts.after_conversion(db, uin)
+    admin = getattr(request.state, "admin", None) or "admin"
+    log.info("guest copy %s made native by %s", uin, admin)
+    return await _summarize(db, user)
+
+
+@router.delete("/users/{uin}/guest")
+async def delete_guest_copy(uin: int, request: Request, db: AsyncSession = Depends(get_db)) -> dict:
+    """"Delete guest copy" (spec 2026-09-15, section 14): remove a guest or an
+    unclaimed seat the way a burn removes an account (`purge_account`), and
+    tell the rooms it was in.
+
+    ⚠ GUEST ROWS ONLY, by construction: a native account is 409 `not_a_guest`
+    and nothing is touched. The console has a ban for residents; deleting a
+    person who lives here is not an operator button on this route.
+
+    The check runs with the row locked, so a guest who settles in the same
+    moment is either converted first (and refused here) or deleted first (and
+    their settle fails), never deleted as a resident. No `account_burned`
+    frame: the person did not burn anything, and their client must not wipe an
+    identity whose home is alive. The epoch bump still ends the copy's
+    sessions.
+    """
+    from app.services.account_delete import announce_rooms_after_purge, purge_account
+
+    user = await db.scalar(select(User).where(User.uin == uin).with_for_update())
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    if user.guest_status is None:
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_a_guest"})
+    result = await purge_account(db, uin, "guest_deleted_by_operator", announce_burn=False)
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    await announce_rooms_after_purge(db, result.member_rooms)
+    admin = getattr(request.state, "admin", None) or "admin"
+    log.info("guest copy %s deleted by %s", uin, admin)
+    return {"deleted": True, "uin": uin}
+
+
+class GuestDayPoint(BaseModel):
+    # The same shape as the charts' `DayPoint`, declared here because that
+    # class is defined further down this module and a route's response model
+    # has to be complete when the route is registered.
+    date: str
+    count: int
+
+
+class GuestSeriesOut(BaseModel):
+    #: The counter, as in `stat:<name>:<YYYYMMDD>`.
+    name: str
+    #: One point per UTC day, oldest first, zeros where nothing was counted.
+    points: list[GuestDayPoint]
+    total: int
+
+
+class GuestsOverviewOut(BaseModel):
+    #: What `/server/info` says as `guest_accounts_v1` right now.
+    admission_open: bool
+    guest_users: int
+    guest_seats: int
+    days: int
+    series: list[GuestSeriesOut]
+
+
+#: The daily guest counters an operator can read (spec 2026-09-15, 14). All of
+#: them are `guest_policy.bump_stat` names; none carries a uin.
+GUEST_COUNTERS = (
+    "guest_mint",
+    "guest_claim",
+    "guest_add_mint",
+    "guest_add_existing",
+    "guest_restricted",
+    "guest_settle",
+    "guest_swept_a",
+    "guest_swept_b",
+    "guest_swept_c",
+    "guest_host_from_header",
+)
+
+
+@router.get("/guests", response_model=GuestsOverviewOut)
+async def guests_overview(
+    days: int = Query(30, ge=1, le=40),
+    db: AsyncSession = Depends(get_db),
+) -> GuestsOverviewOut:
+    """Guests from other islands at a glance: whether this island admits new
+    ones, how many there are, and the daily counters of what happened to them
+    (spec 2026-09-15, section 14).
+
+    Counts only. ⚠ Nothing here, or anywhere, records who added whom or which
+    island a guest comes from, and the counters are keyed by day, never by
+    account. `days` stops at 40 because that is how long the counters live
+    (`guest_policy.STAT_TTL_SECONDS`).
+    """
+    from app.core import guest_policy
+    from app.core.redis import get_redis
+
+    counts = {
+        status_: int(n)
+        for status_, n in (
+            await db.execute(
+                select(User.guest_status, func.count(User.uin))
+                .where(User.guest_status.is_not(None))
+                .group_by(User.guest_status)
+            )
+        ).all()
+    }
+    today = datetime.now(timezone.utc).date()
+    dates = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    values: list = []
+    try:
+        redis = await get_redis()
+        keys = [f"stat:{name}:{d:%Y%m%d}" for name in GUEST_COUNTERS for d in dates]
+        values = await redis.mget(keys)
+    except Exception:  # noqa: BLE001 - counters are telemetry; show zeros
+        values = []
+    series: list[GuestSeriesOut] = []
+    for i, name in enumerate(GUEST_COUNTERS):
+        chunk = values[i * days:(i + 1) * days] if values else [None] * days
+        points = [GuestDayPoint(date=d.isoformat(), count=int(v or 0)) for d, v in zip(dates, chunk)]
+        series.append(GuestSeriesOut(name=name, points=points, total=sum(p.count for p in points)))
+    return GuestsOverviewOut(
+        admission_open=await guest_policy.admission_open(),
+        guest_users=counts.get("proven", 0),
+        guest_seats=counts.get("added", 0),
+        days=days,
+        series=series,
+    )
 
 
 @router.get("/badges")
@@ -1015,6 +1221,13 @@ async def _group_summary(db: AsyncSession, g: Group) -> GroupSummary:
         select(func.count(GroupMember.id)).where(GroupMember.group_id == g.id)
     ) or 0
     owner = await db.get(User, g.owner_uin)
+    # Members that are guest copies or unclaimed seats. Read from the rows,
+    # like the roster's `guest` flag, never from the guest cache.
+    guest_count = await db.scalar(
+        select(func.count(GroupMember.id))
+        .join(User, User.uin == GroupMember.uin)
+        .where(GroupMember.group_id == g.id, User.guest_status.is_not(None))
+    ) or 0
     return GroupSummary(
         id=g.id,
         name=g.name,
@@ -1025,6 +1238,9 @@ async def _group_summary(db: AsyncSession, g: Group) -> GroupSummary:
         is_closed=bool(getattr(g, "is_closed", False)),
         badge=g.badge,
         created_at=getattr(g, "created_at", None),
+        # `is not False`: a NULL column means True (models/group.py).
+        allow_guests=g.allow_guests is not False,
+        guest_count=int(guest_count),
     )
 
 
@@ -1090,6 +1306,8 @@ async def _summarize(db: AsyncSession, user: User) -> UserSummary:
         last_seen=user.last_seen,
         created_at=user.identity_created_at or user.created_at,
         reports_against=int(reports_against),
+        guest_status=user.guest_status,
+        guest_since=user.guest_since,
     )
 
 
@@ -1345,15 +1563,25 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
     day_ago = now - timedelta(days=1)
     week_ago = now - timedelta(days=7)
 
-    total_users = await db.scalar(select(func.count(User.uin))) or 0
+    # Residents, guests and seats, from one grouped read (see StatsOut for why
+    # the headline numbers leave guests out).
+    by_kind = {
+        status_: int(n)
+        for status_, n in (
+            await db.execute(select(User.guest_status, func.count(User.uin)).group_by(User.guest_status))
+        ).all()
+    }
+    total_users = by_kind.get(None, 0)
+    guest_users = by_kind.get("proven", 0)
+    guest_seats = by_kind.get("added", 0)
     suspended_users = await db.scalar(
         select(func.count(User.uin)).where(User.is_suspended == True)  # noqa: E712
     ) or 0
     new_users_24h = await db.scalar(
-        select(func.count(User.uin)).where(User.created_at >= day_ago)
+        select(func.count(User.uin)).where(User.created_at >= day_ago, User.guest_status.is_(None))
     ) or 0
     new_users_7d = await db.scalar(
-        select(func.count(User.uin)).where(User.created_at >= week_ago)
+        select(func.count(User.uin)).where(User.created_at >= week_ago, User.guest_status.is_(None))
     ) or 0
     open_crashes = await db.scalar(
         select(func.count(Report.id)).where(
@@ -1439,6 +1667,8 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
         pools_needing_nodes=int(pools_needing_nodes),
         pools_dark=int(pools_dark),
         total_users=int(total_users),
+        guest_users=int(guest_users),
+        guest_seats=int(guest_seats),
         suspended_users=int(suspended_users),
         new_users_24h=int(new_users_24h),
         new_users_7d=int(new_users_7d),
@@ -1481,6 +1711,8 @@ async def signups_timeseries(
             func.count(User.uin).label("c"),
         )
         .where(User.created_at >= start)
+        # People coming through the door, not guest copies (StatsOut).
+        .where(User.guest_status.is_(None))
         .group_by("d")
         .order_by("d")
     )).all()
@@ -1513,6 +1745,9 @@ async def dau_timeseries(
             func.count(User.uin).label("c"),
         )
         .where(User.last_seen >= start)
+        # A polling guest copy is stamped an hour ago (spec 2026-09-15, 8.3),
+        # which would count every guest as active every day it polls.
+        .where(User.guest_status.is_(None))
         .group_by("d")
         .order_by("d")
     )).all()
@@ -1535,6 +1770,9 @@ class HourPoint(BaseModel):
     ws: int
     call: int
     online_max: int
+    # Guest copies minted by self-join (activity_rollup FIELDS). Kept out of
+    # `reg`, which is people coming through the door. Additive default.
+    guest: int = 0
 
 
 class ActivityHourlyOut(BaseModel):

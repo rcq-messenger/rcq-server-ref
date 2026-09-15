@@ -6,6 +6,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_uin
 from app.models.contact import Contact
 from app.models.group import GroupMember
@@ -61,6 +62,7 @@ class StatusIn(BaseModel):
 
 
 @router.post("/status")
+@guest(ALLOW)
 async def set_status(
     body: StatusIn,
     uin: int = Depends(current_uin),

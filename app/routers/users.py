@@ -16,6 +16,8 @@ from app.models.contact import Contact
 from app.models.group import GroupMember
 from app.core.db import get_db
 from app.core.rate_limit import enforce_cost_budget, rate_limit
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
@@ -128,6 +130,13 @@ class PublicUser(BaseModel):
     #: null on a row older than the column (models/user.py). Null for third
     #: parties.
     entered_via: str | None = None
+    #: This account is a guest copy from another island (spec 2026-09-15,
+    #: 2.3): a proven guest or an unclaimed seat. Filled for the owner's own
+    #: view and for somebody who shares a room with the account, because a
+    #: room roster already tells them the same thing; False for everybody else,
+    #: so the card of a stranger does not become a way to learn who here is a
+    #: guest. Never names an island.
+    guest: bool = False
     # Owner-only mirror of "wear my mark where others can see it". A bool
     # rather than the tri-state the fields around it use: the mark rides in
     # list rows and rosters that are built once for many viewers, so
@@ -272,6 +281,7 @@ class PublicUser(BaseModel):
             badges_earned=(earned_badges(u) if owner_self else []),
             resident_since=(u.resident_since if owner_self else None),
             entered_via=(u.entered_via if owner_self else None),
+            guest=(u.guest_status is not None) if (owner_self or shares_group) else False,
             last_seen_visibility=(u.last_seen_visibility if owner_self else None),
             gender_visibility=(u.gender_visibility if owner_self else None),
             profile_visibility=(u.profile_visibility if owner_self else None),
@@ -464,12 +474,18 @@ class ProfileUpdate(BaseModel):
     # for human use.
     dependencies=[Depends(rate_limit("users_search", 60, 60))],
 )
+@guest(RULE)
 async def search(
     q: str = Query(min_length=1),
     limit: int = Query(20, le=100),
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> list[PublicUser]:
+    # A guest copy gets an empty directory (spec 2026-09-15, 6.2). Being found
+    # is what the door sells, and shipped clients call this from a copy signed
+    # in as an account, so an empty list rather than a 403 they would surface.
+    if await guest_policy.is_guest(me):
+        return []
     raw = q.strip()
     like = f"%{raw.lower()}%"
     # Search matches a NAME or a number, which is what the clients promise in
@@ -589,6 +605,10 @@ async def search(
             .where(clause)
             .where(User.uin != me)
             .where(User.is_suspended.is_(False))
+            # Nor guest copies, whoever asks: a copy is somebody who lives on
+            # another island and sits in a room here, not a directory entry
+            # (spec 2026-09-15, 6.2).
+            .where(User.guest_status.is_(None))
             .order_by(rank, contact_last, func.lower(User.nickname), User.uin)
             .limit(limit)
         )
@@ -747,6 +767,7 @@ class LookupOut(BaseModel):
     # (metadata-map-2026-08-22 §1.1). `bucket_name` HMACs even this.
     dependencies=[Depends(rate_limit("users_lookup", 120, 3600))],
 )
+@guest(RULE)
 async def lookup(
     body: LookupIn,
     me: int = Depends(current_uin),
@@ -828,6 +849,11 @@ async def lookup(
     keeps snapshots. That is a real residue and it is smaller than the table
     it replaces, not zero.
     """
+    # A guest copy has no contact list here to resolve (spec 2026-09-15, 6.2),
+    # and the rows would be a directory read by the batch. Empty rather than
+    # 403, for the same reason as `/users/search`.
+    if await guest_policy.is_guest(me):
+        return LookupOut(users=[])
     # De-duplicated, self dropped (the caller has `/users/me` and the
     # owner-self view differs on every gate), non-positive dropped.
     wanted = {u for u in body.uins if u > 0 and u != me}
@@ -929,6 +955,7 @@ async def lookup(
     # into something that needs many accounts, which registration limits price.
     dependencies=[Depends(rate_limit("users_info", 180, 60))],
 )
+@guest(RULE)
 async def info(
     uin: int,
     request: Request,
@@ -950,7 +977,19 @@ async def info(
     #   * a resident asking about ONE named number passes (services/door.py
     #     explains why that is safe only because discovery lists are stripped),
     #     and a stranger passes only with a card the target handed out.
-    if not await door.may_fetch_key(
+    #
+    # A GUEST caller (spec 2026-09-15, 6.2) is judged by the one relationship
+    # the island can see instead: itself, or somebody it shares a room with,
+    # whose card that room's roster already shows it. Anybody else is the same
+    # 404 as a number that does not exist, on an open island too, so a free
+    # guest token is not a way to walk the numbers. It does not go through the
+    # door, because the door would refuse a co-member on a closed island (a
+    # guest is not a resident there, services/door.py) and a shared room is
+    # exactly what is allowed to read this card.
+    if await guest_policy.is_guest(me):
+        if me != user.uin and not await guest_policy.shares_room(db, me, user.uin):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    elif not await door.may_fetch_key(
         db, target_uin=uin, caller_uin=me, card=door.card_from(request)
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -1018,6 +1057,7 @@ async def _announce_rename(
 
 
 @router.put("/me", response_model=PublicUser)
+@guest(RULE)
 async def update_me(
     body: ProfileUpdate,
     uin: int = Depends(current_uin),
@@ -1027,6 +1067,14 @@ async def update_me(
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
     data = body.model_dump(exclude_unset=True)
+    if user.guest_status is not None:
+        # A guest copy is never on this island's Hall of Fame (spec 2026-09-15,
+        # 6.2). DROPPED, not refused: shipped clients PUT the whole profile
+        # body, and a 403 would also lose the nickname, which is the one field
+        # a copy exists to keep in step with its home (#985). Read from the
+        # row this handler already holds.
+        data.pop("hof_opt_in", None)
+        data.pop("hof_avatar", None)
     if "interests" in data and data["interests"] is not None:
         data["interests"] = ",".join(data["interests"])
     if "last_seen_visibility" in data:
@@ -1144,6 +1192,7 @@ class PushTokenIn(BaseModel):
 
 
 @router.post("/me/push-token", status_code=status.HTTP_204_NO_CONTENT)
+@guest(RULE)
 async def register_push_token(
     body: PushTokenIn,
     uin: int = Depends(current_uin),
@@ -1167,6 +1216,12 @@ async def register_push_token(
             status.HTTP_400_BAD_REQUEST,
             {"code": "token_too_long", "max": MAX_PUSH_TOKEN_LEN, "got": len(body.token)},
         )
+    # A guest mailbox never wakes a phone (spec 2026-09-15, 6.2): being
+    # reachable is what the door sells. 204 and NOTHING stored, because shipped
+    # clients register on every launch from a copy signed in as an account and
+    # would retry an error forever.
+    if await guest_policy.is_guest(uin):
+        return None
     now = datetime.now(timezone.utc)
     device_id = (body.device_id or "").strip() or None
     # Upsert on the existing (uin, token) constraint either way — an app
@@ -1249,6 +1304,7 @@ class PushHealthOut(BaseModel):
 
 
 @router.get("/me/push-health", response_model=PushHealthOut)
+@guest(ALLOW)
 async def push_health(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -1282,6 +1338,7 @@ async def push_health(
 
 
 @router.delete("/me/push-token", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def delete_push_token(
     body: PushTokenIn,
     uin: int = Depends(current_uin),
@@ -1316,6 +1373,7 @@ class CapabilitiesIn(BaseModel):
 
 
 @router.post("/me/capabilities", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def set_capabilities(
     body: CapabilitiesIn,
     uin: int = Depends(current_uin),
@@ -1379,6 +1437,7 @@ def _hydrate_push_prefs(prefs: dict | None) -> PushPreferencesOut:
 
 
 @router.get("/me/push-preferences", response_model=PushPreferencesOut)
+@guest(ALLOW)
 async def get_push_preferences(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -1390,6 +1449,7 @@ async def get_push_preferences(
 
 
 @router.put("/me/push-preferences", response_model=PushPreferencesOut)
+@guest(ALLOW)
 async def set_push_preferences(
     body: PushPreferencesIn,
     uin: int = Depends(current_uin),

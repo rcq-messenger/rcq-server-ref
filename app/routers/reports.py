@@ -41,12 +41,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import enforce_rate_limit, rate_limit
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import current_uin
 from app.models.report import Report
 from app.models.report_message import ReportMessage
 from app.services import server_settings
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+#: Reports a guest copy may file per day (spec 2026-09-15, section 13), on top
+#: of the hourly budget everybody has. A guest costs nothing to make, and the
+#: budget fails CLOSED: an abuse queue that opens to free accounts whenever
+#: Redis blinks is a harassment tool.
+GUEST_REPORTS_PER_DAY = 5
+
+
+async def _guest_report_budget(uin: int) -> None:
+    """Spend one of a guest's daily reports, or 429. Residents pay nothing."""
+    if await guest_policy.is_guest(uin):
+        await enforce_rate_limit(
+            f"uin:{uin}", "guest_report", GUEST_REPORTS_PER_DAY, 86400, fail_closed=True
+        )
 
 
 async def require_reports_open() -> None:
@@ -198,6 +214,7 @@ class CreateReportOut(BaseModel):
     # BUG_REPORTS_PER_HOUR.
     dependencies=[Depends(require_reports_open)],
 )
+@guest(RULE)
 async def create_report(
     body: CreateReportIn,
     uin: int = Depends(current_uin),
@@ -218,6 +235,7 @@ async def create_report(
         BUG_REPORTS_PER_HOUR if is_bug_report else ABUSE_REPORTS_PER_HOUR,
         3600,
     )
+    await _guest_report_budget(uin)
     # Self-target is rejected for normal abuse reports (no meaningful
     # action an admin can take) but PERMITTED for bug-bounty
     # submissions, which ride this same endpoint with `context =
@@ -288,6 +306,7 @@ async def create_report(
         Depends(rate_limit("reports_create", ABUSE_REPORTS_PER_HOUR, 3600)),
     ],
 )
+@guest(RULE)
 async def create_report_with_evidence(
     target_uin: int = Form(...),
     reason: str = Form(...),
@@ -307,6 +326,7 @@ async def create_report_with_evidence(
     with admin-only access; never re-encrypts (the whole point is
     that the moderator can read it).
     """
+    await _guest_report_budget(uin)
     if target_uin == uin:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot report yourself")
     if not consent_acknowledged:
@@ -520,6 +540,7 @@ class AddTurnIn(BaseModel):
 
 
 @router.get("/mine", response_model=list[MyReportOut])
+@guest(ALLOW)
 async def my_reports(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -560,6 +581,7 @@ async def my_reports(
     # log line you forgot, not enough to turn the queue into a chat room.
     dependencies=[Depends(rate_limit("report_reply", 20, 3600))],
 )
+@guest(ALLOW)
 async def add_to_my_report(
     report_id: int,
     body: AddTurnIn,
@@ -600,6 +622,7 @@ async def add_to_my_report(
 
 
 @router.delete("/mine/{report_id}", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def delete_my_report(
     report_id: int,
     uin: int = Depends(current_uin),
@@ -683,6 +706,7 @@ class EditReportIn(BaseModel):
     # normal, rewriting it in a loop is a client bug.
     dependencies=[Depends(rate_limit("report_edit", 20, 3600))],
 )
+@guest(ALLOW)
 async def edit_my_report(
     report_id: int,
     body: EditReportIn,

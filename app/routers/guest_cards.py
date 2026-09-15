@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_uin
 from app.models.guest_card import GuestCard
 
@@ -111,6 +112,7 @@ async def add_card(
 
 
 @router.get("", response_model=list[CardOut])
+@guest(ALLOW)
 async def list_cards(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -132,6 +134,7 @@ async def list_cards(
 # happened the first time this was written.
 @router.delete("/{card_hash}", status_code=status.HTTP_204_NO_CONTENT,
                response_model=None)
+@guest(ALLOW)
 async def revoke_card(
     card_hash: str,
     uin: int = Depends(current_uin),

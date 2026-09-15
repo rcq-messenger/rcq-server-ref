@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_uin, require_admin
 from app.models.site import Site
 
@@ -204,6 +205,7 @@ def _out(s: Site, *, public: bool = False) -> SiteOut:
 
 
 @router.get("/mine", response_model=list[SiteOut])
+@guest(ALLOW)
 async def my_sites(
     me: int = Depends(current_uin), db: AsyncSession = Depends(get_db)
 ) -> list[SiteOut]:
@@ -490,6 +492,7 @@ async def catalogue(db: AsyncSession = Depends(get_db)) -> list[SiteOut]:
 
 
 @router.delete("/{name}")
+@guest(ALLOW)
 async def delete_site(
     name: str, me: int = Depends(current_uin), db: AsyncSession = Depends(get_db)
 ) -> dict:

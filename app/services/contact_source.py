@@ -194,6 +194,25 @@ async def add_edges(db: AsyncSession, a: int, b: int) -> bool:
         return False
     if await edges_frozen(db, a, b):
         return False
+    # ⚠ Defence in depth for guest copies (spec 2026-09-15, 6.2). Every route
+    # that writes edges refuses a guest caller already; this is the floor under
+    # a route somebody adds later. A contact edge is exactly what the paid door
+    # sells, so a guest on either side writes nothing. Read from the rows, not
+    # the guest cache: this runs inside a transaction that is about to write.
+    from app.models.user import User  # local: models import services lazily too
+
+    guests = await db.scalar(
+        select(User.uin)
+        .where(User.uin.in_((a, b)), User.guest_status.is_not(None))
+        .limit(1)
+    )
+    if guests is not None:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[contacts] edge with a guest copy refused; a route let a guest through"
+        )
+        return False
     for owner, contact in ((a, b), (b, a)):
         exists = await db.scalar(
             select(Contact.id).where(

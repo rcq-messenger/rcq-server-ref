@@ -131,7 +131,15 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
     # How this account got in: "voucher" (paid at the door), "invite" (an
-    # invite row was consumed), "open" (walked in while the door was open).
+    # invite row was consumed), "open" (walked in while the door was open),
+    # "guest" (a guest copy minted for a room, spec 2026-09-15; see
+    # `guest_status` below).
+    #
+    # "guest" is HISTORY, like the other three: it is written at mint and never
+    # rewritten, not even when the guest later settles as a resident. Nothing
+    # needs a special case for it. The free invite drip requires this column to
+    # be NULL and the paid drip requires `resident_since`, so a guest gets
+    # neither by construction.
     #
     # ⚠⚠ NULL MEANS "BEFORE THIS COLUMN EXISTED", and that is the
     # whole point of it. The free invite drip (routers/invites.py) is for the
@@ -143,6 +151,47 @@ class User(Base):
     # existing rows would make every one of them look like a fresh walk-in and
     # cost exactly the people the drip exists for.
     entered_via: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: NULL = native account (every row older than this column, and every
+    #: registration through the door). "added" = a member of a room here put
+    #: these PUBLIC keys in the room; nobody has proven the private key; no
+    #: token exists. "proven" = a guest whose key was proven (POST /auth/guest,
+    #: or a recover or refresh that claimed an "added" row). Guests take part in
+    #: rooms and nothing else: app/core/guest_policy.py. Set at INSERT or claim;
+    #: cleared only by a conversion to resident. Never set on an existing
+    #: native row.
+    #:
+    #: ⚠ The restrictions read THIS column (through the guest cache), never the
+    #: `guest_admission` setting. Turning admission off stops new guests; it
+    #: does not turn existing guests into residents.
+    guest_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: When the row became a seat or a guest (mint, or claim of an "added"
+    #: row). The sweeps read it. `created_at` is a fact about the number, and a
+    #: seat claimed a week after it was minted became a guest on the day of the
+    #: claim.
+    guest_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: Set by `/auth/reissue` when it moves a GUEST row onto a different signing
+    #: key. Cleared by the first request that proves the private half of the
+    #: row's current key (recover, refresh, `/auth/guest`, a door registration),
+    #: and that clearing bumps the uin epoch: see
+    #: `guest_accounts.retire_bearers_before_proof`.
+    #:
+    #: ⚠⚠ WHY IT EXISTS (review 2026-09-15). A reissue proves the bearer and at
+    #: most the OLD key, never the new one. So a free guest copy could be
+    #: rotated onto anybody's public signing key, which their home card hands
+    #: out. When that person later proved the key here, they were handed the
+    #: rotator's row while the rotator's bearers stayed valid, and a paid
+    #: registration even converted the row into a resident the rotator was
+    #: still signed into. This column tells "arrived by rotation, nobody has
+    #: proven it since" from every other row, so the first proof kills every
+    #: bearer minted before it, exactly once. The permanent rotation marker
+    #: (`retired_signing_keys`) cannot say "once": an honest rotated copy would
+    #: be refused, or logged out, at every proof for ever.
+    #:
+    #: Guest rows only. A native row on an open island has the same shape of
+    #: problem and predates this change; see the reissue comment.
+    key_unproven_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # How many invites this resident has ever minted. MONOTONE: it counts up
     # and is never decremented, not even when an invite is revoked or expires.
     #

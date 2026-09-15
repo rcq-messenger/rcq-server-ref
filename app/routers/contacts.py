@@ -44,6 +44,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit
+from app.core import guest_policy
+from app.core.guest_policy import ALLOW, RULE, guest
 from app.core.security import current_uin
 from app.models.contact import Contact, ContactRequest
 from app.models.user import (
@@ -135,6 +137,7 @@ class RespondIn(BaseModel):
 
 
 @router.get("", response_model=list[ContactRow])
+@guest(ALLOW)
 async def list_contacts(
     request: Request,
     uin: int = Depends(current_uin),
@@ -422,6 +425,7 @@ async def send_request(
     # gone wrong from turning a JOIN on `users` into the island's hot path.
     dependencies=[Depends(rate_limit("contact_pending", 120, 60))],
 )
+@guest(ALLOW)
 async def pending(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -440,6 +444,7 @@ async def pending(
 
 
 @router.get("/outgoing", response_model=list[OutgoingRow])
+@guest(ALLOW)
 async def outgoing(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -470,6 +475,7 @@ async def outgoing(
 
 
 @router.delete("/outgoing/{to_uin}", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def cancel_outgoing(
     to_uin: int,
     uin: int = Depends(current_uin),
@@ -500,11 +506,19 @@ async def cancel_outgoing(
 
 
 @router.post("/respond")
+@guest(RULE)
 async def respond(
     body: RespondIn,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    if body.accept:
+        # A guest copy declines, never accepts (spec 2026-09-15, 6.2). Accept
+        # writes the two contact rows below, a relationship on THIS island,
+        # which is what the door sells. Decline writes nothing but the answer:
+        # residents may still ask a copy (F1), and the person answers from
+        # home over §5f.
+        await guest_policy.refuse_guest(uin)
     req = await db.get(ContactRequest, body.request_id)
     if req is None or req.to_uin != uin:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such request")
@@ -571,6 +585,7 @@ async def respond(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(rate_limit("contact_pending_withdraw", 60, 3600))],
 )
+@guest(ALLOW)
 async def withdraw_pending(
     request_id: int,
     uin: int = Depends(current_uin),
@@ -609,6 +624,7 @@ async def withdraw_pending(
 
 
 @router.delete("/{contact_uin}", status_code=status.HTTP_204_NO_CONTENT)
+@guest(ALLOW)
 async def remove_contact(
     contact_uin: int,
     uin: int = Depends(current_uin),
@@ -659,6 +675,7 @@ async def remove_contact(
 
 
 @router.post("/{contact_uin}/block")
+@guest(ALLOW)
 async def block_contact(
     contact_uin: int,
     uin: int = Depends(current_uin),

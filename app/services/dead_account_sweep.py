@@ -82,6 +82,11 @@ _CANDIDATES = text("""
     FROM users u
     WHERE u.created_at < :cutoff
       AND u.resident_since IS NULL
+      -- Guest copies and unclaimed seats belong to guest_sweep, which knows
+      -- their lifetimes (spec 2026-09-15, 6.3). A seat is minted with a long
+      -- backdated last_seen, so the "never came back" test below would read
+      -- every one of them as dead on its first day.
+      AND u.guest_status IS NULL
       AND u.nickname LIKE 'user-%'
       AND u.avatar_media_id IS NULL
       AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.uin = u.uin)

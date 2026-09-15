@@ -107,7 +107,16 @@ def strip_keys_from_discovery(closed: bool) -> bool:
 async def _is_resident(db: AsyncSession, uin: int | None) -> bool:
     if uin is None:
         return False
-    return await db.scalar(select(User.uin).where(User.uin == uin)) is not None
+    # A guest copy is NOT a resident here (spec 2026-09-15, 6.3). It holds a
+    # session, so without this line every point lookup on a closed island would
+    # open to anybody who self-joined one open room: a free token would walk
+    # the numbers one request at a time, which is the directory this door
+    # exists to refuse. Read from the row, not the guest cache, because this is
+    # already a database read and a guest mark must never be the only thing
+    # standing between a stranger and a resident's key.
+    return await db.scalar(
+        select(User.uin).where(User.uin == uin, User.guest_status.is_(None))
+    ) is not None
 
 
 async def redeem_card(db: AsyncSession, *, target_uin: int, raw: str | None) -> bool:

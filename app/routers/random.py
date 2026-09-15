@@ -45,6 +45,7 @@ from app.core.redis import (
     get_redis,
     renew_leadership,
 )
+from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_uin
 from app.models.contact import Contact
 from app.models.user import User
@@ -371,6 +372,7 @@ async def queue(
 
 
 @router.post("/leave", response_model=LeaveOut)
+@guest(ALLOW)
 async def leave(uin: int = Depends(current_uin)) -> LeaveOut:
     """Cancel queueing OR end the active pair (whichever applies). Notifies
     the peer with `random_end` so their UI can fade out cleanly."""

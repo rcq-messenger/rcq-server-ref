@@ -252,6 +252,12 @@ async def current_uin(
     # So the metrics middleware can count distinct accounts and boot chains
     # without decoding a second token of its own. Nothing else reads this.
     request.state.uin = uin
+    # Guest copies (spec 2026-09-15, 6.1): a route without an ALLOW or RULE
+    # marker is closed to them. Here and not in `authorize_session`, because
+    # the WebSocket authorizes with that too and has its own frame rules.
+    from app.core import guest_policy
+
+    await guest_policy.enforce(request, uin)
     return uin
 
 
@@ -424,6 +430,7 @@ async def current_device_id(creds: HTTPAuthorizationCredentials = Depends(_beare
 
 
 async def current_uin_optional(
+    request: Request,
     creds: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> int | None:
     """Like `current_uin` but lets through anonymous callers.
@@ -441,9 +448,18 @@ async def current_uin_optional(
         # other things, and a revoked device passing as the owner there would
         # be the revocation meaning nothing again. A token that fails simply
         # reads as anonymous, which is what every caller already handles.
-        return await authorize_session(creds.credentials)
+        uin = await authorize_session(creds.credentials)
     except HTTPException:
         return None
+    # ⚠ OUTSIDE the try on purpose. A guest session on a route closed to
+    # guests is REFUSED, not quietly downgraded to anonymous: an anonymous
+    # caller is still somebody on several of these routes (a key fetch with a
+    # card, a group post), and "your token was ignored" would read as success
+    # to a client that should be showing the restricted sentence.
+    from app.core import guest_policy
+
+    await guest_policy.enforce(request, uin)
+    return uin
 
 
 def require_admin(creds: HTTPBasicCredentials = Depends(_basic)) -> str:
