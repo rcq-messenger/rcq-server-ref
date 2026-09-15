@@ -804,6 +804,10 @@ const EN = {
   'rel.err_broker': '{err} — the broker may be disabled on this island.',
   'rel.prune_confirm': 'Remove {n} relay(s) that are not answering?',
   'rel.remove_confirm': 'Remove relay {tag}?',
+  'rel.pool': 'pool {pool}',
+  'rel.tenant': 'tenant',
+  'rel.paid_hint': 'Served only to keys of this pool or tenant, never in the public answer',
+  'rel.remove_paid_confirm': 'Remove relay {tag}? It serves paying customers ({who}) and they lose this node at once.',
 
   'fea.note': '',
   'fea.g.features': 'Features',
@@ -1129,6 +1133,10 @@ const I18N = {
   'rel.err_broker': '{err}. Возможно, брокер на этом острове выключен.',
   'rel.prune_confirm': 'Убрать релеи, которые не отвечают ({n})?',
   'rel.remove_confirm': 'Убрать релей {tag}?',
+  'rel.pool': 'пул {pool}',
+  'rel.tenant': 'арендатор',
+  'rel.paid_hint': 'Выдаётся только ключам этого пула или арендатора, в публичный ответ не попадает',
+  'rel.remove_paid_confirm': 'Убрать релей {tag}? Он обслуживает платящих ({who}), и они сразу лишатся этого узла.',
 
   'fea.h1': 'Настройки',
   'fea.sub': 'Включайте и выключайте необязательные функции, задавайте лимиты и оформление острова. Изменения применяются сразу, перезапуск не нужен.',
@@ -1488,6 +1496,10 @@ const I18N = {
   'rel.err_broker': '{err}。这座岛屿上的 broker 可能是关闭的。',
   'rel.prune_confirm': '移除 {n} 个没有应答的中继？',
   'rel.remove_confirm': '移除中继 {tag}？',
+  'rel.pool': '池 {pool}',
+  'rel.tenant': '租户',
+  'rel.paid_hint': '只提供给该池或租户的密钥，从不出现在公开列表中',
+  'rel.remove_paid_confirm': '移除中继 {tag}？它为付费用户服务（{who}），他们会立即失去这个节点。',
 
   'fea.h1': '设置',
   'fea.sub': '打开或关闭可选功能，设定岛屿的限制和外观。改动立即生效，不用重启。',
@@ -2337,14 +2349,14 @@ async function loadRelays() {
       <td>${alive?'<span class="pill green">'+t('rel.serving')+'</span>':'<span class="pill red">'+t('rel.noanswer')+'</span>'}</td>
       <td class="mono" style="color:var(--dim)">${escAttr(ep)}</td>
       <td class="mono">${escAttr(x.tag)}</td>
-      <td><span class="pill ${x.tier==='trusted'?'green':''}">${x.tier}</span></td>
+      <td>${x.pool_id?'<span class="pill" title="'+escAttr(t('rel.paid_hint'))+'">'+escAttr(t('rel.pool',{pool:x.pool_id}))+'</span>':(x.tenant_id?'<span class="pill" title="'+escAttr(t('rel.paid_hint'))+'">'+t('rel.tenant')+'</span>':'<span class="pill '+(x.tier==='trusted'?'green':'')+'">'+x.tier+'</span>')}</td>
       <td>${x.enabled?'<span class="pill green">'+t('rel.on')+'</span>':'<span class="pill red">'+t('rel.off')+'</span>'}</td>
       <td class="mono" style="color:var(--dim)">${timeago(x.last_ok)}</td>
       <td>${x.fail_count||0}</td>
       <td class="acts">
         <button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{enabled:${!x.enabled}})">${x.enabled?t('rel.disable'):t('rel.enable')}</button>
-        <button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{tier:'${x.tier==='trusted'?'community':'trusted'}'})">${x.tier==='trusted'?t('rel.demote'):t('rel.promote')}</button>
-        <button class="btn danger sm" onclick="removeRelay('${escAttr(x.tag)}')">${t('common.remove')}</button>
+        ${(x.pool_id||x.tenant_id)?'':`<button class="btn ghost sm" onclick="setRelay('${escAttr(x.tag)}',{tier:'${x.tier==='trusted'?'community':'trusted'}'})">${x.tier==='trusted'?t('rel.demote'):t('rel.promote')}</button>`}
+        <button class="btn danger sm" onclick="removeRelay('${escAttr(x.tag)}','${escAttr(x.pool_id?t('rel.pool',{pool:x.pool_id}):(x.tenant_id?t('rel.tenant'):''))}')">${t('common.remove')}</button>
       </td></tr>`;}).join('') : `<tr><td colspan="8" class="empty">${t('rel.empty')}</td></tr>`;
   } catch(e){ $('relays').innerHTML='<tr><td colspan="8" class="err">'+t('rel.err_broker',{err:e.message})+'</td></tr>'; }
 }
@@ -2361,7 +2373,7 @@ async function pruneDeadRelays(){
   loadRelays();
 }
 async function setRelay(tag, patch){ try{ await rawApi('POST','/broker/admin/set', Object.assign({tag}, patch)); loadRelays(); }catch(e){ alert(e.message); } }
-async function removeRelay(tag){ if(!confirm(t('rel.remove_confirm',{tag:tag})))return; try{ await rawApi('DELETE','/broker/admin/'+encodeURIComponent(tag)); loadRelays(); }catch(e){ alert(e.message); } }
+async function removeRelay(tag, who){ if(!confirm(who?t('rel.remove_paid_confirm',{tag:tag,who:who}):t('rel.remove_confirm',{tag:tag})))return; try{ await rawApi('DELETE','/broker/admin/'+encodeURIComponent(tag)); loadRelays(); }catch(e){ alert(e.message); } }
 
 /* ---- features (operator toggles) ---- */
 const FGROUPS = { features:'fea.g.features', limits:'fea.g.limits', numbers:'fea.g.numbers', branding:'fea.g.branding' };
