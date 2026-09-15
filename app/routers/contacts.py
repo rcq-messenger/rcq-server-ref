@@ -411,7 +411,17 @@ async def send_request(
     return {"id": req.id, "state": "pending"}
 
 
-@router.get("/pending", response_model=list[RequestRow])
+@router.get(
+    "/pending",
+    response_model=list[RequestRow],
+    # Guest drains now poll this on every island a person visits (spec
+    # 2026-09-15, F1), so it went from "once when the Requests screen opens" to
+    # something every client calls on a timer. The designed cadence is one poll
+    # per five minutes or slower; 120 a minute leaves a wide margin for a
+    # force-refresh and several installs behind one account, and stops a loop
+    # gone wrong from turning a JOIN on `users` into the island's hot path.
+    dependencies=[Depends(rate_limit("contact_pending", 120, 60))],
+)
 async def pending(
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
@@ -554,6 +564,48 @@ async def respond(
         await apns_send(req_from, **push_args)
         await up_send(req_from, **push_args)
     return {"state": state}
+
+
+@router.delete(
+    "/pending/{request_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(rate_limit("contact_pending_withdraw", 60, 3600))],
+)
+async def withdraw_pending(
+    request_id: int,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """The ADDRESSEE clears a pending request without answering it here.
+
+    Built for a guest copy (spec 2026-09-15, F1): somebody on this island asked
+    the guest account a person holds here, and that person answered from their
+    HOME island with a sealed §5f accept. The row on this island then has to go,
+    and neither answer `/respond` can give is honest:
+
+      * accept=true writes the two `contacts` rows on THIS island
+        (`add_edges`), a relationship between the requester and the guest copy
+        that nobody asked for and that the vault-era clients never read;
+      * accept=false leaves a "declined" row that `GET /contacts/outgoing`
+        serves to the requester for 180 days (services/contact_request_sweep),
+        telling them "no" about a request that was in fact accepted elsewhere.
+
+    So this deletes the row and says nothing: no socket frame, no push, no
+    edges. What the island learns is that a pending row was withdrawn, which it
+    would have learned from a decline anyway.
+
+    ⚠ The same 404 for "not addressed to you", "no longer pending" and "no such
+    id", with the endpoint's own code in the detail. The single answer keeps
+    this from probing other people's request ids; the code is how a client
+    tells "done" from an island that lost the route (a plain 404 with no code),
+    where it must re-check the capability instead of hiding the row as if the
+    withdraw had worked.
+    """
+    req = await db.get(ContactRequest, request_id)
+    if req is None or req.to_uin != uin or req.state != "pending":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "no_such_request"})
+    await db.delete(req)
+    await db.commit()
 
 
 @router.delete("/{contact_uin}", status_code=status.HTTP_204_NO_CONTENT)

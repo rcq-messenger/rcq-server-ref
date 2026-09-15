@@ -1,15 +1,18 @@
 import base64
+import hashlib
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.config import log_identity, settings
 from app.core.db import get_db
 from app.core.rate_limit import rate_limit, island_ceiling
 from base64 import b64decode
@@ -18,6 +21,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from app.core.security import (
+    _bearer,
     bump_uin_epoch,
     cache_uin_epoch,
     carry_device_id,
@@ -53,6 +57,8 @@ from app.services.key_owner import uin_for_signing_key
 from app.services.queue_drain import account_watermark
 from app.services.uin import allocate_uin, is_reserved_uin, uin_is_taken
 from app.services.uin_rows import purge_gossip_mirror, purge_uin_rows
+from app.models.retired_signing_key import RetiredSigningKey
+from app.services import reissue_proof
 
 log = logging.getLogger(__name__)
 
@@ -851,6 +857,15 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     # differently, the member recovered into an account outside the group.
     uin = await uin_for_signing_key(db, sk)
     if uin is None:
+        # ⚠⚠ Not every missing key is a burned account. A key this island
+        # retired in a rotation still opens nothing, but the account behind it
+        # is alive, and `identity_not_found` is the word every client wipes on.
+        # See `_rotated_account`.
+        rotated = await _rotated_account(db, sk)
+        if rotated is not None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail={"code": "identity_rotated", "uin": rotated}
+            )
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
     # Recovery is the other door into the same room: it mints a session from the
     # signing key alone, so a disconnected install must not be able to walk
@@ -971,6 +986,18 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
                 # owner to recovery, where a person is looking at the screen.
                 ambiguous = True
     if owned is None:
+        if not ambiguous:
+            # ⚠⚠ The third reason the number is not there under this key: its
+            # owner changed keys on another device. Same shape as the move
+            # above, same stakes: answered `identity_not_found`, the device
+            # erases a live account. The uin is the account's CURRENT number,
+            # which a move after the rotation may have changed.
+            rotated = await _rotated_account(db, sk)
+            if rotated is not None:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail={"code": "identity_rotated", "uin": rotated},
+                )
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             detail={"code": "identity_ambiguous" if ambiguous else "identity_not_found"},
@@ -1010,14 +1037,196 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
 # changed" warning the next time they sync this user's keys. Used when a user
 # fears their keys were compromised, or just wants a fresh recovery phrase.
 #
-# Unlike /auth/recover this needs no signature proof: the JWT already authorises
-# the change, and a user can only ever brick their OWN account by uploading a
-# pubkey whose private half they don't hold (the client always generates the
-# pair locally, so it does). The existing token stays valid; we return a fresh
-# one for convenience / parity with register.
+# Until 2026-09-15 this took no signature proof: the JWT alone authorised the
+# change, on the theory that a user can only brick their OWN account. The theory
+# missed the token thief (spec F3, critic 2). A stolen bearer could rotate the
+# row to keys of its own and lock the owner out, and since nothing here touched
+# the epoch, the thief's session also outlived the owner's rotation.
+#
+# So a change can now carry a proof signed by the OLD signing key over exactly
+# what changes, bound to this island and this number (services/reissue_proof).
+# A signed change bumps the epoch, which kills every older token; the rotating
+# caller gets a fresh one. And the retired key is recorded, so the account's
+# other devices hear `identity_rotated` from /auth/refresh and /auth/recover
+# instead of the `identity_not_found` they wipe on.
+#
+# GRACE MODE. A missing proof is still accepted, counted and logged, because
+# every client in people's hands today sends none. The operator setting
+# `reissue_require_proof` turns that into a 403; the spec's release order says
+# when (30 days at zero unsigned, and the signing builds as the minimum).
 class ReissueIn(BaseModel):
     identity_key: str
     signing_key: str
+    # ── the optional `rcq-reissue-v1` proof ────────────────────────────────
+    # All six or none. Optional on the wire so an old client's body still
+    # parses; checked by hand below rather than by pydantic, so a broken proof
+    # gets the documented 400 code instead of a generic 422.
+    proof_v: int | None = None
+    #: The island the client believes it is talking to. Checked against this
+    #: island's own name, never trusted: see `_reissue_hosts`.
+    host: str | None = Field(default=None, max_length=260)
+    #: The key being replaced. Redundant with the row on purpose: a client that
+    #: signed against a key the island no longer holds gets a distinct 409 it
+    #: can act on, instead of a bad-signature 403 it cannot tell from forgery.
+    old_signing_key: str | None = None
+    ts: int | None = None
+    #: 16 random bytes, base64url, no padding (22 characters).
+    nonce: str | None = None
+    #: Ed25519 by the OLD signing key over `reissue_proof.proof_bytes`, standard base64.
+    signature: str | None = None
+
+
+_PROOF_FIELDS = ("proof_v", "host", "old_signing_key", "ts", "nonce", "signature")
+# The daily counters live 40 days so the "30 consecutive days at zero" the
+# require switch waits for can be read straight off Redis.
+_STAT_TTL_SECONDS = 40 * 24 * 60 * 60
+# Longer than the whole acceptance window (ts +/- REISSUE_PROOF_SKEW_SECONDS),
+# so a nonce cannot be spent a second time while its ts is still acceptable.
+_NONCE_TTL_SECONDS = 1800
+
+
+async def _bump_reissue_stat(name: str) -> None:
+    """INCR `stat:<name>:<YYYYMMDD>` (UTC). Best-effort: a counter must never
+    fail a key change. No uin in the key: these count HOW rotations happen on
+    the island, and a per-account tally would be a rotation log."""
+    try:
+        from app.core.redis import get_redis
+
+        redis = await get_redis()
+        key = f"stat:{name}:{datetime.now(timezone.utc):%Y%m%d}"
+        pipe = redis.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, _STAT_TTL_SECONDS)
+        await pipe.execute()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _claim_reissue_nonce(key: str) -> bool:
+    """SET NX the replay guard. True when this is the first use.
+
+    ⚠ Deliberately NOT best-effort, unlike the counters: a proof with no
+    replay guard behind it is a proof anyone who saw it once can spend again
+    inside its window. Raises when Redis is unreachable and the caller answers
+    503, so the client retries the identical request later.
+    """
+    from app.core.redis import get_redis
+
+    redis = await get_redis()
+    return bool(await redis.set(key, "1", nx=True, ex=_NONCE_TTL_SECONDS))
+
+
+async def _release_reissue_nonce(key: str) -> None:
+    """Give a nonce back when the change it guarded did not commit.
+
+    Without this a commit failure after the guard was claimed turns the
+    client's IDENTICAL resend (the spec's lost-reply rule) into a 409
+    `reissue_replayed` for a change that never happened.
+    """
+    try:
+        from app.core.redis import get_redis
+
+        await (await get_redis()).delete(key)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _reissue_hosts(request: Request) -> tuple[set[str], bool]:
+    """The hosts a proof may be bound to on THIS island, and whether the set had
+    to come from the request's Host header.
+
+    The island's own name (`island_host`) plus the fronts that proxy to it
+    (FRONT_ALIAS_HOSTS: a client reaching the flagship through cdn.rcq.app
+    signs the host it dialled). When `island_host` is empty, which is the
+    default on a self-hosted island, the Host header is used instead of
+    skipping the check (critic 11): skipping made a proof for island A good on
+    any island C where the same key happened to sit on the same number. A
+    header is written by the caller, so this is weaker than a configured name,
+    and it is counted so an operator can see it happening.
+    """
+    own = reissue_proof.canonical_host(str(await server_settings.get("island_host") or ""))
+    from_header = False
+    if not own:
+        own = reissue_proof.canonical_host(request.headers.get("host", ""))
+        from_header = True
+    allowed = {own} if own else set()
+    allowed |= {
+        reissue_proof.canonical_host(h) for h in settings.FRONT_ALIAS_HOSTS.split(",") if h.strip()
+    }
+    return allowed, from_header
+
+
+def _key_bytes_or_none(value: str | None) -> bytes | None:
+    """The 32 raw bytes of a stored key, or None for a value that is not one.
+
+    Stored keys predate validation (an account on the flagship holds "x"), so a
+    row's own key is decoded defensively rather than trusted to parse.
+    """
+    try:
+        return reissue_proof.decode_key32(value or "")
+    except ValueError:
+        return None
+
+
+async def _rotated_account(db: AsyncSession, signing_key: str) -> int | None:
+    """The live account that retired `signing_key` in a rotation, or None.
+
+    Both callers verified a signature under this key first, so only a holder
+    of the OLD private key ever learns the answer. "Live" is checked here and
+    not trusted to the marker: a burn deletes the marker (uin_rows), but a
+    number recycled by some other path must not make a stranger's account the
+    answer.
+    """
+    raw = _key_bytes_or_none(signing_key)
+    if raw is None:
+        return None
+    row = await db.get(RetiredSigningKey, hashlib.sha256(raw).hexdigest())
+    if row is None:
+        return None
+    alive = await db.scalar(select(User.uin).where(User.uin == row.uin))
+    return int(alive) if alive is not None else None
+
+
+async def _signing_key_taken_by(db: AsyncSession, raw: bytes, uin: int) -> set[int]:
+    """Other accounts on this island whose signing key is `raw`.
+
+    Both spellings, because padded and unpadded base64 both sit in the live
+    table and `uin_for_signing_key` matches verbatim: a check on one spelling
+    would let the other one through to the very lookup it protects.
+    """
+    padded = base64.b64encode(raw).decode()
+    rows = await db.scalars(
+        select(User.uin).where(
+            User.signing_key.in_((padded, padded.rstrip("="))), User.uin != uin
+        )
+    )
+    return {int(u) for u in rows}
+
+
+async def _retire_signing_key(db: AsyncSession, old_raw: bytes, uin: int, signed: bool) -> None:
+    """Record `old_raw` as retired by `uin`. The caller owns the commit.
+
+    ⚠ ONE ROW PER KEY, and a key can be on more than one account here: seven
+    signing keys on the flagship are, from before registration demanded proof.
+    So a second rotation of the same key has to decide whose marker it is. A
+    SIGNED rotation proved the private key and always takes it. An unsigned one
+    proved only a token, which a squatter holding a copy of somebody's public
+    key also has, so it may not move a marker off another LIVE account: that
+    would send the real owner's other devices to the squatter's number.
+    """
+    sk_hash = hashlib.sha256(old_raw).hexdigest()
+    now = datetime.now(timezone.utc)
+    row = await db.get(RetiredSigningKey, sk_hash)
+    if row is None:
+        db.add(RetiredSigningKey(sk_hash=sk_hash, uin=uin, rotated_at=now))
+        return
+    if (
+        signed
+        or row.uin == uin
+        or await db.scalar(select(User.uin).where(User.uin == row.uin)) is None
+    ):
+        row.uin = uin
+        row.rotated_at = now
 
 
 @router.post(
@@ -1027,18 +1236,33 @@ class ReissueIn(BaseModel):
 )
 async def reissue(
     body: ReissueIn,
+    request: Request,
     uin: int = Depends(current_uin),
     device_id: str = Depends(current_device_id),
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ) -> RegisterOut:
-    ik = body.identity_key.strip()
-    sk = body.signing_key.strip()
-    if not ik or not sk:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "missing_key"})
+    # a) Keys that are not keys are refused before anything is looked at. This
+    # used to accept any non-empty string, which is how an account came to hold
+    # "x" (see `_pubkey32`); a rotation onto such a key bricks the account.
+    try:
+        ik = _pubkey32(body.identity_key, "identity_key")
+        sk = _pubkey32(body.signing_key, "signing_key")
+    except HTTPException:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "bad_key"}) from None
+    new_ik_raw = reissue_proof.decode_key32(ik)
+    new_sk_raw = reissue_proof.decode_key32(sk)
+    # b)
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found"})
-    if user.identity_key == ik and user.signing_key == sk:
+    require_proof = bool(await server_settings.get("reissue_require_proof"))
+    # c) Compared as decoded bytes, so a retry that spells the same key with or
+    # without padding is still "the same keys" and not a second rotation.
+    if (
+        _key_bytes_or_none(user.identity_key) == new_ik_raw
+        and _key_bytes_or_none(user.signing_key) == new_sk_raw
+    ):
         # ⚠ THE SAME KEYS ARE NOT A ROTATION, and this route is destructive
         # enough that "do it again" has to be free. The documented flow is
         # read the slots, call this, write them back under the new derivation,
@@ -1048,9 +1272,142 @@ async def reissue(
         # rewritten, and `vault_reset` would tell every other session that a
         # derivation which has not moved is retired. Nothing to change and
         # nothing to announce, so only the token is reissued.
+        #
+        # ⚠⚠ But "only the token" was itself a hole (critic 2): the row's
+        # current public keys are served by the open key card, so ANY valid
+        # bearer could post them here and walk away with a brand-new session,
+        # for ever, including after the owner rotated because of that very
+        # theft. Once the switch is on, the branch hands back the bearer it
+        # was shown and mints nothing. A genuine lost-reply retry does not need
+        # a fresh token: after a SIGNED rotation the old bearer is stale and
+        # never reaches this line, and the client probes /auth/refresh with the
+        # new key instead.
+        if require_proof:
+            return RegisterOut(uin=uin, token=creds.credentials if creds else "")
+        await _bump_reissue_stat("reissue_samekeys")
         return RegisterOut(
             uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))
         )
+
+    # ⚠⚠ A key change may not adopt a signing key another account here holds.
+    # /auth/register has refused that since 2026-08 (`key_proof_required`), and
+    # this route was the door left open: the key card hands out anyone's public
+    # key, a bearer posts it here, and because a rotation leaves created_at and
+    # identity_created_at alone, an OLDER account wins `uin_for_signing_key`
+    # from then on. Recovery with the victim's own phrase lands in the
+    # attacker's row, and /federation/uin-for-key sends group owners there.
+    # The old-key proof does not close it (it proves the key being REPLACED,
+    # which the attacker holds for its own row), so the check stands on its own,
+    # in grace mode and after the flip alike.
+    # Honest rotations mint fresh random keys and never collide.
+    taken_by = await _signing_key_taken_by(db, new_sk_raw, uin)
+
+    signed = False
+    nonce_key: str | None = None
+    if any(getattr(body, f) is not None for f in _PROOF_FIELDS):
+        # d) A proof was offered, so it is judged, switch or no switch. ⚠ A
+        # present-but-bad proof is NEVER waved through as "unsigned": that
+        # would let a forger downgrade a refusal into grace-mode acceptance
+        # simply by sending garbage instead of nothing.
+        try:
+            if (
+                body.proof_v is None
+                or body.ts is None
+                or not body.host
+                or not body.old_signing_key
+                or not body.nonce
+                or not body.signature
+            ):
+                raise ValueError("missing field")
+            host = reissue_proof.canonical_host(body.host)
+            if not host:
+                raise ValueError("empty host")
+            old_sk_raw = reissue_proof.decode_key32(body.old_signing_key)
+            nonce_raw = reissue_proof.decode_nonce(body.nonce)
+            sig_raw = reissue_proof.decode_signature(body.signature)
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail={"code": "reissue_proof_malformed"}
+            ) from None
+        if body.proof_v != reissue_proof.VERSION:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "reissue_proof_version"})
+        allowed, from_header = await _reissue_hosts(request)
+        if from_header:
+            await _bump_reissue_stat("reissue_host_from_header")
+        if host not in allowed:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail={"code": "reissue_wrong_host"})
+        if _key_bytes_or_none(user.signing_key) != old_sk_raw:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, detail={"code": "reissue_old_key_mismatch"}
+            )
+        now = int(time.time())
+        if abs(now - int(body.ts)) > settings.REISSUE_PROOF_SKEW_SECONDS:
+            # `now` so the client can rebuild the proof against the island's
+            # clock once, rather than guessing how far off its own is.
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail={"code": "reissue_clock_skew", "now": now}
+            )
+        signed_bytes = reissue_proof.proof_bytes(
+            host, uin, old_sk_raw, new_ik_raw, new_sk_raw, int(body.ts), nonce_raw
+        )
+        try:
+            Ed25519PublicKey.from_public_bytes(old_sk_raw).verify(sig_raw, signed_bytes)
+        except (InvalidSignature, ValueError):
+            # 403, never 401: every client answers 401 by refreshing its token
+            # and trying again, and a forged proof must not start that loop.
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail={"code": "reissue_bad_signature"}
+            ) from None
+        if taken_by:
+            # The one collision that is legitimate: a person's duplicate rows on
+            # this island, following each other in a rotation cascade onto the
+            # same new keys. It is recognised by the marker the FIRST of those
+            # rotations left: the key this caller just proved it holds was
+            # retired by the very row that now carries the new key. Nobody else
+            # can meet that: the marker names a row that once held this private
+            # key, and the signature above proves the caller holds it too.
+            # Signed only; an unsigned change proves nothing about the old key.
+            marker = await db.get(RetiredSigningKey, hashlib.sha256(old_sk_raw).hexdigest())
+            if marker is None or int(marker.uin) not in taken_by:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN, detail={"code": "key_proof_required"}
+                )
+        # Claimed LAST, after everything that can refuse, so a request refused
+        # for any other reason does not burn its nonce and the client can fix
+        # and resend it. Keyed by the canonical spelling: the same 16 bytes
+        # spelled with different trailing bits must hit the same guard.
+        nonce_key = (
+            f"rin:{hashlib.sha256(old_sk_raw).hexdigest()[:16]}:"
+            f"{reissue_proof.canonical_nonce(nonce_raw)}"
+        )
+        try:
+            fresh = await _claim_reissue_nonce(nonce_key)
+        except Exception:  # noqa: BLE001
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": "reissue_unavailable"}
+            ) from None
+        if not fresh:
+            # ⚠ Means "possibly applied", not "attack": the first copy may
+            # have committed and its reply been lost. The client probes
+            # /auth/refresh with the NEW key rather than giving up.
+            raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "reissue_replayed"})
+        signed = True
+    else:
+        # e) No proof.
+        if require_proof:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail={"code": "reissue_proof_required"}
+            )
+        if taken_by:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "key_proof_required"})
+        # The number the require switch waits on, and the line that says a
+        # token alone just rewrote an account's keys. The uin is behind
+        # RCQ_LOG_IDENTITIES like every other log line that names a person.
+        await _bump_reissue_stat("reissue_unsigned")
+        log.warning("[reissue] unsigned key change uin=%s", log_identity(uin))
+
+    # f) Apply.
+    retired_raw = _key_bytes_or_none(user.signing_key)
     user.identity_key = ik
     user.signing_key = sk
     # The vault (stage 4a) is sealed under, and its slots named by, keys the
@@ -1070,8 +1427,34 @@ async def reissue(
     # contact list under the retired name, sealed with the retired key. The
     # ABA hazard the tombstone rule exists for is covered here by the same
     # floor: the recreated slot counts from 1 again, which is below it.
-    await db.execute(delete(VaultSlot).where(VaultSlot.uin == uin))
-    await db.commit()
+    new_epoch: int | None = None
+    try:
+        await db.execute(delete(VaultSlot).where(VaultSlot.uin == uin))
+        # The marker behind `identity_rotated`, written for signed and unsigned
+        # changes alike: an old device holding the retired key has to hear
+        # "rotated" whichever way the change was authorised. Only when the
+        # signing key actually changed; an identity-key-only change retires
+        # nothing that /auth/refresh could be asked about.
+        if retired_raw is not None and retired_raw != new_sk_raw:
+            await _retire_signing_key(db, retired_raw, uin, signed)
+        # ⚠⚠ A SIGNED change bumps the epoch, so every token minted before it
+        # dies, the thief's included (critic 2); this caller gets a fresh one
+        # below. An UNSIGNED change does not, deliberately: the old sibling
+        # clients still in the field answer a 401 by re-proving a key that no
+        # longer matches, and would reach their wipe path sooner. Those are
+        # exactly the clients that send no proof, so the two stay paired until
+        # the require switch retires both.
+        if signed:
+            new_epoch = await bump_uin_epoch(db, uin)
+        await db.commit()
+    except Exception:
+        if nonce_key is not None:
+            await _release_reissue_nonce(nonce_key)
+        raise
+    if new_epoch is not None:
+        await cache_uin_epoch(uin, new_epoch)
+    if signed:
+        await _bump_reissue_stat("reissue_signed")
 
     # ...and the account's OTHER sessions are told, which until 2026-08-23 they
     # were not: this route emptied the vault and announced nothing at all. What
@@ -1109,9 +1492,22 @@ async def reissue(
         {"type": "vault_reset", "reason": "identity_reissued"},
         except_device=carry_device_id(device_id),
     )
-    return RegisterOut(
-        uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))
-    )
+    # ⚠ The epoch bump kills old tokens at the NEXT handshake, and a socket
+    # opened before it stays up regardless: a thief's live socket would keep
+    # receiving everything. So a signed change closes every socket of the
+    # account, the caller's included (a stolen phone token names the same
+    # "primary" device the owner's phone does). AFTER `vault_reset`, and on the
+    # same channel, so the other sessions hear it before they are closed. An
+    # unsigned change leaves tokens alive by design (see the bump above), so
+    # there is nothing to evict.
+    if new_epoch is not None:
+        await manager.kick_uin(uin)
+    # Minted under the epoch this change produced, read from the bump itself
+    # rather than back from the cache, so a Redis blip between the write-through
+    # and this line cannot hand the rotating device a token that is stale on
+    # arrival.
+    epoch = new_epoch if new_epoch is not None else await uin_epoch(uin)
+    return RegisterOut(uin=uin, token=issue_token(uin, epoch, carry_device_id(device_id)))
 
 
 @router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)

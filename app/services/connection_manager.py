@@ -336,6 +336,14 @@ class ConnectionManager:
                             await self._close_local_sockets_for_device(
                                 uin, dev if isinstance(dev, str) else "primary"
                             )
+                    elif target == "kick_uin":
+                        # Every socket of the account, every device, the
+                        # origin worker included (see `kick_uin`). Handled in
+                        # this loop, in channel order, so a frame published
+                        # just before the kick is delivered before the close.
+                        uin = envelope.get("uin")
+                        if isinstance(uin, int):
+                            await self._close_local_sockets_for_uin(uin)
                     ended = time.time()
                     transit = began - published_at if isinstance(published_at, (int, float)) else 0.0
                     if transit > _SLOW_STEP or ended - began > _SLOW_STEP:
@@ -425,7 +433,7 @@ class ConnectionManager:
             uin,
         )
 
-    def _close_soon(self, ws: WebSocket) -> None:
+    def _close_soon(self, ws: WebSocket, code: int = 4000, reason: str = "superseded") -> None:
         """Start closing a superseded socket, and do NOT wait for it.
 
         ★ Closing a websocket is a handshake, not a hang-up: the library sends
@@ -447,14 +455,14 @@ class ConnectionManager:
         be sent to it; whether the handshake completes is of no interest to
         anyone. Its own endpoint task cleans up regardless.
         """
-        task = asyncio.create_task(self._close_quietly(ws))
+        task = asyncio.create_task(self._close_quietly(ws, code, reason))
         self._closing.add(task)
         task.add_done_callback(self._closing.discard)
 
     @staticmethod
-    async def _close_quietly(ws: WebSocket) -> None:
+    async def _close_quietly(ws: WebSocket, code: int = 4000, reason: str = "superseded") -> None:
         try:
-            await ws.close(code=4000, reason="superseded")
+            await ws.close(code=code, reason=reason)
         except Exception:  # noqa: BLE001
             pass
 
@@ -475,6 +483,25 @@ class ConnectionManager:
                     self._conns.pop(uin, None)
         for ws in old:
             self._close_soon(ws)
+
+    async def _close_local_sockets_for_uin(self, uin: int) -> None:
+        """Close every socket we hold for `uin`, whatever device it names.
+
+        ⚠ 1012, not the 4000 a supersede uses. The shipped clients sit out a
+        30-60 s pause on 4000 (it means "another install took your slot"), and
+        the one install that is supposed to come straight back here is the one
+        that just rotated, holding the token it was handed. On 1012 it redials
+        on the ordinary one-second backoff, the same soft close ws.py already
+        uses for its resync bounce. Every other session redials into a refused
+        handshake, which is what the epoch bump already made of its token.
+        """
+        async with self._lock:
+            old = list(self._conns.pop(uin, ()))
+            for ws in old:
+                self._device_of.pop(ws, None)
+                self._opened_at.pop(ws, None)
+        for ws in old:
+            self._close_soon(ws, code=1012, reason="identity_reissued")
 
     async def _deliver_all_local(self, text: str) -> int:
         # Same head-of-line problem as the per-user path, only worse: here one
@@ -514,6 +541,42 @@ class ConnectionManager:
             log.warning(
                 "could not fan out device kick uin=%s dev=%s", log_identity(uin), device_id
             )
+
+    async def kick_uin(self, uin: int) -> None:
+        """Drop every socket this cluster holds for `uin`, every device of it.
+
+        For a SIGNED key change (/auth/reissue). That change bumps the epoch, and
+        the epoch is checked only at the handshake (`authorize_session`), so a
+        token thief whose socket was already open kept receiving messages,
+        presence and call signalling for as long as it stayed up. The same hole
+        `kick_device` closed for a revoke, except that here no device can be
+        spared: a stolen phone token names "primary", exactly as the rotating
+        phone's own token does.
+
+        ⚠ ORDER. Unlike `kick_device` this does NOT close local sockets first.
+        `send` reaches this worker's own sockets only through the pub/sub loop,
+        so a direct close would beat the `vault_reset` frame the caller published
+        a moment earlier and the account's other sessions would never hear it.
+        Publishing the kick on the same channel keeps it behind that frame on
+        every worker, this one included. Only when the publish fails, which is
+        also when `send` fell back to local delivery, is the close done here.
+
+        A worker still running code from before this target existed ignores the
+        envelope; its sockets for the account then last until their next redial,
+        where the stale token is refused.
+        """
+        await self._ensure_pubsub()
+        try:
+            redis = await get_redis()
+            # The same bookkeeping `kick_device` does for one device: these
+            # sockets leave `_conns` before their endpoint's `disconnect` runs,
+            # which then finds no device to drop, so the account would linger in
+            # the online set as a ghost.
+            await redis.delete(_online_devs_key(uin))
+            await redis.publish(_FANOUT_CHANNEL, self._envelope(target="kick_uin", uin=uin))
+        except Exception:  # noqa: BLE001
+            await self._close_local_sockets_for_uin(uin)
+            log.warning("could not fan out account kick uin=%s", log_identity(uin))
 
     async def connect(self, uin: int, ws: WebSocket, device_id: str = "primary") -> None:
         await ws.accept()

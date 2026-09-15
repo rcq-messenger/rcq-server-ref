@@ -124,6 +124,7 @@ from app.models.uin_listing import UinListing
 from app.models.guest_card import GuestCard
 from app.models.queue_cursor import QueueCursor
 from app.models.report import Report
+from app.models.retired_signing_key import RetiredSigningKey
 from app.models.vault import VaultSlot
 
 # (model, uin-bearing column). Order is irrelevant — none of these carry FKs
@@ -211,6 +212,14 @@ PER_UIN_COLUMNS: list[tuple[type, object]] = [
     # `invites.code` had until 2026-08-22, cited in this model's own docstring,
     # arriving from the other direction.
     (GuestCard, GuestCard.owner_uin),
+    # The `identity_rotated` markers (spec 2026-09-15, F3). ⚠ Both halves
+    # matter and they pull in opposite directions. A MOVE must carry them, or a
+    # second device asking about its old key after its owner rotated AND moved
+    # hears `identity_not_found` and wipes a live account. A BURN must delete
+    # them, or for the marker's whole life an old-seed holder keeps hearing
+    # "this account exists and rotated" about an account its owner deleted,
+    # and an offline sibling keeps the history the burn was meant to erase.
+    (RetiredSigningKey, RetiredSigningKey.uin),
 ]
 
 # Rows that must NOT ride along to the new UIN — they assert something about

@@ -144,6 +144,24 @@ _reg(SettingSpec("federation_refuse_strangers", "bool", lambda: False, "limits",
                  "Refusals are the same answer for every number, existing or "
                  "not, so this never becomes a directory for guessing which "
                  "numbers are real."))
+# Spec 2026-09-15, F3. Read on every /auth/reissue through the 5-second cache,
+# so flipping it back off is the rollback and needs no deploy.
+_reg(SettingSpec("reissue_require_proof", "bool",
+                 lambda: os.environ.get("RCQ_REISSUE_REQUIRE_PROOF", "") == "1", "limits",
+                 "Key change needs the old key",
+                 "Off by default. When on, an account can change its keys only "
+                 "by signing the change with the key it is replacing, so a "
+                 "stolen session token can no longer swap in keys of its own, "
+                 "and repeating a key change with the same keys stops handing "
+                 "out fresh sessions. "
+                 "⚠⚠ APPS THAT DO NOT SIGN THE CHANGE ARE REFUSED: they "
+                 "get an error and cannot change keys on this island at all. "
+                 "Turn it on only after unsigned key changes (Redis "
+                 "stat:reissue_unsigned:<date>) have been zero for 30 days in a "
+                 "row and the oldest app versions people still run sign the "
+                 "change. Turning it off again takes effect within seconds. "
+                 "Self-hosted islands can set RCQ_REISSUE_REQUIRE_PROOF=1 "
+                 "instead."))
 _reg(SettingSpec("registration_policy", "str", lambda: _env.REGISTRATION_POLICY, "limits",
                  "Registration",
                  "Who may create an account on this island. \u201cpaid\u201d takes "

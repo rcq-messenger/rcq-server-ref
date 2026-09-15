@@ -220,6 +220,28 @@ class ServerCapabilities(BaseModel):
     # client must keep treating `GET /contacts` as a live list while this is
     # false; when it flips, its own vault slot is the truth.
     contacts_readonly: bool = False
+    # DELETE /contacts/pending/{id}: the addressee clears a pending request
+    # without answering it (spec 2026-09-15, F1). A guest copy's owner answers
+    # from the home island, so the row here must go without writing edges
+    # (/respond accept=true would) and without leaving a "declined" row the
+    # requester reads for 180 days (/respond accept=false would). Permanent
+    # capability of this codebase, like `users_lookup`.
+    #
+    # ⚠ A MISSING KEY MEANS "NO WITHDRAW". A client talking to an island that
+    # omits it must hide the row locally and must NOT decline instead: a
+    # decline is an answer the requester sees, a withdraw is not.
+    contact_pending_withdraw: bool = True
+    # /auth/reissue understands the optional `rcq-reissue-v1` proof, answers
+    # `identity_rotated` from /auth/refresh and /auth/recover for a retired
+    # key, and bumps the epoch on a signed key change (spec 2026-09-15, F3).
+    # Permanent capability of this codebase. Whether the proof is REQUIRED is
+    # the operator setting `reissue_require_proof`, not this flag.
+    #
+    # ⚠ Clients start a rotation only on a home island that advertises this.
+    # An island without it would take the new keys and then answer the user's
+    # other devices with `identity_not_found`, which older clients read as a
+    # burn and wipe on.
+    reissue_proof_v1: bool = True
     # The `/media` blob ceiling this island enforces while reading an upload
     # body (routers/media.py MAX_BLOB_SIZE, env-tunable per island). Purely
     # informational: nothing here changes what the endpoint does. It exists so

@@ -223,6 +223,12 @@ async def lifespan(_: FastAPI):
     from app.services.contact_request_sweep import contact_request_sweep_loop
 
     contact_request_sweep_task = asyncio.create_task(contact_request_sweep_loop())
+    # Retention for the `identity_rotated` markers /auth/reissue leaves behind.
+    # See retired_key_sweep's docstring for the horizon and what shortening it
+    # costs.
+    from app.services.retired_key_sweep import retired_key_sweep_loop
+
+    retired_key_sweep_task = asyncio.create_task(retired_key_sweep_loop())
     # Retention for the encrypted media store — see media_sweep's docstring
     # (30-day age sweep that spares avatars and report evidence).
     from app.services.media_sweep import media_sweep_loop
@@ -276,6 +282,7 @@ async def lifespan(_: FastAPI):
         inquiry_sweep_task.cancel()
         activity_sampler_task.cancel()
         contact_request_sweep_task.cancel()
+        retired_key_sweep_task.cancel()
         media_sweep_task.cancel()
         for task in retention_tasks:
             task.cancel()

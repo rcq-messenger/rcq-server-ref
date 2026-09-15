@@ -106,6 +106,15 @@ class Settings(BaseSettings):
     DEPOSIT_AUTH_POW_BITS: int = 18
     DEPOSIT_AUTH_REQUIRED: bool = False
 
+    # How far the `ts` of a signed /auth/reissue may sit from this island's
+    # clock, either way. It bounds when a delayed request can still apply
+    # (at most ts + 2 x this, in client time), which is what lets a client
+    # abandon an unanswered rotation safely after ts + 1500 s (spec 2026-09-15,
+    # F3). The nonce guard in Redis lives 1800 s, longer than the whole window,
+    # so a nonce cannot be spent twice inside it. Raise both together or not
+    # at all.
+    REISSUE_PROOF_SKEW_SECONDS: int = 600
+
     # APNs config — populated in production via /opt/rcq/.env. Empty values
     # disable push (the sender no-ops cleanly), so dev environments without
     # the .p8 key just don't send pushes — they don't crash.
