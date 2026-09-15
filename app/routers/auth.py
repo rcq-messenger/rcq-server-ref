@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -49,6 +49,7 @@ from app.routers.groups import (
 )
 from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
+from app.services.key_owner import uin_for_signing_key
 from app.services.queue_drain import account_watermark
 from app.services.uin import allocate_uin, is_reserved_uin, uin_is_taken
 from app.services.uin_rows import purge_gossip_mirror, purge_uin_rows
@@ -842,22 +843,13 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     # ⏭ This is a mitigation, not the fix. The fix is to stop accepting a
     # signing key at registration without proof of the matching private key —
     # /auth/recover/challenge already has the machinery.
-    # ⚠ COALESCE, and it is the whole repair. `created_at` is a fact about the
-    # NUMBER - a migration deliberately does not copy it - so ordering by it
-    # alone sent a person to the back of the queue for their own key every time
-    # they moved, and handed their recovery to any older row carrying the same
-    # key. `identity_created_at` follows the PERSON across a move; rows written
-    # before the column existed have NULL and fall back to `created_at`, which
-    # for a row that never moved is the same instant.
-    first_claim = func.coalesce(User.identity_created_at, User.created_at)
-    uin = (
-        await db.execute(
-            select(User.uin)
-            .where(User.signing_key == sk)
-            .order_by(first_claim.asc(), User.uin.asc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    #
+    # ⚠⚠ The order itself (COALESCE of identity_created_at and created_at, then
+    # uin) lives in services/key_owner.py and nowhere else. /federation/uin-for-key
+    # must pick the SAME row, because a group owner adds whatever it returns and
+    # the member later recovers into whatever this returns; when the two sorted
+    # differently, the member recovered into an account outside the group.
+    uin = await uin_for_signing_key(db, sk)
     if uin is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "identity_not_found"})
     # Recovery is the other door into the same room: it mints a session from the

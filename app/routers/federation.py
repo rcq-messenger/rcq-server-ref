@@ -28,6 +28,7 @@ from app.core.db import get_db
 from app.core.rate_limit import rate_limit
 from app.core.security import current_uin
 from app.services import door
+from app.services.key_owner import uin_for_signing_key
 from app.models.federation import GossipRecord, HomeIslandRecord
 from app.models.user import User, card_openable_for_viewer
 
@@ -463,16 +464,18 @@ async def uin_for_key(
     `key → uin`. Used by cross-island GROUP add (§5c): the inviting member
     looks up whether the foreign contact already has an account on THIS island
     before registering one for their keys, so an owner-initiated add never
-    mints a duplicate account. Returns the SAME lowest uin that
-    `/auth/recover` would resolve for the key (so the added uin matches the one
-    the contact later recovers). IP rate-limited to bound enumeration.
+    mints a duplicate account. IP rate-limited to bound enumeration.
+
+    ⚠⚠ Returns the SAME row `/auth/recover` resolves for the key, so the uin the
+    owner adds is the uin the contact later recovers into. This used to sort by
+    `User.uin` while recover sorted by first claim, and for a key held by two
+    rows on this island (not hypothetical: several flagship keys are) the owner
+    added one row and the member recovered into the other, outside the group.
+    Both now go through `services/key_owner.uin_for_signing_key`; do not
+    reintroduce a local query here.
     """
     sk = signing_key.strip()
-    uin = (
-        await db.execute(
-            select(User.uin).where(User.signing_key == sk).order_by(User.uin).limit(1)
-        )
-    ).scalar_one_or_none()
+    uin = await uin_for_signing_key(db, sk)
     if uin is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no account for key")
     return UinForKeyOut(uin=uin)
