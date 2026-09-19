@@ -256,6 +256,49 @@ async def _wait_out_answer_grace(call_id: str, sender_uin: int) -> None:
     await asyncio.sleep(_ANSWER_ICE_GRACE_S - waited)
 
 
+async def _call_pair_live(a: int, b: int, call_id: str) -> bool:
+    """Is there a REGISTERED 1:1 call between [a] and [b]?
+
+    ⚠⚠ THE GATE FOR EVERY CALL FRAME THAT IS NOT AN OFFER. Only `call_offer`
+    was ever checked: it goes through `_caller_allowed`, which honours the
+    callee's `call_policy` and refuses guest pairs. Everything else — the
+    answer, ICE, renegotiation, the ICE restart, the end — was relayed to
+    whatever `to_uin` said, with `sdp`, `candidate`, `media` and `reason`
+    copied straight through and nothing asking whether a call existed. The
+    comment beside the guest check said so out loud and fixed it for guests
+    only, so an ordinary account could still push arbitrary strings into any
+    other account's socket: past a `call_policy` of "nobody" (which stops
+    offers and nothing else), past a block, leaving no row in any queue.
+
+    The registry is the natural invariant, because a call frame outside a call
+    means nothing: an offer that passed the policy gate is the only thing that
+    writes this hash, and a pair that never got one has no business relaying
+    anything. EITHER side's entry is enough — one of the two is cleared first
+    on teardown, and a late frame from the other end is a real frame, not an
+    intrusion.
+
+    ⚠ Cross-island calls do NOT come through here at all: they arrive as
+    sealed deposits (`POST /messages/sealed` with `ring`), so nothing about
+    this gate reaches them.
+    """
+    redis = await _get_redis()
+    for who, peer in ((a, b), (b, a)):
+        raw = await redis.hget(_CALLS_KEY, str(who))
+        if not raw:
+            continue
+        entry = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+        # `call_id|peer|started_at`, and entries written by an older worker
+        # during a rolling restart carry only the first two.
+        parts = entry.split("|")
+        if len(parts) < 2 or parts[1] != str(peer):
+            continue
+        # An empty id on the frame matches whatever is registered: some
+        # clients omit it on `call_end`, and the pair is what matters here.
+        if not call_id or parts[0] == call_id:
+            return True
+    return False
+
+
 async def _register_call(call_id: str, a: int, b: int) -> bool:
     """Atomic check-and-set for `call_offer`. Returns True if both ends
     were free and we registered the pair, False if either side was busy
@@ -782,6 +825,14 @@ async def _handle_client_message(
         # pairs: a resident calling a copy sees the call end as `unavailable`
         # at once, and nothing reaches the other end.
         if kind != "call_offer" and await _guest_pair(uin, target):
+            return healed
+
+        # ⚠⚠ And the same question for everybody else: is there a call at all?
+        # See `_call_pair_live`. Dropped in silence, exactly like the guest
+        # case above: a sender who is not in a call with this target learns
+        # nothing from us about whether the target exists, is online, or
+        # refused them.
+        if kind != "call_offer" and not await _call_pair_live(uin, target, call_id):
             return healed
 
         # Concurrency guard fires only on call_offer. Answer/ICE/end can't
