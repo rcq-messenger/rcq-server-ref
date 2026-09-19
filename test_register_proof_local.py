@@ -27,6 +27,28 @@ import os
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_register_proof.db"
 os.environ["ENV"] = "dev"
+# ⚠ A SCRATCH Redis namespace, and this line is why the file could look broken
+# for weeks. The throwaway SQLite above is deleted on every run, but the rate
+# limiter and the island-wide registration ceiling do not live in SQLite: they
+# live in Redis, which is shared with the local two-island stand and with the
+# previous run of this very file. Fifteen registrations later the island answers
+# 503 island_busy or 429 to a perfectly good request, the FIRST check fails, and
+# the file reads as "registration is broken" when nothing is. db 15 is nobody's
+# product data, and `setdefault` leaves an operator free to point it elsewhere.
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
+# ⚠ And the island's own protections, raised for this file only. `/auth/register`
+# carries three independent limits, and a file that registers a dozen accounts in
+# two seconds trips all of them on its SECOND run of the hour:
+#   * the island ceiling, 40/minute and 400/hour (config.REGISTER_CEILING_*),
+#     read through a lambda precisely so a test may raise it (see the docstring
+#     of core.rate_limit.island_ceiling);
+#   * rate_limit("auth_register", 20, 3600) per caller, and
+#   * the same per /24, both hardcoded on the route, which is why the caller
+#     ADDRESS below is unique per run instead.
+# Without this the island answers 503 island_busy or 429 to a perfectly good
+# request and the file reads as "registration is broken".
+os.environ.setdefault("REGISTER_CEILING_PER_MINUTE", "5000")
+os.environ.setdefault("REGISTER_CEILING_PER_HOUR", "5000")
 
 for f in ("test_register_proof.db",):
     try:
@@ -89,7 +111,14 @@ async def clear_limiter():
 async def main():
     await init_db()
     await clear_limiter()
-    transport = httpx.ASGITransport(app=app)
+    # A caller address nobody else shares, and a fresh one on every run: the two
+    # per-caller limits on the route are keyed by it, they live in Redis rather
+    # than in the throwaway database, and 20 per hour is fewer than this file
+    # spends in one pass. The subnet moves too, because one of the two limits is
+    # per /24.
+    who = os.getpid()
+    client_ip = f"10.{(who >> 8) & 0xFF}.{who & 0xFF}.{(who >> 16) % 254 + 1}"
+    transport = httpx.ASGITransport(app=app, client=(client_ip, 44444))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         alice_sk, alice_pub = keypair()
 
