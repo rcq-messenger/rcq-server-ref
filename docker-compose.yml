@@ -46,6 +46,15 @@ services:
       - "443:443/udp"
     environment:
       RCQ_DOMAIN: ${RCQ_DOMAIN}
+      # ⚠⚠ THE MASQUERADE'S WHOLE SECRET, and it was not reaching Caddy. The
+      # masquerade Caddyfile expands {$RCQ_AUTH_TOKEN} when it loads its
+      # config, inside this container, where only the variables listed here
+      # exist — so an operator who followed docs/private-island.md to the
+      # letter got a gate built around an EMPTY token, which is not a closed
+      # gate but an open one wearing its clothes. The default in the Caddyfile
+      # now refuses everybody when this is unset, and this line is what makes
+      # the configured case work at all.
+      RCQ_AUTH_TOKEN: ${RCQ_AUTH_TOKEN:-}
     volumes:
       # Which Caddyfile: Let's Encrypt by default; the fingerprint one when
       # install.sh ran without a domain (RCQ_CADDYFILE in .env); a masquerade

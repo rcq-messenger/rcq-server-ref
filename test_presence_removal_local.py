@@ -184,11 +184,17 @@ async def main() -> None:
 
     u.status, u.last_seen = "online", now - timedelta(seconds=5)
     check("a fresh heartbeat reads online", effective_status(u) == "online")
-    u.last_seen = now - timedelta(seconds=59)
-    check("still online at 59s, one heartbeat short of the window",
+    # ⚠ DERIVED, not written out. These read 59 and 61 while the window was 60
+    # seconds; it is 90 now (one missed heartbeat was making a live person read
+    # offline, #1030), and a hardcoded number would have gone on asserting the
+    # old rule against the new code. The constant is the subject here.
+    from app.models.user import PRESENCE_FRESHNESS_SECONDS as WINDOW
+
+    u.last_seen = now - timedelta(seconds=WINDOW - 1)
+    check(f"still online a second inside the {WINDOW}s window",
           effective_status(u) == "online")
-    u.last_seen = now - timedelta(seconds=61)
-    check("offline at 61s, whatever `status` says", effective_status(u) == "offline")
+    u.last_seen = now - timedelta(seconds=WINDOW + 1)
+    check(f"offline a second past it, whatever `status` says", effective_status(u) == "offline")
     # The case the removed setting existed to break: the app is gone, the
     # column that used to keep them "around" is gone with it.
     u.status, u.last_seen = "away", now - timedelta(hours=5)

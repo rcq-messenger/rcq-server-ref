@@ -14,7 +14,6 @@ canonicalisation, the way `test_till_interop_local.py` does for numbers.
 Run: .venv/bin/python test_entry_voucher_local.py   (from RCQ/backend)
 """
 import base64, json, sys, time
-sys.path.insert(0, '/Users/tager/Documents/RCQ/backend')
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from app.services import uin_voucher as V

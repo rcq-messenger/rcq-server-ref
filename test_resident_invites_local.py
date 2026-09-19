@@ -10,7 +10,6 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, '/Users/tager/Documents/RCQ/backend')
 
 from app.models.user import User
 from app.routers.invites import _accrued

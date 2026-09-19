@@ -17,7 +17,7 @@ with `bad_signature`, so this pins:
     newline inside a field would let two requests sign the same bytes.
 
 Pure: no database, no Redis. NOT deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_guest_proof_fixture_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_guest_proof_fixture_local.py
 """
 import base64
 import json

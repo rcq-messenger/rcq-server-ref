@@ -34,7 +34,7 @@ island calls itself, resolved at publish time through the same chain
 In-process ASGI against a throwaway SQLite DB, Redis db 15 for the realtime
 nudge a publish sends (falls back to local fan-out if Redis is down). NOT
 deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_news_author_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_news_author_local.py
 """
 import asyncio
 import os

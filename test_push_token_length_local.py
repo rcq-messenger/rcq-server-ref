@@ -30,7 +30,7 @@ list.
 
 In-process ASGI against a throwaway SQLite DB, Redis db 15 for the rate
 limiter. NOT deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_push_token_length_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_push_token_length_local.py
 """
 import asyncio
 import base64

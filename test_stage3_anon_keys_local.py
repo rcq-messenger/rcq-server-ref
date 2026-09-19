@@ -15,7 +15,7 @@ gets the bundle minus the OPK. Pins:
 
 Runs the real FastAPI stack in-process on a throwaway SQLite DB and a local
 Redis db 15 (deposit-auth issuer key + spent set live there). NOT deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_stage3_anon_keys_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_stage3_anon_keys_local.py
 """
 import asyncio
 import base64

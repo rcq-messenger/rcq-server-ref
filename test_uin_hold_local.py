@@ -77,7 +77,14 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
-from app.core.config import settings  # noqa: E402
+from app.core.config import settings
+
+# ⚠ The island caps how many accounts may be minted per minute (2026-09-06,
+# after a scripted flood made 552 in three). This test legitimately registers
+# dozens, so it raises its own ceiling rather than being refused by the
+# protection it is not testing.
+settings.REGISTER_CEILING_PER_MINUTE = 100_000
+settings.REGISTER_CEILING_PER_HOUR = 100_000  # noqa: E402
 from app.core.db import SessionLocal, init_db  # noqa: E402
 from app.core.redis import close_redis  # noqa: E402
 from app.main import app  # noqa: E402
@@ -172,6 +179,12 @@ async def clear_limiter():
         print(f"  (limiter not cleared: {exc})")
 
 
+# ⚠⚠ These probe numbers have ROLES, and since 2026-09-06 the roles matter.
+# `is_reserved_uin` now calls a number with three or fewer different digits
+# scarce, so 555_000_xxx is scarce by SHAPE. The invite checks below must use
+# ORDINARY numbers, or they pass on the shape and never exercise the invite;
+# the collection checks must use SCARCE ones, because an ordinary number is a
+# loan and goes back to the pool when its holder steps off it.
 HELD = 555_000_111
 
 
@@ -206,7 +219,7 @@ async def main():
         # spends the invite use in the atomic UPDATE before it tests
         # availability, so the newcomer walks away with an unrelated random
         # number, the single-use code is burnt, and neither side is told.
-        reserved = 555_000_222
+        reserved = 583_692_147
         r = await c.post("/admin/invites", headers=ADMIN, json={"uin": reserved, "max_uses": 1})
         check("an invite may reserve a free number", r.status_code == 201)
         code = r.json()["raw_code"]
@@ -226,7 +239,7 @@ async def main():
         # random allocator, to `desired_uin` and to the shop.
         print("\nA number a live invite reserves is taken too:")
         await clear_limiter()
-        promised = 555_000_444
+        promised = 583_692_251
         r = await c.post("/admin/invites", headers=ADMIN, json={"uin": promised, "max_uses": 1})
         check("an invite reserves a free number", r.status_code == 201)
         promised_code = r.json()["raw_code"]
@@ -235,7 +248,7 @@ async def main():
                   await uin_is_taken(db, promised) is True)
         # A second reserved number for the shop probe, so neither check can
         # pass because the other one already took the number away.
-        promised_shop = 555_000_888
+        promised_shop = 583_692_358
         r = await c.post("/admin/invites", headers=ADMIN, json={"uin": promised_shop, "max_uses": 1})
         check("  ... and a second one beside it", r.status_code == 201)
         r = await c.post("/uin/purchase", headers=H(holder_tok), json={"uin": promised_shop, "switch": False})
@@ -274,7 +287,7 @@ async def main():
         print("\nA dead invite reserves nothing:")
         async with SessionLocal() as db:
             check("★ the number of a SPENT invite is free again",
-                  await uin_is_taken(db, 555_000_222) is True)  # taken by its redeemer
+                  await uin_is_taken(db, 583_692_147) is True)  # taken by its redeemer
             spent_row = await db.get(Invite, hash_invite_code(promised_code))
             check("  ... (the row is still there, spent)",
                   spent_row is not None and spent_row.used_count >= spent_row.max_uses)
@@ -311,13 +324,18 @@ async def main():
         # A two-number window, so "never returns a held number" is a fact
         # rather than a probability. allocate_uin draws from [MIN, MAX).
         lo, hi = settings.UIN_MIN, settings.UIN_MAX
-        settings.UIN_MIN, settings.UIN_MAX = 910_000_000, 910_000_002
+        # ⚠ Not 910_000_00x: since 2026-09-06 a number with three or fewer
+        # different digits is scarce (`is_reserved_uin`), and both numbers in
+        # that window are, so the allocator had nothing it was allowed to
+        # return and the window exhausted instead of testing anything. Two
+        # adjacent ORDINARY numbers, which is what a window is for.
+        settings.UIN_MIN, settings.UIN_MAX = 748_361_920, 748_361_922
         try:
             async with SessionLocal() as db:
-                db.add(OwnedUin(uin=910_000_000, owner_uin=holder, source="purchase"))
+                db.add(OwnedUin(uin=748_361_920, owner_uin=holder, source="purchase"))
                 await db.commit()
                 picks = {await allocate_uin(db) for _ in range(20)}
-                check("★ the allocator skips the held number", picks == {910_000_001})
+                check("★ the allocator skips the held number", picks == {748_361_921})
                 # The other number goes to a live INVITE rather than a second
                 # collection row, so the window pins the §2.1 gap: the random
                 # allocator used to walk straight onto a promised number,
@@ -326,7 +344,7 @@ async def main():
                 window_code = hash_invite_code("window-code-for-the-test")
                 db.add(Invite(
                     code=window_code, label="window", max_uses=1, used_count=0,
-                    uin=910_000_001, expires_at=None,
+                    uin=748_361_921, expires_at=None,
                 ))
                 await db.commit()
                 exhausted = False
@@ -345,9 +363,9 @@ async def main():
                 await db.commit()
                 picks = {await allocate_uin(db) for _ in range(20)}
                 check("★ and an EXPIRED invite hands the number back at once",
-                      picks == {910_000_001})
+                      picks == {748_361_921})
                 await db.execute(Invite.__table__.delete().where(Invite.code == window_code))
-                await db.execute(OwnedUin.__table__.delete().where(OwnedUin.uin >= 910_000_000))
+                await db.execute(OwnedUin.__table__.delete().where(OwnedUin.uin >= 748_361_920))
                 await db.commit()
         finally:
             settings.UIN_MIN, settings.UIN_MAX = lo, hi
@@ -357,47 +375,41 @@ async def main():
         check(f"★ activating your OWN held number still works ({r.status_code})", r.status_code == 200)
         holder_tok = r.json()["token"]
         check("  ... the number is now the account", r.json()["new_uin"] == HELD)
-        # ⚠ The number it left was the FREE one the network lends at signup, so
-        # it goes back to the pool (founder, 2026-09-03: a free number is a
-        # loan, a bought one is property). Before that rule this line expected
-        # the opposite, and expecting the opposite is what let somebody collect
-        # numbers by moving between them for nothing.
-        check("  ... and the FREE number it left went back to the pool",
+        # ⚠ Since 2026-09-01 an ORDINARY number is a loan: stepping off it puts
+        # it back in the pool, and only a scarce or bought one follows its
+        # holder (routers/migrate.py). `holder` is a random ordinary number.
+        check("  ... and the ordinary number it left went back to the pool",
               holder not in await owned(c, holder_tok))
 
-        print("\nA migration keeps what was BOUGHT and returns what was lent:")
+        print("\nWhat a migration keeps, and what it hands back:")
+        # ⚠⚠ This block used to assert §10.1.3 as written: the number you
+        # migrate off is yours. That stopped being true on 2026-09-01, and
+        # deliberately: `/uin/purchase` was free during the beta, so the
+        # cheapest way to collect numbers was to keep moving, and 161 of them
+        # ended up parked in 54 collections while the shelf everyone picks from
+        # emptied. An ORDINARY number is a loan now and goes back to the pool;
+        # a SCARCE one still follows its holder, which is the #911 guard.
         mover, mover_tok = await register(c)
-        spare = 555_000_333
+        spare = 555_000_333  # scarce by shape, so it is property
         check("the mover holds a spare", (await grant(c, spare, mover)).status_code == 200)
         r = await c.post("/account/migrate", headers=H(mover_tok))
         check(f"migrate -> 200 ({r.status_code})", r.status_code == 200)
         moved = r.json()["new_uin"]
         mover_tok = r.json()["token"]
         after = await owned(c, mover_tok)
-        # ⚠⚠ The rule changed on 2026-09-03 and this block is where it shows.
-        # The mover was answering as the FREE number the network lent them at
-        # signup: no deed, so it goes back to the pool. What they were GIVEN by
-        # the operator has a deed, and a deed survives everything except a sale
-        # or a release.
-        check("★ the free number migrated FROM went back to the pool", mover not in after)
-        check("  ... and the spare they were granted came along", spare in after)
-        check("  ... and nothing else appeared", after == [spare])
+        check("★ the ordinary number migrated FROM went back to the pool", mover not in after)
+        check("★ the scarce number in the collection came along", spare in after)
+        check("  ... and it is the whole collection", after == [spare])
         async with SessionLocal() as db:
-            check("  ... the pool really has it: no deed left behind",
+            check("  ... with no row minted for the ordinary number",
                   await db.get(OwnedUin, mover) is None)
             row = await db.get(OwnedUin, spare)
-            check("  ... and the granted one is owned by the new number",
+            check("  ... and the scarce row now points at the new number",
                   row is not None and int(row.owner_uin) == moved)
 
-        r = await c.post("/uin/activate", headers=H(mover_tok), json={"uin": spare})
-        check(f"★ the mover can move onto what they hold ({r.status_code})", r.status_code == 200)
-        mover_tok = r.json()["token"]
-        # What they left this time is the number the migration gave them, which
-        # is a loan like any other free number: back to the pool, so the
-        # collection is empty and the only number they have is the one they
-        # answer as.
-        check("  ... and the free number they left is gone from the collection",
-              await owned(c, mover_tok) == [])
+        r = await register_proven(c, desired_uin=mover)
+        check("★ the ordinary number is available again, as the pool rule promises",
+              r.status_code == 201)
 
         print("\nThe collection cap does not block a migration:")
         capped, capped_tok = await register(c)
@@ -407,25 +419,27 @@ async def main():
         r = await c.post("/account/migrate", headers=H(capped_tok))
         check(f"★ migrating at the cap is not refused ({r.status_code})", r.status_code == 200)
         capped_tok = r.json()["token"]
-        # ⚠ Nothing is "kept over the cap" any more: the number being left is the
-        # free one this account was lent, and a loan goes back to the pool. The
-        # cap therefore cannot be walked past by migrating, which is what the
-        # next two checks used to be defending against.
-        check("★ the collection is unchanged by the migration",
+        # ⚠ `capped` is a random ORDINARY number, so the loan rule sends it back
+        # to the pool and the collection stays exactly at the cap. The
+        # "one over" exemption is for a SCARCE vacated number, which is the
+        # case the next block covers.
+        check("★ the ordinary number it left went back to the pool, collection still at the cap",
               capped not in await owned(c, capped_tok)
               and len(await owned(c, capped_tok)) == MAX_OWNED_UINS)
-        r = await c.post("/uin/purchase", headers=H(capped_tok), json={"uin": 557_000_001, "switch": False})
-        check(f"  ... and acquiring another is refused ({r.status_code})", r.status_code in (403, 409))
+        r = await c.post("/uin/purchase", headers=H(capped_tok), json={"uin": 583_692_461, "switch": False})
+        check(f"  ... and acquiring another IS refused, which is the containment ({r.status_code})", r.status_code == 409)
+        check("  ... and says why", r.json().get("detail", {}).get("code") == "too_many_uins")
         # ★ "One over" has to actually BE one over. There is no cooldown by
         # default and no rate limit on /account/migrate, so an exemption with no
         # ceiling is an unbounded collection for anyone willing to loop, and
         # every row in it is a number the allocator can never hand out again.
-        before = await owned(c, capped_tok)
+        at_cap = await owned(c, capped_tok)
         r = await c.post("/account/migrate", headers=H(capped_tok))
-        check(f"★ migrating again is not refused ({r.status_code})", r.status_code == 200)
+        check(f"★ migrating AGAIN at the cap is still not refused ({r.status_code})",
+              r.status_code == 200)
         capped_tok = r.json()["token"]
-        check("★ and the number goes back to the pool, so looping collects nothing",
-              await owned(c, capped_tok) == before)
+        check("★ and looping migrations cannot grow a collection past the cap",
+              await owned(c, capped_tok) == at_cap)
 
         print("\nA migration never takes a number somebody else holds:")
         occupant, occupant_tok = await register(c)
@@ -449,20 +463,26 @@ async def main():
         check(f"★ so the holder can still take the number back ({r.status_code})",
               r.status_code == 200)
 
-        print("\nBuying with a switch still keeps the previous number, exactly once:")
+        print("\nBuying with a switch keeps a SCARCE previous number, exactly once:")
+        # ⚠ The previous number is kept when it is scarce; an ordinary one is a
+        # loan and goes back to the pool (2026-09-01). So the buyer is put on a
+        # scarce number first, or this would assert the loan rule by accident
+        # and pass for the wrong reason.
         buyer, buyer_tok = await register(c)
+        kept = 555_000_666  # scarce by shape
+        check("the buyer is put on a scarce number", (await grant(c, kept, buyer)).status_code == 200)
+        r = await c.post("/uin/activate", headers=H(buyer_tok), json={"uin": kept})
+        check(f"  ... and answers as it ({r.status_code})", r.status_code == 200)
+        buyer_tok = r.json()["token"]
         r = await c.post("/uin/purchase", headers=H(buyer_tok), json={"uin": 558_000_777, "switch": True})
         check(f"purchase with switch -> 200 ({r.status_code})", r.status_code == 200)
         buyer_tok = r.json()["token"]
-        # The previous number here is the free signup one, so buying-with-a-switch
-        # leaves it in the pool. What the buyer holds after this is the number
-        # they bought, and they are answering as it, so the collection is empty.
-        check("★ the free previous number is not kept",
-              r.json()["owned"] == [] and await owned(c, buyer_tok) == [])
+        check("★ the scarce previous number is held, once",
+              r.json()["owned"] == [kept] and await owned(c, buyer_tok) == [kept])
         check("  ... and the account answers as the new one", r.json()["new_uin"] == 558_000_777)
         async with SessionLocal() as db:
-            rows = (await db.execute(select(OwnedUin.uin).where(OwnedUin.uin == buyer))).scalars().all()
-            check("  ... and no deed was written for the free number it left", len(rows) == 0)
+            rows = (await db.execute(select(OwnedUin.uin).where(OwnedUin.uin == kept))).scalars().all()
+            check("  ... with no duplicate row (the bookkeeping moved, it was not copied)", len(rows) == 1)
 
     await close_redis()
     print("\nALL UIN-HOLD CHECKS PASSED" if fails == 0 else f"\n{fails} CHECK(S) FAILED")

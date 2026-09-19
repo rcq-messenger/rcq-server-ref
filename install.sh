@@ -450,17 +450,25 @@ else
 
     JWT_SECRET=$(openssl rand -hex 32)
     POSTGRES_PASSWORD=$(openssl rand -hex 16)
+    # ⚠⚠ THE CONSOLE USED TO SHIP OFF. `.env.example` leaves ADMIN_USERNAME
+    # empty, which the server reads as "disable every /admin/* route", so an
+    # operator who followed the documented install to the letter had no way to
+    # name their island, write a welcome, set an entry price or read a report,
+    # and nothing anywhere said so. Generated here, printed once below, and
+    # never again: the file is mode 0600 and we keep no copy.
+    ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '\n/+=' | cut -c1-24)
 
     cp .env.example .env
     # Pass values via env so bash escaping doesn't bite us on
     # special characters from openssl-random output (none today, but
     # belt-and-suspenders).
-    DOMAIN="$DOMAIN" JWT_SECRET="$JWT_SECRET" POSTGRES_PASSWORD="$POSTGRES_PASSWORD" TLS_MODE="$TLS_MODE" python3 - <<'PY'
+    DOMAIN="$DOMAIN" JWT_SECRET="$JWT_SECRET" POSTGRES_PASSWORD="$POSTGRES_PASSWORD" TLS_MODE="$TLS_MODE" ADMIN_PASSWORD="$ADMIN_PASSWORD" python3 - <<'PY'
 import os
 from pathlib import Path
 domain = os.environ["DOMAIN"]
 jwt = os.environ["JWT_SECRET"]
 pgpw = os.environ["POSTGRES_PASSWORD"]
+adminpw = os.environ["ADMIN_PASSWORD"]
 # "" or "ca": the example's own TLS lines stay as they are (CA mode).
 fingerprint = os.environ["TLS_MODE"] == "fingerprint"
 caddyfile = "./deploy/Caddyfile.fingerprint.compose"
@@ -468,7 +476,8 @@ p = Path(".env")
 lines = p.read_text().splitlines()
 out = []
 seen = {"ENV": False, "RCQ_DOMAIN": False, "JWT_SECRET": False, "POSTGRES_PASSWORD": False,
-        "RCQ_TLS_MODE": False, "RCQ_CADDYFILE": False, "APP_NAME": False}
+        "RCQ_TLS_MODE": False, "RCQ_CADDYFILE": False, "APP_NAME": False,
+        "ADMIN_USERNAME": False, "ADMIN_PASSWORD": False}
 for line in lines:
     key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
     if key == "ENV":
@@ -487,6 +496,10 @@ for line in lines:
         out.append(f"JWT_SECRET={jwt}"); seen["JWT_SECRET"] = True
     elif key == "POSTGRES_PASSWORD":
         out.append(f"POSTGRES_PASSWORD={pgpw}"); seen["POSTGRES_PASSWORD"] = True
+    elif key == "ADMIN_USERNAME":
+        out.append("ADMIN_USERNAME=admin"); seen["ADMIN_USERNAME"] = True
+    elif key == "ADMIN_PASSWORD":
+        out.append(f"ADMIN_PASSWORD={adminpw}"); seen["ADMIN_PASSWORD"] = True
     elif key == "RCQ_TLS_MODE" and fingerprint:
         out.append("RCQ_TLS_MODE=fingerprint"); seen["RCQ_TLS_MODE"] = True
     elif key == "RCQ_CADDYFILE" and fingerprint:
@@ -495,6 +508,10 @@ for line in lines:
         out.append(line)
 if not seen["POSTGRES_PASSWORD"]:
     out.append(f"POSTGRES_PASSWORD={pgpw}")
+if not seen["ADMIN_USERNAME"]:
+    out.append("ADMIN_USERNAME=admin")
+if not seen["ADMIN_PASSWORD"]:
+    out.append(f"ADMIN_PASSWORD={adminpw}")
 if not seen["APP_NAME"]:
     out.append(f"APP_NAME={domain}")
 if fingerprint and not seen["RCQ_TLS_MODE"]:
@@ -572,6 +589,14 @@ if [ "$TLS_MODE_VAL" = "fingerprint" ]; then
         echo "    fingerprint accept one banner then; nobody else notices). By IP, the address"
         echo "    itself changes, and everyone adds the island again."
     fi
+    echo
+    echo "Your island's console — the ONLY place to name the island, write its"
+    echo "welcome, set an entry price, grant badges and read reports:"
+    echo "    https://$(url_host "$DOMAIN_VAL")/admin/console"
+    echo "    user: admin"
+    echo "    pass: $ADMIN_PASSWORD"
+    echo "  This is printed once. It lives in $INSTALL_DIR/.env (mode 0600) and"
+    echo "  nowhere else; change it there and restart to rotate."
     echo
     echo "Next steps:"
     echo "  • In RCQ on Android, iOS, the desktop or the CLI: add a server and enter"
@@ -670,6 +695,14 @@ for _ in $(seq 1 12); do
     if curl -fsS -m 5 "https://$DOMAIN_VAL/health" >/dev/null 2>&1; then
         echo
         say "${GREEN}Server is live at https://$DOMAIN_VAL${RESET}"
+        echo
+        echo "Your island's console — the ONLY place to name the island, write its"
+        echo "welcome, set an entry price, grant badges and read reports:"
+        echo "    https://$DOMAIN_VAL/admin/console"
+        echo "    user: admin"
+        echo "    pass: $ADMIN_PASSWORD"
+        echo "  This is printed once. It lives in $INSTALL_DIR/.env (mode 0600) and"
+        echo "  nowhere else; change it there and restart to rotate."
         echo
         echo "Next steps:"
         echo "  • In the RCQ iOS app, open the account switcher (top-left pill),"

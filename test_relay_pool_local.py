@@ -29,7 +29,7 @@ two `/admin/stats` counters.
 Runs the real FastAPI stack in-process on a throwaway SQLite DB. Redis is a
 recording fake (the limiter and /bridges swallow Redis errors anyway, and the
 fake lets case 10 assert what would have been written). No network.
-Run: cd rcq-server-ref && PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_relay_pool_local.py
+Run: cd rcq-server-ref && PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_relay_pool_local.py
 """
 import asyncio
 import base64

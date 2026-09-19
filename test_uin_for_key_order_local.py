@@ -25,7 +25,7 @@ and not through a copy of its query.
 
 Direct calls into the router functions against a throwaway SQLite DB, no HTTP.
 Redis db 15 is only touched by `uin_epoch`, which degrades to the DB without it.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_uin_for_key_order_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_uin_for_key_order_local.py
 """
 import asyncio
 import base64

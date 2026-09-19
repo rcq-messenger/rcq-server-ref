@@ -22,8 +22,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, '/Users/tager/Documents/RCQ/backend')
-DB = pathlib.Path('/Users/tager/Documents/RCQ/backend/test_residency.db')
+# Beside this file, wherever it is checked out — not inside somebody's home.
+DB = pathlib.Path(__file__).resolve().parent / 'test_residency.db'
 if DB.exists():
     DB.unlink()
 os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB}")

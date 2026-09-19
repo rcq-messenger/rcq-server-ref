@@ -46,7 +46,7 @@ finishes and prints its count.
 
 Runs the real FastAPI stack in-process via httpx ASGITransport on a throwaway
 SQLite DB with Redis db 15. NOT part of the prod suite; NOT deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_group_log_cursor_race_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_group_log_cursor_race_local.py
 """
 import asyncio
 import base64

@@ -107,7 +107,10 @@ async def capture_up(**kwargs) -> dict:
     """Run unifiedpush.send_to_user, return the JSON body it would POST."""
     seen: dict = {}
 
-    async def fake_deliver(endpoint, body, ttl):
+    # `quick` since the wake split: a stub that does not take it stops
+    # standing in for the real one, and these stubs exist to pin what a
+    # push banner may carry.
+    async def fake_deliver(endpoint, body, ttl, quick=False):
         seen["body"] = json.loads(body.decode())
         return "ok", "200"
 

@@ -29,7 +29,7 @@ Pins:
 
 Runs the real FastAPI stack in-process on a throwaway SQLite DB with Redis
 db 15. NOT deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_guest_rooms_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_guest_rooms_local.py
 """
 import asyncio
 import base64

@@ -7,7 +7,6 @@ from a column select rather than from a User, so it does not get the gate for
 free.
 """
 import sys, types, asyncio
-sys.path.insert(0, '/Users/tager/Documents/RCQ/backend')
 
 from app.models.user import User, badge_for_viewer
 
@@ -40,7 +39,7 @@ check("hidden and absent are the same answer on the wire",
 # is a grep, deliberately: the failure being guarded against is a NEW call site
 # added later that reads `u.badge` straight.
 import re, pathlib
-ROOT = pathlib.Path('/Users/tager/Documents/RCQ/backend/app/routers')
+ROOT = pathlib.Path(__file__).resolve().parent / 'app' / 'routers'
 offenders = []
 for f in ('users.py', 'contacts.py'):
     for n, line in enumerate(( ROOT / f).read_text().split('\n'), 1):

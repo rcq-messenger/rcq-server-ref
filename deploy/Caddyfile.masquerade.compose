@@ -47,7 +47,14 @@
 	# expands {$RCQ_AUTH_TOKEN} at config-load time, so the token never
 	# leaves the operator's box. A scanner that doesn't know the token
 	# cannot satisfy this matcher.
-	@authed header X-RCQ-Auth {$RCQ_AUTH_TOKEN}
+	#
+	# ⚠⚠ THE DEFAULT IS THE SAFETY, not decoration. An unset or empty
+	# RCQ_AUTH_TOKEN used to expand to nothing, and `header X-RCQ-Auth ""`
+	# is Caddy's "this field exists" matcher: every scanner that sent the
+	# header at all sailed through, on an island whose operator believed
+	# they were hidden. With a sentinel nobody will ever send, a forgotten
+	# token closes the door instead of opening it.
+	@authed header X-RCQ-Auth {$RCQ_AUTH_TOKEN:token-not-configured-nobody-passes}
 
 	# Authed requests pass through to FastAPI exactly as the default
 	# Caddyfile would.

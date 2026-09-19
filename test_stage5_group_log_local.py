@@ -19,7 +19,7 @@ log (iOS can be weeks behind), and the switch is implicit: the first
 
 Runs the real FastAPI stack in-process on a throwaway SQLite DB with Redis
 db 15. NOT deployed.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_stage5_group_log_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_stage5_group_log_local.py
 """
 import asyncio
 import base64

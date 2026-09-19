@@ -13,7 +13,7 @@ Worker's own canonicalisation, signs both documents the till can send (a
 voucher and a hold request), and verifies them with the island's verifier.
 
 Needs `node` on PATH. NOT deployed, and it touches no database.
-Run: PYTHONPATH=. /Users/tager/Documents/RCQ/backend/.venv/bin/python test_till_interop_local.py
+Run: PYTHONPATH=. PYTHONPATH=. .venv/bin/python test_till_interop_local.py
 """
 import base64
 import json

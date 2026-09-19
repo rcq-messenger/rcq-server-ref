@@ -101,7 +101,10 @@ async def main():
         delivered.append(token)
         return True, False
 
-    async def fake_deliver(endpoint, body, ttl):
+    # `quick` since the wake split: a stub that does not take it stops
+    # standing in for the real one, and these stubs exist to pin what a
+    # push banner may carry.
+    async def fake_deliver(endpoint, body, ttl, quick=False):
         delivered.append(endpoint)
         return "ok", "200"
 
