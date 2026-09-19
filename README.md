@@ -292,16 +292,28 @@ one paragraph in [SECURITY.md](SECURITY.md#islands-trusted-by-fingerprint).
 
 ## The `test_*_local.py` files
 
-The fifty-odd files in the root are the server's own tests, and they are here
+The seventy-odd files in the root are the server's own tests, and they are here
 on purpose: a reference implementation whose claims about its own behaviour
 cannot be run is a claim on trust. Each one stands alone against a throwaway
-SQLite file, needs no network and no Docker, and is named after the thing it
-pins.
+SQLite file and is named after the thing it pins.
 
 ```bash
-python3 test_uin_hold_local.py       # one of them
-for f in test_*_local.py; do python3 "$f" || break; done
+PYTHONPATH=. .venv/bin/python test_uin_hold_local.py      # one of them
+for f in test_*_local.py; do PYTHONPATH=. .venv/bin/python "$f" || echo "FAILED: $f"; done
 ```
+
+Two of them are the exception and say so in their own first lines: the
+federation harness (`test_cross_island_local.py`) and the room-signalling one
+(`test_room_signalling_local.py`) drive TWO live islands over the wire, so they
+need `uvicorn app.main:app` on ports 8099 and 8098 first. Everything else runs
+with nothing but this checkout.
+
+⚠ They need a local Redis, and they take their own corner of it (db 15) rather
+than the one a dev stand uses, because the rate limiter and the island-wide
+registration ceiling live there and are not part of the throwaway database: a
+file that registers a dozen accounts would otherwise pass once and then be
+refused by the island's own flood protection, which reads exactly like a
+product bug.
 
 They leave a `.db` behind, which is why `*.db` is ignored. If you are reading
 this repository to decide whether to trust it, these are the files to read

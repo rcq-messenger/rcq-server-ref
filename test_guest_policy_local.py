@@ -593,11 +593,23 @@ async def main() -> int:
         print("\nWebSocket:")
         fake = FakeManager()
         real_manager, real_register = ws_mod.manager, ws_mod._register_call
+        real_pair_live = ws_mod._call_pair_live
 
         async def always_register(call_id, a, b):
             return True
 
+        # ⚠ The frame gate, stubbed for the same reason as the register above:
+        # since 2026-09-19 a non-offer frame is relayed only between a pair
+        # with a live `calls:active` entry, and neither stub writes one. This
+        # section is about the GUEST rule — which frames a guest may exchange —
+        # so the pair question is answered yes and the guest question is left
+        # to the code under test. The gate has its own file
+        # (test_call_frame_gate_local).
+        async def pair_is_live(a, b, call_id):
+            return True
+
         ws_mod.manager, ws_mod._register_call = fake, always_register
+        ws_mod._call_pair_live = pair_is_live
         try:
             async def frame(sender, msg):
                 fake.sent.clear()
@@ -628,6 +640,7 @@ async def main() -> int:
                   not await ws_mod._caller_allowed(M, G) and not await ws_mod._caller_allowed(G, M))
         finally:
             ws_mod.manager, ws_mod._register_call = real_manager, real_register
+            ws_mod._call_pair_live = real_pair_live
 
         # ── 6. Redis down ────────────────────────────────────────────────
         print("\nRedis down:")

@@ -143,6 +143,20 @@ async def main() -> int:
 
     ws_mod._register_call = always_register
 
+    # ⚠ And the gate that reads what `_register_call` would have written. Since
+    # 2026-09-19 every call frame that is not an offer is relayed only between
+    # a pair with a live entry in `calls:active` — the answer, the ICE and the
+    # end used to go to whatever `to_uin` said, which let any account push
+    # arbitrary strings into any other account's socket past a `call_policy` of
+    # "nobody". The stub above never writes that entry, so without this the
+    # follow-up frames below are dropped before they can produce the wakes this
+    # file is about. What is under test here is what a PUSH may carry, not who
+    # may ring whom; the gate has test_call_frame_gate_local to itself.
+    async def pair_is_live(a: int, b: int, call_id: str) -> bool:
+        return True
+
+    ws_mod._call_pair_live = pair_is_live
+
     print("\n1. the offer wake")
     await offer(voip, up)
 

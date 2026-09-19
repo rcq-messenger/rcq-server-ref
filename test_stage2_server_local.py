@@ -323,13 +323,22 @@ async def main() -> None:
     check("group content row stored with cls 1", gstored.get("message") == 1)
     check("group skdm row stored with cls 2", gstored.get("skdm") == 2)
 
-    # ── _keep_for branches on cls==2, not the type string ───────────────────
+    # ── _keep_for branches on cls==2, and since the sknack split on the
+    #    envelope_type beside it ──────────────────────────────────────────────
     print("\n_keep_for keeps critical class for everyone")
     everyone = [1, 2, 3]
     check("cls 2 kept for all recipients regardless of dormancy",
-          M._keep_for(everyone, set(), 2, []) == {1, 2, 3})
+          M._keep_for(everyone, set(), 2, [], "skdm") == {1, 2, 3})
     check("cls 1 kept only for queueable | wake",
-          M._keep_for(everyone, {1}, 1, [2]) == {1, 2})
+          M._keep_for(everyone, {1}, 1, [2], "message") == {1, 2})
+    # The one cls-2 type that does NOT keep for everyone: a `sknack` is the
+    # question "who holds key id X", worthless once stale, and keeping it for
+    # everyone wrote a row for all ~930 members of the flagship group per
+    # recovery request. It stays cls 2 (cls 1 drives the push, and a banner for
+    # a key-recovery question is not a message anybody wants) and follows the
+    # ordinary dormant rule.
+    check("a sknack is the exception, by envelope_type and not by class",
+          M._keep_for(everyone, {1}, 2, [], "sknack") == {1})
 
     total = len(PASS) + len(FAIL)
     print(f"\n{'ALL' if not FAIL else str(len(FAIL)) + ' FAILED of'} {total} STAGE-2 CHECKS "

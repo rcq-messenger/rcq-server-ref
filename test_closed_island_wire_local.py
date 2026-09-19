@@ -222,18 +222,41 @@ async def main() -> None:
         # anybody, because reaching it requires a session; these three take no
         # session, which is what makes cross-island messaging work and what
         # makes them the only thing between a stranger and a resident's key.
+        # ⚠⚠ DOOR 1 DOES NOT REFUSE, AND THAT IS THE FIX, NOT THE BUG. Refusing
+        # this endpoint does not close an island, it unplugs it: every
+        # cross-island contact request starts here, and the flagship spent
+        # hours on 2026-09-09 answering "cannot add people from other islands"
+        # because of exactly that. Since report #969 a stranger with no card
+        # gets a SEAL-ONLY card — the three keys an envelope cannot be sealed
+        # without, and nothing that describes a person: no nickname, no
+        # profile, no confirmation that the number they typed is who they meant.
         r = await c.get(f"/federation/keys/{resident}")
-        check("door 1 refuses an anonymous stranger", r.status_code == 404, str(r.status_code))
-        check("and with the same 404 body as a number that does not exist",
-              r.text == gone.text, f"{r.text!r} vs {gone.text!r}")
+        body = r.json() if r.status_code == 200 else {}
+        check("door 1 hands a stranger the seal keys, so federation still works",
+              r.status_code == 200 and bool(body.get("identity_key")) and bool(body.get("signing_key")),
+              str(r.status_code))
+        check("★ and nothing that describes the person behind them",
+              body.get("nickname") is None and body.get("status_message") is None
+              and body.get("gender") is None and body.get("profile_openable") is False,
+              str(body))
+        # ⚠ WHAT THIS DOOR STILL TELLS AN OUTSIDER: that the number exists at
+        # all. A number nobody holds answers 404 here, an existing one answers
+        # 200, and `closed_island`'s own help text promises the opposite
+        # ("Refusals look exactly like 'no such number'"). Closing that costs
+        # something real — a mistyped number would stop being visibly wrong to
+        # the sender — so it is a decision, not a patch, and it is open. The
+        # neighbouring endpoint /federation/island-record/{uin} is the cheaper
+        # oracle of the two and knows nothing about doors at all.
 
         r = await c.get(f"/federation/keys/{resident}", headers={"X-RCQ-Guest-Card": raw})
         check("door 1 opens for the card its owner handed out",
               r.status_code == 200 and bool(r.json().get("identity_key")), str(r.status_code))
 
         r = await c.get(f"/federation/keys/{neighbour}", headers={"X-RCQ-Guest-Card": raw})
-        check("and that card opens ONE door: not the neighbour's",
-              r.status_code == 404, str(r.status_code))
+        nb = r.json() if r.status_code == 200 else {}
+        check("★ and that card opens ONE door: the neighbour is back to seal-only",
+              r.status_code == 200 and bool(nb.get("identity_key")) and nb.get("nickname") is None,
+              f"{r.status_code} {nb}")
 
         r = await c.get(f"/keys/{resident}/bundle")
         check("door 2 refuses an anonymous stranger too — leaving it open would "
@@ -271,14 +294,26 @@ async def main() -> None:
               r.status_code == 200, str(r.status_code))
 
         info = (await c.get("/server/info")).json()
-        check("a closed island stops advertising anonymous key fetches: a door "
-              "that cannot tell a resident from an outsider is not a door",
-              info["capabilities"]["anon_keys"] is False)
+        # `anon_keys` answers "may a stranger fetch a key here", and on a closed
+        # island the honest answer is still yes: they get the seal-only card.
+        # It turns false only under `federation_refuse_strangers`, the setting
+        # for an operator who really does want off the network.
+        check("a closed island still advertises anonymous key fetches, because "
+              "it still serves them, seal-only",
+              info["capabilities"]["anon_keys"] is True,
+              str(info["capabilities"].get("anon_keys")))
 
+        # ⚠ This used to reopen the island and check `/users/{uin}/info` with a
+        # SESSION, which answers 200 on a closed island too — so it passed
+        # whatever the setting said, including with a stuck settings cache. The
+        # question is whether reopening restores what closing took away, so ask
+        # the door that actually changes: a full card, nickname and all.
         await set_setting("closed_island", "false")
-        r = await c.get(f"/users/{resident}/info", headers=auth(otok))
-        check("reopening the island restores it immediately, with no restart",
-              r.status_code == 200)
+        r = await c.get(f"/federation/keys/{resident}")
+        reopened = r.json() if r.status_code == 200 else {}
+        check("★ reopening restores the FULL card immediately, with no restart",
+              r.status_code == 200 and reopened.get("nickname") is not None,
+              f"{r.status_code} {reopened}")
 
     print(f"\nclosed island on the wire: {ok}/{ok + bad} ok")
     raise SystemExit(0 if bad == 0 else 1)

@@ -122,7 +122,14 @@ def hold_req(uin: int, hold_id: str, *, kind: str = "hold", ttl: int = 300, sign
     return base64.b64encode(json.dumps(doc).encode()).decode()
 
 
-ALICE = 700400001
+# ⚠ An ORDINARY nine-digit number, and the "000" in the number this used to be
+# is why. `is_reserved_uin` reads a run of three identical digits as a pattern
+# and files the number with the scarce stock, and scarce stock stays in its
+# owner's collection instead of going back to the pool (founder, 2026-09-03).
+# So the check below — "the free number the network lent went back to the
+# pool" — was asserting the rule for lent numbers against a number the rules
+# treat as a trophy.
+ALICE = 718352946
 ADMIN = ("admin", "adminpw")
 
 
@@ -272,8 +279,12 @@ async def main() -> int:
               r.status_code == 403 and code(r) == "bad_voucher")
 
         print("\nWhat the shop says a number costs, and how it is obtained:")
-        q = (await c.post("/uin/quote", json={"uin": 4477}, headers=H3)).json()
-        check(f"a four-digit number is FOR SALE ({q.get('acquire')}, {q.get('price_display')})",
+        # ⚠ 4813, not 4477: four digits, but `price_length` reads the repeated
+        # pair in 4477 as a pattern and prices it in the three-digit trophy
+        # tier ($999), so the case meant to pin the FOUR-DIGIT price was
+        # pinning the wrong one.
+        q = (await c.post("/uin/quote", json={"uin": 4813}, headers=H3)).json()
+        check(f"a plain four-digit number is FOR SALE ({q.get('acquire')}, {q.get('price_display')})",
               q.get("acquire") == "purchase" and q.get("price_cents") == 19900)
         check("  ⚠⚠ ... and still reads as unavailable to a client that predates "
               "`acquire`, so three released clients do not offer it for free",
