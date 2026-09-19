@@ -32,6 +32,31 @@ from datetime import datetime, timedelta, timezone
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_burn_recover_chain.db"
 os.environ["ENV"] = "dev"
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+
+# ⚠ The island ceiling, raised for this file only. db 15 above keeps this file
+# out of the stand's Redis, but it does NOT give it a private ceiling: every
+# _local file that registers shares `rl:ceiling:auth_register:3600` in db 15, and
+# the island default is 40/minute and 400/hour. A few full passes of the suite
+# inside one hour push the shared counter past 400, and the next file that has
+# NOT raised it answers 503 island_busy on a perfectly good registration — which
+# is why the failing SET used to move between runs. Read through a lambda
+# precisely so a test may raise it (core.rate_limit.island_ceiling).
+os.environ.setdefault("REGISTER_CEILING_PER_MINUTE", "5000")
+os.environ.setdefault("REGISTER_CEILING_PER_HOUR", "5000")
+
+
+def _caller_addr():
+    """A caller address nobody else shares, fresh on every run.
+
+    `/auth/register` carries two per-caller limits hardcoded on the route — one
+    per IP, one per /24 — and both live in Redis rather than in the throwaway
+    database. Left at httpx's default the whole suite registers as ONE caller and
+    spends the 20/hour between them, so whether this file passes depends on which
+    files ran before it. The subnet moves too, because one limit is per /24.
+    """
+    who = os.getpid()
+    return (f"10.{(who >> 8) & 0xFF}.{who & 0xFF}.{(who >> 16) % 254 + 1}", 44444)
+
 os.environ.pop("RCQ_ISLAND_HOST", None)
 for f in ("test_burn_recover_chain.db",):
     try:
@@ -96,7 +121,7 @@ async def count(model, *where):
 async def main() -> int:
     await init_db()
     await (await get_redis()).flushdb()
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, client=_caller_addr())
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
 
         async def register(keys: Keys, nick: str, proven: bool = False):

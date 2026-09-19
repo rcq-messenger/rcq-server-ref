@@ -11,6 +11,23 @@ import asyncio
 import os
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test_slot_revoke.db")
+# ⚠ A SCRATCH Redis namespace. This file asserts on the session registry, which
+# lives in Redis and NOT in the throwaway SQLite above: pointed at db 0 it reads
+# and deletes `dev:revoked:460001` in the same Redis as the local two-island
+# stand. db 15 is nobody's product data, and `setdefault` leaves an operator free
+# to point it elsewhere.
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
+
+# ⚠ And the throwaway database is thrown away, which it was not. The rows below
+# are inserted with fixed keys (uin 460001, device_id 2 and 3), so a file that
+# leaves its SQLite behind passes once and then dies on
+# `UNIQUE constraint failed: devices.uin, devices.device_id` — which reads like
+# a broken revoke and is nothing but yesterday's rows.
+for _f in ("test_slot_revoke.db",):
+    try:
+        os.remove(_f)
+    except FileNotFoundError:
+        pass
 
 from sqlalchemy import select  # noqa: E402
 

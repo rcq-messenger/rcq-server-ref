@@ -33,6 +33,35 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_reports_integrity.db"
 os.environ["ENV"] = "dev"
 os.environ["ADMIN_USERNAME"] = "admin"
 os.environ["ADMIN_PASSWORD"] = "test-pass"
+# ⚠ A SCRATCH Redis namespace, and the reason this file could look broken for
+# weeks. The throwaway SQLite above is deleted on every run, but the rate limiter
+# and the island-wide registration ceiling do not live in SQLite: they live in
+# Redis, which is shared with the local two-island stand and with the previous
+# run of this very file. A dozen registrations later the island answers 503
+# island_busy or 429 to a perfectly good request and the file reads as "the
+# server is broken" when nothing is. db 15 is nobody's product data, and
+# `setdefault` leaves an operator free to point it elsewhere.
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
+# ⚠ And the island's own ceiling, raised for this file only. It is read through
+# a lambda precisely so a test may raise it (core.rate_limit.island_ceiling); a
+# file that registers several accounts in two seconds trips 40/minute and
+# 400/hour on its SECOND run of the hour.
+os.environ.setdefault("REGISTER_CEILING_PER_MINUTE", "5000")
+os.environ.setdefault("REGISTER_CEILING_PER_HOUR", "5000")
+
+
+def _caller_addr():
+    """A caller address nobody else shares, fresh on every run.
+
+    `/auth/register` carries two per-caller limits hardcoded on the route — one
+    per IP, one per /24 — and both live in Redis rather than in the throwaway
+    database. 20 per hour is fewer than this file spends in one pass, so a second
+    run would answer 429 to its first registration. The subnet moves too, because
+    one of the two limits is per /24.
+    """
+    who = os.getpid()
+    return (f"10.{(who >> 8) & 0xFF}.{who & 0xFF}.{(who >> 16) % 254 + 1}", 44444)
+
 
 for f in ("test_reports_integrity.db",):
     try:
@@ -71,7 +100,7 @@ async def stats(uin: int) -> tuple[int, int]:
 
 async def main():
     await init_db()
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, client=_caller_addr())
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.post("/auth/register", json={
             "nickname": "tester", "identity_key": b64(), "signing_key": b64(),

@@ -39,6 +39,31 @@ from datetime import datetime, timedelta, timezone
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_guest_rooms.db"
 os.environ["ENV"] = "dev"
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+
+# ⚠ The island ceiling, raised for this file only. db 15 above keeps this file
+# out of the stand's Redis, but it does NOT give it a private ceiling: every
+# _local file that registers shares `rl:ceiling:auth_register:3600` in db 15, and
+# the island default is 40/minute and 400/hour. A few full passes of the suite
+# inside one hour push the shared counter past 400, and the next file that has
+# NOT raised it answers 503 island_busy on a perfectly good registration — which
+# is why the failing SET used to move between runs. Read through a lambda
+# precisely so a test may raise it (core.rate_limit.island_ceiling).
+os.environ.setdefault("REGISTER_CEILING_PER_MINUTE", "5000")
+os.environ.setdefault("REGISTER_CEILING_PER_HOUR", "5000")
+
+
+def _caller_addr():
+    """A caller address nobody else shares, fresh on every run.
+
+    `/auth/register` carries two per-caller limits hardcoded on the route — one
+    per IP, one per /24 — and both live in Redis rather than in the throwaway
+    database. Left at httpx's default the whole suite registers as ONE caller and
+    spends the 20/hour between them, so whether this file passes depends on which
+    files ran before it. The subnet moves too, because one limit is per /24.
+    """
+    who = os.getpid()
+    return (f"10.{(who >> 8) & 0xFF}.{who & 0xFF}.{(who >> 16) % 254 + 1}", 44444)
+
 for var in ("RCQ_GUEST_ADMISSION", "RCQ_ISLAND_HOST", "RCQ_FOUNDER_UIN", "RCQ_FOUNDER_BETA_GROUP_ID",
             "RCQ_GUEST_SWEEP_DRY_RUN"):
     os.environ.pop(var, None)
@@ -192,7 +217,7 @@ async def main() -> int:
 
     groups_mod._broadcast_membership = broadcast_recorder
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=_caller_addr()), base_url="http://t") as c:
 
         async def register(nick: str):
             await clear("rl:*")
