@@ -256,6 +256,12 @@ async def _wait_out_answer_grace(call_id: str, sender_uin: int) -> None:
     await asyncio.sleep(_ANSWER_ICE_GRACE_S - waited)
 
 
+#: How old a `calls:active` entry may be and still authorise a call frame.
+#: Six hours is longer than any real 1:1 call and far shorter than the forever
+#: a leaked entry would otherwise last. See the note inside `_call_pair_live`.
+_CALL_FRAME_MAX_AGE_S = 6 * 3600
+
+
 async def _call_pair_live(a: int, b: int, call_id: str) -> bool:
     """Is there a REGISTERED 1:1 call between [a] and [b]?
 
@@ -282,6 +288,7 @@ async def _call_pair_live(a: int, b: int, call_id: str) -> bool:
     this gate reaches them.
     """
     redis = await _get_redis()
+    now = int(time.time())
     for who, peer in ((a, b), (b, a)):
         raw = await redis.hget(_CALLS_KEY, str(who))
         if not raw:
@@ -291,6 +298,17 @@ async def _call_pair_live(a: int, b: int, call_id: str) -> bool:
         # during a rolling restart carry only the first two.
         parts = entry.split("|")
         if len(parts) < 2 or parts[1] != str(peer):
+            continue
+        # ⚠ An entry that LEAKED is not a call. Nothing expires this hash — it
+        # is cleared by `call_end` or by the socket-close handler, and neither
+        # runs when the worker holding the socket dies — so without a bound a
+        # pair who spoke once in June could still relay frames at each other in
+        # December, past a `call_policy` set to "nobody" in the meantime. The
+        # bound is hours rather than the ten minutes `_call_entry_is_live` uses
+        # for "busy": that one is protecting the NEXT caller from a ghost, and
+        # being wrong costs a redial, while being wrong here would cut the
+        # renegotiation of a genuinely long call.
+        if len(parts) >= 3 and parts[2].isdigit() and now - int(parts[2]) > _CALL_FRAME_MAX_AGE_S:
             continue
         # An empty id on the frame matches whatever is registered: some
         # clients omit it on `call_end`, and the pair is what matters here.
