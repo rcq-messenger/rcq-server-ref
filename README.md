@@ -302,11 +302,12 @@ PYTHONPATH=. .venv/bin/python test_uin_hold_local.py      # one of them
 for f in test_*_local.py; do PYTHONPATH=. .venv/bin/python "$f" || echo "FAILED: $f"; done
 ```
 
-Two of them are the exception and say so in their own first lines: the
-federation harness (`test_cross_island_local.py`) and the room-signalling one
-(`test_room_signalling_local.py`) drive TWO live islands over the wire, so they
-need `uvicorn app.main:app` on ports 8099 and 8098 first. Everything else runs
-with nothing but this checkout.
+Three of them are the exception and say so in their own first lines: the
+federation harness (`test_cross_island_local.py`), the room-signalling one
+(`test_room_signalling_local.py`) and the key-rotation one
+(`test_rotation_cascade_local.py`) drive TWO live islands over the wire, so
+they need `uvicorn app.main:app` on ports 8099 and 8098 first. Everything else
+runs with nothing but this checkout.
 
 ⚠ They need a local Redis, and they take their own corner of it (db 15) rather
 than the one a dev stand uses, because the rate limiter and the island-wide
