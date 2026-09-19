@@ -62,7 +62,7 @@ from app.services.island_hosts import island_hosts
 from app.services.connection_manager import manager
 from app.services.contact_source import add_edges
 from app.services.key_owner import uin_for_signing_key
-from app.services.queue_drain import account_watermark
+from app.services.queue_drain import account_watermark, upsert_cursor
 from app.services.uin import allocate_uin, is_reserved_uin, uin_is_taken
 from app.services.uin_rows import purge_gossip_mirror, purge_uin_rows
 from app.models.retired_signing_key import RetiredSigningKey
@@ -855,13 +855,16 @@ async def claim_device(
             # furthest device got to, never at zero, or the upgrade itself would
             # replay the queue it was written to avoid replaying.
             floor_direct, floor_group = await account_watermark(db, uin)
-        db.add(QueueCursor(
-            uin=uin,
-            device_id=body.device_id,
-            last_direct_id=floor_direct,
-            last_group_id=floor_group,
-            updated_at=datetime.now(timezone.utc),
-        ))
+        # Upsert, not INSERT: the client may well be retrying this call (it keeps
+        # the token it gets, so a lost answer means a second attempt with the same
+        # device id), and a plain insert made that retry a 500 on
+        # `queue_cursors_pkey`. On conflict the row's marks are left where they
+        # are, which is right: whoever created it in between seeded it themselves.
+        # Only `updated_at` moves, so the row does not look abandoned.
+        await upsert_cursor(
+            db, uin, body.device_id,
+            seed_direct=floor_direct, seed_group=floor_group,
+        )
         # ⚠⚠ And RETIRE the one it inherited from. The install that was
         # "primary" is this install, under its own name from now on, so the old
         # row is an orphan nothing will ever advance again. Left in place it
@@ -1163,13 +1166,13 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
     if body.device_id:
         if await db.get(QueueCursor, (owned, body.device_id)) is None:
             floor_direct, floor_group = await account_watermark(db, owned)
-            db.add(QueueCursor(
-                uin=owned,
-                device_id=body.device_id,
-                last_direct_id=floor_direct,
-                last_group_id=floor_group,
-                updated_at=datetime.now(timezone.utc),
-            ))
+            # Upsert for the same reason as /auth/device above: two refreshes of
+            # one install can land at once (a reconnect racing a foreground
+            # refresh), and the loser of a plain INSERT was a 500.
+            await upsert_cursor(
+                db, owned, body.device_id,
+                seed_direct=floor_direct, seed_group=floor_group,
+            )
             await db.commit()
     guest = await _claim_seat_on_proof(db, owned)
     return RefreshOut(

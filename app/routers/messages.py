@@ -41,7 +41,7 @@ from app.services.apns import (
 from app.services.unifiedpush import send_call_to_user as up_call, send_to_user as up_send
 from app.services.connection_manager import manager
 from app.services.offline_queue_sweep import dormant_cutoff
-from app.services.queue_drain import account_watermark, drain_floor
+from app.services.queue_drain import account_watermark, drain_floor, upsert_cursor
 
 log = logging.getLogger(__name__)
 
@@ -1464,22 +1464,25 @@ async def _advance_cursor(
     axis left at zero would hand this device the whole queue on its next drain
     (and pin the account's reap floor at zero forever). The caller has already
     read above that watermark, so seeding it loses nothing.
+
+    ⚠ The write is a single upsert, never read-then-INSERT. Two drains of the
+    same account overlap often enough that the loser's INSERT was a 500 on the
+    `queue_cursors_pkey` constraint a few times a day, which threw away the ack
+    it was carrying. See `upsert_cursor`: the monotonic rule and the watermark
+    seed both live there now, so a lost race still lands its ack.
     """
+    seed_direct = seed_group = 0
     if cursor is None:
         cursor = await db.get(QueueCursor, (uin, device_id))
     if cursor is None:
-        floor_direct, floor_group = await account_watermark(db, uin)
-        cursor = QueueCursor(
-            uin=uin, device_id=device_id,
-            last_direct_id=floor_direct, last_group_id=floor_group,
-        )
-        db.add(cursor)
-    if max_direct > cursor.last_direct_id:
-        cursor.last_direct_id = max_direct
-    if max_group > cursor.last_group_id:
-        cursor.last_group_id = max_group
-    cursor.updated_at = datetime.now(timezone.utc)
-    await db.flush()
+        # No row for this device (or none a moment ago): only in that case does
+        # the watermark seed apply, and only if this statement creates the row.
+        seed_direct, seed_group = await account_watermark(db, uin)
+    await upsert_cursor(
+        db, uin, device_id,
+        direct=max_direct, group=max_group,
+        seed_direct=seed_direct, seed_group=seed_group,
+    )
     return await _reap_below_min(db, uin)
 
 
@@ -1514,7 +1517,17 @@ async def _reap_below_min(db: AsyncSession, uin: int) -> int:
     the backstop for rows held up by a device that went away without
     unlinking."""
     cursors = (
-        await db.execute(select(QueueCursor).where(QueueCursor.uin == uin))
+        await db.execute(
+            select(QueueCursor)
+            .where(QueueCursor.uin == uin)
+            # ⚠ Read the DATABASE, not the session's identity map. The cursor this
+            # request just moved was moved by an upsert statement rather than by
+            # assigning to a loaded object, so an instance fetched earlier in the
+            # same session still carries its pre-write marks. The minimum below
+            # would then be computed from them and the reap would trail a whole
+            # ack behind, for every ack, forever.
+            .execution_options(populate_existing=True)
+        )
     ).scalars().all()
     # Drop cursors nobody is behind any more. Reinstalling mints a NEW device
     # id, so the abandoned one would otherwise sit at its old position forever
@@ -1639,19 +1652,18 @@ async def fetch_queue(
         # Leaving it unwritten until the ack lets a sibling device's ack raise
         # the account watermark in between, and this device would then be
         # rebased onto the higher mark — burying the very rows it is holding.
-        cursor = QueueCursor(
-            uin=uin, device_id=device_id,
-            last_direct_id=after_direct, last_group_id=after_group,
-            updated_at=datetime.now(timezone.utc),
+        #
+        # One upsert, so a concurrent first drain from the same device (two
+        # sockets for a moment after a reconnect, or a retried request) no longer
+        # dies on `queue_cursors_pkey`. It cannot move an existing row's marks:
+        # the ones it applies on conflict are zero, and the seed only fills a row
+        # this statement creates. The row's `updated_at` is bumped, which is what
+        # the reaper reads, so a losing racer keeps the cursor alive. Whatever the row holds afterwards is this device's
+        # floor, which for the loser of the race is the winner's value.
+        after_direct, after_group = await upsert_cursor(
+            db, uin, device_id, seed_direct=after_direct, seed_group=after_group,
         )
-        db.add(cursor)
-        try:
-            await db.commit()
-        except IntegrityError:  # concurrent first drain from the same device
-            await db.rollback()
-            cursor = await db.get(QueueCursor, (uin, device_id))
-            if cursor is not None:
-                after_direct, after_group = cursor.last_direct_id, cursor.last_group_id
+        await db.commit()
 
     # `dev` is the caller's LIBSIGNAL device id (1 = primary), not the install
     # id the cursor is keyed by. A fan-out copy addressed to another device is
