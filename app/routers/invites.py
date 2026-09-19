@@ -135,15 +135,24 @@ def _utc(value: datetime) -> datetime:
 
 
 def _accrued(user: User, *, total: int, period_days: int, now: datetime) -> tuple[int, datetime | None]:
-    """How many this resident has EARNED so far, and when the next one lands."""
+    """How many this resident has EARNED so far, and when the next one lands.
+
+    ⚠ Anchored on `invites_paid_base`, the counter as it stood at the moment
+    of payment, so the first paid code is in hand the same minute. Zero for
+    anybody who arrived through the paid door, which is every new resident, and
+    non-zero only for an account that had already taken free codes before
+    buying: without it that person paid and saw nothing change, because the
+    drip's first grant was one they had already spent. The lifetime cap is
+    still `total`, so this moves the timing and not the number."""
     if user.resident_since is None or total <= 0:
         return 0, None
     since = _utc(user.resident_since)
+    base = max(0, int(user.invites_paid_base or 0))
     periods = (now - since) // timedelta(days=period_days)
-    granted = min(total, 1 + int(periods))
+    granted = min(total, base + 1 + int(periods))
     if granted >= total:
         return granted, None
-    return granted, since + timedelta(days=period_days * granted)
+    return granted, since + timedelta(days=period_days * (granted - base))
 
 
 def _joined(user: User) -> datetime | None:

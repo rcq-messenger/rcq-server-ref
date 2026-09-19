@@ -130,6 +130,12 @@ async def redeem(
 
     now = datetime.now(timezone.utc)
     user.resident_since = now
+    # ⚠ Where the paid drip starts, read BEFORE anything mints anything: what
+    # this account had already taken as a legacy free account. Without it the
+    # first paid code was one they had already spent, so paying put nothing in
+    # their hand and the next code was a month out (routers/invites.py
+    # `_accrued`). The lifetime cap does not move.
+    user.invites_paid_base = max(0, int(user.invites_minted or 0))
     # Added to what they hold; worn only if nothing is. `entered_via` and
     # `invites_minted` are deliberately not touched, see the module docstring.
     grant_badge(user, "resident")

@@ -194,6 +194,11 @@ _USER_STAGE3_COLUMNS: list[tuple[str, str]] = [
     ("key_unproven_since", "TIMESTAMP WITH TIME ZONE"),
     # Monotone counter, see models/user.py for why it is not a COUNT.
     ("invites_minted", "INTEGER DEFAULT 0"),
+    # Where the paid drip is anchored (19.09). 0 on every existing row, which
+    # reads as "never paid", and that is true of every row that predates it
+    # except the three who paid before it existed; their first paid code lands
+    # on the old schedule, which is the harmless direction.
+    ("invites_paid_base", "INTEGER DEFAULT 0"),
     # Profile picture (see models/user.py). Additive: NULL on every existing
     # row means "no picture", which is exactly the old behaviour.
     ("avatar_media_id", "VARCHAR(64)"),

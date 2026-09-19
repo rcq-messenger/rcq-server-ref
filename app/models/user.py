@@ -202,6 +202,19 @@ class User(Base):
     # quarter and "five in total" becomes five per quarter, for ever, silently.
     invites_minted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # What `invites_minted` stood at when this account PAID (19.09), so the
+    # paid drip starts from there rather than from zero.
+    #
+    # ⚠ The counter still carries over: it is one counter, and a resident's
+    # lifetime total is still the published number. What this column changes is
+    # WHEN the first paid code lands. Without it, somebody who had already
+    # taken the one free code of a legacy account paid fifteen dollars and got
+    # nothing that day, because the drip's first grant was a grant they had
+    # already spent; the next one was a month out. Paying has to put something
+    # in your hand, so the drip is anchored at what you held when you paid.
+    # Zero on every row that never paid, which is what it means.
+    invites_paid_base: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
     # Hall of Fame. `hof_opt_in` is set by the user from their client (consent
     # to be considered). `hof_approved` is set by the founder from the admin
     # console — only the founder decides who actually appears. Both true → the
