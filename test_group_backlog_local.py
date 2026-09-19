@@ -14,6 +14,15 @@ looked at who we were about to WAKE. So:
 This pins the corrected rule: sender-key control is kept for everyone, and a
 content envelope is kept for anyone we are going to wake.
 
+And then a third edge of the same rule, which is why `_keep_for` is asked for
+the envelope_type beside the class: the two CRITICAL (cls 2) types want
+opposite things. An `skdm` IS the chain key and is kept for everyone. A
+`sknack` is the QUESTION "who holds key id X?", worthless once stale and
+re-fired every ten minutes, and keeping it for everyone wrote a row for all
+~930 members of the flagship group per recovery request. It follows the
+ordinary dormant rule now, while staying cls 2 everywhere else — cls 1 is what
+drives the push, so demoting the class would banner a key-recovery question.
+
 Runs offline, no DB. NOT part of the prod suite; NOT deployed.
 Run: cd backend && PYTHONPATH=. .venv/bin/python test_group_backlog_local.py
 """
@@ -55,16 +64,35 @@ print("\n-- the dormant rule itself --")
 check("an active member is queueable", ACTIVE in queueable)
 check("a long-absent member is not", RETURNING not in queueable and GONE not in queueable)
 
-# Stage 2a: `_keep_for` now branches on the 3-value class, not the type string.
-# `_cls_for` is the same ingest-alias map the deposit path applies, so the
-# critical types still land as cls 2 (kept for everyone) and content as cls 1.
-print("\n-- sender-key control is never dropped (critical class, cls 2) --")
-for t in ("skdm", "sknack"):
-    keep = _keep_for(recipients, queueable, _cls_for(t), {})
-    check(f"{t} (cls {_cls_for(t)}) is kept for every recipient", keep == set(recipients))
+# Stage 2a: `_keep_for` branches on the 3-value class, not the type string —
+# and, since the sknack split, on the envelope_type beside it. `_cls_for` is the
+# same ingest-alias map the deposit path applies, so the critical types still
+# land as cls 2 and content as cls 1; both cls-2 types are asked separately
+# below, because they are the one place where the class is not the whole answer.
+print("\n-- sender-key DISTRIBUTION is never dropped (cls 2, skdm) --")
+check("skdm is critical", _cls_for("skdm") == 2)
+keep = _keep_for(recipients, queueable, _cls_for("skdm"), {}, "skdm")
+check("★ skdm is kept for every recipient, dormant or not", keep == set(recipients))
+check(
+    "★ and it is kept even when we are waking nobody at all",
+    _keep_for(recipients, queueable, 2, {}, "skdm") == set(recipients),
+)
+
+print("\n-- a sender-key QUESTION is not (cls 2, sknack) --")
+# The same class, the opposite keep. Both halves stated, so neither type can
+# stand in for the other and hide the split.
+check("sknack is still critical, so it never pushes a banner", _cls_for("sknack") == 2)
+keep = _keep_for(recipients, queueable, _cls_for("sknack"), {}, "sknack")
+check("★ a sknack follows the plain dormant rule instead", keep == queueable)
+check("★ a dormant member gets no sknack row", RETURNING not in keep and GONE not in keep)
+check(
+    "★ the envelope_type is what decides between the two, not the class",
+    _keep_for(recipients, queueable, 2, {}, "skdm") == set(recipients)
+    and _keep_for(recipients, queueable, 2, {}, "sknack") == queueable,
+)
 
 print("\n-- content: kept for everyone we wake --")
-keep = _keep_for(recipients, queueable, _cls_for("message"), wake)
+keep = _keep_for(recipients, queueable, _cls_for("message"), wake, "message")
 check("active member kept", ACTIVE in keep)
 check("★ member we WAKE is kept even though dormant", RETURNING in keep)
 check("dormant member we do not wake is still skipped", GONE not in keep)
@@ -72,11 +100,11 @@ check("dormant member we do not wake is still skipped", GONE not in keep)
 print("\n-- nothing else changed --")
 check(
     "no wake targets → the plain dormant rule",
-    _keep_for(recipients, queueable, _cls_for("message"), {}) == queueable,
+    _keep_for(recipients, queueable, _cls_for("message"), {}, "message") == queueable,
 )
 check(
     "a non-pushable, non-key type keeps the dormant rule",
-    _keep_for(recipients, queueable, _cls_for("reaction"), {}) == queueable,
+    _keep_for(recipients, queueable, _cls_for("reaction"), {}, "reaction") == queueable,
 )
 
 # ── the other half of the same rule: the SWEEP ───────────────────────────
