@@ -27,7 +27,7 @@ from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.group import Group, GroupMember, OfflineGroupMessage
 from app.models.group_log import GroupLog, GroupLogCursor
-from app.services.group_log import log_readers as _group_log_readers, mark_reader as _mark_group_log_reader, room_head as _group_head
+from app.services.group_log import log_readers as _group_log_readers, mark_reader as _mark_group_log_reader, room_head as _group_head, upsert_log_cursor
 from app.models.message import OfflineMessage
 from app.models.queue_cursor import QueueCursor
 from app.models.user import User, _as_aware
@@ -1897,16 +1897,16 @@ async def fetch_group_log(
     else:
         wanted = [(r.gid, r.after) for r in body.rooms if r.gid in member_of]
 
-    cursors = {
-        c.group_id: c
-        for c in (await db.execute(
-            select(GroupLogCursor).where(
-                GroupLogCursor.uin == uin, GroupLogCursor.device_id == device_id,
-                GroupLogCursor.group_id.in_([g for g, _ in wanted] or [-1]),
-            )
-        )).scalars().all()
-    }
-    now = datetime.now(timezone.utc)
+    # Positions, not ORM rows: the cursor a first read creates below is written
+    # by an upsert STATEMENT, and an instance sitting in this session's identity
+    # map would not be refreshed by it. Reading the columns keeps the two from
+    # ever disagreeing (the `populate_existing` trap on the 1:1 reap path).
+    cursors: dict[int, int] = dict((await db.execute(
+        select(GroupLogCursor.group_id, GroupLogCursor.last_seq).where(
+            GroupLogCursor.uin == uin, GroupLogCursor.device_id == device_id,
+            GroupLogCursor.group_id.in_([g for g, _ in wanted] or [-1]),
+        )
+    )).all())
     out_rows: list[GroupLogRow] = []
     heads: dict[int, int] = {}
     cur_out: dict[int, int] = {}
@@ -1919,14 +1919,17 @@ async def fetch_group_log(
     for gid, after in wanted:
         head = await _group_head(db, gid)
         heads[gid] = head
-        cursor = cursors.get(gid)
-        if cursor is None:
-            # First read of this room from this device: start at the head.
-            cursor = GroupLogCursor(group_id=gid, uin=uin, device_id=device_id, last_seq=head, updated_at=now)
-            db.add(cursor)
-            cursors[gid] = cursor
-        cur_out[gid] = cursor.last_seq
-        start = after if after is not None else cursor.last_seq
+        at = cursors.get(gid)
+        if at is None:
+            # First read of this room from this device: start at the head. One
+            # upsert, so two first reads from the same device (a reconnect on top
+            # of a poll, a retried request) no longer collide on
+            # `group_log_cursors_pkey`. On conflict the row keeps the position
+            # the winner seeded, and that is what this answer reports.
+            at = await upsert_log_cursor(db, gid, uin, device_id, seed=head)
+            cursors[gid] = at
+        cur_out[gid] = at
+        start = after if after is not None else at
         if budget <= 0 or byte_budget <= 0:
             if head > start:
                 more = True
@@ -1979,12 +1982,12 @@ async def fetch_group_log(
     # follows those rows does (see ack_group_log).
     if not out_rows:
         await _mark_group_log_reader(db, uin, device_id)
-    try:
-        await db.commit()
-    except IntegrityError:
-        # Two devices of one account, or one device twice, racing on their
-        # first read: the cursors are already there, the rows were read.
-        await db.rollback()
+    # No `except IntegrityError` here any more, and that is the point of the
+    # change: every row this handler writes goes in through an upsert, so the
+    # collision the guard used to absorb cannot happen. Left in place it would
+    # only hide the next real one, after rolling back the cursor this read just
+    # created and the reader mark it just earned.
+    await db.commit()
     return GroupLogFetchOut(rows=out_rows, heads=heads, cursors=cur_out, more=more)
 
 
@@ -2006,27 +2009,49 @@ async def ack_group_log(
     """Move this device's cursor in each room forward to `upto`. Forward only,
     so a stale or out-of-order ack is harmless. The row is not deleted here:
     a room log has one retention window for the whole room (the sweep), not
-    a per-member keep, which is the whole point of the stage."""
-    now = datetime.now(timezone.utc)
+    a per-member keep, which is the whole point of the stage.
+
+    ⚠ The write is a single upsert per room, never read-then-INSERT. Two acks
+    from one device overlap whenever a client pages through a catch-up or
+    re-sends a page whose answer it never saw, and the loser's INSERT died on
+    `group_log_cursors_pkey`. The rollback that followed threw away the ack, and
+    the 200 this handler returned said otherwise, so the client moved on while
+    the island kept rebuilding the same page. See `upsert_log_cursor`: the
+    monotonic rule lives in the statement now.
+    """
+    # One read for the whole batch instead of a `db.get` per room, and it decides
+    # nothing: it is here to count what moves for the answer, and to leave a
+    # stale ack completely untouched (no write at all, so no stamp either). A
+    # position that changes under us between this read and the write is settled
+    # inside the statement, and the count is then one room out, which is all
+    # `deleted` is worth on a path that deletes nothing.
+    known: dict[int, int] = dict((await db.execute(
+        select(GroupLogCursor.group_id, GroupLogCursor.last_seq).where(
+            GroupLogCursor.uin == uin, GroupLogCursor.device_id == device_id,
+            GroupLogCursor.group_id.in_([r.gid for r in body.rooms] or [-1]),
+        )
+    )).all())
     moved = 0
-    for r in body.rooms:
-        cursor = await db.get(GroupLogCursor, (r.gid, uin, device_id))
-        if cursor is None:
-            # An ack for a room this device never fetched: record it as the
-            # cursor rather than dropping it, a client that persisted the row
-            # from the live socket is telling us where it is.
-            cursor = GroupLogCursor(group_id=r.gid, uin=uin, device_id=device_id, last_seq=r.upto, updated_at=now)
-            db.add(cursor)
-            moved += 1
-        elif r.upto > cursor.last_seq:
-            cursor.last_seq = r.upto
-            cursor.updated_at = now
-            moved += 1
+    # Sorted by room, so two acks from one device that list the same rooms in a
+    # different order take the row locks in the same order and cannot deadlock
+    # each other on Postgres. The client sees no ordering either way.
+    for r in sorted(body.rooms, key=lambda room: room.gid):
+        at = known.get(r.gid)
+        if at is not None and r.upto <= at:
+            # Forward only. Stale, repeated, or out-of-order: nothing to write.
+            continue
+        # An ack for a room this device never fetched seeds the cursor at `upto`
+        # rather than being dropped: a client that persisted the row from the
+        # live socket is telling us where it is.
+        known[r.gid] = await upsert_log_cursor(
+            db, r.gid, uin, device_id, seq=r.upto, seed=r.upto,
+        )
+        moved += 1
     # Proof that this device is actually receiving, which is what the reader
     # mark is for. See the long note at the other call site in fetch_group_log.
     await _mark_group_log_reader(db, uin, device_id)
-    try:
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
+    # Plain commit: nothing this handler writes can raise `IntegrityError` any
+    # more, and the guard that used to be here is exactly what turned a lost
+    # race into a silent 200 with the ack discarded.
+    await db.commit()
     return AckOut(deleted=moved)
