@@ -439,7 +439,23 @@ class User(Base):
 # heartbeat (~25s); when it stops, the user goes offline purely by
 # staleness — no disconnect handler has to fire. The `status` column is
 # trusted ONLY for the user-chosen sub-states (away / dnd / invisible).
-PRESENCE_FRESHNESS_SECONDS = 60
+#
+# ⚠⚠ THE WINDOW HAS TO CLEAR SEVERAL HEARTBEATS, NOT ONE. At 60 seconds it
+# cleared two pings with ten seconds to spare, so a single missed ping — a
+# tunnel, a screen off, a backgrounded tab the browser throttles, a phone that
+# dozed for twenty seconds — made a live person read offline to everyone, and
+# the next ping made them arrive again. Nobody went anywhere, and every client
+# announced both events: reports #1030 and #1029, where the sound fires while
+# the contact's own flower is still green. The clients now refuse to shout
+# about a flap, but the flap itself is here, and a presence column that lies
+# twice a minute is wrong whether or not anything plays a sound.
+#
+# 90 seconds clears three pings and leaves fifteen for jitter. The cost is that
+# somebody who really did close the app reads online for up to half a minute
+# longer, which is the right side to err on: presence is a courtesy, and
+# "maybe still there" is a smaller lie than "left and came back" twice a
+# minute.
+PRESENCE_FRESHNESS_SECONDS = 90
 
 
 def _as_aware(dt: datetime) -> datetime:

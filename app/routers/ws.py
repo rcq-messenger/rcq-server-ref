@@ -14,6 +14,7 @@ from app.core.security import authorize_session, decode_device_id
 from app.models.contact import Contact
 from app.models.device_token import DeviceToken
 from app.models.user import (
+    PRESENCE_FRESHNESS_SECONDS,
     User,
     card_openable_for_viewer,
     presence_is_fresh,
@@ -536,7 +537,10 @@ def _may_bounce(uin: int, device_id: str) -> bool:
 # Wi-Fi reassociation; smaller windows (20s) produced reproducible
 # online/offline flicker on cell-network testers.
 _pending_offline_tasks: dict[int, asyncio.Task] = {}
-_OFFLINE_DEBOUNCE_SECONDS = 60.0
+# ⚠ Derived, not copied. `_debounced_offline` below reasons out loud that this
+# window is "the same length as the freshness window"; when the two were two
+# separate numbers that sentence was one edit away from being false.
+_OFFLINE_DEBOUNCE_SECONDS = float(PRESENCE_FRESHNESS_SECONDS)
 
 # (A second set of timers lived here until 2026-08-23: one alarm clock per
 # user who disconnected inside a "stay visible for N minutes" window, firing at
