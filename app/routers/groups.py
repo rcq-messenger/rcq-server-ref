@@ -1144,24 +1144,38 @@ async def search_groups(
     # filter at all, so they rendered in its Add view. Enforced here instead,
     # because the client is not the security boundary.
     #
-    # Exact-id lookup keeps working for closed groups: that path is how a
-    # share link resolves, and there the LINK is the capability (same rule as
-    # `/{group_id}/preview` below).
     # Catalog rows only (stage 6): a room is searchable by name because its
-    # owner published it, and for no other reason. The exact-id clause below
-    # stays unfiltered - there the LINK is the capability, same rule as
-    # preview. Existing open rooms were seeded in_catalog=TRUE on rollout, so
-    # nothing the island's users could already find went dark.
-    clauses = [
-        and_(
-            Group.name.ilike(f"%{needle}%"),
-            Group.is_closed.is_(False),
-            Group.in_catalog.is_(True),
-        )
-    ]
+    # owner published it, and for no other reason. Existing open rooms were
+    # seeded in_catalog=TRUE on rollout, so nothing the island's users could
+    # already find went dark.
+    #
+    # ⚠⚠ THE EXACT-ID CLAUSE USED TO SIT OUTSIDE THIS FILTER, in an `or_`, and
+    # the comment above it said "there the LINK is the capability, same rule as
+    # preview". That stopped being true when the preview grew its own gate:
+    # `/{group_id}/preview` hands a CLOSED room only a stripped card and asks
+    # for a share token, while this endpoint answered a bare number with the
+    # name, the description, the owner's number and nickname, and the member
+    # count — for a closed room, from any account, at 60 a minute. The two
+    # sides of "same rule as preview" had simply drifted apart, and this was
+    # the loose one (report #990). Typing a number now obeys exactly the rule
+    # typing a name does. A share link does not come through here: every client
+    # resolves one through `/preview`, which is where the link-as-capability
+    # rule actually lives.
+    by_name = and_(
+        Group.name.ilike(f"%{needle}%"),
+        Group.is_closed.is_(False),
+        Group.in_catalog.is_(True),
+    )
+    clauses = [by_name]
     if needle.isdigit():
         try:
-            clauses.append(Group.id == int(needle))
+            clauses.append(
+                and_(
+                    Group.id == int(needle),
+                    Group.is_closed.is_(False),
+                    Group.in_catalog.is_(True),
+                )
+            )
         except ValueError:
             pass
     # Exclude groups the caller is already a member of — those already
