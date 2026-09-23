@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Text
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Index, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -41,6 +41,12 @@ class ReportMessage(Base):
     # Who wrote it, for the admin side's benefit. 0 for an operator.
     author_uin: Mapped[int] = mapped_column(BigInteger, default=0)
     body: Mapped[str] = mapped_column(Text)
+    # What the reporter attached to THIS turn: the same JSON list of
+    # {media_id, key, mime, size} that `reports.attachments` holds for the
+    # report itself, sealed and uploaded the same way. NULL on every turn
+    # written before the column existed, on every operator turn, and on every
+    # text-only turn. Protected from the media sweep like the report's own.
+    attachments: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

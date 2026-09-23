@@ -12,8 +12,9 @@ What a pass never touches, regardless of age (the ids the DB still points
 at):
 - user avatars (`users.avatar_media_id`) and group avatars
   (`groups.avatar_media_id`) — long-lived by design, same directory;
-- report evidence (`reports.attachments[*].media_id`) — few, and an open
-  investigation must not lose its screenshots.
+- report evidence (`reports.attachments[*].media_id`, and the reporter's
+  follow-up pictures in `report_messages.attachments[*].media_id`) — few, and
+  an open investigation must not lose its screenshots.
 
 Hourly, leader-elected, deletion-capped per cycle, and one log line per pass
 that did anything — silent truncation would read as "covered everything".
@@ -31,6 +32,7 @@ from sqlalchemy import select
 from app.core.db import SessionLocal
 from app.models.group import Group
 from app.models.report import Report
+from app.models.report_message import ReportMessage
 from app.models.user import User
 from app.services.periodic_leader import lead_this_cycle
 
@@ -57,11 +59,12 @@ async def _referenced_ids() -> set[str]:
             for v in (await db.scalars(select(col).where(col.is_not(None)))).all():
                 if v:
                     ids.add(v.lower())
-        for atts in (await db.scalars(select(Report.attachments).where(Report.attachments.is_not(None)))).all():
-            for a in atts or []:
-                mid = (a or {}).get("media_id")
-                if mid:
-                    ids.add(str(mid).lower())
+        for col in (Report.attachments, ReportMessage.attachments):
+            for atts in (await db.scalars(select(col).where(col.is_not(None)))).all():
+                for a in atts or []:
+                    mid = (a or {}).get("media_id") if isinstance(a, dict) else None
+                    if mid:
+                        ids.add(str(mid).lower())
     return ids
 
 

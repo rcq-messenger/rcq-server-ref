@@ -382,6 +382,14 @@ _REPORT_COLUMNS: list[tuple[str, str]] = [
     ("edited_at", "TIMESTAMPTZ"),
 ]
 
+# Additive on `report_messages`: attachments on a reporter's turn, the same
+# shape as `reports.attachments`. NULL on every existing row = text-only turn,
+# which is what they all are. ADD COLUMN of a nullable JSON is metadata-only on
+# Postgres and does not touch the cached plans (see the ALTER TYPE note).
+_REPORT_MESSAGE_COLUMNS: list[tuple[str, str]] = [
+    ("attachments", "JSON"),
+]
+
 # Additive on `invites` — an optional reserved UIN so an invite can grant a
 # specific (vanity) number at registration. NULL on existing rows = the prior
 # random-allocation behaviour.
@@ -473,6 +481,7 @@ async def init_db() -> None:
         ("group_members", _GROUP_MEMBER_COLUMNS),
         ("audio_rooms", _AUDIO_ROOM_COLUMNS),
         ("reports", _REPORT_COLUMNS),
+        ("report_messages", _REPORT_MESSAGE_COLUMNS),
         ("one_time_prekeys", _ONE_TIME_PREKEY_COLUMNS),
         ("offline_messages", _OFFLINE_MESSAGE_COLUMNS),
         ("offline_group_messages", _OFFLINE_GROUP_MESSAGE_COLUMNS),

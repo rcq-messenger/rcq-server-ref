@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -420,6 +420,10 @@ class ReportTurnOut(BaseModel):
     from_admin: bool
     body: str
     created_at: datetime
+    # What the reporter attached to this turn. Always present (empty when
+    # none), so a client can tell "kept nothing" from "island predates it":
+    # an island without the field answers a turn with no `attachments` key.
+    attachments: list[ReportAttachmentOut] = []
 
 
 class MyReportOut(BaseModel):
@@ -445,6 +449,13 @@ class MyReportOut(BaseModel):
     # The whole exchange, oldest first — what a client with a ticket screen
     # renders. Empty on a report nobody has answered and nobody has added to.
     thread: list[ReportTurnOut] = []
+    # Whether a turn on THIS report may carry pictures. Same rule as filing:
+    # attachments are kept only on bug reports, a complaint about a person
+    # drops them (see create_report). Exposed as a yes/no rather than the
+    # report's context, so the reporter's own view says what they can do and
+    # nothing more. ⚠ Absent on an island that predates turn attachments,
+    # which clients must read as false.
+    attachments_allowed: bool = False
     # What the reporter attached when they wrote it. Empty on a report with no
     # blobs, which is most of them, and on every row written before the column
     # existed. A client that predates the field ignores it.
@@ -470,9 +481,7 @@ async def _thread_of(db: AsyncSession, report_ids: list[int]) -> dict[int, list[
     ).scalars().all()
     out: dict[int, list[ReportTurnOut]] = {}
     for m in rows:
-        out.setdefault(m.report_id, []).append(
-            ReportTurnOut(id=m.id, from_admin=m.from_admin, body=m.body, created_at=m.created_at)
-        )
+        out.setdefault(m.report_id, []).append(_turn_out(m))
     return out
 
 
@@ -499,6 +508,7 @@ def _mine_out(report: Report, thread: list[ReportTurnOut]) -> MyReportOut:
     end up disagreeing about which fields a report has."""
     return MyReportOut(
         id=report.id,
+        attachments_allowed=report.context == "bug_bounty",
         number=_report_number(report),
         reason=report.reason,
         status=report.status,
@@ -521,6 +531,18 @@ def _mine_out(report: Report, thread: list[ReportTurnOut]) -> MyReportOut:
     )
 
 
+def _turn_out(m: ReportMessage) -> ReportTurnOut:
+    return ReportTurnOut(
+        id=m.id,
+        from_admin=m.from_admin,
+        body=m.body,
+        created_at=m.created_at,
+        attachments=[
+            a for a in (_attachment_out(x) for x in (m.attachments or [])) if a is not None
+        ],
+    )
+
+
 def _attachment_out(raw: object) -> ReportAttachmentOut | None:
     if not isinstance(raw, dict):
         return None
@@ -536,7 +558,18 @@ def _attachment_out(raw: object) -> ReportAttachmentOut | None:
 
 
 class AddTurnIn(BaseModel):
-    body: str = Field(..., min_length=1, max_length=4000)
+    # Empty is allowed ONLY when a picture carries the turn ("here is the
+    # screenshot" needs no words). Old clients always send text, and an empty
+    # body with nothing attached is still a 422, as it was.
+    body: str = Field(default="", max_length=4000)
+    # Same shape and same cap as a new report's (`CreateReportIn`).
+    attachments: list[ReportAttachmentIn] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _something_to_add(self) -> "AddTurnIn":
+        if not self.body.strip() and not self.attachments:
+            raise ValueError("a turn needs text or an attachment")
+        return self
 
 
 @router.get("/mine", response_model=list[MyReportOut])
@@ -612,13 +645,37 @@ async def add_to_my_report(
             status.HTTP_409_CONFLICT,
             detail={"code": "closed", "message": "this report is closed"},
         )
-    turn = ReportMessage(report_id=report.id, from_admin=False, author_uin=uin, body=body.body.strip())
+    if len(body.attachments) > MAX_ATTACHMENTS_PER_REPORT:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={"code": "too_many_attachments", "max": MAX_ATTACHMENTS_PER_REPORT},
+        )
+    # ⚠ Pictures on a turn follow the FILING rule, not a looser one: a report
+    # about a person keeps none (create_report drops them quietly), so a turn on
+    # that report keeps none either. Otherwise a complaint could collect images
+    # one turn at a time that it could never have been filed with. Dropped, not
+    # refused, like at filing — unless that leaves the turn empty, which is
+    # then the same 422 as an empty text turn.
+    keep = body.attachments if report.context == "bug_bounty" else []
+    if not body.body.strip() and not keep:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "empty_turn", "message": "this report takes text only"},
+        )
+    turn = ReportMessage(
+        report_id=report.id,
+        from_admin=False,
+        author_uin=uin,
+        body=body.body.strip(),
+        attachments=[
+            {"media_id": a.media_id, "key": a.key, "mime": a.mime, "size": a.size}
+            for a in keep
+        ] or None,
+    )
     db.add(turn)
     await db.commit()
     await db.refresh(turn)
-    return ReportTurnOut(
-        id=turn.id, from_admin=turn.from_admin, body=turn.body, created_at=turn.created_at
-    )
+    return _turn_out(turn)
 
 
 @router.delete("/mine/{report_id}", status_code=status.HTTP_204_NO_CONTENT)

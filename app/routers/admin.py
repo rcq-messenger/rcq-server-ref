@@ -330,6 +330,9 @@ class ReportTurnOut(BaseModel):
     author_uin: int
     body: str
     created_at: datetime
+    # The reporter's pictures on this turn, decrypted in the queue exactly
+    # like the report's own `attachments`.
+    attachments: list[ReportAttachmentOut] = []
 
 
 class ReportOut(BaseModel):
@@ -599,6 +602,7 @@ async def list_reports(
             turns.setdefault(m.report_id, []).append(ReportTurnOut(
                 id=m.id, from_admin=m.from_admin, author_uin=m.author_uin,
                 body=m.body, created_at=m.created_at,
+                attachments=_coerce_attachments(m.attachments),
             ))
 
     items = [
@@ -684,6 +688,7 @@ async def _report_out(db: AsyncSession, report: Report) -> ReportOut:
             ReportTurnOut(
                 id=m.id, from_admin=m.from_admin, author_uin=m.author_uin,
                 body=m.body, created_at=m.created_at,
+                attachments=_coerce_attachments(m.attachments),
             )
             for m in (await db.execute(
                 select(ReportMessage)

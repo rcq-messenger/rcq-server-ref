@@ -232,6 +232,15 @@ class ServerCapabilities(BaseModel):
     # omits it must hide the row locally and must NOT decline instead: a
     # decline is an answer the requester sees, a withdraw is not.
     contact_pending_withdraw: bool = True
+    # POST /reports/mine/{id}/messages takes `attachments` (same shape and cap
+    # as a new report), hands them back on the turn, and accepts an empty body
+    # when a picture carries the turn. Permanent capability of this codebase.
+    #
+    # ⚠ A MISSING KEY MEANS "NO ATTACHMENTS ON A TURN". An island without it
+    # does not refuse the field: pydantic ignores unknown keys, so the text is
+    # stored, 201 comes back and the screenshot is gone. Clients show the
+    # attach button only where this is true.
+    report_turn_attachments: bool = True
     #: POST /auth/guest/challenge, /auth/guest, /auth/guest/settle and
     #: /groups/{id}/guests exist AND this island admits new guests right now
     #: (spec 2026-09-15, section 3.3). ABSENT or false: clients use the legacy
