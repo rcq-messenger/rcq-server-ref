@@ -93,7 +93,10 @@ async def clear_limiter():
     try:
         from app.core.redis import get_redis
         redis = await get_redis()
-        for pattern in ("rl:auth_register:*", "rl:auth_register_challenge:*", "rl:auth_refresh:*"):
+        for pattern in (
+            "rl:auth_register:*", "rl:auth_register_challenge:*", "rl:auth_refresh:*",
+            "rl:auth_refresh_uin:*",
+        ):
             keys = [k async for k in redis.scan_iter(match=pattern)]
             if keys:
                 await redis.delete(*keys)
@@ -184,6 +187,30 @@ async def main():
             check("★ refresh created a cursor for the named install", row is not None)
             floor_ok = row is not None and row.last_direct_id >= 0
             check("and it is a real floor, not a missing row", floor_ok)
+
+        # --- #1041: the budget is the ACCOUNT's, and only its owner spends it --
+        # A browser keeps no token on disk and mints on every page load. The
+        # address used to hold the only budget (60/hour), so one phone
+        # reloading the page, or a few people behind one carrier NAT, locked
+        # everybody at that address out for an hour.
+        for _ in range(3):
+            r = await refresh(c, alice_uin, alice_sk, alice_pub, signer=bob_sk)
+        check("(wrongly signed attempts are refused)", r.status_code == 401)
+        spent = 0
+        for _ in range(130):
+            r = await refresh(c, alice_uin, alice_sk, alice_pub, device_id="web-install-1")
+            if r.status_code != 200:
+                break
+            spent += 1
+        # One refresh went to the ordinary case above, so 119 more fit.
+        check(f"★ 120 an hour per account, well past the old 60 per address (got {spent + 1})",
+              spent == 119)
+        check("the 121st is a 429", r.status_code == 429)
+        detail = (r.json() or {}).get("detail") or {}
+        check("and it says how long to wait", isinstance(detail, dict)
+              and int(detail.get("retry_after") or 0) > 0)
+        r = await refresh(c, bob_uin, bob_sk, bob_pub, device_id="web-install-b")
+        check("★ another account at the SAME address still gets its token", r.status_code == 200)
 
     print("\n" + ("ALL PASS" if fails == 0 else f"{fails} FAILED"))
     raise SystemExit(1 if fails else 0)

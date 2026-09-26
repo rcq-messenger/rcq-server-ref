@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import log_identity, settings
 from app.core.db import get_db
-from app.core.rate_limit import rate_limit, island_ceiling
+from app.core.rate_limit import enforce_rate_limit, rate_limit, island_ceiling
 from base64 import b64decode
 
 from cryptography.exceptions import InvalidSignature
@@ -1075,7 +1075,15 @@ class RefreshIn(BaseModel):
     response_model=RefreshOut,
     # Once per start-up per install, plus the odd 401 retry. Keyed by IP (there
     # is no session yet), and loose for the same CGNAT reason as /auth/register.
-    dependencies=[Depends(rate_limit("auth_refresh", 60, 3600))],
+    #
+    # ⚠ 60 an hour was the whole address's budget, and a browser keeps no
+    # token on disk: it mints on every page load (it minted TWICE until
+    # web 2026-09-26). One phone reloading the page a few dozen times, or a
+    # handful of people behind one carrier NAT, and the address was out for an
+    # hour, every call after that going out tokenless (#1041). The address
+    # ceiling is now an abuse ceiling, and the per-account budget below, taken
+    # only AFTER the signature checks out, is the one a real person meets.
+    dependencies=[Depends(rate_limit("auth_refresh", 240, 3600))],
 )
 async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> RefreshOut:
     sk = body.signing_key.strip()
@@ -1155,6 +1163,10 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
             status.HTTP_404_NOT_FOUND,
             detail={"code": "identity_ambiguous" if ambiguous else "identity_not_found"},
         )
+    # Per account, and only once the key has been proved: a stranger cannot
+    # spend somebody else's budget, and the account holder can only spend
+    # their own (#1041).
+    await enforce_rate_limit(f"uin:{owned}", "auth_refresh_uin", 120, 3600)
     # ★ The whole point of report #607. Proving the signing key says WHO is
     # asking, never WHERE from, so this is the only thing standing between a
     # disconnected browser and a brand-new session for the same account.
