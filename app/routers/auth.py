@@ -1163,14 +1163,15 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
             status.HTTP_404_NOT_FOUND,
             detail={"code": "identity_ambiguous" if ambiguous else "identity_not_found"},
         )
-    # Per account, and only once the key has been proved: a stranger cannot
-    # spend somebody else's budget, and the account holder can only spend
-    # their own (#1041).
-    await enforce_rate_limit(f"uin:{owned}", "auth_refresh_uin", 120, 3600)
     # ★ The whole point of report #607. Proving the signing key says WHO is
     # asking, never WHERE from, so this is the only thing standing between a
     # disconnected browser and a brand-new session for the same account.
     await _refuse_revoked_device(owned, body.device_id)
+    # Per account, and only once the key has been proved and the install is
+    # still allowed in: a stranger cannot spend somebody else's budget, and a
+    # browser its owner disconnected is told so rather than eating the budget
+    # of the devices still in use (#1041).
+    await enforce_rate_limit(f"uin:{owned}", "auth_refresh_uin", 120, 3600)
     # Same queue-cursor floor as /auth/device. A named install that has no
     # cursor yet (its row was dropped when the session was revoked, or the
     # install id is new) would otherwise be handed the ENTIRE queue on its next
