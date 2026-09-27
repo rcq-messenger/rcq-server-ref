@@ -22,7 +22,7 @@ from app.core.security import current_device_id, current_uin
 from app.models.capability import UserCapability
 from app.models.device_token import DeviceToken
 from app.models.user import POLICY_VALUES, User, card_openable_for_viewer, visible_status, coarse_last_seen, badge_for_viewer, earned_badges
-from app.services import door
+from app.services import backup_copy, door
 from app.services.connection_manager import manager
 from app.services.contact_source import mark_vault_device, unmark_vault_device
 
@@ -196,6 +196,11 @@ class PublicUser(BaseModel):
     # membership rather than by the contact list.
     avatar_media_id: str | None = None
     avatar_media_key: str | None = None
+    # Set when this account is somebody's BACKUP mailbox (federation §5a,
+    # #1054): the person lives at `home`, and a request to this number would
+    # never be read. A client says so and offers that address instead. Filled
+    # by the route, never by the two builders below, since it needs a query.
+    home: backup_copy.HomeRef | None = None
 
     @classmethod
     def from_model_for_viewer(
@@ -476,6 +481,7 @@ class ProfileUpdate(BaseModel):
 )
 @guest(RULE)
 async def search(
+    request: Request,
     q: str = Query(min_length=1),
     limit: int = Query(20, le=100),
     me: int = Depends(current_uin),
@@ -610,9 +616,21 @@ async def search(
             # (spec 2026-09-15, 6.2).
             .where(User.guest_status.is_(None))
             .order_by(rank, contact_last, func.lower(User.nickname), User.uin)
-            .limit(limit)
+            # Over-fetched, because backup copies are dropped below and on is2
+            # they are a third of all accounts: a page of `limit` would come
+            # back short for no reason the caller could see.
+            .limit(min(limit * 2 + 10, 250))
         )
     ).scalars().all()
+    # Backup copies (federation §5a, #1054) are mailboxes, not people. Out of
+    # every NAME match, like guest copies above: somebody who put a backup on
+    # this island did not ask to be listed in its directory, and finding their
+    # nickname here led straight to a request nobody would ever read. An exact
+    # NUMBER stays, marked with `home`, because that number came from
+    # somewhere and the caller should learn where the person really is rather
+    # than be told nobody holds it.
+    homes = await backup_copy.homes_of(db, list(rows), await backup_copy.own_hosts(request))
+    rows = [u for u in rows if u.uin not in homes or u.uin == exact_uin][:limit]
     # Card gate (item 22). A search row is a surface that opens a card, so it
     # has to carry `profile_openable` — and "contacts" is the only value that
     # needs the graph to answer. So ask the graph ONLY when this page actually
@@ -648,7 +666,7 @@ async def search(
             # and the only thing behind `rcq find`; and the rows never touch
             # the key anyway, they render a name and send back a number.
             with_keys=not closed,
-        )
+        ).model_copy(update={"home": backup_copy.home_ref(homes.get(u.uin))})
         for u in rows
     ]
 
@@ -1017,9 +1035,17 @@ async def info(
                 .limit(1)
             )
         ) is not None
-    return PublicUser.from_model_for_viewer(
+    out = PublicUser.from_model_for_viewer(
         user, viewer_uin=me, is_contact=is_contact, shares_group=shares_group,
     )
+    # A profile opened by number, link or QR is where the Add button lives on
+    # every client, so this is where a backup copy has to say whose it is
+    # (#1054). After the door: a caller refused above learns nothing here.
+    if me != user.uin:
+        out.home = backup_copy.home_ref(
+            await backup_copy.home_of(db, user, await backup_copy.own_hosts(request))
+        )
+    return out
 
 
 async def _announce_rename(

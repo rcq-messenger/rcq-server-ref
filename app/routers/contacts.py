@@ -53,6 +53,7 @@ from app.models.user import (
 )
 from app.services.apns import send_to_user as apns_send, should_push_for
 from app.services.connection_manager import manager
+from app.services import backup_copy
 from app.services.contact_source import add_edges
 from app.services.unifiedpush import send_to_user as up_send
 
@@ -125,6 +126,10 @@ class OutgoingRow(BaseModel):
     to_uin: int
     nickname: str
     state: str  # pending | declined
+    #: Set when `to_uin` is a backup copy: the request can never be read
+    #: there, and a client offers the home address instead. Rows written
+    #: before the refusal existed are the ones that carry it.
+    home: backup_copy.HomeRef | None = None
 
 
 class AddRequestIn(BaseModel):
@@ -248,6 +253,7 @@ async def list_contacts(
 )
 async def send_request(
     body: AddRequestIn,
+    request: Request,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -256,6 +262,8 @@ async def send_request(
     Cases handled:
       * self-add → 400
       * unknown target → 404
+      * the target is somebody's BACKUP mailbox (federation §5a) → 403
+        `backup_copy`, naming the home address (#1054)
       * already a mutual contact → 409 (the client should hide its Add button)
       * an existing pending request from us → no-op, return it
       * an existing declined/expired request from us → reopen as pending
@@ -269,6 +277,17 @@ async def send_request(
     target = await db.get(User, body.to_uin)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+
+    # A backup copy is a mailbox, not a person (#1054). Its owner drains only
+    # the message queue here: nothing ever reads a request row addressed to it,
+    # no socket or push reaches it, and the request used to sit at "pending"
+    # forever. Refuse before anything is written and say where they live; the
+    # client adds that address through the cross-island path. Before the
+    # contact and reverse-request checks on purpose: neither can exist for a
+    # copy that never answers, and a stale one must not turn into an accept.
+    home = await backup_copy.home_of(db, target, await backup_copy.own_hosts(request))
+    if home is not None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=backup_copy.refusal(home))
 
     # ⚠ At the drop this check finds nothing for a pair that lives only in
     # the vault, so a re-add will open a fresh request rather than answering
@@ -446,6 +465,7 @@ async def pending(
 @router.get("/outgoing", response_model=list[OutgoingRow])
 @guest(ALLOW)
 async def outgoing(
+    request: Request,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> list[OutgoingRow]:
@@ -468,8 +488,14 @@ async def outgoing(
             )
         )
     ).all()
+    homes = await backup_copy.homes_of(
+        db, [u for _, u in rows], await backup_copy.own_hosts(request)
+    ) if rows else {}
     return [
-        OutgoingRow(id=r.id, to_uin=r.to_uin, nickname=u.nickname, state=r.state)
+        OutgoingRow(
+            id=r.id, to_uin=r.to_uin, nickname=u.nickname, state=r.state,
+            home=backup_copy.home_ref(homes.get(u.uin)),
+        )
         for r, u in rows
     ]
 
