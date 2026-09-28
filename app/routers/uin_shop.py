@@ -550,7 +550,7 @@ async def listings(
     # Numbers are what the door sells, and a guest copy can buy none (spec
     # 2026-09-15, 6.2). Empty rather than 403 so a copy signed in as an
     # account draws an empty shelf instead of an error.
-    if await guest_policy.is_guest(me):
+    if await guest_policy.is_guest(me, db):
         return []
     rows = (
         await db.execute(
@@ -748,7 +748,7 @@ async def suggestions(
     number: a suggestion can be registered by someone else a moment
     later. Fulfilment re-checks when the operator mints the invite."""
     # Empty for a guest copy, like `/uin/listings`.
-    if await guest_policy.is_guest(me):
+    if await guest_policy.is_guest(me, db):
         return []
     # ⚠ Was [4,5,5,6,6,7,7,8] — the interesting middle, which is now exactly
     # the reserved stock. Suggesting a number the next endpoint refuses is
@@ -1269,7 +1269,7 @@ async def _take(
     return PurchaseOut(
         new_uin=new_uin,
         # Keep naming this install on the new token (see carry_device_id).
-        token=issue_token(new_uin, await uin_epoch(new_uin), carry_device_id(device_id)),
+        token=issue_token(new_uin, await uin_epoch(new_uin, db), carry_device_id(device_id)),
         switched=True,
         owned=await _owned_uins(db, new_uin),
     )

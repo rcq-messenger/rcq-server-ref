@@ -7,24 +7,64 @@ the console). `/server/info` and the feature routers consult `effective()` /
 `get()`; an absent override falls back to the env/code default in the registry
 below.
 
-Cross-worker propagation: each worker caches the override rows for `_TTL`
-seconds, so a toggle written on one worker is visible everywhere within that
-window (the writing worker is updated immediately). Feature flags tolerate a
-few seconds of lag, so this avoids a DB read on every request without needing a
-pub/sub invalidation.
+Cross-worker propagation: each worker caches the override rows, and a ticker
+in the lifespan (main.py `_cache_ticker`) re-reads them as soon as they are
+`_TTL` seconds old, whether or not anybody is asking. A toggle written on one
+worker is therefore visible everywhere within about `_TTL` plus one read (the
+writing worker is updated at once, by `reload()` after the admin's commit).
+Feature flags tolerate a few seconds of lag, so this avoids a DB read on every
+request without needing a pub/sub invalidation.
+
+⚠⚠ A STALE CACHE IS SERVED, AND REFRESHED BEHIND THE REQUEST. Until 28.09 a
+read that found the rows older than `_TTL` reloaded them inline, on a session
+of its own, from inside whatever handler asked, and those handlers had usually
+run a query already. That is a second pooled connection requested while the
+first is held, by every concurrent request at once (no single-flight), and a
+failed reload did not move `at`, so the next request nested again. It stalled
+the whole island for minutes at a time; core/single_flight.py has the story.
+Now, see `_overrides`:
+
+  * fresh rows (younger than `_TTL`): returned;
+  * stale rows up to `_MAX_STALE`: returned AS THEY ARE, and ONE refresh per
+    worker starts in the background on its own session, holding nothing
+    else. The ticker keeps a running worker inside this band;
+  * ⚠ stale rows past `_MAX_STALE` (a worker whose loop stood still, a tool
+    with no lifespan): the reader gives one refresh up to `_STALE_WAIT`
+    first, shared by everybody reading during that attempt, unless the
+    database is already failing. Without this cap, how old a served value
+    could be depended on traffic: an idle worker answered its first request
+    after an hour with the settings of an hour ago (a paid island "open",
+    last month's payout wallet), and only then refreshed;
+  * never loaded (a cold worker) or explicitly invalidated (tests): the
+    caller joins the one shared read, for at most `_COLD_WAIT` per attempt.
+    The lifespan warms this cache before the worker takes traffic, so this
+    is a boot with the database away and nothing else;
+  * a refresh that fails is not retried by every reader: the next attempt
+    for a stale cache waits `_RETRY_AFTER` from the moment of the failure.
+
+⚠ The env defaults are never published as if they were the island's
+settings: `get_strict` refuses on a cold worker, /server/info answers 503
+until `is_loaded()` (routers/server.py), and the decisions whose default is
+the dangerous answer read strictly (registration policy and key-change proof
+in routers/auth.py, `door.island_is_closed`, `guest_policy.admission_open`).
 """
+import asyncio
 import time as _time
 import json
 import re
 import os
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from fastapi import HTTPException, status
 from sqlalchemy import select
 
+from app.core import db_nesting
 from app.core.config import settings as _env
 from app.core.db import SessionLocal
+from app.core.single_flight import SingleFlight
 from app.models.server_setting import ServerSetting
 
 
@@ -504,6 +544,15 @@ def _parse(spec: SettingSpec, raw: str) -> Any:
 
 class _Cache:
     rows: dict[str, str] = {}
+    #: `time.monotonic()` when the read that produced `rows` STARTED, i.e. the
+    #: rows are at least this fresh. Only a successful read moves it: a failed
+    #: one used to push it forward as a back-off, which made a cold worker's
+    #: empty rows look fresh for 2 s and hid how old a warm worker's rows
+    #: really were. ⚠ `at <= 0` is not a time: never read, or explicitly
+    #: invalidated (only the local tests do that now, `_cache.at = -1e9`). The
+    #: next reader then waits for a fresh read instead of being served these
+    #: rows. A monotonic clock is seconds since boot, so a real reading is
+    #: never <= 0.
     at: float = -1e9
     #: True once the override rows have been read from the database at least
     #: once in this worker. It never goes back to False: after a successful
@@ -512,6 +561,22 @@ class _Cache:
     #: means "never looked", not "no overrides", and `get_strict` is how a
     #: caller refuses to act on that difference.
     loaded: bool = False
+    #: Bumped by every write through this module (`apply`, `reload`). A
+    #: refresh remembers the generation it started under and throws its rows
+    #: away if a write happened meanwhile: it may have read the table BEFORE
+    #: that write, and publishing it would put the old value back with a
+    #: fresh `at`, so the console would show the change as ignored for `_TTL`.
+    gen: int = 0
+    #: No refresh is started for a STALE cache before this `monotonic()`
+    #: reading. Set `_RETRY_AFTER` past the moment a refresh FAILED (not past
+    #: when it started: a failure usually is the pool's 20 s timeout, and a
+    #: pause counted from the start would be over before it began). A cold or
+    #: invalidated cache ignores it: it has nothing to serve, so every reader
+    #: joins or starts the one read in flight.
+    retry_at: float = 0.0
+    #: The last refresh failed and none has succeeded since. A reader of rows
+    #: past `_MAX_STALE` does not wait on a database that is already failing.
+    failing: bool = False
 
 
 class SettingsUnavailable(RuntimeError):
@@ -519,26 +584,188 @@ class SettingsUnavailable(RuntimeError):
     value of a setting is unknown. Raised by `get_strict` only."""
 
 
+def busy_error() -> HTTPException:
+    """The 503 for a request that cannot be answered without this island's own
+    settings, on a worker that has not read them (`SettingsUnavailable`).
+
+    Same body and header as the pool's 503 (main.py), which every client
+    already retries: from the outside both mean "this island cannot answer
+    that right now, ask again in a few seconds"."""
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="island_busy",
+        headers={"Retry-After": str(2 + secrets.randbelow(6))},
+    )
+
+
 _cache = _Cache()
+#: Rows younger than this are served without a thought.
 _TTL = 5.0  # seconds
+#: After a failed refresh, how long before the next one is started for a
+#: stale cache. Short, because a blip is usually short; not zero, because zero
+#: is every request retrying against a pool that is already out of
+#: connections.
+_RETRY_AFTER = 2.0
+# ⚠ An attempt has a deadline of its own. Without one a read stuck in the
+# PgBouncer queue (query_wait_timeout is ~120 s) held the single flight: the
+# ticker kept finding the same task, no new attempt started, and the cache
+# stayed frozen for as long as the read hung. A deadline turns the hang into
+# an ordinary failure, so the next attempt takes a fresh checkout.
+_READ_DEADLINE = 10.0
+#: ⚠⚠ The hard cap on what a reader is served without a fresh read being
+#: tried first. Between `_TTL` and this, stale rows are served at once and
+#: refreshed behind the request; the lifespan ticker keeps a running worker
+#: well inside it, so on a healthy island only a worker whose event loop
+#: stood still (or a tool with no lifespan) ever gets here. Past it the reader
+#: gives ONE refresh up to `_STALE_WAIT` seconds, shared by every reader of
+#: that attempt, and serves the rows either way. Not when the last refresh
+#: failed: then the database is the problem, and waiting on it would only add
+#: every request's wait to a pool in trouble.
+_MAX_STALE = 30.0
+_STALE_WAIT = 2.0
+#: How long a cold or invalidated cache lets its readers wait for the shared
+#: read, per attempt (not per reader, see `SingleFlight.wait_for_attempt`).
+#: After that `get` serves the defaults and `get_strict` refuses. Bounded,
+#: because some of those readers hold a connection: a cold worker's first
+#: requests must not become the hold-and-wait this module was rebuilt against.
+_COLD_WAIT = 2.0
+_flight = SingleFlight("settings")
+
+
+async def _read_rows() -> dict[str, str]:
+    # `SessionLocal` is this module's global, looked up at call time, so a
+    # test can swap it for one that fails.
+    async with SessionLocal() as db:
+        rows = (await db.execute(select(ServerSetting.key, ServerSetting.value))).all()
+    return {k: v for k, v in rows}
+
+
+async def _refresh() -> bool:
+    """Read the rows and publish them, unless a write landed meanwhile. Raises
+    on a database error (the SingleFlight logs it), after recording the
+    failure and when the next attempt for a stale cache may start."""
+    started = _time.monotonic()
+    gen = _cache.gen
+    try:
+        rows = await asyncio.wait_for(_read_rows(), _READ_DEADLINE)
+    except Exception:
+        _cache.retry_at = _time.monotonic() + _RETRY_AFTER
+        _cache.failing = True
+        raise
+    _cache.failing = False
+    _cache.retry_at = 0.0
+    if _cache.gen != gen:
+        return False
+    _cache.rows = rows
+    _cache.at = started
+    _cache.loaded = True
+    return True
 
 
 async def _overrides() -> dict[str, str]:
     now = _time.monotonic()
-    if now - _cache.at < _TTL:
+    at = _cache.at
+    if at > 0:
+        age = now - at
+        if age < _TTL:
+            return _cache.rows
+        # Stale: ONE refresh per worker behind this request, unless the last
+        # one failed moments ago.
+        task = _flight.current()
+        if task is None and now >= _cache.retry_at:
+            task = _flight.start(_refresh)
+        if age <= _MAX_STALE or task is None or _cache.failing:
+            # Served as they are. See the module docstring for why a request
+            # must not wait here.
+            return _cache.rows
+        # Past the hard cap, with a database that has not been failing: give
+        # the refresh a moment, once per attempt, then serve what there is.
+        db_nesting.note_wait("server_settings")
+        await _flight.wait_for_attempt(task, _STALE_WAIT)
         return _cache.rows
-    try:
-        async with SessionLocal() as db:
-            rows = (await db.execute(select(ServerSetting.key, ServerSetting.value))).all()
-    except Exception:  # noqa: BLE001
-        # A DB blip must NOT take down /server/info (unauth, boot-polled) or a
-        # feature route — fall back to the last-known overrides (or defaults if
-        # we never loaded) and retry on the next call without poisoning `at`.
-        return _cache.rows
-    _cache.rows = {k: v for k, v in rows}
-    _cache.at = now
-    _cache.loaded = True
+    # Cold or invalidated: there is nothing correct to serve, so join (or
+    # start, back-off or not) the shared read, for at most `_COLD_WAIT` per
+    # attempt. Twice at most: a refresh that was already running may have
+    # read the table before an invalidating write and thrown its rows away
+    # (`gen`), and then one more is worth it. A FAILED one is not retried
+    # here; the next reader or the ticker starts the next attempt.
+    db_nesting.note_wait("server_settings")
+    for _ in range(2):
+        task = _flight.start(_refresh)
+        await _flight.wait_for_attempt(task, _COLD_WAIT)
+        if _cache.at > 0 or _cache.failing or not task.done():
+            break
     return _cache.rows
+
+
+def is_loaded() -> bool:
+    """Whether this worker has read the override rows at least once, i.e.
+    whether `effective()` describes this island rather than the defaults."""
+    return _cache.loaded
+
+
+async def wait_loaded(timeout: float) -> bool:
+    """`is_loaded()`, after waiting up to `timeout` for the shared read when
+    the worker is cold. For callers that hold no connection (/server/info).
+    A read that fails is retried once within `timeout`, not in a loop: a
+    database that refuses fast gets a fast 503, which the client retries."""
+    if _cache.loaded:
+        return True
+    deadline = _time.monotonic() + timeout
+    for _ in range(2):
+        left = deadline - _time.monotonic()
+        if left <= 0:
+            break
+        await _flight.wait(_flight.start(_refresh), left)
+        if _cache.loaded:
+            break
+    return _cache.loaded
+
+
+async def warm(timeout: float) -> bool:
+    """Read the rows now, for the lifespan before the worker takes traffic.
+    Ignores the failure back-off: boot is exactly when a retry is wanted."""
+    await _flight.wait(_flight.start(_refresh), timeout)
+    return _cache.loaded
+
+
+def tick() -> None:
+    """For the lifespan ticker (main.py `_cache_ticker`), once a second: start
+    the refresh as soon as the rows are due, whether or not anybody is
+    reading them. This is what bounds the age of what a request is served
+    (about `_TTL` plus one read) on a quiet island as much as on a busy one;
+    serving stale on the request path alone let a worker that sat idle for an
+    hour answer its next request with hour-old settings. Never waits."""
+    now = _time.monotonic()
+    at = _cache.at
+    if at > 0 and now - at < _TTL:
+        return
+    if now < _cache.retry_at:
+        return
+    _flight.start(_refresh)
+
+
+async def reload() -> bool:
+    """Re-read the rows NOW, for the admin path right after its commit.
+
+    ⚠ Not through the shared refresh, and after the commit rather than inside
+    `apply`. A refresh another request started between the write's flush and
+    its commit read the table WITHOUT the write; waiting for that one would
+    publish the old value with a fresh `at`. Bumping `gen` first discards any
+    such refresh, and this read is the one that is guaranteed to see the
+    commit. The admin request has committed, so it holds no connection here.
+
+    On failure the rows stay as they were, with the back-off `_refresh` set;
+    the ticker publishes the write as soon as the database answers again.
+    ⚠ Deliberately NOT an invalidation: that made every reader on this worker
+    (hot handlers mid-transaction among them) wait on the same database the
+    reload had just failed to read.
+    """
+    _cache.gen += 1
+    try:
+        return await _refresh()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def cached_str(key: str) -> str | None:
@@ -546,7 +773,8 @@ def cached_str(key: str) -> str | None:
 
     ⚠ For hot paths that cannot be async and must not open a session per call —
     voucher verification is the one that asked for it. It reads whatever the
-    last refresh saw, which is at most `_TTL` old; a key changed in the console
+    last refresh saw, which the lifespan ticker keeps about `_TTL` old (it
+    starts no refresh of its own); a key changed in the console
     takes effect within seconds rather than instantly, and never blocks a
     signature check on a database round trip. Returns None when there is no
     override, so the caller falls back to its own default.
@@ -716,8 +944,21 @@ def validate(updates: dict[str, Any]) -> dict[str, str]:
 
 
 async def apply(db, serialized: dict[str, str]) -> None:
-    """Upsert validated overrides on the caller's session + bust the local
-    cache. The caller commits."""
+    """Upsert validated overrides on the caller's session. The caller
+    commits, and then calls `reload()`: THAT is what publishes the change on
+    this worker (the others pick it up within `_TTL` or so, from their
+    tickers).
+
+    ⚠ The rows are NOT written into the cache here. Before the commit they
+    are a promise, not a fact: a commit that fails would leave this worker
+    serving a value the database never took.
+
+    ⚠ And the cache is NOT invalidated here any more, only its generation
+    bumped, so a refresh already in flight (which may have read the table
+    before this write) cannot publish over it. An invalidation made every
+    reader on this worker wait for a shared read until the admin's commit,
+    hot handlers holding a connection among them, and for nothing: a read
+    taken before the commit sees the old rows anyway."""
     for key, raw in serialized.items():
         row = await db.get(ServerSetting, key)
         if row is None:
@@ -725,7 +966,7 @@ async def apply(db, serialized: dict[str, str]) -> None:
         else:
             row.value = raw
     await db.flush()
-    _cache.at = -1e9  # force a refresh on the next read (this worker; others ≤ _TTL)
+    _cache.gen += 1
 
 
 async def describe() -> list[dict[str, Any]]:

@@ -161,6 +161,11 @@ async def patch_settings(
             log.warning("[admin] money settings changed by %s: %s", admin, money)
         await server_settings.apply(db, serialized)
         await db.commit()
+        # Read back what was committed before describing it. The cache serves
+        # stale rows while it refreshes in the background, so without this
+        # the console could show the old value right after saving the new
+        # one (see `reload` for the race it closes).
+        await server_settings.reload()
     return {"settings": await server_settings.describe()}
 
 
@@ -233,6 +238,9 @@ async def put_island_logo(
         )
     version = await island_logo.store(db, mime, blob)
     await db.commit()
+    # Visible at once to the operator who uploaded it (GET /admin/server/logo
+    # and this worker's /server/info), not after the next background refresh.
+    await island_logo.reload()
     return _logo_state(version)
 
 
@@ -244,6 +252,7 @@ async def delete_island_logo(
     before one was set. Idempotent."""
     await island_logo.clear(db)
     await db.commit()
+    await island_logo.reload()
     return _logo_state("")
 
 

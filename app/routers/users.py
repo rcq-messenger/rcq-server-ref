@@ -490,8 +490,13 @@ async def search(
     # A guest copy gets an empty directory (spec 2026-09-15, 6.2). Being found
     # is what the door sells, and shipped clients call this from a copy signed
     # in as an account, so an empty list rather than a 403 they would surface.
-    if await guest_policy.is_guest(me):
+    if await guest_policy.is_guest(me, db):
         return []
+    # Read from the caches before the first query, not after it: see the note
+    # in `info` below for why a handler holding a connection must not be the
+    # one that finds a cache stale.
+    own = await backup_copy.own_hosts(request)
+    closed = door.strip_keys_from_discovery(await door.island_is_closed())
     raw = q.strip()
     like = f"%{raw.lower()}%"
     # Search matches a NAME or a number, which is what the clients promise in
@@ -629,7 +634,7 @@ async def search(
     # NUMBER stays, marked with `home`, because that number came from
     # somewhere and the caller should learn where the person really is rather
     # than be told nobody holds it.
-    homes = await backup_copy.homes_of(db, list(rows), await backup_copy.own_hosts(request))
+    homes = await backup_copy.homes_of(db, list(rows), own)
     rows = [u for u in rows if u.uin not in homes or u.uin == exact_uin][:limit]
     # Card gate (item 22). A search row is a surface that opens a card, so it
     # has to carry `profile_openable` — and "contacts" is the only value that
@@ -654,7 +659,6 @@ async def search(
                 )
             ).all()
         )
-    closed = door.strip_keys_from_discovery(await door.island_is_closed())
     return [
         PublicUser.from_model(
             u, viewer_uin=me, is_contact=u.uin in contact_set,
@@ -870,7 +874,7 @@ async def lookup(
     # A guest copy has no contact list here to resolve (spec 2026-09-15, 6.2),
     # and the rows would be a directory read by the batch. Empty rather than
     # 403, for the same reason as `/users/search`.
-    if await guest_policy.is_guest(me):
+    if await guest_policy.is_guest(me, db):
         return LookupOut(users=[])
     # De-duplicated, self dropped (the caller has `/users/me` and the
     # owner-self view differs on every gate), non-positive dropped.
@@ -966,11 +970,16 @@ async def lookup(
     response_model=PublicUser,
     # `/search` was capped against scraping from day one and this was not, which
     # left the whole directory walkable one UIN at a time by anyone holding a
-    # single account. Every client call site is user-driven — opening a profile,
-    # resolving one unknown sender, the `#911` exact lookup — and group fan-out
-    # reads keys from the roster, not from here, so no legitimate path loops
-    # over this endpoint. 180/min is far above human use and turns enumeration
+    # single account. 180/min is far above human use and turns enumeration
     # into something that needs many accounts, which registration limits price.
+    #
+    # ⚠ This used to say no legitimate path loops over this endpoint. Prod
+    # traffic says otherwise: Android 0.208-0.210 (and on 24.09 a browser or
+    # desktop client) asked for ~20-30 cards within a second right after
+    # opening a room with 2271 members; which client code does it is not
+    # pinned down yet. That burst is well under the limit and was the trigger
+    # of the 11.09-28.09 stalls, so the handler must stay cheap under a burst:
+    # see the note at the top of its body.
     dependencies=[Depends(rate_limit("users_info", 180, 60))],
 )
 @guest(RULE)
@@ -980,6 +989,24 @@ async def info(
     me: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> PublicUser:
+    # ⚠⚠ EVERYTHING THIS HANDLER NEEDS FROM THE ISLAND'S CACHES IS READ HERE,
+    # BEFORE ITS FIRST QUERY. This endpoint is the one clients fan out over
+    # (~30 cards at once after a big room is opened, see the note on the
+    # route), and on 11.09-28.09
+    # it was the trigger of island-wide stalls: `db.get` below opens a
+    # transaction and pins a connection, and the guest check, the door and
+    # the host names used to reload their caches on a SECOND session after
+    # it. With the caches now serving stale values and refreshing behind the
+    # request (core/single_flight.py) none of these touches the pool on a warm
+    # worker, and reading them first means that even a cold cache can only
+    # make this request wait while it holds nothing. The guest check gets the
+    # session anyway, for its Redis-down fallback.
+    #
+    # The existence check below still comes before the door's own queries, so
+    # a missing number and a refused one cost the same (see the door note).
+    caller_is_guest = await guest_policy.is_guest(me, db)
+    closed = await door.island_is_closed()
+    own = await backup_copy.own_hosts(request) if me != uin else set()
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -1004,11 +1031,11 @@ async def info(
     # door, because the door would refuse a co-member on a closed island (a
     # guest is not a resident there, services/door.py) and a shared room is
     # exactly what is allowed to read this card.
-    if await guest_policy.is_guest(me):
+    if caller_is_guest:
         if me != user.uin and not await guest_policy.shares_room(db, me, user.uin):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     elif not await door.may_fetch_key(
-        db, target_uin=uin, caller_uin=me, card=door.card_from(request)
+        db, target_uin=uin, caller_uin=me, card=door.card_from(request), closed=closed,
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     is_contact: bool
@@ -1042,9 +1069,7 @@ async def info(
     # every client, so this is where a backup copy has to say whose it is
     # (#1054). After the door: a caller refused above learns nothing here.
     if me != user.uin:
-        out.home = backup_copy.home_ref(
-            await backup_copy.home_of(db, user, await backup_copy.own_hosts(request))
-        )
+        out.home = backup_copy.home_ref(await backup_copy.home_of(db, user, own))
     return out
 
 
@@ -1246,7 +1271,7 @@ async def register_push_token(
     # reachable is what the door sells. 204 and NOTHING stored, because shipped
     # clients register on every launch from a copy signed in as an account and
     # would retry an error forever.
-    if await guest_policy.is_guest(uin):
+    if await guest_policy.is_guest(uin, db):
         return None
     now = datetime.now(timezone.utc)
     device_id = (body.device_id or "").strip() or None

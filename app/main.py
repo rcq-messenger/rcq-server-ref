@@ -9,11 +9,13 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.core.config import settings
 from app.core.db import engine, init_db
 from app.core import metrics
+from app.core.single_flight import SingleFlight
 from app.core.feature_gate import require_feature
 from app.core.rate_limit import _client_ip
 from app.core.redis import close_redis, get_redis
@@ -150,6 +152,102 @@ def _install_log_redaction() -> None:
         logging.getLogger(name).addFilter(f)
 
 
+#: How long boot waits for the per-worker caches before taking traffic anyway.
+_WARM_DEADLINE_SECONDS = 10.0
+
+
+async def _warm_caches() -> None:
+    """Read the settings, the logo and the headcount before this worker
+    serves its first request.
+
+    ⚠ Why it matters now: those caches serve stale values and refresh behind
+    the request, so a request never waits on the pool for them (the 28.09
+    stalls, core/single_flight.py) -- EXCEPT on a worker that has never read
+    them, where there is no value to serve. Warming here makes that window
+    boot-only instead of "the first burst after a restart".
+
+    ⚠ Bounded, and never fatal. `init_db` has already talked to the database,
+    so this normally takes milliseconds; if the database went away since, a
+    worker that refuses to start is worse than one that starts cold. Cold,
+    /server/info answers 503 until the settings load (never the defaults),
+    `get_strict` refuses (the door reads as closed, registration answers
+    503), and `_cache_ticker` retries each cache every couple of seconds.
+    """
+    from app.core import guest_policy, security
+    from app.routers.server import warm_user_count
+    from app.services import island_logo, server_settings
+
+    deadline = time.monotonic() + _WARM_DEADLINE_SECONDS
+    # The Redis mirrors (guest set, uin epochs, suspended set): built here if
+    # this Redis has never held them, so no request is the one that does it.
+    try:
+        redis = await get_redis()
+        for mirror in (guest_policy._mirror, security._EPOCH_MIRROR, security._SUSPENDED_MIRROR):
+            await asyncio.wait_for(mirror.prime(redis), max(0.1, deadline - time.monotonic()))
+    except Exception as exc:  # noqa: BLE001 - the request path still builds them if this fails
+        _log.warning("[boot] Redis mirrors not primed (%s: %s)", type(exc).__name__, exc)
+    status: tuple = ()
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        status = tuple(
+            await asyncio.gather(
+                server_settings.warm(timeout=left),
+                island_logo.warm(timeout=left),
+                warm_user_count(timeout=left),
+            )
+        )
+        if all(status):
+            return
+        await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    _log.warning(
+        "[boot] serving with cold caches (settings, logo, count loaded: %s); "
+        "they retry in the background",
+        status,
+    )
+
+
+#: How often the ticker below looks at the per-worker caches. It reads the
+#: database only for a cache that is due (settings and logo every `_TTL`, 5 s;
+#: the headcount every minute), so a second here costs nothing but a glance.
+_TICK_SECONDS = 1.0
+
+
+async def _cache_ticker() -> None:
+    """Keep this worker's settings, logo and headcount fresh ON A CLOCK.
+
+    ⚠⚠ Why this exists. Those caches serve a stale value and refresh behind
+    the request (core/single_flight.py: a request that reloaded them inline
+    was the 28.09 stalls). Left at that, how old a served value can be
+    depended on traffic: a worker nobody asked for an hour answered its next
+    request with the settings of an hour ago, so a paid island's quiet worker
+    let the first walk-in register for free, and the till handed out the
+    wallet the operator had just replaced. With this loop a running worker's
+    settings are never much older than `_TTL` plus one read, idle or not,
+    and no request waits for them. Every worker runs one; each costs one
+    small read per cache per `_TTL`.
+
+    Never raises out of the loop: a tick that fails is logged once a minute
+    at most, and the caches' own back-off decides when the next read goes.
+    """
+    from app.routers.server import tick_user_count
+    from app.services import island_logo, server_settings
+
+    last_log = 0.0
+    while True:
+        await asyncio.sleep(_TICK_SECONDS)
+        try:
+            server_settings.tick()
+            island_logo.tick()
+            tick_user_count()
+        except Exception as exc:  # noqa: BLE001 - the loop outlives any one tick
+            now = time.monotonic()
+            if now - last_log >= 60.0:
+                last_log = now
+                _log.warning("[cache-ticker] tick failed: %s: %s", type(exc).__name__, exc)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _install_log_redaction()
@@ -197,6 +295,8 @@ async def lifespan(_: FastAPI):
         _log.info("[boot] transport knows %d broker relay address(es)", n)
     except Exception:  # noqa: BLE001 - never block boot on a counter
         _log.exception("[boot] broker transport set unavailable")
+    await _warm_caches()
+    cache_ticker_task = asyncio.create_task(_cache_ticker())
     expire_task = asyncio.create_task(random_chat.expire_loop())
     offline_queue_sweep_task = asyncio.create_task(offline_queue_sweep_loop())
     # Accounts minted and never used — see dead_account_sweep's docstring.
@@ -280,6 +380,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        cache_ticker_task.cancel()
         expire_task.cancel()
         offline_queue_sweep_task.cancel()
         dead_account_sweep_task.cancel()
@@ -442,26 +543,74 @@ async def cors_aware_internal_error(request: Request, exc: Exception):
     metronome and brings the same wave back in unison.
     """
     if isinstance(exc, SQLAlchemyTimeoutError):
-        # Not `exception`: a busy minute would write hundreds of identical
-        # tracebacks, and the one that matters is the pool gauge, not the stack.
-        in_use, ceiling = _pool_gauge()
-        _log.warning(
-            "Pool exhausted on %s %s (%s/%s checked out)",
-            request.method, request.url.path, in_use, ceiling,
-        )
-        return JSONResponse(
-            {"detail": "island_busy"},
-            status_code=503,
-            headers={
-                "Retry-After": str(2 + secrets.randbelow(6)),
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-    _log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return await pool_exhausted(request, exc)
+    _log.exception("Unhandled error on %s %s", request.method, _route_template(request))
     return JSONResponse(
         {"detail": "internal_error"},
         status_code=500,
         headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+def _route_template(request: Request) -> str:
+    """`/users/{uin}/info`, never `/users/995814918/info`.
+
+    ⚠ The raw path put account numbers into the journal: the 503 line below
+    wrote one per refused request, 1,797 of them on 28.09 alone, while the
+    access log and Caddy both mask the same numbers. The template says which
+    endpoint was refused, which is all the line is read for."""
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "(unmatched)"
+
+
+@app.exception_handler(SQLAlchemyTimeoutError)
+async def pool_exhausted(request: Request, exc: Exception):
+    """503 island_busy for a pool checkout that timed out. See the handler
+    above for why a 503 and not a 500.
+
+    ⚠⚠ REGISTERED FOR THE EXCEPTION CLASS, not only caught in the catch-all
+    above, and that is the log fix. A handler for `Exception` runs in
+    Starlette's ServerErrorMiddleware, which sends the response and then
+    RE-RAISES, so uvicorn printed "Exception in ASGI application" and a ~100
+    line ExceptionGroup traceback after every one of these warnings. On 28.09
+    journald dropped ~171k lines in three minutes of a stall, and with them
+    most of the evidence. A handler for the class itself runs in
+    ExceptionMiddleware, which answers and stops: one line per refusal.
+    """
+    # Not `exception`: a busy minute would write hundreds of identical
+    # tracebacks, and the one that matters is the pool gauge, not the stack.
+    in_use, ceiling = _pool_gauge()
+    if request.scope.get("type") != "http":
+        # ⚠ A WEBSOCKET lands here too: a handler registered for an exception
+        # class runs for every scope, and Starlette hands it the WebSocket.
+        # That has no `.method` and takes no JSONResponse, so the HTTP branch
+        # below crashed with AttributeError and uvicorn printed two chained
+        # tracebacks per socket, the very noise this handler removes. During
+        # a stall ws.py raises the pool timeout out of the connect, ping and
+        # disconnect paths. One line, and the socket is closed with 1013 "try
+        # again later". The web and iOS clients redial on their ordinary
+        # backoff for any code but 4000/4401/4403 (web-chat lib/ws.tsx,
+        # iOS WebSocketService); Android was not checked.
+        _log.warning(
+            "Pool exhausted on WS %s (%s/%s checked out)",
+            _route_template(request), in_use, ceiling,
+        )
+        try:
+            await request.close(code=1013)
+        except Exception:  # noqa: BLE001 - already closed by the client or by ws.py
+            pass
+        return None
+    _log.warning(
+        "Pool exhausted on %s %s (%s/%s checked out)",
+        request.method, _route_template(request), in_use, ceiling,
+    )
+    return JSONResponse(
+        {"detail": "island_busy"},
+        status_code=503,
+        headers={
+            "Retry-After": str(2 + secrets.randbelow(6)),
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 
@@ -511,6 +660,67 @@ app.include_router(ws.router)
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "app": settings.APP_NAME, "version": settings.SERVER_VERSION}
+
+
+#: The probe below, at most one in flight per worker, and its last answer.
+_DB_PROBE = SingleFlight("health-db")
+_DB_PROBE_LAST: tuple[float, bool] = (-1e9, False)
+_DB_PROBE_TIMEOUT = 3.0
+#: A flood of /health/db is answered from the last probe for this long, so
+#: the endpoint costs the pool at most one checkout per worker per second
+#: whoever calls it.
+_DB_PROBE_REUSE = 1.0
+
+
+async def _probe_db() -> bool:
+    global _DB_PROBE_LAST
+
+    async def _checkout_and_select() -> None:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+
+    try:
+        await asyncio.wait_for(_checkout_and_select(), _DB_PROBE_TIMEOUT)
+        ok = True
+    except Exception:  # noqa: BLE001 - any failure is "not ok", and says nothing more
+        ok = False
+    _DB_PROBE_LAST = (time.monotonic(), ok)
+    return ok
+
+
+@app.get("/health/db")
+async def health_db():
+    """Can this worker get a pooled connection and run a query, within 3 s?
+
+    ⚠ The probe for the database, and the only one. `/health` never touches
+    it, and `/server/info` no longer does on a warm worker (it serves from
+    memory), so after the 28.09 fix a stalled pool would be invisible to the
+    monitor without this.
+
+    ⚠ The body is `{"ok": true}` or a 503 `{"ok": false}` and nothing else.
+    It is unauthenticated, and pool counters or error text would tell anybody
+    who asks how loaded the island is and when a push would hurt it.
+
+    One checkout plus `SELECT 1` under a 3 s timeout, shared by concurrent
+    callers on the worker, and reused for a second, so this endpoint cannot
+    itself become the load it measures. It answers for ONE worker, whichever
+    the request lands on; a stall on one worker of four may take a few probes
+    to be seen.
+    """
+    at, ok = _DB_PROBE_LAST
+    if time.monotonic() - at >= _DB_PROBE_REUSE:
+        # The caller's own wait is bounded too: a probe cancelled mid-query
+        # can take a while to hand its connection back (the reset on return
+        # waits for the database it just gave up on), and a caller that
+        # joined it must still get its answer within the 3 s.
+        ok = await _DB_PROBE.wait(_DB_PROBE.start(_probe_db), _DB_PROBE_TIMEOUT)
+    if ok:
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        {"ok": False},
+        status_code=503,
+        headers={"Retry-After": "5", "Cache-Control": "no-store"},
+    )
 
 
 # Nothing on an island is for a search engine. `.rcq` sites are served without

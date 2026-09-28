@@ -81,10 +81,13 @@ from app.services import server_settings  # noqa: E402
 
 async def set_setting(key: str, raw: str) -> None:
     """Flip an operator setting the way the admin console does: upsert the
-    override and bust the cache, so the very next request sees it."""
+    override, commit, then `reload()`, so the very next request sees it.
+    (Since 28.09 `apply` no longer busts the cache; the console's
+    `reload()` after its commit is what publishes a change.)"""
     async with SessionLocal() as db:
         await server_settings.apply(db, {key: raw})
         await db.commit()
+    await server_settings.reload()
 
 ok = 0
 bad = 0

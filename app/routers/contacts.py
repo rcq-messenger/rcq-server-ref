@@ -274,6 +274,10 @@ async def send_request(
     """
     if body.to_uin == uin:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot add yourself")
+    # This island's names, read before the first query: a handler that holds a
+    # connection must not be the one that finds the settings cache stale
+    # (core/single_flight.py has the stalls that taught this).
+    own = await backup_copy.own_hosts(request)
     target = await db.get(User, body.to_uin)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -285,7 +289,7 @@ async def send_request(
     # client adds that address through the cross-island path. Before the
     # contact and reverse-request checks on purpose: neither can exist for a
     # copy that never answers, and a stale one must not turn into an accept.
-    home = await backup_copy.home_of(db, target, await backup_copy.own_hosts(request))
+    home = await backup_copy.home_of(db, target, own)
     if home is not None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=backup_copy.refusal(home))
 
@@ -378,6 +382,11 @@ async def send_request(
             await db.commit()
         sender = await db.get(User, uin)
         sender_nick = sender.nickname if sender else str(uin)
+        # ⚠ Give the connection back before the push: `should_push_for` and the
+        # senders read on sessions of their own, and a handler that asks the
+        # pool for a second connection while holding one is how the island
+        # stalled on 28.09 (core/db_nesting.py flagged this call site).
+        await db.commit()
         delivered = await manager.send(
             body.to_uin,
             {
@@ -410,6 +419,8 @@ async def send_request(
     await db.refresh(req)
     sender = await db.get(User, uin)
     sender_nick = sender.nickname if sender else str(uin)
+    # The connection goes back before the push, as in the reopen path above.
+    await db.commit()
     delivered = await manager.send(
         body.to_uin,
         {
@@ -476,6 +487,8 @@ async def outgoing(
     recipient is never told from here that they were the one who declined.
     Accepted requests are dropped from the list (the peer is already a
     mutual contact, visible in the normal contact list)."""
+    # Before the query, for the same reason as in `send_request`.
+    own = await backup_copy.own_hosts(request)
     rows = (
         await db.execute(
             select(ContactRequest, User)
@@ -488,9 +501,7 @@ async def outgoing(
             )
         )
     ).all()
-    homes = await backup_copy.homes_of(
-        db, [u for _, u in rows], await backup_copy.own_hosts(request)
-    ) if rows else {}
+    homes = await backup_copy.homes_of(db, [u for _, u in rows], own) if rows else {}
     return [
         OutgoingRow(
             id=r.id, to_uin=r.to_uin, nickname=u.nickname, state=r.state,
@@ -544,7 +555,7 @@ async def respond(
         # which is what the door sells. Decline writes nothing but the answer:
         # residents may still ask a copy (F1), and the person answers from
         # home over §5f.
-        await guest_policy.refuse_guest(uin)
+        await guest_policy.refuse_guest(uin, db)
     req = await db.get(ContactRequest, body.request_id)
     if req is None or req.to_uin != uin:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such request")

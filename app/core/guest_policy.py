@@ -44,10 +44,18 @@ log = logging.getLogger(__name__)
 #: flushed Redis rebuilds it from the table.
 GUEST_KEY = "guest_uins"
 #: Freshness marker for the set. While it exists the set is trusted; when it
-#: expires the next reader rebuilds from `users`. One small query per worker
-#: per window, never per request.
+#: expires the set is rebuilt from `users` in the background, one worker at a
+#: time, while readers keep answering from the set as it is (see
+#: `core/single_flight.RedisMirror` for why a reader must not rebuild it).
 GUEST_LOADED_KEY = "guest_uins:loaded"
 GUEST_TTL_SECONDS = 300
+#: Set, with no TTL, by every rebuild. Tells "the marker lapsed" (the set is
+#: still an answer: it is authoritative on write) from "this Redis has never
+#: held the set" (a flush or a restart without persistence took both, and the
+#: set is not an answer until it is rebuilt, which then happens inline).
+GUEST_BUILT_KEY = "guest_uins:built"
+#: One background rebuild per island at a time.
+GUEST_REBUILD_LOCK_KEY = "guest_uins:rebuild"
 #: Marks made recently, kept beside the set so a rebuild cannot erase them.
 #:
 #: ⚠⚠ WHY THIS EXISTS. A mark is written before its row is committed. A rebuild
@@ -166,18 +174,24 @@ async def _redis():
     return await get_redis()
 
 
-async def _rebuild(redis) -> None:
+async def _rebuild(redis, db=None) -> None:
     """Replace the set with `guest rows UNION pending marks`, and arm the
     marker. The union is done by Redis inside one MULTI, so a reader never
     sees a half-built set and two workers rebuilding at once both finish with
-    a correct one."""
-    from app.core.db import SessionLocal
+    a correct one.
+
+    `db`: the caller's session, when the rebuild has to happen inline inside a
+    request that may already hold a connection (see `is_guest`). None opens a
+    short session of its own, which is what the background rebuild does."""
+    from app.core.single_flight import read_on
     from app.models.user import User
 
-    async with SessionLocal() as db:
-        rows = (
-            await db.execute(select(User.uin).where(User.guest_status.is_not(None)))
+    async def _read(session):
+        return (
+            await session.execute(select(User.uin).where(User.guest_status.is_not(None)))
         ).scalars().all()
+
+    rows = await read_on(db, _read)
     # A private scratch key per rebuild, so concurrent rebuilds cannot read
     # each other's half-filled sets.
     scratch = f"{GUEST_KEY}:build:{secrets.token_hex(8)}"
@@ -192,34 +206,60 @@ async def _rebuild(redis) -> None:
     pipe.sunionstore(GUEST_KEY, [scratch, GUEST_PENDING_KEY])
     pipe.delete(scratch)
     pipe.set(GUEST_LOADED_KEY, "1", ex=GUEST_TTL_SECONDS)
+    pipe.set(GUEST_BUILT_KEY, "1")
     await pipe.execute()
 
 
-async def _is_guest_from_row(uin: int) -> bool:
-    from app.core.db import SessionLocal
+def _make_mirror():
+    from app.core.single_flight import RedisMirror
+
+    return RedisMirror(
+        "guest",
+        marker=GUEST_LOADED_KEY,
+        built=GUEST_BUILT_KEY,
+        lock=GUEST_REBUILD_LOCK_KEY,
+        rebuild=_rebuild,
+    )
+
+
+_mirror = _make_mirror()
+
+
+async def _is_guest_from_row(uin: int, db=None) -> bool:
+    """The row itself, on the caller's session when there is one (a second
+    session inside a request that holds a connection is how the 28.09 stalls
+    happened; see core/single_flight.py)."""
+    from app.core.single_flight import read_on
     from app.models.user import User
 
-    async with SessionLocal() as db:
-        value = await db.scalar(select(User.guest_status).where(User.uin == int(uin)))
-    return value is not None
+    async def _read(session):
+        return await session.scalar(select(User.guest_status).where(User.uin == int(uin)))
+
+    return (await read_on(db, _read)) is not None
 
 
-async def is_guest(uin: int) -> bool:
+async def is_guest(uin: int, db=None) -> bool:
     """True when `uin` is a guest copy or an unclaimed seat.
 
-    Redis first (marker, rebuild if it is missing, then SISMEMBER). On ANY
-    Redis error the row is read instead. If the database is unreachable as
-    well, the exception propagates and the request fails; it is never answered
-    as "native".
+    Redis first (marker, then SISMEMBER). On ANY Redis error the row is read
+    instead. If the database is unreachable as well, the exception propagates
+    and the request fails; it is never answered as "native".
+
+    ⚠ Pass `db`, the handler's own session, from anywhere inside a handler
+    that may already have run a query. The two paths that touch the database
+    here (the row read on a Redis error, the inline rebuild on a Redis that
+    has never held the set) then run on the connection the request already
+    holds instead of asking the pool for a second one. A lapsed marker no
+    longer rebuilds on the request path at all: the set is authoritative on
+    write, so it is answered as is and rebuilt behind the request.
     """
     try:
         redis = await _redis()
-        if not await redis.exists(GUEST_LOADED_KEY):
-            await _rebuild(redis)
+        await _mirror.ensure(redis, db)
         return bool(await redis.sismember(GUEST_KEY, str(int(uin))))
     except Exception as exc:  # noqa: BLE001 - any cache failure reads the row
         log.warning("[guest] cache unavailable, reading the row: %s", exc)
-    return await _is_guest_from_row(uin)
+    return await _is_guest_from_row(uin, db)
 
 
 async def mark_guest(uin: int) -> None:
@@ -246,12 +286,13 @@ async def unmark_guest(uin: int) -> None:
     """Take `uin` out of the guest set AFTER the commit that converted it to a
     resident, deleted it, or failed to create it. Best effort, never raises.
 
-    If the removal cannot be written, the marker is dropped instead so the next
-    reader rebuilds from the table. Should that fail too, the stale entry
-    restricts the former guest until the marker expires on its own (300 s,
-    plus up to the pending TTL if the uin was marked in the last two minutes).
-    That is the safe direction, and the reason this may be best effort while
-    `mark_guest` may not.
+    If the removal cannot be written, the marker is dropped instead so the set
+    is rebuilt from the table (in the background: the next reader still sees
+    the stale entry for the moment the rebuild takes). Should that fail too,
+    the stale entry restricts the former guest until the marker expires on
+    its own (300 s, plus up to the pending TTL if the uin was marked in the
+    last two minutes). That is the safe direction, and the reason this may be
+    best effort while `mark_guest` may not.
     """
     try:
         redis = await _redis()
@@ -385,10 +426,11 @@ def restricted_error() -> HTTPException:
     return HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_restricted"})
 
 
-async def refuse_guest(uin: int) -> None:
+async def refuse_guest(uin: int, db=None) -> None:
     """Raise `restricted_error()` when `uin` is a guest, counting the refusal.
-    For RULE handlers whose rule is "this part is not for guests"."""
-    if await is_guest(uin):
+    For RULE handlers whose rule is "this part is not for guests". `db` as for
+    `is_guest`."""
+    if await is_guest(uin, db):
         await bump_stat("guest_restricted")
         raise restricted_error()
 

@@ -1057,7 +1057,7 @@ async def discover_groups(
     would sit above the second."""
     # The island's room directory. A guest copy gets an empty one (spec
     # 2026-09-15, 6.2); it still joins a room by that room's link.
-    if await guest_policy.is_guest(viewer_uin):
+    if await guest_policy.is_guest(viewer_uin, db):
         return []
     capped = max(1, min(limit, 50))
     own_group_ids = (
@@ -1128,7 +1128,7 @@ async def search_groups(
     branch on lookup mode. Caller's own groups are filtered out
     server-side."""
     # A directory, so empty for a guest copy, like `/discover` above.
-    if await guest_policy.is_guest(viewer_uin):
+    if await guest_policy.is_guest(viewer_uin, db):
         return []
     needle = q.strip()
     if len(needle) < 2:
@@ -1317,7 +1317,7 @@ async def join_group(
     # because every client calls this right after `/auth/guest` already put
     # the guest in the room. The room budget is spent last, so a refusal for
     # any other reason does not use up the room's day.
-    if await guest_policy.is_guest(uin):
+    if await guest_policy.is_guest(uin, db):
         if g.allow_guests is False:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_room_closed"})
         await guest_accounts.refuse_full_room(db, g)
@@ -1529,7 +1529,7 @@ async def add_guest(
 
     # 1. A guest adds nobody: it shares the link instead. Checked here as well
     # as by the route policy, because this route mints rows.
-    if await guest_policy.is_guest(uin):
+    if await guest_policy.is_guest(uin, db):
         await guest_policy.bump_stat("guest_restricted")
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_restricted"})
     # 2.

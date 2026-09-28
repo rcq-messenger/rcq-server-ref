@@ -235,8 +235,16 @@ async def main() -> int:
                 raised = True
             check("★ get_strict raises SettingsUnavailable instead", raised)
             check("★ admission_open fails closed in that window", await gp.admission_open() is False)
-            check("  ... and /server/info still answers, with the capability false",
-                  await cap() is False)
+            # ⚠ Changed on 28.09. /server/info used to answer here from the
+            # env defaults (open, free, "RCQ"), and clients and other islands
+            # cache that reply. It now refuses until this worker has read the
+            # island's own settings, the same 503 the pool answers with.
+            r = await c.get("/server/info")
+            check(f"★ ... and /server/info refuses (503 island_busy, Retry-After) instead of "
+                  f"publishing the defaults ({r.status_code})",
+                  r.status_code == 503 and r.json().get("detail") == "island_busy"
+                  and int(r.headers.get("Retry-After", "0")) >= 1
+                  and "capabilities" not in r.json())
         finally:
             server_settings.SessionLocal = saved_session
             server_settings._env.REGISTRATION_POLICY = saved_env
@@ -308,18 +316,92 @@ async def main() -> int:
         ttl = await redis.ttl(gp.GUEST_LOADED_KEY)
         check("the marker is armed for at most 300 s", 0 < ttl <= 300)
 
+        check("  ... and the set is recorded as built (no TTL)",
+              await redis.exists(gp.GUEST_BUILT_KEY) == 1 and await redis.ttl(gp.GUEST_BUILT_KEY) == -1)
+
+        # ⚠ A rebuild INLINE happens only on a Redis that has never held the
+        # set (no `built` key). Deleting both keys below is how these checks
+        # force one; a lapsed marker alone is rebuilt in the background, which
+        # is pinned right after them.
         X = await unused_uin()
         await gp.mark_guest(X)
-        await redis.delete(gp.GUEST_LOADED_KEY)
+        await redis.delete(gp.GUEST_LOADED_KEY, gp.GUEST_BUILT_KEY)
         check("★ a rebuild racing a mark whose row is not committed yet keeps the mark",
               await gp.is_guest(X) is True)
-        await redis.delete(gp.GUEST_PENDING_KEY, gp.GUEST_LOADED_KEY)
+        await redis.delete(gp.GUEST_PENDING_KEY, gp.GUEST_LOADED_KEY, gp.GUEST_BUILT_KEY)
         check("  ... which is the pending set's doing: without it the same rebuild drops it",
               await gp.is_guest(X) is False)
         await gp.mark_guest(X)
         await gp.unmark_guest(X)
-        await redis.delete(gp.GUEST_LOADED_KEY)
+        await redis.delete(gp.GUEST_LOADED_KEY, gp.GUEST_BUILT_KEY)
         check("a mark whose commit failed is gone after unmark, rebuild included", await gp.is_guest(X) is False)
+
+        # ── 6b. a lapsed marker is not rebuilt on the request path ─────────
+        # The 28.09 stalls: every request that found the marker gone rebuilt
+        # the set on a SECOND database session, from inside handlers that
+        # already held one. Now the set (authoritative on write) answers at
+        # once and ONE rebuild runs behind the request.
+        await redis.delete(gp.GUEST_LOADED_KEY)
+        await redis.sadd(gp.GUEST_KEY, "1")  # a stale member only a rebuild removes
+        real_rebuild = gp._mirror._rebuild
+        rebuilds: list[bool] = []
+        gate = asyncio.Event()
+
+        async def slow_rebuild(redis_, db_):
+            rebuilds.append(db_ is None)
+            await gate.wait()
+            await real_rebuild(redis_, db_)
+
+        gp._mirror._rebuild = slow_rebuild
+        gp._mirror._next_kick = 0.0
+        try:
+            answers = await asyncio.gather(*[gp.is_guest(G) for _ in range(20)])
+            check("★ marker lapsed, set built: 20 concurrent readers answer from the set "
+                  "without waiting for the rebuild", all(a is True for a in answers) and not gate.is_set())
+            for _ in range(50):
+                if rebuilds:
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.gather(*[gp.is_guest(G) for _ in range(5)])
+            check(f"  ... and exactly ONE rebuild started, in the background on its own session "
+                  f"({rebuilds})", rebuilds == [True])
+            gate.set()
+            for _ in range(50):
+                if await redis.exists(gp.GUEST_LOADED_KEY):
+                    break
+                await asyncio.sleep(0.02)
+            check("  ... which re-arms the marker and drops what the table does not hold",
+                  await redis.exists(gp.GUEST_LOADED_KEY) == 1
+                  and not await redis.sismember(gp.GUEST_KEY, "1"))
+            check("  ... and releases the island-wide rebuild lock",
+                  await redis.exists(gp.GUEST_REBUILD_LOCK_KEY) == 0)
+        finally:
+            gp._mirror._rebuild = real_rebuild
+            gate.set()
+
+        # The row fallback uses the CALLER'S session when it has one.
+        opened: list[int] = []
+        saved_session_factory = db_mod.SessionLocal
+
+        def counting_session(*a, **kw):
+            opened.append(1)
+            return saved_session_factory(*a, **kw)
+
+        saved_get_redis_0 = redis_mod.get_redis
+
+        async def redis_gone():
+            raise ConnectionError("redis unreachable")
+
+        async with SessionLocal() as caller_db:
+            db_mod.SessionLocal = counting_session
+            redis_mod.get_redis = redis_gone
+            try:
+                via_caller = await gp.is_guest(G, caller_db)
+            finally:
+                db_mod.SessionLocal = saved_session_factory
+                redis_mod.get_redis = saved_get_redis_0
+        check(f"★ Redis down with the caller's session: the row is read on THAT session, "
+              f"no second one ({via_caller}, opened {len(opened)})", via_caller is True and not opened)
 
         async with SessionLocal() as db:
             await db.execute(text("UPDATE users SET guest_status=NULL, guest_since=NULL WHERE uin=:u"), {"u": G})

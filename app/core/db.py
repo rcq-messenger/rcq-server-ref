@@ -78,12 +78,39 @@ if settings.DATABASE_URL.startswith(("postgresql", "postgres")):
         # this is correct whether DATABASE_URL points at the pool or direct.
         connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
     )
+#
+# ⚠⚠ AND A POOL THIS SIZE IS ONLY SAFE IF NO REQUEST EVER HOLDS ONE CONNECTION
+# WHILE WAITING FOR A SECOND. 40 client connections over 15 backends is fine
+# for requests that each need one; it deadlocks for requests that need two,
+# because every open transaction pins a backend and the second checkout queues
+# behind the very requests that hold them. That is what stalled the island for
+# 2-11 minutes at a time from 11.09 to 28.09: cached helpers (settings, guest
+# set, host names) reloaded themselves on a NESTED session from inside
+# handlers that had already run a query. core/single_flight.py has the story
+# and the fix; core/db_nesting.py is the tripwire that names a call site that
+# does it again.
+#
+# ⚠ Deliberately NOT here: a global asyncpg `command_timeout`. It would apply
+# to every statement on every connection, including the DDL in `init_db` (an
+# `ALTER ... IF NOT EXISTS` that waits on a lock at boot) and the retention
+# sweeps, so a slow lock at boot would put the worker in a restart loop. And
+# `pool_timeout` stays at 20 s: with the nesting gone, a checkout waits only
+# for requests that are actually running, and nothing measured says 20 s is
+# the wrong wall for those.
 engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+from . import db_nesting as _db_nesting  # noqa: E402  (needs nothing from here)
+
+_db_nesting.install()
 
 
 async def get_db() -> AsyncSession:
     async with SessionLocal() as session:
+        # Only a label for the nesting tripwire (core/db_nesting.py): "this is
+        # the session the request holds". No connection is taken here; the
+        # first query takes one.
+        _db_nesting.mark_request_session(session)
         yield session
 
 

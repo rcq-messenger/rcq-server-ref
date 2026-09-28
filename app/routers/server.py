@@ -14,11 +14,12 @@ to a value that keeps old clients working, and gate the new client-side
 feature behind the lookup.
 """
 
+import asyncio
 import json
 import re
 import logging
 import time
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, Header, HTTPException, status
 from fastapi.responses import Response as RawResponse
 from pydantic import BaseModel
 
@@ -27,6 +28,7 @@ from sqlalchemy import func, select
 from app.core.config import settings
 from app.core.db import SessionLocal
 from app.core.guest_policy import admission_open
+from app.core.single_flight import SingleFlight
 from app.models.user import User
 from app.routers import media, vault
 from app.services import island_logo, server_settings
@@ -384,39 +386,130 @@ def _http_or_https(raw: object) -> str:
 #: person swipes past, so the headcount behind it is counted at most once a
 #: minute and served from here in between. A minute-old number is right for a
 #: figure that moves by ones.
+#:
+#: `(at, count)`: `at` is `time.monotonic()` of the count, and `at <= 0` means
+#: never counted on this worker (or reset). ⚠ Decided by `at`, not by the
+#: count: a count of 0 is an answer too, and `if value and ...` used to
+#: re-count on every request on an island with no residents yet.
 _USER_COUNT: tuple[float, int] = (0.0, 0)
 _USER_COUNT_TTL = 60.0
+_USER_COUNT_RETRY_AFTER = 2.0
+# A count's own deadline, see server_settings._READ_DEADLINE.
+_USER_COUNT_DEADLINE = 10.0
+_user_count_retry_at = 0.0
+_user_count_flight = SingleFlight("user-count")
 
 
-async def _user_count() -> int:
-    """Accounts on this island, cached. Returns 0 if the count cannot be taken:
-    the field's own contract is that 0 means "not published", and a card that
-    draws nothing is better than one that says an island is empty."""
-    global _USER_COUNT
-    at, value = _USER_COUNT
-    now = time.monotonic()
-    if value and now - at < _USER_COUNT_TTL:
-        return value
-    try:
+async def _count_users() -> bool:
+    global _USER_COUNT, _user_count_retry_at
+    started = time.monotonic()
+    async def count_once() -> int:
         async with SessionLocal() as db:
             # People who live here. A guest copy is somebody from another
             # island sitting in a room (spec 2026-09-15, 6.2), and counting it
             # would let a busy open room inflate the number every island card
             # shows.
-            count = int(
+            return int(
                 await db.scalar(
                     select(func.count(User.uin)).where(User.guest_status.is_(None))
                 )
                 or 0
             )
+
+    try:
+        count = await asyncio.wait_for(count_once(), _USER_COUNT_DEADLINE)
     except Exception:
+        # From the failure, not from `started`: a failed count is usually the
+        # pool's 20 s timeout, and a pause counted from the start would be
+        # over before it began.
+        _user_count_retry_at = time.monotonic() + _USER_COUNT_RETRY_AFTER
+        raise
+    _USER_COUNT = (started, count)
+    return True
+
+
+async def _user_count(wait: float = 2.0) -> int:
+    """Accounts on this island, cached. Returns 0 if the count cannot be taken:
+    the field's own contract is that 0 means "not published", and a card that
+    draws nothing is better than one that says an island is empty.
+
+    ⚠ Never counted inline on a warm worker. A stale count is served while ONE
+    background count per worker runs on its own session (the reason is in
+    services/server_settings.py). Only a worker that has never counted waits,
+    and for at most `wait` seconds: this reply holds no connection of its own,
+    and after that 0 ("not published") is the honest answer.
+    """
+    at, value = _USER_COUNT
+    now = time.monotonic()
+    if at > 0 and now - at < _USER_COUNT_TTL:
         return value
-    _USER_COUNT = (now, count)
-    return count
+    task = _user_count_flight.current()
+    if task is None and now >= _user_count_retry_at:
+        task = _user_count_flight.start(_count_users)
+    if at > 0:
+        return value
+    if task is not None:
+        await _user_count_flight.wait(task, wait)
+    at, value = _USER_COUNT
+    return value if at > 0 else 0
+
+
+async def warm_user_count(timeout: float) -> bool:
+    """For the lifespan, before the worker takes traffic."""
+    await _user_count_flight.wait(_user_count_flight.start(_count_users), timeout)
+    return _USER_COUNT[0] > 0
+
+
+def tick_user_count() -> None:
+    """For the lifespan ticker (main.py): recount once the count is due, on a
+    clock rather than on the next /server/info. See server_settings.tick."""
+    at, _ = _USER_COUNT
+    now = time.monotonic()
+    if at > 0 and now - at < _USER_COUNT_TTL:
+        return
+    if now < _user_count_retry_at or _user_count_flight.current() is not None:
+        return
+    _user_count_flight.start(_count_users)
+
+
+#: How long a COLD worker lets /server/info wait for its first read of the
+#: settings, the logo and the headcount, ALL TOGETHER, before it answers 503.
+#: One budget for the three, not one each: the monitor gives the probe 10 s
+#: and clients give it 15, and three sequential waits used to add up to more.
+#: The lifespan warms all three before the worker takes traffic, so this is
+#: only ever spent on a worker that booted while the database was away.
+_COLD_WAIT_SECONDS = 5.0
+
+
+def _not_ready() -> HTTPException:
+    """503 while this worker does not know the island's own settings.
+
+    ⚠⚠ Not the defaults. On the flagship the defaults say registration is
+    open and free and the island is called "RCQ", while the island says paid,
+    $15, "RCQ Flagship" and api.rcq.app. Clients and other islands CACHE this
+    reply, so one served from defaults is a free open door advertised for as
+    long as they keep it. Same body and header as the pool's 503 (main.py),
+    which every client already retries.
+    """
+    return server_settings.busy_error()
 
 
 @router.get("/info", response_model=ServerInfo)
 async def server_info() -> ServerInfo:
+    # ⚠⚠ On a warm worker nothing below touches the database pool: settings,
+    # logo, admission and the headcount are all served from memory, and a
+    # stale one is refreshed behind the reply. This reply used to make up to
+    # seven sequential pool checkouts and swallow a 20 s timeout on each, so
+    # during the 28.09 stalls it took 90-162 s to answer and was the only
+    # probe of the monitor that noticed anything. /health/db (main.py) is the
+    # probe for the pool now.
+    settings_ok, logo_ok, user_count = await asyncio.gather(
+        server_settings.wait_loaded(_COLD_WAIT_SECONDS),
+        island_logo.wait_loaded(_COLD_WAIT_SECONDS),
+        _user_count(wait=min(2.0, _COLD_WAIT_SECONDS)),
+    )
+    if not (settings_ok and logo_ok):
+        raise _not_ready()
     eff = await server_settings.effective()
     return ServerInfo(
         name=await server_settings.island_name(),
@@ -463,7 +556,7 @@ async def server_info() -> ServerInfo:
             till_url=_https_only(eff["uin_till_url"]),
             guest_accounts_v1=await admission_open(),
             terms_url=_http_or_https(eff["terms_url"]),
-            user_count=await _user_count(),
+            user_count=user_count,
             random_chat=eff["random_enabled"],
             reports=eff["reports_enabled"],
             max_accounts_per_device=eff["max_accounts_per_device"],
@@ -494,6 +587,11 @@ async def server_logo(
     changed URL. `ETag` covers the clients (and the CDN in front of the
     flagship) that ask again anyway -- a revalidation costs a 304 with no body.
     """
+    if not await island_logo.wait_loaded(_COLD_WAIT_SECONDS):
+        # Never read on this worker: "no logo" would be a guess, and a 404
+        # tells the client this island has none. Same 503 as /server/info,
+        # after the same bounded wait for the first read.
+        raise _not_ready()
     row = await island_logo.current()
     if row is None:
         return RawResponse(status_code=status.HTTP_404_NOT_FOUND)

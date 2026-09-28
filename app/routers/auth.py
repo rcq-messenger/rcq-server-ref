@@ -408,7 +408,14 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     reserved_uin: int | None = None
     invite_gates = _invite_gates(code_hash)
     _spent_now = _invite_spent_now()
-    policy = await server_settings.get("registration_policy")
+    # ⚠ STRICT. On a worker that has never read the settings `get` answers
+    # with the default (the environment's, "open" unless it says otherwise),
+    # and a walk-in would be registered for free on a paid island.
+    # `guest_settle` below has the same guard. A 503 costs one retry.
+    try:
+        policy = await server_settings.get_strict("registration_policy")
+    except server_settings.SettingsUnavailable:
+        raise server_settings.busy_error() from None
     # ⚠⚠ PAID ENTRY RIDES THE INVITE FIELD, on purpose. An entry voucher and an
     # invite answer the same question — "may this person have an account here"
     # — and every client already has one box for that answer, on four
@@ -714,7 +721,7 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     activity_bump("reg")
     # Mint under the number's CURRENT epoch: a recycled UIN starts above 0,
     # which is what stops a previous holder's saved bearer from working.
-    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id))
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin, db), body.device_id))
 
 
 async def _convert_guest_on_register(
@@ -768,7 +775,7 @@ async def _convert_guest_on_register(
     await guest_accounts.after_conversion(db, uin)
     # No founder edge, no inviter edge, no beta room: this is not a new
     # account, and it already has the rooms it chose.
-    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin), device_id), guest=False)
+    return RegisterOut(uin=uin, token=issue_token(uin, await uin_epoch(uin, db), device_id), guest=False)
 
 
 async def _refuse_revoked_device(uin: int, device_id: str | None) -> None:
@@ -882,7 +889,7 @@ async def claim_device(
             await db.delete(old)
         await db.commit()
     return SessionOut(
-        token=issue_token(uin, await uin_epoch(uin), body.device_id),
+        token=issue_token(uin, await uin_epoch(uin, db), body.device_id),
         ws_url=f"/ws/{uin}",
     )
 
@@ -983,7 +990,7 @@ async def recover(body: RecoverIn, db: AsyncSession = Depends(get_db)) -> Regist
     await _refuse_revoked_device(uin, body.device_id)
     guest = await _claim_seat_on_proof(db, uin)
     return RegisterOut(
-        uin=uin, token=issue_token(uin, await uin_epoch(uin), body.device_id), guest=guest
+        uin=uin, token=issue_token(uin, await uin_epoch(uin, db), body.device_id), guest=guest
     )
 
 
@@ -1190,7 +1197,7 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)) -> Refres
     guest = await _claim_seat_on_proof(db, owned)
     return RefreshOut(
         uin=owned,
-        token=issue_token(owned, await uin_epoch(owned), body.device_id),
+        token=issue_token(owned, await uin_epoch(owned, db), body.device_id),
         moved_from=moved_from,
         guest=guest,
     )
@@ -1406,7 +1413,13 @@ async def reissue(
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "user_not_found"})
-    require_proof = bool(await server_settings.get("reissue_require_proof"))
+    # Strict for the same reason as the registration policy: the default is
+    # "no proof", and a cold worker must not waive a proof the operator asked
+    # for.
+    try:
+        require_proof = bool(await server_settings.get_strict("reissue_require_proof"))
+    except server_settings.SettingsUnavailable:
+        raise server_settings.busy_error() from None
     # c) Compared as decoded bytes, so a retry that spells the same key with or
     # without padding is still "the same keys" and not a second rotation.
     if (
@@ -1436,7 +1449,7 @@ async def reissue(
             return RegisterOut(uin=uin, token=creds.credentials if creds else "")
         await _bump_reissue_stat("reissue_samekeys")
         return RegisterOut(
-            uin=uin, token=issue_token(uin, await uin_epoch(uin), carry_device_id(device_id))
+            uin=uin, token=issue_token(uin, await uin_epoch(uin, db), carry_device_id(device_id))
         )
 
     # ⚠⚠ A key change may not adopt a signing key another account here holds.
@@ -1670,7 +1683,7 @@ async def reissue(
     # rather than back from the cache, so a Redis blip between the write-through
     # and this line cannot hand the rotating device a token that is stale on
     # arrival.
-    epoch = new_epoch if new_epoch is not None else await uin_epoch(uin)
+    epoch = new_epoch if new_epoch is not None else await uin_epoch(uin, db)
     return RegisterOut(uin=uin, token=issue_token(uin, epoch, carry_device_id(device_id)))
 
 
@@ -1922,7 +1935,7 @@ async def guest_join(
     # 12.
     return GuestOut(
         uin=uin,
-        token=issue_token(uin, await uin_epoch(uin), body.device_id),
+        token=issue_token(uin, await uin_epoch(uin, db), body.device_id),
         guest=True,
         created=True,
     )
@@ -1966,7 +1979,7 @@ async def _guest_existing_row(
     if row.guest_status is None:
         return GuestOut(
             uin=row.uin,
-            token=issue_token(row.uin, await uin_epoch(row.uin), device_id),
+            token=issue_token(row.uin, await uin_epoch(row.uin, db), device_id),
             guest=False,
             created=False,
         )
@@ -2002,7 +2015,7 @@ async def _guest_existing_row(
     status_now = await db.scalar(select(User.guest_status).where(User.uin == row.uin))
     return GuestOut(
         uin=row.uin,
-        token=issue_token(row.uin, await uin_epoch(row.uin), device_id),
+        token=issue_token(row.uin, await uin_epoch(row.uin, db), device_id),
         guest=status_now is not None,
         created=False,
     )

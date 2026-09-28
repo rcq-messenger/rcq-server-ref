@@ -385,7 +385,7 @@ async def _may_take_opk(request: Request, me: int | None) -> bool:
 
 
 async def _guest_key_caller(
-    db: AsyncSession, request: Request, me: int | None, uin: int
+    db: AsyncSession, request: Request, me: int | None, uin: int, closed: bool | None = None
 ) -> tuple[int | None, bool]:
     """The key rule for a GUEST session (spec 2026-09-15, 6.2).
 
@@ -407,10 +407,10 @@ async def _guest_key_caller(
     guest gets a bundle without an OPK unless it presents a deposit token,
     which is what any stranger gets.
     """
-    if me is None or not await guest_policy.is_guest(me):
+    if me is None or not await guest_policy.is_guest(me, db):
         return me, False
     if not await guest_policy.shares_room(db, me, uin) and not await door.may_fetch_key(
-        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request), closed=closed
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     return None, True
@@ -439,6 +439,12 @@ async def fetch_bundle(
     with that single-use key, and the recipient's libsignal consumes it on the
     first decrypt — making the second message undecryptable (InvalidKeyId), so
     it shows a generic push and never lands in the chat. See `_claim_opk`."""
+    # The island's door setting, read before the first query: a handler that
+    # holds a connection must not be the one that waits on the settings
+    # cache (core/single_flight.py). Free on a warm worker, and read for
+    # every caller alike, so it costs a missing number and a refused one the
+    # same.
+    closed = await door.island_is_closed()
     user = await db.get(User, uin)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -457,9 +463,9 @@ async def fetch_bundle(
     # The 404 here doubles as the sender's "fall back to v=1" signal, which is
     # the right outcome: the fallback then asks /federation/keys, which refuses
     # the same caller, so an outsider ends with no key rather than a downgrade.
-    me, door_checked = await _guest_key_caller(db, request, me, uin)
+    me, door_checked = await _guest_key_caller(db, request, me, uin, closed)
     if me is None and not door_checked and not await door.may_fetch_key(
-        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request), closed=closed
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     # Multi-device: while a web session is linked to this account, withhold the
@@ -691,9 +697,12 @@ async def list_devices(
     # device list. A lock with a second door is not a lock. Same refusal as the
     # gated door: 404 "no such user", indistinguishable from a number that does
     # not exist.
-    me, door_checked = await _guest_key_caller(db, request, me, uin)
+    # Read before the first query, like fetch_bundle: settings read while this
+    # session holds a transaction is the nested checkout the pool stalls on.
+    closed = await door.island_is_closed()
+    me, door_checked = await _guest_key_caller(db, request, me, uin, closed)
     if me is None and not door_checked and not await door.may_fetch_key(
-        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request), closed=closed
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
 
@@ -751,9 +760,11 @@ async def fetch_device_bundle(
     the closed-island door lived there too, so an outsider refused at
     `/keys/{uin}/bundle` got the very same primary bundle by asking for device
     1 instead. The lock had a second door standing open."""
-    me, door_checked = await _guest_key_caller(db, request, me, uin)
+    # Before the first query, see list_devices.
+    closed = await door.island_is_closed()
+    me, door_checked = await _guest_key_caller(db, request, me, uin, closed)
     if me is None and not door_checked and not await door.may_fetch_key(
-        db, target_uin=uin, caller_uin=None, card=door.card_from(request)
+        db, target_uin=uin, caller_uin=None, card=door.card_from(request), closed=closed
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     if device_id == PRIMARY_DEVICE_ID:

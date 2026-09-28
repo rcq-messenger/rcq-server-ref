@@ -534,5 +534,5 @@ async def migrate(
     # gets woken about messages it already has.
     return MigrateOut(
         new_uin=new_uin,
-        token=issue_token(new_uin, await uin_epoch(new_uin), carry_device_id(device_id)),
+        token=issue_token(new_uin, await uin_epoch(new_uin, db), carry_device_id(device_id)),
     )

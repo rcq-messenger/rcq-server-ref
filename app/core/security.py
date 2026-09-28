@@ -269,53 +269,90 @@ async def current_uin(
 _EPOCH_KEY = "uin_epochs"
 _EPOCH_LOADED_KEY = "uin_epochs:loaded"
 _EPOCH_TTL_SECONDS = 300
+#: See `core/single_flight.RedisMirror`: "built" survives the marker, the lock
+#: keeps the background rebuild to one worker at a time.
+_EPOCH_BUILT_KEY = "uin_epochs:built"
+_EPOCH_LOCK_KEY = "uin_epochs:rebuild"
 
 
-async def _ensure_epochs_loaded(redis) -> None:
-    if await redis.exists(_EPOCH_LOADED_KEY):
-        return
+async def _load_epochs(redis, db=None) -> None:
     from sqlalchemy import select
 
-    from app.core.db import SessionLocal
+    from app.core.single_flight import read_on
     from app.models.uin_epoch import UinEpoch
 
-    async with SessionLocal() as db:
-        rows = (
-            await db.execute(select(UinEpoch.uin, UinEpoch.epoch).where(UinEpoch.epoch > 0))
+    async def _read(session):
+        return (
+            await session.execute(select(UinEpoch.uin, UinEpoch.epoch).where(UinEpoch.epoch > 0))
         ).all()
+
+    rows = await read_on(db, _read)
     pipe = redis.pipeline()
     pipe.delete(_EPOCH_KEY)
     if rows:
         pipe.hset(_EPOCH_KEY, mapping={str(u): str(e) for u, e in rows})
     pipe.set(_EPOCH_LOADED_KEY, "1", ex=_EPOCH_TTL_SECONDS)
+    pipe.set(_EPOCH_BUILT_KEY, "1")
     await pipe.execute()
 
 
-async def uin_epoch(uin: int) -> int:
+def _mirror(label, **keys):
+    from app.core.single_flight import RedisMirror
+
+    return RedisMirror(label, **keys)
+
+
+# ⚠⚠ A lapsed marker used to make EVERY authorized request on EVERY worker
+# reload the whole table inline, from inside `authorize_session`, and the
+# same from `uin_epoch` calls in the middle of auth handlers that had already
+# run a query (a second pooled connection while holding one: the 28.09 stalls,
+# core/single_flight.py). The hash is written through on every bump
+# (`cache_uin_epoch`), so a lapsed marker only means "due for a resync": it is
+# answered as is and rebuilt behind the request, one worker at a time.
+_EPOCH_MIRROR = _mirror(
+    "uin-epochs",
+    marker=_EPOCH_LOADED_KEY,
+    built=_EPOCH_BUILT_KEY,
+    lock=_EPOCH_LOCK_KEY,
+    rebuild=_load_epochs,
+)
+
+
+async def _ensure_epochs_loaded(redis, db=None) -> None:
+    await _EPOCH_MIRROR.ensure(redis, db)
+
+
+async def uin_epoch(uin: int, db=None) -> int:
     """Current epoch of `uin`. Falls back to the DB, then to 0.
 
     Unlike the suspension gate this must NOT fail open into "reject": a Redis
     outage returning 0 would refuse every token that legitimately carries an
     epoch. It therefore degrades to the database, and only to 0 if that is
     unreachable too — at which point nothing else works either.
+
+    ⚠ Pass `db` from inside a handler that may already have run a query (the
+    auth routes mint a token at the END of their work). The two database
+    paths here, the inline build on a Redis that never held the hash and the
+    row read on a Redis error, then use the connection the request already
+    holds instead of asking the pool for a second one.
     """
     try:
         from app.core.redis import get_redis
         redis = await get_redis()
-        await _ensure_epochs_loaded(redis)
+        await _ensure_epochs_loaded(redis, db)
         raw = await redis.hget(_EPOCH_KEY, str(uin))
         return int(raw) if raw else 0
     except Exception:  # noqa: BLE001
         try:
             from sqlalchemy import select
 
-            from app.core.db import SessionLocal
+            from app.core.single_flight import read_on
             from app.models.uin_epoch import UinEpoch
 
-            async with SessionLocal() as db:
-                return int(
-                    await db.scalar(select(UinEpoch.epoch).where(UinEpoch.uin == uin)) or 0
-                )
+            async def _read(session):
+                return await session.scalar(select(UinEpoch.epoch).where(UinEpoch.uin == uin))
+
+            return int(await read_on(db, _read) or 0)
         except Exception:  # noqa: BLE001
             return 0
 
@@ -370,26 +407,47 @@ _SUSPENDED_KEY = "suspended_uins"
 # worker per window, not per request.
 _SUSPENDED_LOADED_KEY = "suspended_uins:loaded"
 _SUSPENDED_TTL_SECONDS = 300
+_SUSPENDED_BUILT_KEY = "suspended_uins:built"
+_SUSPENDED_LOCK_KEY = "suspended_uins:rebuild"
 
 
-async def _ensure_suspended_loaded(redis) -> None:
-    if await redis.exists(_SUSPENDED_LOADED_KEY):
-        return
+async def _load_suspended(redis, db=None) -> None:
     from sqlalchemy import select
 
-    from app.core.db import SessionLocal
+    from app.core.single_flight import read_on
     from app.models.user import User
 
-    async with SessionLocal() as db:
-        rows = (
-            await db.execute(select(User.uin).where(User.is_suspended.is_(True)))
+    async def _read(session):
+        return (
+            await session.execute(select(User.uin).where(User.is_suspended.is_(True)))
         ).scalars().all()
+
+    rows = await read_on(db, _read)
     pipe = redis.pipeline()
     pipe.delete(_SUSPENDED_KEY)
     if rows:
         pipe.sadd(_SUSPENDED_KEY, *[str(u) for u in rows])
     pipe.set(_SUSPENDED_LOADED_KEY, "1", ex=_SUSPENDED_TTL_SECONDS)
+    pipe.set(_SUSPENDED_BUILT_KEY, "1")
     await pipe.execute()
+
+
+# Same treatment as the epochs above: answered as is while a lapsed marker is
+# rebuilt behind the request. The set is written through by every ban and
+# unban (`mark_suspended`), and "built" is lost exactly when the set is, which
+# is the Redis-restart case the marker was introduced for: then it is rebuilt
+# inline, as before.
+_SUSPENDED_MIRROR = _mirror(
+    "suspended",
+    marker=_SUSPENDED_LOADED_KEY,
+    built=_SUSPENDED_BUILT_KEY,
+    lock=_SUSPENDED_LOCK_KEY,
+    rebuild=_load_suspended,
+)
+
+
+async def _ensure_suspended_loaded(redis, db=None) -> None:
+    await _SUSPENDED_MIRROR.ensure(redis, db)
 
 
 async def is_suspended(uin: int) -> bool:

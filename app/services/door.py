@@ -77,10 +77,23 @@ async def island_is_closed() -> bool:
     Read live from server settings rather than the environment, so an operator
     who closes the island in the console does not have to restart it, and so a
     mistake is one click from being undone.
+
+    ⚠ Fails CLOSED on a worker that has never read the settings (it booted
+    while the database was away). The code default is "open", and acting on
+    it hands a closed island's cards and keys to strangers for as long as the
+    worker stays cold. Closed is the cheap mistake: residents still pass (the
+    door checks residency), and an open island's strangers get what any
+    closed island serves them, seal-only through /federation/keys, until the
+    settings load a moment later. `federation_refuse_strangers` is left to
+    its default (off) in that window on purpose: refusing would bounce every
+    envelope from another island instead of merely describing nobody.
     """
     from app.services import server_settings
 
-    return bool(await server_settings.get("closed_island"))
+    try:
+        return bool(await server_settings.get_strict("closed_island"))
+    except server_settings.SettingsUnavailable:
+        return True
 
 
 def strip_keys_from_discovery(closed: bool) -> bool:

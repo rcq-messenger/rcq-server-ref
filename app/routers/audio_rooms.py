@@ -240,7 +240,7 @@ async def list_rooms(
     # A guest copy holds no audio rooms (it can neither create nor join one,
     # spec 2026-09-15, 6.2), so its list is empty by construction. Answered
     # before the query so that stays true for a row left from any older path.
-    if await guest_policy.is_guest(uin):
+    if await guest_policy.is_guest(uin, db):
         return []
     rows = (
         await db.execute(
