@@ -31,6 +31,7 @@ from app.core.guest_policy import admission_open
 from app.core.single_flight import SingleFlight
 from app.models.user import User
 from app.routers import media, vault
+from app.services.apns import _is_configured as apns_configured
 from app.services import island_logo, server_settings
 
 
@@ -266,6 +267,15 @@ class ServerCapabilities(BaseModel):
     # other devices with `identity_not_found`, which older clients read as a
     # burn and wipe on.
     reissue_proof_v1: bool = True
+    # Room links carry a key (#990 step 2): preview, join and guest entry take
+    # `k`, and `POST /groups/{id}/share-token` resets it. Clients put `k` in
+    # the links they make and send it back; an island without this ignores it.
+    room_link_token_v1: bool = True
+    # Whether this island can wake an iPhone (APNs credentials configured). An
+    # island installed with the defaults cannot, and an iPhone that makes it
+    # primary would get no pushes at all; clients warn before such a switch.
+    # None from an island older than the field: unknown, not "no".
+    apns: bool | None = None
     # The `/media` blob ceiling this island enforces while reading an upload
     # body (routers/media.py MAX_BLOB_SIZE, env-tunable per island). Purely
     # informational: nothing here changes what the endpoint does. It exists so
@@ -517,6 +527,7 @@ async def server_info() -> ServerInfo:
         logo_version=await island_logo.version(),
         badges=_badge_texts(eff["badge_labels"]),
         capabilities=ServerCapabilities(
+            apns=apns_configured(),
             # ⚠ From the console like every other capability on this reply.
             # It alone read the .env constant, so an operator who opened their
             # shop in the console moved the ENDPOINTS and not the clients: the

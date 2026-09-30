@@ -1164,6 +1164,11 @@ GUEST_COUNTERS = (
     "guest_swept_b",
     "guest_swept_c",
     "guest_host_from_header",
+    # #990 step 2: uses of a room link without its key, while the island is in
+    # soft mode. When these stay near zero, hard mode can go on.
+    "room_link_preview_tokenless",
+    "room_join_tokenless",
+    "room_guest_tokenless",
 )
 
 

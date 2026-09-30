@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 
@@ -1756,6 +1757,10 @@ class GuestIn(BaseModel):
     #: Ed25519 over `guest_proof.proof_bytes`, standard base64.
     signature: str = Field(max_length=128)
     device_id: str | None = Field(default=None, max_length=64)
+    #: The room link's key (#990 step 2), for a room outside the catalogue.
+    #: Deliberately outside the guest proof: it is a bearer capability, like
+    #: the preview's `k`, and the proof is about the key pair, not the link.
+    k: str | None = Field(default=None, max_length=64)
 
 
 class GuestOut(BaseModel):
@@ -1866,6 +1871,17 @@ async def guest_join(
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "group_closed"})
     if g.allow_guests is False:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "guest_room_closed"})
+    # A room outside the catalogue needs its link (#990 step 2). A guest has no
+    # membership yet, so only the catalogue or the key entitles it. Soft mode
+    # counts a tokenless entry and lets it through; hard mode refuses it.
+    if not g.in_catalog and not (
+        g.share_token and body.k and secrets.compare_digest(body.k[:64], g.share_token)
+    ):
+        from app.routers.groups import _REQUIRE_ROOM_LINK_TOKEN
+
+        if _REQUIRE_ROOM_LINK_TOKEN:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "room_link_invalid"})
+        await guest_policy.bump_stat("room_guest_tokenless")
     await guest_accounts.refuse_full_room(db, g)
     await guest_accounts.spend_room_budget(g.id)
 

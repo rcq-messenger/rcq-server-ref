@@ -24,6 +24,18 @@ old link still sees that there is a closed group to ask about.
 Once those clients are out, set `RCQ_REQUIRE_CLOSED_GROUP_TOKEN=true` and a
 tokenless preview becomes an ordinary 404 — indistinguishable from a group that
 does not exist, which is the end state.
+
+UNLISTED OPEN ROOMS (report #990, step 2). A room that is open but not in the
+catalogue is still reachable by walking ids through the join and the preview:
+unlisted meant "not searchable", never "needs the link". Now the share token
+is the key to those too. Entitled without it: a room in the catalogue that is
+open, the owner, a member. Everyone else needs `k`.
+Same rollout as above: in SOFT mode (the default) a tokenless preview or join
+of an unlisted room still works and is counted (`room_link_*_tokenless`,
+visible in the admin guests overview); `RCQ_REQUIRE_ROOM_LINK_TOKEN=true` makes
+it a 404 on preview and 403 `room_link_invalid` on join and guest entry. An
+owner or admin can reset the link (`POST /{id}/share-token`), and the old one
+stops working at once in hard mode. `/discover` shows catalogue rooms only.
 """
 
 import os
@@ -31,7 +43,7 @@ import base64
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,6 +72,31 @@ _REQUIRE_CLOSED_GROUP_TOKEN: bool = (
     os.environ.get("RCQ_REQUIRE_CLOSED_GROUP_TOKEN", "false").strip().lower()
     in {"1", "true", "yes"}
 )
+
+# The same switch for UNLISTED OPEN rooms (#990 step 2): a tokenless preview is
+# 404 and a tokenless join 403 `room_link_invalid`. FALSE until the token-aware
+# clients are out; the tokenless counters say when that is.
+_REQUIRE_ROOM_LINK_TOKEN: bool = (
+    os.environ.get("RCQ_REQUIRE_ROOM_LINK_TOKEN", "false").strip().lower()
+    in {"1", "true", "yes"}
+)
+
+
+async def _link_entitled(db: AsyncSession, g: Group, viewer_uin: int | None, k: str | None) -> bool:
+    """May this viewer see or enter `g` without anything else? A room in the
+    catalogue that is open, its owner, a member, or the holder of the share
+    token (`k`, compared in constant time)."""
+    if g.in_catalog and not g.is_closed:
+        return True
+    if viewer_uin is not None:
+        if viewer_uin == g.owner_uin:
+            return True
+        if await db.scalar(
+            select(GroupMember.id).where(GroupMember.group_id == g.id, GroupMember.uin == viewer_uin)
+        ) is not None:
+            return True
+    return bool(g.share_token) and bool(k) and secrets.compare_digest(k[:64], g.share_token)
+
 
 # Above this member count the roster stops carrying live presence — see the
 # comment in `_members_with_users`. Env-tunable so a self-hoster running one
@@ -948,7 +985,7 @@ async def preview_group(
     # The unguessable half of the share link (`.../g/<id>?k=<token>`). Supplied
     # by clients that know about it; absent from links shared before the token
     # existed and from older client builds.
-    k: str | None = None,
+    k: str | None = Query(default=None, max_length=64),
     # Optional auth: the invite LINK is the capability, so a cross-island /
     # not-yet-joined client (no token on this island) can still read the public
     # card (name / avatar / member count / open-closed) to render the join card.
@@ -964,14 +1001,17 @@ async def preview_group(
     # walking sequential ids, which is how the whole catalogue of an island's
     # private communities leaked.
     entitled = True
-    if g.is_closed:
-        is_member = _viewer_uin is not None and await db.scalar(
-            select(GroupMember.id).where(
-                GroupMember.group_id == group_id, GroupMember.uin == _viewer_uin
-            )
-        ) is not None
-        has_token = bool(g.share_token) and bool(k) and secrets.compare_digest(k, g.share_token)
-        entitled = is_member or has_token
+    if g.is_closed or not g.in_catalog:
+        entitled = await _link_entitled(db, g, _viewer_uin, k)
+
+    # An UNLISTED OPEN room without the key (#990 step 2): the full card in soft
+    # mode, counted, because every link in the wild is tokenless and a blank
+    # card would break them; a 404 in hard mode, like a closed room's.
+    if not entitled and not g.is_closed:
+        if _REQUIRE_ROOM_LINK_TOKEN:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+        await guest_policy.bump_stat("room_link_preview_tokenless")
+        entitled = True
 
     if not entitled:
         if _REQUIRE_CLOSED_GROUP_TOKEN:
@@ -1076,6 +1116,9 @@ async def discover_groups(
             select(Group, live_count.c.n)
             .join(live_count, live_count.c.group_id == Group.id)
             .where(Group.is_closed.is_(False))
+            # Catalogue rooms only (#990): an unlisted room showed up in the
+            # newcomers' carousel, one tap from its id.
+            .where(Group.in_catalog.is_(True))
             .where(Group.id.notin_(own_group_ids) if own_group_ids else True)
             .order_by(live_count.c.n.desc(), Group.created_at.asc())
             .limit(capped)
@@ -1283,6 +1326,9 @@ async def get_group(
 @guest(RULE)
 async def join_group(
     group_id: int,
+    # The share link's key (#990 step 2): needed for a room outside the
+    # catalogue. Absent from old links and old clients.
+    k: str | None = Query(default=None, max_length=64),
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> GroupOut:
@@ -1310,6 +1356,13 @@ async def join_group(
             status.HTTP_403_FORBIDDEN,
             detail={"code": "group_closed"},
         )
+
+    # A room outside the catalogue needs its link (#990 step 2). Soft mode lets
+    # a tokenless join through and counts it; hard mode refuses it.
+    if not g.in_catalog and not await _link_entitled(db, g, uin, k):
+        if _REQUIRE_ROOM_LINK_TOKEN:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "room_link_invalid"})
+        await guest_policy.bump_stat("room_join_tokenless")
 
     # A guest copy walking into ANOTHER room here (spec 2026-09-15, 6.2): the
     # same room rules as the mint in `/auth/guest`, plus the per-guest room
@@ -1824,6 +1877,34 @@ async def remove_member(
         group_id, members, payload, extra_uins=notify_uins - {m.uin for m in members}
     )
     return {"deleted": False, "left_uin": member_uin}
+
+
+@router.post(
+    "/{group_id}/share-token",
+    response_model=GroupOut,
+    dependencies=[Depends(rate_limit("group_link_reset", 10, 3600))],
+)
+async def reset_share_token(
+    group_id: int,
+    uin: int = Depends(current_uin),
+    db: AsyncSession = Depends(get_db),
+) -> GroupOut:
+    """A new share link for the room (#990 step 2): the owner, or a member
+    holding the `members` permission. The old key stops opening the room the
+    moment hard mode is on; membership is untouched. Every member's client is
+    told the new token through the ordinary membership broadcast, so the share
+    sheet shows the new link without a reload. No guest marker: a guest copy
+    never resets a room's link."""
+    me = await _ensure_member(db, group_id, uin)
+    g = await _load_group(db, group_id)
+    if not _member_can(g, me, "members"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
+    g.share_token = secrets.token_urlsafe(16)[:22]
+    await db.commit()
+    members = await _members_with_users(db, group_id)
+    payload = _serialize(g, members)
+    await _broadcast_membership(group_id, members, payload)
+    return payload
 
 
 @router.patch("/{group_id}", response_model=GroupOut)
