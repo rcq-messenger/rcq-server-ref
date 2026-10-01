@@ -13,11 +13,14 @@ class DeviceToken(Base):
     if the user is signed in on multiple devices (multi-device path is not
     yet wired client-side, but the schema doesn't block it).
 
-    Tokens get pruned in three places:
+    Tokens get pruned in these places, among others:
       * `DELETE /users/me/push-token` when the iOS client logs out / burns
       * Cascade from `User` row deletion (account burn)
       * APNs returning 410 Gone — token revoked by Apple, we drop it from
         the table so we don't keep banging on a dead address
+      * revoking the install that registered it (`routers/devices._revoke`)
+      * `POST /users/me/push-token` with `accounts_here`: the same install
+        saying which accounts it still holds on this island (report 1066)
     """
     __tablename__ = "device_tokens"
     __table_args__ = (UniqueConstraint("uin", "token", name="uq_device_tokens_uin_token"),)

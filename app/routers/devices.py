@@ -47,6 +47,7 @@ from app.core.redis import get_redis
 from app.core.redis_keys import DEV_REVOKED_PREFIX, DEVICES_PREFIX, account_key
 from app.core.guest_policy import ALLOW, guest
 from app.core.security import current_device_id, current_uin, issue_device_token, uin_epoch
+from app.models.device_token import DeviceToken
 from app.models.queue_cursor import QueueCursor
 from app.services.connection_manager import manager
 
@@ -344,6 +345,19 @@ async def _revoke(uin: int, device_id: str, db: AsyncSession) -> dict:
     # for the others). Best-effort.
     await db.execute(
         delete(QueueCursor).where(QueueCursor.uin == uin, QueueCursor.device_id == device_id)
+    )
+    # And its push rows (report 1066). A disconnected install cannot mint a
+    # session for this account while the denylist above holds it (it is asked
+    # at minting too), so a row it left behind does nothing but wake a phone
+    # that is no longer signed in here, with a banner for an account it does
+    # not hold. Nothing else removes it: a live endpoint never answers 404/410,
+    # and the install's own token is now refused, so it cannot send
+    # DELETE /users/me/push-token either.
+    # Matched by the install id the client registers its push token under, which
+    # is the id a slot revoke passes in (`auth_device_id`); a linked browser has
+    # no push rows and this deletes nothing for it.
+    await db.execute(
+        delete(DeviceToken).where(DeviceToken.uin == uin, DeviceToken.device_id == device_id)
     )
     await db.commit()
     await _announce(uin, "device_revoked", device_id)

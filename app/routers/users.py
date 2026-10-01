@@ -1234,12 +1234,30 @@ async def update_me(
 MAX_PUSH_TOKEN_LEN = 1024
 
 
+# How long a row of the same install is spared by `accounts_here` after its
+# last registration. A list is composed on the device before it travels, so a
+# registration that was slow, queued or retried can arrive AFTER the install
+# added an account and registered that account's row; without this window the
+# stale list would delete the newcomer's row and its pushes would stop, with
+# nothing on either side to say so, until the next registration put it back.
+# An abandoned row is not in a hurry: it is removed by the next registration
+# after the window.
+ACCOUNTS_HERE_GRACE = timedelta(hours=1)
+
+
 class PushTokenIn(BaseModel):
     token: str
     platform: str = "ios"  # "ios" | "ios-voip"
     # Stable per-install id (client Keychain, survives reinstall). Optional so
     # pre-device-id clients keep working via the legacy (uin, token) upsert.
     device_id: str | None = None
+    # Every account THIS install holds on THIS island, by number, the caller
+    # included (report 1066). Optional: absent is the old behaviour exactly.
+    # When present, rows of the same install (same token, same non-empty
+    # device id) for any other number are removed, which is how an install
+    # sheds the row of an account it deleted without that account's
+    # credentials. Ignored on DELETE. See `register_push_token` for the guards.
+    accounts_here: list[int] | None = Field(default=None, max_length=64)
 
 
 @router.post("/me/push-token", status_code=status.HTTP_204_NO_CONTENT)
@@ -1259,7 +1277,10 @@ async def register_push_token(
     once from the explicit refresh in `AppState.boot` — both succeed
     with a 204 instead of one of them blowing up on the unique
     constraint and bubbling a 500 back to the client (which then gives
-    up and never retries)."""
+    up and never retries).
+
+    With `accounts_here` (report 1066) the same install also sheds the rows it
+    left under accounts it no longer holds on this island; see below."""
     if not body.token.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty token")
     if len(body.token) > MAX_PUSH_TOKEN_LEN:
@@ -1275,6 +1296,25 @@ async def register_push_token(
         return None
     now = datetime.now(timezone.utc)
     device_id = (body.device_id or "").strip() or None
+    # `accounts_here` acts only for an install that was ALREADY registered
+    # under this account with this exact token and device id, before this
+    # request. The token and the device id travel to every island the device
+    # has an account on (and the endpoint to its distributor), so they are
+    # not secrets from those parties. Without this, a throwaway account here
+    # could name a stranger's endpoint with `accounts_here=[itself]` in one
+    # request and silence that stranger's other accounts on this island. It
+    # is a speed bump and not a wall (a second request gets past it), and
+    # whoever holds a UnifiedPush endpoint can already publish to it directly;
+    # it is the minimum the review of report 1066 settled on. A first
+    # registration therefore never prunes; the next one does.
+    prune_others = False
+    if body.accounts_here is not None and device_id:
+        prior_device = await db.scalar(
+            select(DeviceToken.device_id).where(
+                DeviceToken.uin == uin, DeviceToken.token == body.token,
+            )
+        )
+        prune_others = prior_device == device_id
     # Upsert on the existing (uin, token) constraint either way — an app
     # UPDATE keeps the same APNs token, so this just refreshes last_seen (and
     # backfills device_id on the first device-id-aware launch). A reinstall
@@ -1334,6 +1374,31 @@ async def register_push_token(
                 DeviceToken.platform == body.platform,
                 DeviceToken.device_id.is_(None),
                 DeviceToken.last_seen < now - timedelta(days=7),
+            ))
+        )
+    if prune_others:
+        # ⚠⚠ Report 1066: "logged out of the account, notifications for it
+        # still arrive". A row is (number, this install's endpoint), and the
+        # only thing that removed one was the account itself saying DELETE.
+        # An install that deleted an account had already thrown away the
+        # credentials to say it with, so the row stayed and woke the phone for
+        # an account it no longer holds, for good: a live endpoint never
+        # answers 404/410. The install still knows which accounts it DOES hold,
+        # and that list is what this acts on.
+        #
+        # Only rows of the same install: the same token AND the same non-empty
+        # device id. A row without a device id is left to the per-account rule
+        # above. And never a row registered inside `ACCOUNTS_HERE_GRACE`, which
+        # is what keeps a stale list from deleting an account added a moment
+        # ago. No sweep by age across installs instead: a sleeping second
+        # account looks exactly like an abandoned one from here.
+        keep = set(body.accounts_here or ()) | {uin}
+        await db.execute(
+            delete(DeviceToken).where(and_(
+                DeviceToken.token == body.token,
+                DeviceToken.device_id == device_id,
+                DeviceToken.uin.not_in(keep),
+                DeviceToken.last_seen < now - ACCOUNTS_HERE_GRACE,
             ))
         )
     await db.commit()
