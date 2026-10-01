@@ -19,8 +19,9 @@ router changes yet, and that is the correction the review made:
     that exists, for everyone, which is what keeps the plan's invariant that
     "at no point is a contact list only in one place".
   * Removals land as they always did. `DELETE /contacts/{uin}` and the block
-    toggle are unchanged: a relationship that has ended has to stop granting
-    calls and room invites.
+    flag on the row are unchanged by stage 4: a relationship that has ended
+    has to stop granting calls and room invites. (Block takes an explicit
+    `{"blocked": bool}` since 2026-10-01; an empty body still toggles.)
   * The CONSENT flow is untouched from end to end. Requests, the 202, the
     `contact_request` / `contact_response` frames, `/pending`, `/outgoing`
     and the cross-island `contactreq` envelope of federation §5f all behave
@@ -36,6 +37,7 @@ vault list. Marked at the call site.
 from datetime import datetime, timezone
 
 import hashlib
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, TypeAdapter
@@ -711,13 +713,49 @@ async def remove_contact(
         })
 
 
+async def _requested_block(request: Request) -> bool | None:
+    """The `blocked` value a client asked for, or None to toggle.
+
+    Read by hand rather than declared as a body model, because the old callers
+    must keep getting exactly what they got: Android sends `{}`, iOS sends no
+    body at all, and whatever content type either uses must not turn into a
+    422. Anything that is not a JSON object with a boolean `blocked` reads as
+    "no value given".
+    """
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001 — a body we cannot read is no body
+        return None
+    if not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    value = data.get("blocked") if isinstance(data, dict) else None
+    return value if isinstance(value, bool) else None
+
+
 @router.post("/{contact_uin}/block")
 @guest(ALLOW)
 async def block_contact(
     contact_uin: int,
+    request: Request,
     uin: int = Depends(current_uin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Block or unblock a contact. Answers `{"blocked": <the flag now>}`.
+
+    ⚠ With a body `{"blocked": true|false}` this SETS the flag; with no body,
+    or one without a boolean `blocked`, it flips it as it always did (report
+    1065). A flip is only right if the caller knows the current state, and a
+    client reading a stale roster (a 304 on the conditional GET, or a second
+    device that blocked first) then turned "Block" into an unblock. The web
+    has sent `{blocked}` for a long time and was flipped anyway. A client
+    should still read the answer and not assume: an island that predates this
+    keeps toggling.
+    """
+    wanted = await _requested_block(request)
     rows = await db.execute(
         select(Contact).where(
             and_(Contact.owner_uin == uin, Contact.contact_uin == contact_uin)
@@ -733,6 +771,6 @@ async def block_contact(
         # stage 4's own "features that die" list already names. It goes pair
         # by pair as pairs move, never all at once.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not in list")
-    contact.blocked = not contact.blocked
+    contact.blocked = (not contact.blocked) if wanted is None else wanted
     await db.commit()
     return {"blocked": contact.blocked}
