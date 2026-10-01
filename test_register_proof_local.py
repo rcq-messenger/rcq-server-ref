@@ -11,11 +11,12 @@ is a loan and asking for your own back is what multihoming IS — but since
 2026-09-01 the SCARCE stock is not handed out through this door at all: a short
 or patterned number (`services/uin.is_reserved_uin` — 4242 is four digits, so
 it is one) leaves only through a door somebody stands at, or to a caller who
-already answers to it on another island (a signed federation home record,
-`_owns_uin_elsewhere`). Proving the SIGNING KEY is not that proof: a squatter
-proves their own key, which says nothing about who holds the number. So the
-proof dimension this file is about has to be tested on a number the scarce rule
-does not speak to, and the scarce rule gets a check of its own at the end.
+already answers to it on a trusted island that confirms it
+(`services/reserved_tenure`, pinned by test_reserved_tenure_local.py). Proving
+the SIGNING KEY is not that proof: a squatter proves their own key, which says
+nothing about who holds the number. So the proof dimension this file is about
+has to be tested on a number the scarce rule does not speak to, and the scarce
+rule gets a check of its own at the end.
 
 Runs the real FastAPI stack in-process on a throwaway SQLite DB.
 NOT part of the prod suite; NOT deployed.

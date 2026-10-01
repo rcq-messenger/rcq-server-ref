@@ -72,6 +72,14 @@ class Settings(BaseSettings):
 
     UIN_MIN: int = 100_000
     UIN_MAX: int = 999_999_999
+    #: Islands whose word this one takes that somebody already holds a SCARCE
+    #: number there (`services/uin.is_reserved_uin`), so that a backup
+    #: registration asking for that number by `desired_uin` may have it here
+    #: too. Comma-separated `host[:port]`; this island's own names are dropped
+    #: from it at use, and an empty value means "never". See
+    #: `services/reserved_tenure` for why it is a list an operator writes and
+    #: not "whatever island the record names".
+    TENURE_TRUSTED_ISLANDS: str = "api.rcq.app,is2.rcq.app"
 
 
     # Surface flag advertised via /server/info → consumed by the iOS

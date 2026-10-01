@@ -42,7 +42,11 @@ hosted-key tooling), keep an eye on releases.
   ladders, four trailing zeros). Those are finite stock and leave only
   through an operator (`POST /admin/uin/grant`, or an invite minted with the
   number on it), never out of the allocator or a free claim — see
-  `app/services/uin.is_reserved_uin`.
+  `app/services/uin.is_reserved_uin`. The one other way is multihoming:
+  somebody who already holds the number on an island listed in
+  `TENURE_TRUSTED_ISLANDS` (by default the project's two islands) may take it
+  here as a backup once that island confirms it, see
+  `app/services/reserved_tenure.py`.
 * **WebSocket fan-out** — presence, typing, group changes, call and
   audio-room signalling. Cross-worker via Redis pub/sub.
 * **APNs push** — both alert pushes (NSE-decrypted on the device) and

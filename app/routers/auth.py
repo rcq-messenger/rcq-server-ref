@@ -1,6 +1,5 @@
 import base64
 import hashlib
-import json
 import logging
 import os
 import secrets
@@ -56,7 +55,7 @@ from app.routers.groups import (
     _members_with_users,
     _serialize,
 )
-from app.services import guest_accounts, guest_proof
+from app.services import guest_accounts, guest_proof, reserved_tenure
 from app.services.account_delete import purge_account
 from app.services.group_log import seed_cursors_on_join
 from app.services.island_hosts import island_hosts
@@ -178,9 +177,11 @@ class RegisterIn(BaseModel):
     # vanity invite still wins over this.
     desired_uin: int | None = None
     # A signed home-island record (federation §2.3, the same document
-    # `PUT /federation/island-record` carries) proving `desired_uin` is ALREADY
-    # this identity's number somewhere else. Only consulted when the number
-    # asked for is a reserved one — see `_owns_uin_elsewhere`.
+    # `PUT /federation/island-record` carries) naming `desired_uin` as this
+    # identity's number somewhere else. Only consulted when the number asked
+    # for is a reserved one, and then only as a POINTER to the island to ask:
+    # a record is signed by its own key, so on its own it proves nothing about
+    # a number. See `services/reserved_tenure`.
     home_record: dict | None = None
     # Stable per-INSTALL id, minted by the client on first launch. Optional:
     # clients that predate it get "primary" and the old shared behaviour.
@@ -209,55 +210,6 @@ class RegisterOut(BaseModel):
 class SessionOut(BaseModel):
     token: str
     ws_url: str
-
-
-async def _owns_uin_elsewhere(
-    db: AsyncSession, uin: int, signing_key: str, offered: dict | None
-) -> bool:
-    """Does this identity ALREADY hold `uin` on some other island?
-
-    The one question that separates multihoming from squatting, and it has a
-    real answer because federation records are self-authenticating: the
-    document names `sk` (this identity's Ed25519 signing key) and its `homes`
-    (`host`,`uin`) pairs, and it is signed by the private half of `sk`. Nobody
-    can forge one for a number they do not already answer to.
-
-    Two sources, both verified the same way. The record the CALLER offers, and
-    the one this island already mirrors for that key (`gossip_records`, written
-    by any client that resolved and verified the identity — the write path
-    verifies the signature before storing, see `routers/federation`). The
-    second is what keeps clients that predate `home_record` multihoming onto a
-    reserved number: their contacts have almost certainly mirrored the record
-    here already.
-
-    ⚠ The signature is re-checked here even for the mirrored row. Verification
-    at write time is what makes the table trustworthy today, but this is an
-    authorisation decision about a scarce asset, and it costs one Ed25519
-    verify to not depend on that.
-    """
-    from app.models.federation import GossipRecord
-    from app.routers.federation import _verify_record_sig
-
-    def names_it(doc) -> bool:
-        if not isinstance(doc, dict) or doc.get("sk") != signing_key:
-            return False
-        homes = doc.get("homes")
-        if not isinstance(homes, list):
-            return False
-        if not any(isinstance(h, dict) and h.get("uin") == uin for h in homes):
-            return False
-        return _verify_record_sig(doc)
-
-    if names_it(offered):
-        return True
-    # `doc` is stored as text, and `sk` IS the primary key of the mirror table.
-    raw = await db.scalar(select(GossipRecord.doc).where(GossipRecord.sk == signing_key))
-    if not raw:
-        return False
-    try:
-        return names_it(json.loads(raw))
-    except (ValueError, TypeError):
-        return False
 
 
 def _invite_gates(code_hash: str) -> tuple:
@@ -344,7 +296,9 @@ async def register_challenge(body: RegisterChallengeIn) -> RegisterChallengeOut:
         )),
     ],
 )
-async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> RegisterOut:
+async def register(
+    body: RegisterIn, request: Request, db: AsyncSession = Depends(get_db)
+) -> RegisterOut:
     # An account whose keys are not keys is not an account: nobody can seal to
     # it and nothing it signs verifies. Checked before anything is minted, so a
     # junk registration cannot claim a UIN on its way to failing.
@@ -384,6 +338,26 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
         except (InvalidSignature, ValueError, TypeError):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"})
         proven = True
+
+    # A RESERVED number asked for by `desired_uin` is granted only when a
+    # trusted island confirms the caller already holds it there (see the long
+    # note at the grant below, and `services/reserved_tenure`). That means
+    # asking another island over the network, so it happens HERE, before this
+    # request's session has run a single statement: a request that holds a
+    # pooled connection while it waits on somebody else's server is how the
+    # island stalled in September (core/db_nesting.py). Nothing above this
+    # line touches the database, and nothing may be moved above it that does.
+    tenure_proven = False
+    if (
+        proven
+        and body.desired_uin is not None
+        and 0 < body.desired_uin <= settings.UIN_MAX
+        and is_reserved_uin(body.desired_uin)
+    ):
+        tenure_proven = await reserved_tenure.holds_elsewhere(
+            request, body.desired_uin, signing_key, body.home_record
+        )
+
     if not proven:
         key_taken = await db.scalar(
             select(User.uin).where(User.signing_key == signing_key).limit(1)
@@ -574,11 +548,8 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # sold through the supported path regardless. Bulk squatting is bounded by
     # the registration limiter above.
     #
-    # The real fix, when vanity numbers become sellable, is to require PROOF of
-    # prior tenure rather than a numeric guess: a signed federation
-    # island-record (`GET /federation/island-record/{uin}`) already binds a UIN
-    # to its holder's keys, so a multihoming client can present one and a
-    # squatter cannot.
+    # The scarce stock itself is guarded by PROOF of prior tenure rather than
+    # by a numeric floor; see the last paragraph of this note.
     #
     # ⚠ Honoured only under `proven`. Refusing the whole registration instead
     # would have been the tidier rule and the wrong one: every client in
@@ -609,20 +580,24 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)) -> Regi
     # as asking for your own. Measured 2026-09-01: 563 of 999 three-digit
     # numbers gone, 450 of them on accounts that never came back.
     #
-    # Multihoming itself is NOT broken by this: the record that proves prior
-    # tenure is the one federation already defines and this island already
-    # mirrors for most identities. A client that has none falls through to a
-    # fresh number, which is what it got before multihoming existed.
+    # "Already answers to it" is decided by `tenure_proven`, computed at the
+    # top of this handler because it asks another island. ⚠⚠ Until 2026-10-01
+    # it was decided by a self-signed record, offered in the request or found
+    # in this island's gossip mirror, and a record is signed by its OWN key: a
+    # squatter signed one naming #777 and was handed #777. Now the record only
+    # points at an island, the island must be on the operator's trusted list,
+    # and that island itself must serve the same key for the number
+    # (`services/reserved_tenure`). Multihoming onto a short number keeps
+    # working for anyone whose home is a trusted island and who published
+    # their record there; anybody else falls through to a fresh number, which
+    # is what they got before multihoming existed.
     if (
         uin is None
         and proven
         and body.desired_uin is not None
         and 0 < body.desired_uin <= settings.UIN_MAX
         and not await uin_is_taken(db, body.desired_uin)
-        and (
-            not is_reserved_uin(body.desired_uin)
-            or await _owns_uin_elsewhere(db, body.desired_uin, signing_key, body.home_record)
-        )
+        and (not is_reserved_uin(body.desired_uin) or tenure_proven)
     ):
         uin = body.desired_uin
     if uin is None:
