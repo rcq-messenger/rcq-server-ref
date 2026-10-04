@@ -40,10 +40,17 @@ apply this same rule, and an island never trusts itself: a free number that a
 record claims is held HERE is a stale or false record.
 
 ⚠ The network wait happens before the registration's own session takes a
-connection, and the one read it needs (the mirror row, plus a cheap "is the
-number free at all") runs on a short session of its own that is closed before
-the request goes out. Holding a pooled connection across an outbound call to
-another island is the 11.09-28.09 stall pattern (core/db_nesting.py).
+connection, and the one read it needs (the mirror row) runs on a short session
+of its own that is closed before the request goes out. Holding a pooled
+connection across an outbound call to another island is the 11.09-28.09 stall
+pattern (core/db_nesting.py).
+
+⚠⚠ No "is the number free HERE" check, on purpose. It runs before the door,
+for a caller who only had to sign a free challenge with a key of their own,
+and a shortcut that skipped the trip for a taken number made the response
+time say whether a short number is held, collected or promised by an invite
+on this island, even a closed one. The grant re-checks `uin_is_taken`, so a
+taken number is never handed out either way.
 """
 from __future__ import annotations
 
@@ -61,7 +68,6 @@ from app.core.db import SessionLocal
 from app.models.federation import GossipRecord
 from app.services import reissue_proof
 from app.services.backup_copy import own_hosts
-from app.services.uin import uin_is_taken
 
 log = logging.getLogger(__name__)
 
@@ -197,11 +203,9 @@ async def holds_elsewhere(
                 small = False
             if small:
                 pointers += _islands_naming(offered, uin, signing_key, trusted)
+        # Whether the number is taken HERE is not asked (module docstring):
+        # the answer would show in the response time, ahead of the door.
         async with SessionLocal() as s:
-            # Checked again at the grant; here it only saves a pointless trip
-            # to another island for a number that is gone anyway.
-            if await uin_is_taken(s, uin):
-                return False
             # `sk` IS the primary key of the mirror table.
             raw = await s.scalar(select(GossipRecord.doc).where(GossipRecord.sk == signing_key))
         if raw:

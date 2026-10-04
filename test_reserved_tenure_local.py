@@ -22,6 +22,13 @@ side is the real FastAPI stack. Pins:
   * a slow island, a redirect, the island's own name, an empty list and a
     number already taken here all end in a fresh number and a 201, never an
     error, and a slow island costs at most the budget;
+  * ★ the lookup takes the same path whether the number is free here or
+    taken (by an account, or promised by a live invite): the trusted island is
+    asked either way, so the response time says nothing about this island's
+    numbers, and that holds behind a closed door too, where it runs before the
+    door answers;
+  * an invite or paid island with nothing in the invite field asks nobody
+    (the door refuses anyway), and an invited newcomer still multihomes;
   * ★ while it waits on the other island the request's own session holds no
     database connection (the 11.09-28.09 pool-stall pattern);
   * ordinary (non-reserved) numbers are untouched and ask nobody.
@@ -51,17 +58,20 @@ for f in ("test_reserved_tenure.db",):
     except FileNotFoundError:
         pass
 
+import secrets  # noqa: E402
+
 import httpx  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 from app.core import db_nesting  # noqa: E402
 from app.core.config import settings  # noqa: E402
-from app.core.db import init_db  # noqa: E402
+from app.core.db import SessionLocal, init_db  # noqa: E402
 from app.core.redis import close_redis  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models.invite import Invite, hash_invite_code  # noqa: E402
 from app.routers.federation import _record_signed_bytes  # noqa: E402
-from app.services import reserved_tenure  # noqa: E402
+from app.services import reserved_tenure, server_settings  # noqa: E402
 
 fails = 0
 
@@ -149,10 +159,12 @@ def client():
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=addr), base_url="http://t")
 
 
-async def register(sk, pub, desired, home_record=None, prove=True):
+async def register(sk, pub, desired, home_record=None, prove=True, invite=None):
     async with client() as c:
         body = {"nickname": "someone", "identity_key": b64(), "signing_key": pub,
                 "desired_uin": desired}
+        if invite is not None:
+            body["invite"] = invite
         if prove:
             ch = (await c.post("/auth/register/challenge", json={"signing_key": pub})).json()["challenge"]
             body["challenge"] = ch
@@ -170,6 +182,25 @@ async def gossip(doc):
 
 def asked(host):
     return [p for h, p in CALLS if h == host]
+
+
+def both(uin):
+    return ["/federation/island-record/%d" % uin, "/federation/keys/%d" % uin]
+
+
+async def set_settings(**values):
+    async with SessionLocal() as db:
+        await server_settings.apply(db, server_settings.validate(values))
+        await db.commit()
+    server_settings._cache.at = -1e9
+
+
+async def make_invite(uin=None) -> str:
+    raw = secrets.token_urlsafe(12)
+    async with SessionLocal() as db:
+        db.add(Invite(code=hash_invite_code(raw), max_uses=1, used_count=0, uin=uin))
+        await db.commit()
+    return raw
 
 
 async def main() -> None:
@@ -255,11 +286,61 @@ async def main() -> None:
     check("★ a record naming THIS island: never asked, never granted",
           r.status_code == 201 and r.json()["uin"] != 786 and not asked("t"), str(CALLS))
 
+    print("\nthe lookup says nothing about this island's own numbers")
+    # #781 belongs to P here. Skipping the trip for a taken number made the
+    # answer come back a whole TLS round trip faster than for a free one.
     CALLS.clear()
     p2, pp2 = keypair()
     r = await register(p2, pp2, 781, record(p2, pp2, [(T, 781)]))
-    check("a number already taken here: fresh number, and nobody is asked",
-          r.status_code == 201 and r.json()["uin"] != 781 and not CALLS, str(CALLS))
+    check("a number already taken here: fresh number", r.status_code == 201 and r.json()["uin"] != 781)
+    check("★ and the trusted island IS asked, exactly as for a free number",
+          sorted(asked(T)) == both(781), str(CALLS))
+
+    await make_invite(uin=789)          # promised to whoever redeems the code
+    CALLS.clear()
+    v, vp = keypair()
+    r = await register(v, vp, 789, record(v, vp, [(T, 789)]))
+    check("★ a number promised by a live invite: asked about all the same",
+          r.status_code == 201 and r.json()["uin"] != 789 and sorted(asked(T)) == both(789), str(CALLS))
+
+    print("\nbehind a closed door")
+    await set_settings(registration_policy="invite")
+    seen = {}
+    for label, n in (("free", 790), ("taken", 781)):
+        x, xp = keypair()
+        CALLS.clear()
+        r = await register(x, xp, n, record(x, xp, [(T, n)]))
+        seen[label] = (r.status_code, r.json().get("detail"), list(CALLS))
+    check("no invite: refused at the door, and nobody is asked, free or taken",
+          seen["free"][:2] == seen["taken"][:2] == (403, {"code": "invite_required"})
+          and not seen["free"][2] and not seen["taken"][2], str(seen))
+
+    seen = {}
+    for label, n in (("free", 790), ("taken", 781)):
+        x, xp = keypair()
+        CALLS.clear()
+        r = await register(x, xp, n, record(x, xp, [(T, n)]), invite="not-a-code")
+        seen[label] = (r.status_code, r.json().get("detail"), sorted(asked(T)))
+    check("★ a made-up code gets past the skip, and then free and taken look alike",
+          seen["free"][:2] == seen["taken"][:2] == (403, {"code": "invite_invalid"})
+          and seen["free"][2] == both(790) and seen["taken"][2] == both(781), str(seen))
+
+    await set_settings(registration_policy="paid")
+    x, xp = keypair()
+    CALLS.clear()
+    r = await register(x, xp, 790, record(x, xp, [(T, 790)]))
+    check("a paid island with no voucher: refused, nobody asked",
+          r.status_code == 403 and r.json().get("detail") == {"code": "entry_required"} and not CALLS,
+          r.text[:200] + str(CALLS))
+
+    await set_settings(registration_policy="invite")
+    i, ip = keypair()
+    doc_i = record(i, ip, [(T, 791)])
+    RECORDS[(T, 791)], CARDS[(T, 791)] = doc_i, ip
+    r = await register(i, ip, 791, doc_i, invite=await make_invite())
+    check("★ an invited newcomer whose trusted island confirms still gets the number",
+          r.status_code == 201 and r.json()["uin"] == 791, r.text[:200])
+    await set_settings(registration_policy="open")
 
     settings.TENURE_TRUSTED_ISLANDS = ""
     e, ep = keypair()

@@ -339,6 +339,18 @@ async def register(
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "bad_signature"})
         proven = True
 
+    # ⚠ STRICT. On a worker that has never read the settings `get` answers
+    # with the default (the environment's, "open" unless it says otherwise),
+    # and a walk-in would be registered for free on a paid island.
+    # `guest_settle` below has the same guard. A 503 costs one retry.
+    # Read this early because the tenure lookup below wants it. It comes from
+    # the worker's cache, or from a session of the settings module's own that
+    # is closed before it returns, never from this request's session.
+    try:
+        policy = await server_settings.get_strict("registration_policy")
+    except server_settings.SettingsUnavailable:
+        raise server_settings.busy_error() from None
+
     # A RESERVED number asked for by `desired_uin` is granted only when a
     # trusted island confirms the caller already holds it there (see the long
     # note at the grant below, and `services/reserved_tenure`). That means
@@ -346,13 +358,23 @@ async def register(
     # request's session has run a single statement: a request that holds a
     # pooled connection while it waits on somebody else's server is how the
     # island stalled in September (core/db_nesting.py). Nothing above this
-    # line touches the database, and nothing may be moved above it that does.
+    # line runs on this request's session, and nothing may be moved above it
+    # that does.
+    #
+    # Not asked at all when the door is going to refuse anyway: an invite or
+    # paid island and nothing in the invite field (which also carries entry
+    # vouchers). That only saves another island a pointless call. It is not
+    # what keeps the lookup from telling a stranger anything about this
+    # island's numbers: any string in the field gets past this test, so the
+    # lookup itself takes the same path whether the number is taken here or
+    # not (see `reserved_tenure`).
     tenure_proven = False
     if (
         proven
         and body.desired_uin is not None
         and 0 < body.desired_uin <= settings.UIN_MAX
         and is_reserved_uin(body.desired_uin)
+        and not (policy in ("invite", "paid") and not (body.invite or "").strip())
     ):
         tenure_proven = await reserved_tenure.holds_elsewhere(
             request, body.desired_uin, signing_key, body.home_record
@@ -383,14 +405,6 @@ async def register(
     reserved_uin: int | None = None
     invite_gates = _invite_gates(code_hash)
     _spent_now = _invite_spent_now()
-    # ⚠ STRICT. On a worker that has never read the settings `get` answers
-    # with the default (the environment's, "open" unless it says otherwise),
-    # and a walk-in would be registered for free on a paid island.
-    # `guest_settle` below has the same guard. A 503 costs one retry.
-    try:
-        policy = await server_settings.get_strict("registration_policy")
-    except server_settings.SettingsUnavailable:
-        raise server_settings.busy_error() from None
     # ⚠⚠ PAID ENTRY RIDES THE INVITE FIELD, on purpose. An entry voucher and an
     # invite answer the same question — "may this person have an account here"
     # — and every client already has one box for that answer, on four
