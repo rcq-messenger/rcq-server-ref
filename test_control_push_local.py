@@ -20,6 +20,8 @@ Pinned here:
            (a dormant member with a push endpoint included, so an edit or a
            delete still reaches whoever holds the original), and no wake goes
            out; a message in the same room still wakes the same members.
+           The sender's own push tokens, read only to keep their phone out of
+           a wake, are not looked up for a kind that is never woken for.
 
 In-process ASGI against a throwaway SQLite DB, Redis db 15 for the limiters.
 The push senders and the connection manager are stubbed (nobody is online).
@@ -107,10 +109,23 @@ async def fake_wake(to_uin, payload):
     return 1
 
 
+# Calls to `_sender_device_tokens`, which a group send makes only to keep the
+# sender's own phone out of the wake. Wraps the real one, so what it returns
+# (and therefore what is pushed) is unchanged.
+LOOKUPS: list[int | None] = []
+_real_sender_tokens = M._sender_device_tokens
+
+
+async def counting_sender_tokens(db, caller):
+    LOOKUPS.append(caller)
+    return await _real_sender_tokens(db, caller)
+
+
 def reset():
     APNS.clear()
     UP.clear()
     RANG.clear()
+    LOOKUPS.clear()
 
 
 CONTROL = ("reaction", "edit", "delete", "homerec", "carbon")
@@ -129,6 +144,7 @@ async def main() -> None:
     M.apns_send = fake_apns
     M.up_send = fake_up
     M._wake_for_sealed_call = fake_wake
+    M._sender_device_tokens = counting_sender_tokens
 
     now = datetime.now(timezone.utc)
     long_ago = now - timedelta(days=120)
@@ -224,6 +240,7 @@ async def main() -> None:
               woken == {RECENT, DORMANT_WAKE}, str(woken))
         msg_kept = await group_rows("message")
         check("message kept for the same two", msg_kept == {RECENT, DORMANT_WAKE}, str(msg_kept))
+        check("message looked up the sender's tokens once", len(LOOKUPS) == 1, str(LOOKUPS))
 
         for t in ("reaction", "edit", "delete", "homerec"):
             reset()
@@ -234,6 +251,7 @@ async def main() -> None:
             await asyncio.sleep(0.2)
             check(f"group-sealed {t}: accepted", r.status_code == 200, r.text[:200])
             check(f"group-sealed {t}: nobody pushed", APNS == [] and UP == [], f"{APNS} {UP}")
+            check(f"group-sealed {t}: sender's tokens not looked up", LOOKUPS == [], str(LOOKUPS))
             kept = await group_rows(t)
             check(f"group-sealed {t}: kept for exactly the members a message is kept for",
                   kept == msg_kept, f"{kept} vs {msg_kept}")
@@ -263,6 +281,7 @@ async def main() -> None:
         msg_kept_b = set(after[before:]) if len(after) > before else set()
         check("broadcast message kept for owner, recent and dormant-with-endpoint",
               msg_kept_b == {OWNER, RECENT, DORMANT_WAKE}, str(msg_kept_b))
+        check("broadcast message looked up the sender's tokens", LOOKUPS == [OWNER], str(LOOKUPS))
 
         for t in ("reaction", "edit", "delete"):
             reset()
@@ -272,6 +291,7 @@ async def main() -> None:
             await asyncio.sleep(0.2)
             check(f"broadcast {t}: accepted", r.status_code == 200, r.text[:200])
             check(f"broadcast {t}: nobody pushed", APNS == [] and UP == [], f"{APNS} {UP}")
+            check(f"broadcast {t}: sender's tokens not looked up", LOOKUPS == [], str(LOOKUPS))
             after = await gmsg_rows()
             kept = set(after[before:])
             check(f"broadcast {t}: kept for exactly the members a message is kept for",

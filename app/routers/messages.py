@@ -1107,6 +1107,7 @@ async def send_group_sealed(
     # ⚠ Resolved BEFORE the queue rows are written, because who we wake now
     # decides who we keep the message for — see `_keep_for` below.
     wake: dict[int, PushEndpoints] = {}
+    pushable = body.envelope_type not in _NEVER_PUSH_TYPES
     if cls == 1:
         payload_by_uin = {p.to_uin: p.payload for p in body.payloads}
         envelope_type = body.envelope_type
@@ -1117,7 +1118,11 @@ async def send_group_sealed(
         # the client, which is the leak the map calls the strongest off-island
         # one we had (§1.6). The wake now carries only `group_id`; the client
         # titles the banner from its own copy of the roster.
-        sender_tokens = await _sender_device_tokens(db, caller)
+        #
+        # The sender's tokens only ever filter the push, so a kind that is never
+        # pushed skips the query. `wake` below is still resolved for it: it
+        # decides who keeps the row.
+        sender_tokens = await _sender_device_tokens(db, caller) if pushable else frozenset()
         # Never push the sender their OWN message (they backgrounded right
         # after sending); their other devices still get the queue carbon.
         # `group_push_targets` then drops everyone with no registered endpoint
@@ -1182,7 +1187,7 @@ async def send_group_sealed(
     # woken for (`wake` above still feeds `_keep_for`, so a dormant member who
     # was woken for a message also gets its edit or delete), and is then not
     # pushed. See _NEVER_PUSH_TYPES.
-    if wake and body.envelope_type not in _NEVER_PUSH_TYPES:
+    if wake and pushable:
 
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
@@ -1373,11 +1378,13 @@ async def send_group_broadcast(
     # keep the message for is a notification for a message that will never
     # arrive (#547). See `_keep_for`.
     wake: dict[int, PushEndpoints] = {}
+    pushable = body.envelope_type not in _NEVER_PUSH_TYPES
     if cls == 1:
         group_id = body.group_id
         payload = body.payload
-        # Same as the sealed path above: the name is not sent, only the id.
-        sender_tokens = await _sender_device_tokens(db, caller)
+        # Same as the sealed path above: the name is not sent, only the id, and
+        # a kind that is never pushed does not look up the sender's tokens.
+        sender_tokens = await _sender_device_tokens(db, caller) if pushable else frozenset()
         # Never push the sender their OWN message: they backgrounded right
         # after sending and fell into offline_recipients. Their other devices
         # still get the WS/queue carbon — just no APNs banner. The rest of the
@@ -1410,7 +1417,7 @@ async def send_group_broadcast(
     # "New group message" banner on every offline member's phone that no
     # client could open in time to take back. Kept as if woken, not pushed;
     # see the sealed path above and _NEVER_PUSH_TYPES.
-    if wake and body.envelope_type not in _NEVER_PUSH_TYPES:
+    if wake and pushable:
 
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
