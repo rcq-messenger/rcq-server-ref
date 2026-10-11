@@ -64,7 +64,8 @@ rule above never touches it, and nothing showed that it was missing that room
 read off the cursors rather than the mark: a device that has read SOMETHING
 within `READING_WITHIN_DAYS`, whose cursor in a room has not moved for
 `STARVED_ROOM_DAYS` while a row it can see has been waiting above it for as
-long. It only reports: one log line per pair and a count in the console. What
+long. It only reports: one log line per pair (naming it only while
+RCQ_LOG_IDENTITIES is on, as it repeats hourly) and a count in the console. What
 to do for such a pair (send it the room by the legacy queue as well, say) is a
 decision nobody has taken, and the cure is in the clients, which are the ones
 that have to write such a row off.
@@ -79,8 +80,8 @@ silence, for as long as nobody looked. So it no longer refuses whole. It
 demotes only the matches that the CURSORS confirm, devices with a row they can
 see waiting above one of their cursors for longer than `STALE_READER_DAYS`,
 which a bug in the mark rule cannot fake; oldest mark first, and never more
-than the share in one cycle. The rest are held back, the line says how many,
-and the console shows the count until a cycle passes clean.
+than the share (at least one) in one cycle. The rest are held back, the line
+says how many, and the console shows the count until a cycle passes clean.
 """
 
 from __future__ import annotations
@@ -230,7 +231,9 @@ async def sweep_once() -> int:
             # confirm, oldest mark first, at most the share.
             starving = await _confirmed_by_cursors(db, rows, cutoff)
             confirmed = [row for row in rows if (row.uin, row.device_id) in starving]
-            cap = int(total * MAX_SHARE_PER_CYCLE)
+            # At least one: on a small island a quarter rounds down to nothing,
+            # and a family of three would be refused outright for ever.
+            cap = max(1, int(total * MAX_SHARE_PER_CYCLE))
             safe = sorted(confirmed, key=lambda row: row.last_seen)[:cap]
             held_back = len(rows) - len(safe)
             log.error(
@@ -296,14 +299,16 @@ async def starving_rooms() -> list[tuple[int, int, str, int]]:
             .order_by(GroupLogCursor.group_id, GroupLogCursor.uin)
         )).all()
     pairs = [(int(g), int(u), str(d), int(gap)) for g, u, d, gap in found]
-    # The account is named, as for a demotion above, because somebody may have
-    # to tell them. The room is not, unless the operator switched identities
-    # on: a number next to a room id is a line of the membership table.
+    # Behind RCQ_LOG_IDENTITIES like every other line that names a person:
+    # this repeats every hour for as long as the pair is stuck, so a raw uin
+    # here is a daily activity record in the journal, and adjacent lines with
+    # equal gaps would show which accounts share a room even with room=-.
     for gid, uin, device_id, gap in pairs[:STARVED_LOG_LIMIT]:
         log.warning(
             "starving room: uin=%s device=%s room=%s has not moved in %s+ days while "
             "the device reads elsewhere (seq gap %s)",
-            uin, device_id[:8], log_identity(gid), STARVED_ROOM_DAYS, gap,
+            log_identity(uin), log_identity(device_id[:8]), log_identity(gid),
+            STARVED_ROOM_DAYS, gap,
         )
     if pairs:
         log.warning(

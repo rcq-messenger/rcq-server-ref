@@ -13,6 +13,8 @@ stop paging when a page moves nothing. Pins:
   * with the stuck room still stuck, a later post in another room arrives;
   * a row bigger than the whole budget at the head of a room waits while any
     other room has a row that fits, and goes out ALONE once none does;
+  * a row that fits an empty page but not what a stalled lower room leaves of
+    it still goes out on the first page (once a page, under twice the budget);
   * the row `limit` is shared too: a three-row room is served whole beside a
     hundred-row room;
   * rows sealed to other members neither show nor count;
@@ -201,6 +203,37 @@ async def main():
         body = r.json()
         check("then goes out ALONE", [(x["gid"], x["seq"]) for x in body["rows"]] == [(huge_room, 1)])
         check("  ... with more set for what is behind it", body["more"] is True)
+
+        # ── a large row behind a stalled room ─────────────────────────────────
+        # The stalled room S comes first in the turn order and is re-served on
+        # every page (its client will not ack it yet). Room A's head fits an
+        # empty page but not what S leaves of it, so it used to wait for ever.
+        print("\nA large row in one room while a lower room stays stalled:")
+        M = 7006
+        await make_user(M)
+        tok = issue_token(M, 0, "m-phone")
+        near = "n" * (GROUP_LOG_PAGE_BYTES - 500)
+        stalled = await make_room((OWNER, M), [(KB, None)] * 3)
+        large = await make_room((OWNER, M), [(near, None), (near, None)])
+        check("the stalled room has the smaller gid", stalled < large)
+        await cursors_at_zero(M, "m-phone", (stalled, large))
+        r = await c.post("/messages/group-log/fetch", headers=H(tok), json={})
+        body = r.json()
+        rooms = by_room(body["rows"])
+        check("the large row is on the FIRST page", rooms.get(large) == [1])
+        check("  ... beside the stalled room's rows", rooms.get(stalled) == [1, 2, 3])
+        check("  ... the page stays under twice the budget",
+              sum(len(x["payload"]) for x in body["rows"]) <= 2 * GROUP_LOG_PAGE_BYTES)
+        check("  ... and the room's second large row waits (one stretch a page)", body["more"] is True)
+        # The client acks the large room only; S stays where it is.
+        await c.post("/messages/group-log/ack", headers=H(tok), json={"rooms": [{"gid": large, "upto": 1}]})
+        r = await c.post("/messages/group-log/fetch", headers=H(tok), json={})
+        body = r.json()
+        rooms = by_room(body["rows"])
+        check("the next page brings the next large row, S still unacked",
+              rooms.get(large) == [2] and rooms.get(stalled) == [1, 2, 3])
+        check("  ... again under twice the budget",
+              sum(len(x["payload"]) for x in body["rows"]) <= 2 * GROUP_LOG_PAGE_BYTES)
 
         # ── the row limit ─────────────────────────────────────────────────────
         print("\nThe row limit is shared as well:")

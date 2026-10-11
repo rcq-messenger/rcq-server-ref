@@ -1935,7 +1935,10 @@ async def _fair_log_page(
     has been given the fewest bytes so far (the lowest gid on a tie), so a
     room with little to say is served whole and the rest is shared by the
     rooms with more. A row that does not fit what is left of the budget waits
-    for the next page; the page stays ONE body of at most 128 KiB.
+    for the next page, with one exception per page: a room's FIRST row that
+    would fit an empty page goes in anyway, uncharged, so a stalled room ahead
+    of it (re-served on every page) cannot keep a large row out of every page.
+    So the page is at most 128 KiB plus one such row, under 256 KiB.
 
     ⚠ A row bigger than the whole budget still goes out, ALONE, or it could
     never be served and would pin its room for ever. But only when no room has
@@ -1961,6 +1964,7 @@ async def _fair_log_page(
     heapq.heapify(turns)
     rows_left, bytes_left = limit, GROUP_LOG_PAGE_BYTES
     too_big: list[int] = []
+    stretched = False
     while turns and rows_left > 0:
         _, _, gid = heapq.heappop(turns)
         if not buf[gid] and unread[gid]:
@@ -1982,12 +1986,22 @@ async def _fair_log_page(
             continue  # nothing for this member in this room
         size = len(buf[gid][0].payload)
         if size > bytes_left:
-            # The budget only shrinks, so this room is done for this page.
-            too_big.append(gid)
-            continue
+            if given[gid] or stretched or size > GROUP_LOG_PAGE_BYTES:
+                # The budget only shrinks and the stretch is spent, so this
+                # room is done for this page.
+                too_big.append(gid)
+                continue
+            # A room's FIRST row of the page that would fit an empty page goes in
+            # past what is left: once per page, and not charged. Otherwise a
+            # stalled room ahead in the turn order (its rows re-served on every
+            # page) keeps this row, and so the whole room, out of every page
+            # until the stall clears. The page stays under 2 x GROUP_LOG_PAGE_BYTES.
+            # A row bigger than the whole budget still goes out only alone (below).
+            stretched = True
+        else:
+            bytes_left -= size
         picked[gid].append(buf[gid].popleft())
         given[gid] += size
-        bytes_left -= size
         rows_left -= 1
         heapq.heappush(turns, (given[gid], order[gid], gid))
     if too_big and not any(picked.values()):

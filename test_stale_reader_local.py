@@ -16,8 +16,9 @@ So the five cases below are the five ways to get this wrong:
 3. fresh mark, account here now              -> left alone, the reader is working
 4. stale mark, account seen just over the horizon -> left alone, at the boundary
 5. more than a quarter of all marks match    -> the valve trips: only what the
-   cursors confirm is demoted, oldest first and at most a quarter, the rest is
-   held back and counted (it used to refuse whole, which left a broken client
+   cursors confirm is demoted, oldest first and at most a quarter (but at
+   least one, or a three-mark island is refused for ever), the rest is held
+   back and counted (it used to refuse whole, which left a broken client
    release starving in silence; report 981)
 
 And the per-room detector (report 981, second half), which the mark cannot
@@ -191,6 +192,32 @@ async def main() -> None:
           (await remaining(), sweep._last_sweep.get("held_back")),
           ({4100 + i for i in range(8)}, 8))
 
+    # ── 5c: a small island is not refused for ever ─────────────────────────
+    # Three marks (one family). One device stopped reading while the account is
+    # here: 1 of 3 trips the valve, and a quarter of 3 rounds down to nothing,
+    # which used to hold that person back every hour indefinitely. At least one
+    # cursor-confirmed mark goes through each cycle.
+    await reset()
+    await room(70, 10, [(s_, None, LONG_AGO) for s_ in range(1, 11)])
+    await device(7001, "dev-7001", STALE, {70: (0, LONG_AGO)}, (70,))
+    await device(7002, "dev-7002", FRESH, {70: (10, FRESH)}, (70,))
+    await device(7003, "dev-7003", FRESH, {70: (10, FRESH)}, (70,))
+    n = await sweep.sweep_once()
+    check("a three-mark island demotes its one confirmed stale mark", n, 1)
+    check("  ... it is gone", 7001 in await remaining(), False)
+    check("  ... nothing held back", sweep._last_sweep.get("held_back"), 0)
+    # The same island, but the stale device is level and the room quiet: the
+    # cursors do not confirm it, so the valve still holds it back.
+    await reset()
+    await room(70, 10, [(s_, None, LONG_AGO) for s_ in range(1, 11)])
+    await device(7001, "dev-7001", STALE, {70: (10, STALE)}, (70,))
+    await device(7002, "dev-7002", FRESH, {70: (10, FRESH)}, (70,))
+    await device(7003, "dev-7003", FRESH, {70: (10, FRESH)}, (70,))
+    n = await sweep.sweep_once()
+    check("an unconfirmed stale mark on a three-mark island is held back", n, 0)
+    check("  ... it stays", 7001 in await remaining(), True)
+    check("  ... and is counted", sweep._last_sweep.get("held_back"), 1)
+
     # ── the valve lets a normal day through ────────────────────────────────
     await reset()
     await seed([(3000, STALE, HERE)] + [(3000 + i, FRESH, HERE) for i in range(1, 9)])
@@ -223,6 +250,39 @@ async def main() -> None:
     check("the detector finds exactly the stuck pairs of reading devices",
           sorted((g, u) for g, u, _, _ in found), [(60, 5001), (62, 5003)])
     check("  ... with the seq gap to the head", sorted(gap for _, _, _, gap in found), [3, 6])
+
+    # The hourly line names nobody unless the operator switched identities on.
+    import logging
+    from app.core.config import settings
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines: list[str] = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    grab = Grab()
+    sweep.log.addHandler(grab)
+    was = settings.RCQ_LOG_IDENTITIES
+    try:
+        settings.RCQ_LOG_IDENTITIES = False
+        await sweep.starving_rooms()
+        lines = [line for line in grab.lines if line.startswith("starving room:")]
+        check("the starving-room line is written per pair", len(lines), 2)
+        check("  ... with no uin, device or room in it",
+              any(s_ in line for line in lines for s_ in ("5001", "5003", "phone-", "room=60", "room=62")),
+              False)
+        grab.lines.clear()
+        settings.RCQ_LOG_IDENTITIES = True
+        await sweep.starving_rooms()
+        lines = [line for line in grab.lines if line.startswith("starving room:")]
+        check("  ... and names them with RCQ_LOG_IDENTITIES on",
+              any("uin=5001" in line and "room=60" in line for line in lines), True)
+    finally:
+        settings.RCQ_LOG_IDENTITIES = was
+        sweep.log.removeHandler(grab)
 
     # ── 7: the console's numbers ───────────────────────────────────────────
     redis = await get_redis()
