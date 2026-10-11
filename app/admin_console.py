@@ -756,6 +756,8 @@ const EN = {
   'usr.guest_n': '{n} guests',
   'ov.stat.guests': 'Guests',
   'ov.stat.seats': 'Unopened invites',
+  'ov.stat.log_stuck': 'Rooms stuck on a device',
+  'ov.stat.reader_held': 'Stale readers held back',
   'ov.guests.admitting': 'This island admits new guests right now.',
   'ov.guests.closed': 'This island admits no new guests right now. Guests already here keep their seats.',
   'ov.guests.th.what': 'What happened',
@@ -1084,6 +1086,8 @@ const I18N = {
   'usr.guest_n': 'гостей: {n}',
   'ov.stat.guests': 'Гости',
   'ov.stat.seats': 'Неоткрытые приглашения',
+  'ov.stat.log_stuck': 'Комнаты, застрявшие на устройстве',
+  'ov.stat.reader_held': 'Придержанные устаревшие читатели',
   'ov.guests.h': 'Гости с других островов',
   'ov.guests.sub': 'Люди, чей аккаунт живёт на другом острове, а место в группах есть здесь. Только числа, без имён и номеров.',
   'ov.guests.admitting': 'Сейчас остров принимает новых гостей.',
@@ -1485,6 +1489,8 @@ const I18N = {
   'usr.guest_n': '访客 {n} 人',
   'ov.stat.guests': '访客',
   'ov.stat.seats': '未打开的邀请',
+  'ov.stat.log_stuck': '在设备上卡住的群组',
+  'ov.stat.reader_held': '被暂缓处理的过期读取者',
   'ov.guests.h': '来自其他岛屿的访客',
   'ov.guests.sub': '账号在别的岛屿、在这里的群组里有位置的人。只有数字，没有名字和号码。',
   'ov.guests.admitting': '这个岛屿目前接受新访客。',
@@ -1821,6 +1827,11 @@ async function loadStats() {
     if ((s.guest_users||0) + (s.guest_seats||0) > 0) {
       cells.push(['ov.stat.guests', s.guest_users||0], ['ov.stat.seats', s.guest_seats||0]);
     }
+    /* The room log, from the hourly stale-reader sweep: somebody missing a
+       room while everything else arrives, and marks its safety valve would not
+       demote. Shown only when there is one, always as a warning. */
+    if ((s.group_log_starving||0) > 0) cells.push(['ov.stat.log_stuck', s.group_log_starving, true]);
+    if ((s.stale_readers_held_back||0) > 0) cells.push(['ov.stat.reader_held', s.stale_readers_held_back, true]);
     $('stats').innerHTML = cells.map(c => `<div class="stat${c[2]?' warn':''}"><div class="n">${typeof c[1]==='number'?num(c[1]):c[1]}</div><div class="l">${t(c[0])}</div></div>`).join('');
     openReports = s.open_reports||0; reportsBadge();
   } catch (e) { $('stats').innerHTML = '<span class="err">'+t('ov.err_auth',{err:e.message})+'</span>'; }

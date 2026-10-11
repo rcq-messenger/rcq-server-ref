@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
+import heapq
 import math
 import logging
+from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
@@ -1071,6 +1073,27 @@ async def send_group_sealed(
     # rows and pushes at the database, repeatedly. Counting `entries` rather
     # than `body.payloads` charges the real work: junk recipients were already
     # dropped above and cost nothing.
+    #
+    # ⚠ WHY THERE IS NO ANONYMOUS MEMBERSHIP PROOF HERE EITHER (decided
+    # 11.10.2026, after the sender-auth audit; /group-broadcast does check,
+    # because its caller is identified anyway). What was weighed:
+    #   * a check on an IDENTIFIED caller only: worthless, an attacker simply
+    #     leaves the token off, and it can only ever fail an honest client;
+    #   * a room posting secret the island hands every member and checks here:
+    #     cheap, unlinkable between members, but it proves "is or WAS a member"
+    #     unless it is rotated on every leave and kick, and a rotation in the
+    #     flagship room is two thousand refetches of the room at once (the
+    #     shape of the 28.09 pool stalls). It must also stay optional until
+    #     three clients and the cross-island guest path all send it, and it
+    #     does nothing about the attack that matters: a member forging another
+    #     member, which only the receiving client can see by checking the
+    #     sender's pinned signing key against the room roster;
+    #   * anonymous credentials (blind tokens, zk group credentials) or a ring
+    #     signature over the roster: a real proof, but a new primitive on every
+    #     platform, and a ring over 2000 keys is not cheap to check.
+    # So integrity of the sender stays a client duty, and what the island does
+    # for this path is bound the cost: recipients filtered to the roster above,
+    # the fan-out budget below, the sknack ceilings at the top.
     identity, allowance = _fanout_charge(request, caller)
     await enforce_cost_budget(
         identity, "group_fanout", len(entries), allowance, _FANOUT_WINDOW_SECONDS
@@ -1295,6 +1318,23 @@ async def send_group_broadcast(
     g = await db.get(Group, body.group_id)
     if g is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
+    # ⚠ The caller must hold a seat in THIS room. Nothing checked it, so any
+    # account on the island could fan a `gmsg` into any room whose number it
+    # could guess (they are small and sequential): a row in the room's log and
+    # a wake for every offline member, from somebody who is not in the room
+    # (sender-auth audit, 11.10.2026). The caller is already identified here,
+    # so asking costs no privacy; the gates below that read the membership row
+    # (slowmode, the age floor) used to let a non-member straight through on
+    # the grounds that "the membership check below is the gate", and there was
+    # no check below. A guest copy is a member like any other: it has a row.
+    # The sealed path cannot do this and does not; see send_group_sealed.
+    seat = (await db.execute(
+        select(GroupMember.id)
+        .where(GroupMember.group_id == g.id, GroupMember.uin == caller)
+        .limit(1)
+    )).first()
+    if seat is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "not_a_member: only a member may post to this room")
     if (
         body.envelope_type == "message"
         and g.post_policy == "owner_only"
@@ -1319,8 +1359,9 @@ async def send_group_broadcast(
     recipients = [uin for uin, _ in recipient_rows]
     if not recipients:
         # A capable client always advertises before its first broadcast, so
-        # at minimum the sender's own uin matches. Empty therefore means a
-        # bogus group id / not-a-member race — nothing to deliver.
+        # at minimum the sender's own uin matches. The caller is a member (see
+        # above), so empty means its own advertisement never landed — nothing
+        # to deliver either way.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no broadcast-capable members")
 
     # Same budget, same rule name as the sealed path: a dual-send (broadcast to
@@ -1859,6 +1900,103 @@ class GroupLogRoomIn(BaseModel):
 #: a page cut here is indistinguishable from one cut by `limit`.
 GROUP_LOG_PAGE_BYTES = 128 * 1024
 
+#: Rows read from ONE room per query while a page is built (see
+#: `_fair_log_page`). The page is about 128 KiB, which is a little over a
+#: hundred flagship rows, so a room never needs more than MAX per read; a room
+#: in a crowd gets its share of that and no less than MIN, so thirty rooms
+#: behind do not each drag a few hundred rows out of the database for the
+#: handful each will be served.
+GROUP_LOG_ROOM_CHUNK_MIN = 8
+GROUP_LOG_ROOM_CHUNK_MAX = 128
+
+
+async def _fair_log_page(
+    db: AsyncSession, uin: int, starts: dict[int, int], limit: int,
+) -> tuple[dict[int, list[GroupLog]], bool]:
+    """Pick one page of room-log rows, SHARED FAIRLY between the rooms.
+
+    `starts` is every room this device is behind in, mapped to the seq it
+    reads from, in the order the rooms are to be answered. Returns the rows
+    picked for each room (ascending, contiguous from its start, exactly as a
+    client's per-room ack expects) and whether anything is left.
+
+    ⚠⚠ WHY NOT ROOM BY ROOM. The page used to be filled in room order until
+    `limit` or GROUP_LOG_PAGE_BYTES ran out, so one room with a long tail took
+    the whole page. That is harmless while the client acks it, and it does
+    not always: a row a client cannot open holds that room's cursor (each
+    client writes it off only after several drains, and iOS and the web count
+    those drains in memory), and while it holds, every page was the same page
+    of that one room. Every room with a larger gid got `more: true` and not one
+    row, and the clients stop paging when a page moves nothing, so they got
+    nothing at all (report 981: the flagship room is gid 21, so one stuck row
+    there would starve every room created after it).
+
+    Now every room gets turns: the next row always comes from the room that
+    has been given the fewest bytes so far (the lowest gid on a tie), so a
+    room with little to say is served whole and the rest is shared by the
+    rooms with more. A row that does not fit what is left of the budget waits
+    for the next page; the page stays ONE body of at most 128 KiB.
+
+    ⚠ A row bigger than the whole budget still goes out, ALONE, or it could
+    never be served and would pin its room for ever. But only when no room has
+    a row that fits: a stuck room whose next row is huge must not take every
+    page either.
+    """
+    if not starts:
+        return {}, False
+    chunk = min(
+        limit,
+        max(GROUP_LOG_ROOM_CHUNK_MIN, -(-min(limit, GROUP_LOG_ROOM_CHUNK_MAX) // len(starts))),
+    )
+    order = {gid: i for i, gid in enumerate(starts)}
+    buf: dict[int, deque[GroupLog]] = {gid: deque() for gid in starts}
+    # Where the next read of each room begins, and whether the last read came
+    # back full (so there may be more). Rooms are read lazily, on their turn:
+    # a room the budget never reaches costs no query, and `more` covers it.
+    read_to: dict[int, int] = dict(starts)
+    unread: dict[int, bool] = {gid: True for gid in starts}
+    picked: dict[int, list[GroupLog]] = {gid: [] for gid in starts}
+    given: dict[int, int] = {gid: 0 for gid in starts}
+    turns = [(0, order[gid], gid) for gid in starts]
+    heapq.heapify(turns)
+    rows_left, bytes_left = limit, GROUP_LOG_PAGE_BYTES
+    too_big: list[int] = []
+    while turns and rows_left > 0:
+        _, _, gid = heapq.heappop(turns)
+        if not buf[gid] and unread[gid]:
+            got = (await db.execute(
+                select(GroupLog)
+                .where(
+                    GroupLog.group_id == gid,
+                    GroupLog.seq > read_to[gid],
+                    or_(GroupLog.to_uin.is_(None), GroupLog.to_uin == uin),
+                )
+                .order_by(GroupLog.seq.asc())
+                .limit(chunk)
+            )).scalars().all()
+            buf[gid].extend(got)
+            if got:
+                read_to[gid] = got[-1].seq
+            unread[gid] = len(got) == chunk
+        if not buf[gid]:
+            continue  # nothing for this member in this room
+        size = len(buf[gid][0].payload)
+        if size > bytes_left:
+            # The budget only shrinks, so this room is done for this page.
+            too_big.append(gid)
+            continue
+        picked[gid].append(buf[gid].popleft())
+        given[gid] += size
+        bytes_left -= size
+        rows_left -= 1
+        heapq.heappush(turns, (given[gid], order[gid], gid))
+    if too_big and not any(picked.values()):
+        gid = min(too_big, key=lambda g: (len(buf[g][0].payload), order[g]))
+        picked[gid].append(buf[gid].popleft())
+    more = any(buf[gid] or unread[gid] for gid in starts)
+    return picked, more
+
+
 class GroupLogFetchIn(BaseModel):
     # Omitted = every room the account is a member of. Batched on purpose:
     # a client with thirty rooms makes one round trip, not thirty.
@@ -1935,11 +2073,15 @@ async def fetch_group_log(
     /group-log/ack, so a client that crashes between fetch and persist sees
     the same rows again rather than losing them.
 
-    ⚠ The fetch also marks THIS DEVICE as a log reader. Once every device
+    ⚠ An EMPTY fetch also marks THIS DEVICE as a log reader (a fetch that
+    returned rows does not; the ack that follows them does). Once every device
     that drains the account's legacy queue is a reader, the writers stop
     producing per-member legacy rows for the account. Anything already in the
     legacy queue stays there and the client keeps draining /messages/queue
     too, deduping by message UUID, until that queue runs dry.
+
+    A page is shared fairly between the rooms the device is behind in; see
+    `_fair_log_page`.
     """
     from app.routers.devices import mark_device_seen
     await mark_device_seen(uin, device_id)
@@ -1970,12 +2112,10 @@ async def fetch_group_log(
     out_rows: list[GroupLogRow] = []
     heads: dict[int, int] = {}
     cur_out: dict[int, int] = {}
-    budget = body.limit
-    # ⚠ AND a budget in bytes; see GROUP_LOG_PAGE_BYTES for the starvation loop
-    # this closes. Spent across every room in the one call, because the body the
-    # client has to read is the whole answer and not one room's share of it.
-    byte_budget = GROUP_LOG_PAGE_BYTES
-    more = False
+    # Every room this device is behind in, and where it reads from. The rows
+    # themselves are picked afterwards, all rooms at once, so that one room
+    # cannot take the page (see `_fair_log_page`).
+    starts: dict[int, int] = {}
     for gid, after in wanted:
         head = await _group_head(db, gid)
         heads[gid] = head
@@ -1990,40 +2130,20 @@ async def fetch_group_log(
             cursors[gid] = at
         cur_out[gid] = at
         start = after if after is not None else at
-        if budget <= 0 or byte_budget <= 0:
-            if head > start:
-                more = True
-            continue
-        rows = (await db.execute(
-            select(GroupLog)
-            .where(
-                GroupLog.group_id == gid,
-                GroupLog.seq > start,
-                or_(GroupLog.to_uin.is_(None), GroupLog.to_uin == uin),
-            )
-            .order_by(GroupLog.seq.asc())
-            .limit(budget + 1)
-        )).scalars().all()
-        if len(rows) > budget:
-            more = True
-            rows = rows[:budget]
-        emitted = 0
-        for r in rows:
-            out_rows.append(GroupLogRow(
+        # A room listed twice is read once, from its LAST position: the same
+        # rows must not go out twice in one page.
+        starts.pop(gid, None)
+        if head > start:
+            starts[gid] = start
+    picked, more = await _fair_log_page(db, uin, starts, body.limit)
+    for gid, rows in picked.items():
+        out_rows.extend(
+            GroupLogRow(
                 gid=gid, seq=r.seq, envelope_type=r.envelope_type, cls=r.cls,
                 payload=r.payload, received_at=r.received_at,
-            ))
-            emitted += 1
-            # ⚠ Charged AFTER the row is in, never before. A single row larger
-            # than the whole budget still goes out on its own, or it could never
-            # be served at all and would pin its room for ever by itself.
-            byte_budget -= len(r.payload)
-            if byte_budget <= 0:
-                break
-        budget -= emitted
-        # Cut by bytes rather than by `limit`: there is more of this room left.
-        if emitted < len(rows):
-            more = True
+            )
+            for r in rows
+        )
     # ⚠⚠ THE MARK IS EARNED BY AN ACK, NOT BY ASKING, except when there was
     # nothing to ack.
     #
@@ -2109,7 +2229,16 @@ async def ack_group_log(
         moved += 1
     # Proof that this device is actually receiving, which is what the reader
     # mark is for. See the long note at the other call site in fetch_group_log.
-    await _mark_group_log_reader(db, uin, device_id)
+    #
+    # ⚠ Only when a cursor MOVED. A stale or repeated ack proves nothing, and it
+    # was refreshing the mark all the same, the same mistake as the mark earned
+    # by asking. The mark is still per device, so a device that moves in one
+    # room is fresh while another room of it starves; that one is found by the
+    # cursor detector in `services/stale_reader_sweep`, not by the mark, because
+    # telling them apart here would cost a probe of every room on every ack,
+    # and a post in the flagship is two thousand acks.
+    if moved:
+        await _mark_group_log_reader(db, uin, device_id)
     # Plain commit: nothing this handler writes can raise `IntegrityError` any
     # more, and the guard that used to be here is exactly what turned a lost
     # race into a silent 200 with the ack discarded.

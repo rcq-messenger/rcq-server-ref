@@ -523,6 +523,14 @@ class StatsOut(BaseModel):
     # Pools whose every enabled node is outside the liveness window: a paying
     # customer with a key that answers `ok` and routes through nothing.
     pools_dark: int = 0
+    # The room log, from the last hourly cycle of services/stale_reader_sweep
+    # (report 981). `group_log_starving`: a device that reads the log yet has
+    # not moved in one room for days with rows waiting there, i.e. a person
+    # missing that room while everything else arrives; nothing else shows it.
+    # `stale_readers_held_back`: stale marks the sweep's safety valve declined
+    # to demote this cycle. Both 0 when the sweep has not reported.
+    group_log_starving: int = 0
+    stale_readers_held_back: int = 0
 
 
 # ── Reports ─────────────────────────────────────────────────────────
@@ -1578,6 +1586,11 @@ async def _call_health() -> dict:
 
 @router.get("/stats", response_model=StatsOut)
 async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
+    # One Redis GET, written by the hourly sweep; never a scan of the log from
+    # here. First, before the session below takes a pooled connection.
+    from app.services.stale_reader_sweep import read_status as _reader_sweep_status
+
+    reader_sweep = await _reader_sweep_status()
     now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)
     week_ago = now - timedelta(days=7)
@@ -1681,6 +1694,8 @@ async def stats(db: AsyncSession = Depends(get_db)) -> StatsOut:
     pools_dark = sum(1 for alive in pool_alive.values() if not alive)
 
     return StatsOut(
+        group_log_starving=int(reader_sweep.get("starving_cursors", 0) or 0),
+        stale_readers_held_back=int(reader_sweep.get("held_back", 0) or 0),
         broker_public_relays=len(public_rows),
         broker_public_live=int(broker_public_live),
         pools_needing_nodes=int(pools_needing_nodes),
