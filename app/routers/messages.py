@@ -58,7 +58,9 @@ log = logging.getLogger(__name__)
 #   cls 1 content    message, reaction, edit, delete, system, secscreen, gmsg,
 #                    call, and any unknown/future kind (fail toward keeping and
 #                    delivering rather than silently dropping). This is the
-#                    pushable class.
+#                    pushable class, minus the content kinds named in
+#                    _NEVER_PUSH_TYPES below, which are stored like content
+#                    and never woken for.
 #   cls 2 critical   skdm, sknack and every future key-distribution kind: never
 #                    a banner, but MUST survive the dormant sweep, because a
 #                    member who loses an skdm cannot read a single later
@@ -82,7 +84,49 @@ _EPHEMERAL_TYPES = {"typing", "read", "visit", "presence", "nudge", "bounce"}
 # It cannot simply join _EPHEMERAL_TYPES: cls 0 changes retention too, and a
 # carbon has to survive until the other device drains it. So it stays content
 # for storage and is refused a push explicitly at the branch.
-_NEVER_PUSH_TYPES = {"carbon"}
+#
+# ⚠⚠ The control kinds below joined it in 2026.10.11.01, for the same reason
+# and with the same constraint. Before stage 2 (2026-08-22) push fired for
+# exactly {message, system, secscreen}; the class swept every other content
+# kind into the push, and since every current client labels its control
+# envelopes with their own type (iOS always has, Android since 0.133, and both
+# Android and web/desktop now do it for contacts on other islands as well),
+# each one woke the recipient with an alert. The iPhone build people have
+# (TestFlight) does not treat these kinds as silent, so its extension shows
+# "<contact> / Message" for every reaction, edit, delete and home record. In a group
+# the same deposit went to every offline member, and a sender-keys broadcast
+# (gmsg) cannot be opened in the extension at all, so it read "New group
+# message" on iOS and Android alike. None of them may become cls 0: an edit or
+# a delete that is dropped for a dormant recipient leaves the original text on
+# their screen, and a reaction or a home record is state the client must
+# still apply when it drains. Stored as content, delivered on the socket and
+# by the drain, never pushed:
+#
+#   reaction  A reaction is drawn on the bubble and on the chat list heart when
+#             the app ingests it; no client makes a notification of one
+#             (Android PushEnvelope.preview returns null for it, the iOS
+#             extension can only say "Message").
+#   edit      Changes the text of a row already in the chat. No client rewrites
+#             a notification already shown, so a wake changes nothing on the
+#             phone that a later drain would not.
+#   delete    Delete for everyone. Checked because it is the one where a wake
+#             could have mattered: neither client takes a shown notification
+#             back when a delete arrives (Android drops a "delete" wake before
+#             opening it and its delete handler only touches the chat; iOS has
+#             no per-message withdrawal, only clearing the whole tray when the
+#             app comes forward), so the wake only ever added a banner.
+#   homerec   Silent home-island record sync. Read when the recipient next
+#             drains, which happens before they can write to the contact; the
+#             web client sends it under this type precisely so it does not buzz.
+#
+# NOT here, deliberately: `secscreen` carries the screenshot-taken notice as
+# well as the silent secure-mode toggle, in one sealed blob the island cannot
+# tell apart, and the notice must reach a backgrounded phone (see above).
+# `system` is text a person reads. A silent wake (APNs content-available with
+# no alert) was considered for these and not used: none of them needs to
+# reach the phone before the app is next opened, and every wake that crosses
+# Apple or the UnifiedPush host is metadata about who is in contact.
+_NEVER_PUSH_TYPES = {"carbon", "reaction", "edit", "delete", "homerec"}
 
 # ⚠ "call" stays a content-class row, never a legible "call" kind. A call
 # deposit is already coerced to frame type "message" on the live socket (see the
@@ -1134,7 +1178,11 @@ async def send_group_sealed(
     if rows:
         await db.execute(insert(OfflineGroupMessage), rows)
     await db.commit()
-    if wake:
+    # A reaction, edit, delete or home record is kept exactly as if it were
+    # woken for (`wake` above still feeds `_keep_for`, so a dormant member who
+    # was woken for a message also gets its edit or delete), and is then not
+    # pushed. See _NEVER_PUSH_TYPES.
+    if wake and body.envelope_type not in _NEVER_PUSH_TYPES:
 
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
@@ -1316,8 +1364,8 @@ async def send_group_broadcast(
     online = await manager.fanout(recipients, pkt)
     delivered_any = bool(online)
     offline_recipients = [uin for uin in recipients if uin not in online]
-    # Push offline members for real posts only (mirrors _PUSHABLE_TYPES
-    # gating on the declared inner type). Everyone gets the SAME envelope —
+    # Push offline members for real posts only (the declared inner type is
+    # checked against _NEVER_PUSH_TYPES below). Everyone gets the SAME envelope —
     # that's the whole point. The iOS NSE shows a generic group banner for
     # gmsg (it never advances ratchet state out-of-process).
     #
@@ -1357,7 +1405,12 @@ async def send_group_broadcast(
     if rows:
         await db.execute(insert(OfflineGroupMessage), rows)
     await db.commit()
-    if wake:
+    # Gated on the DECLARED inner type, since the row and the wake both say
+    # "gmsg" whatever is inside: a reaction broadcast in a big room was a
+    # "New group message" banner on every offline member's phone that no
+    # client could open in time to take back. Kept as if woken, not pushed;
+    # see the sealed path above and _NEVER_PUSH_TYPES.
+    if wake and body.envelope_type not in _NEVER_PUSH_TYPES:
 
         async def _push(target_uin: int, ends: PushEndpoints) -> None:
             await apns_send(
