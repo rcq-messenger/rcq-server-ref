@@ -57,14 +57,22 @@ def _body_ceiling() -> int:
     return MAX_BLOB_SIZE + _FORM_SLACK
 
 
-def _too_large() -> HTTPException:
-    # `Connection: close` so the server stops taking the rest of a body it has
-    # already refused. Without it uvicorn keeps the connection for reuse and
-    # first reads the remainder off the socket, so a 2 GB upload still crossed
-    # the wire in full only to be thrown away.
-    return HTTPException(
-        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "blob too large", headers={"Connection": "close"}
-    )
+def _too_large(close: bool = False) -> HTTPException:
+    """The early 413. `close` only for a body with no declared length, cut
+    part way (`_CappedRequest`): it has no end to read to, so `Connection:
+    close` is how the island stops taking it.
+
+    ⚠ Not for a declared length. Closing the socket while that body is still
+    arriving makes the kernel answer the rest with a reset, and a proxy that
+    is still writing the body loses the 413 to the write error: Go's
+    net/http, which Caddy is built on, answers 502 instead, and a direct
+    client can hit a broken pipe before it reads the status. Through a
+    net/http proxy that was 21 oversize uploads in 40 in a local run, each
+    one a network fault to the client instead of "too large". Kept open,
+    uvicorn drops the rest of the body as it arrives, in memory and never on
+    disk, and the proxy reads a clean 413 and stops sending."""
+    headers = {"Connection": "close"} if close else None
+    return HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "blob too large", headers=headers)
 
 
 class _CappedRequest(Request):
@@ -81,7 +89,7 @@ class _CappedRequest(Request):
         async for chunk in super().stream():
             seen += len(chunk)
             if seen > ceiling:
-                raise _too_large()
+                raise _too_large(close=True)
             yield chunk
 
 
@@ -136,11 +144,12 @@ async def _stream_to(target: Path, blob: UploadFile) -> int:
     Writes to a temp path and LINKS it into place, so a client that dies
     mid-upload never leaves a half blob under a servable name, and the first
     complete copy of an id wins: `os.link` refuses a name that exists, where
-    the old `os.replace` overwrote it. That matters on PUT, whose id the
-    client picks. Two deposits of one id are NOT byte-identical (an RCQM1
-    re-send seals under a fresh nonce prefix, at the same size), so last
-    write wins swapped the blob under a reader, and a download resumed with
-    Range could splice the head of one copy onto the tail of the other."""
+    the old `os.replace` overwrote it (on a mount without hard links it still
+    renames, see below). That matters on PUT, whose id the client picks.
+    Two deposits of one id are NOT byte-identical (an RCQM1 re-send seals
+    under a fresh nonce prefix, at the same size), so last write wins swapped
+    the blob under a reader, and a download resumed with Range could splice
+    the head of one copy onto the tail of the other."""
     # Unique per request: two concurrent deposits of the SAME id must not
     # interleave into one temp file.
     tmp = target.with_suffix(f".{uuid.uuid4().hex[:8]}.part")
@@ -162,9 +171,15 @@ async def _stream_to(target: Path, blob: UploadFile) -> int:
             if exc.errno not in _NO_HARD_LINKS:
                 raise
             # A mount without hard links (some FUSE and network filesystems a
-            # self-hoster may keep media on): the old rename, last write wins,
-            # rather than every upload failing on such a mount.
-            os.replace(tmp, target)
+            # self-hoster may keep media on): the old rename, rather than
+            # every upload failing on such a mount. A copy that landed while
+            # this one streamed still stands, but looking and renaming are two
+            # steps, so two deposits finishing in the same instant can still
+            # replace one another: first write wins outright needs hard links.
+            try:
+                size = target.stat().st_size
+            except FileNotFoundError:
+                os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
     return size
@@ -209,7 +224,8 @@ async def deposit(
     First write wins: re-depositing an existing id is an idempotent success,
     never an overwrite (ids are uuid4 hex, unguessable), and since
     `_stream_to` links rather than renames that holds for two deposits racing
-    each other too."""
+    each other too. Not quite on a media mount without hard links, where two
+    that finish in the same instant can still replace one another."""
     try:
         uuid.UUID(hex=media_id)
     except ValueError:

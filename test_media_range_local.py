@@ -19,14 +19,17 @@ Pins:
   * the ETag is stable for one blob and differs between two blobs of the
     same size; a download resumed from any offset reassembles the blob;
   * an upload declaring a Content-Length over the ceiling is 413 before a
-    single body byte is read, with `Connection: close`;
+    single body byte is read, WITHOUT `Connection: close`: over a real socket
+    a writer still sending the body reads the 413 and is not reset (closing
+    there made a proxy built on Go's net/http answer 502 instead);
   * a chunked upload with no Content-Length is cut at the ceiling, not read
-    to its end, and leaves nothing in the store;
+    to its end, with `Connection: close`, and leaves nothing in the store;
   * a blob of exactly the cap still goes in; one byte over is 413 and leaves
     neither a blob nor a temp file;
   * PUT is first write wins, also when the second deposit loses a race it
     has already passed the existence check for (the `os.link` branch), and
-    an upload still works on a mount without hard links.
+    an upload still works on a mount without hard links, where a copy that
+    landed while a deposit streamed still stands.
 
 Runs the real FastAPI stack in-process with Redis db 15 and a store under
 ./media/test_media_range. No database. NOT deployed.
@@ -49,6 +52,7 @@ for leftover in list(STORE.iterdir()):
     leftover.unlink()
 
 import httpx  # noqa: E402
+import uvicorn  # noqa: E402
 from fastapi import FastAPI, UploadFile  # noqa: E402
 
 import app.routers.media as media_mod  # noqa: E402
@@ -224,7 +228,8 @@ async def main() -> int:
             ], never_read)
             check(f"a declared length over the ceiling is 413 ({status_code})", status_code == 413)
             check(f"before a single body byte is read ({pulled['n']} reads)", pulled["n"] == 0)
-            check("and the connection is closed after it", headers.get("connection") == "close")
+            check("and the connection is kept, so a proxy reads the 413, not a reset",
+                  "connection" not in headers)
             status_code, _ = await raw_call(bare, "PUT", f"/media/{'ab' * 16}", [
                 (b"host", b"t"),
                 (b"content-type", b"multipart/form-data; boundary=rcq"),
@@ -232,6 +237,36 @@ async def main() -> int:
             ], never_read)
             check(f"PUT the same ({status_code}, {pulled['n']} reads)", status_code == 413 and pulled["n"] == 0)
             check("nothing was stored", stored() == before)
+
+            # The same over a real socket, the way a proxy sends it: the body
+            # keeps coming while the answer goes back. A writer that is reset
+            # here is a proxy that answers 502 instead of passing the 413 on.
+            server = uvicorn.Server(uvicorn.Config(bare, host="127.0.0.1", port=0,
+                                                   log_level="warning", lifespan="off"))
+            serving = asyncio.create_task(server.serve())
+            while not server.started:
+                await asyncio.sleep(0.01)
+            port = server.servers[0].sockets[0].getsockname()[1]
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(f"PUT /media/{'cd' * 16} HTTP/1.1\r\nHost: t\r\n"
+                         "Content-Type: multipart/form-data; boundary=rcq\r\n"
+                         f"Content-Length: {ceiling + 64 * 1024 * 1024}\r\n\r\n".encode())
+            writer.write(b"z" * 65536)
+            await writer.drain()
+            status_line = await asyncio.wait_for(reader.readline(), 10)
+            reset = None
+            try:
+                for _ in range(128):
+                    writer.write(b"z" * 65536)
+                    await writer.drain()
+                    await asyncio.sleep(0)
+            except (ConnectionError, OSError) as exc:
+                reset = exc
+            writer.close()
+            server.should_exit = True
+            await serving
+            check(f"over a socket: 413 ({status_line.decode().strip()})", status_line.startswith(b"HTTP/1.1 413"))
+            check(f"and 8 MB more of body after it are taken, not reset ({reset!r})", reset is None)
 
             # Chunked: no Content-Length, a body that would never end.
             sent_bytes = {"n": 0}
@@ -299,6 +334,10 @@ async def main() -> int:
             check(f"an upload still goes in ({r.status_code})", ok)
             if ok:
                 check("and reads back", (await get(r.json()["media_id"])).content == blob)
+            # A deposit that passed the existence check while another one
+            # landed: the rename must look first, not replace the winner.
+            size = await media_mod._stream_to(target, UploadFile(file=io.BytesIO(b"other")))
+            check("a copy that landed meanwhile still stands", target.read_bytes() == a and size == len(a))
         finally:
             os.link = real_link
         check("no temp file left", not any(n.endswith(".part") for n in stored()))
