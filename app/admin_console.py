@@ -773,6 +773,12 @@ const EN = {
   'ov.guests.c.guest_swept_a': 'Removed: invite never opened',
   'ov.guests.c.guest_swept_b': 'Removed: never checked for messages',
   'ov.guests.c.guest_swept_c': 'Removed: idle',
+  'ov.guests.c.room_link_preview_tokenless': 'Room link with no key, let in: preview',
+  'ov.guests.c.room_join_tokenless': 'Room link with no key, let in: join',
+  'ov.guests.c.room_guest_tokenless': 'Room link with no key, let in: guest entry',
+  'ov.guests.c.room_link_badkey': 'Room link with a wrong key, refused',
+  'ov.guests.c.room_link_keyless_refused': 'Room link with no key, refused',
+  'ov.guests.c.closed_preview_tokenless': 'Closed room previewed with no key',
 
   'rep.evidence': 'evidence',
   'rep.answered': 'answered',
@@ -1105,6 +1111,12 @@ const I18N = {
   'ov.guests.c.guest_swept_a': 'Удалены: приглашение так и не открыли',
   'ov.guests.c.guest_swept_b': 'Удалены: ни разу не проверяли сообщения',
   'ov.guests.c.guest_swept_c': 'Удалены: давно не заходили',
+  'ov.guests.c.room_link_preview_tokenless': 'Ссылка на группу без ключа, пропущено: превью',
+  'ov.guests.c.room_join_tokenless': 'Ссылка на группу без ключа, пропущено: вход',
+  'ov.guests.c.room_guest_tokenless': 'Ссылка на группу без ключа, пропущено: вход гостя',
+  'ov.guests.c.room_link_badkey': 'Ссылка на группу с неверным ключом, отказ',
+  'ov.guests.c.room_link_keyless_refused': 'Ссылка на группу без ключа, отказ',
+  'ov.guests.c.closed_preview_tokenless': 'Превью закрытой группы без ключа',
   'usr.kind.all': 'Все',
   'usr.kind.native': 'Живут здесь',
   'usr.kind.guest': 'Гости с других островов',
@@ -1508,6 +1520,12 @@ const I18N = {
   'ov.guests.c.guest_swept_a': '已删除：邀请始终未打开',
   'ov.guests.c.guest_swept_b': '已删除：从未查看消息',
   'ov.guests.c.guest_swept_c': '已删除：长期不活跃',
+  'ov.guests.c.room_link_preview_tokenless': '不带密钥的群组链接，已放行：预览',
+  'ov.guests.c.room_join_tokenless': '不带密钥的群组链接，已放行：加入',
+  'ov.guests.c.room_guest_tokenless': '不带密钥的群组链接，已放行：访客进入',
+  'ov.guests.c.room_link_badkey': '密钥错误的群组链接，已拒绝',
+  'ov.guests.c.room_link_keyless_refused': '不带密钥的群组链接，已拒绝',
+  'ov.guests.c.closed_preview_tokenless': '不带密钥预览封闭群组',
   'usr.kind.all': '所有人',
   'usr.kind.native': '住在这里',
   'usr.kind.guest': '来自其他岛屿的访客',
@@ -1839,8 +1857,12 @@ async function loadStats() {
 }
 /* The guest counters: what happened to guests today, this week, this month.
    Counts only; the island keeps no list of who. The card stays hidden on an
-   island that does not admit guests and never had any. */
-const GUEST_COUNTERS = ['guest_mint','guest_claim','guest_add_mint','guest_add_existing','guest_restricted','guest_settle','guest_swept_a','guest_swept_b','guest_swept_c'];
+   island that does not admit guests and never had any. The room link rows
+   count every visitor, not guests only: they are what an operator reads
+   before turning on RCQ_REQUIRE_ROOM_LINK_TOKEN (the "let in" rows) or
+   RCQ_REQUIRE_CLOSED_GROUP_TOKEN (the closed room row). */
+const GUEST_COUNTERS = ['guest_mint','guest_claim','guest_add_mint','guest_add_existing','guest_restricted','guest_settle','guest_swept_a','guest_swept_b','guest_swept_c',
+  'room_link_preview_tokenless','room_join_tokenless','room_guest_tokenless','room_link_badkey','room_link_keyless_refused','closed_preview_tokenless'];
 async function loadGuests() {
   const card = $('guests-card');
   try {
@@ -1852,7 +1874,10 @@ async function loadGuests() {
     if (!g.admission_open && !any && !(g.guest_users||0) && !(g.guest_seats||0)) { card.style.display='none'; return; }
     const rows = GUEST_COUNTERS.map(name => {
       const x = byName[name];
-      return `<tr><td>${escAttr(tOpt('ov.guests.c.'+name) || name)}</td>
+      // ⚠ EN as well: tOpt reads only the overlay, and the English overlay is
+      // empty, so in English every row used to show its raw counter name.
+      const id = 'ov.guests.c.' + name;
+      return `<tr><td>${escAttr(tOpt(id) || EN[id] || name)}</td>
         <td style="text-align:right">${num(sum(x,1))}</td>
         <td style="text-align:right">${num(sum(x,7))}</td>
         <td style="text-align:right">${num(sum(x,30))}</td></tr>`;
@@ -3054,8 +3079,8 @@ function mock(method, path, body) {
   if (path.startsWith('/broker/admin/') && method==='DELETE') return {ok:true};
   if (path==='/stats') return {total_users:1284, guest_users:37, guest_seats:4, suspended_users:7, new_users_24h:23, new_users_7d:141, open_reports:3, open_crashes:1, resolved_reports_7d:12};
   if (path.startsWith('/guests')) return {admission_open:true, guest_users:37, guest_seats:4, days:30,
-    series:['guest_mint','guest_claim','guest_add_mint','guest_add_existing','guest_restricted','guest_settle','guest_swept_a','guest_swept_b','guest_swept_c'].map((name,k)=>{
-      const points = Array.from({length:30},(_,i)=>({date:new Date(Date.UTC(2026,7,17+i)).toISOString().slice(0,10), count:Math.max(0, Math.round((9-k)*Math.abs(Math.sin((i+k)/5)))-2)}));
+    series:GUEST_COUNTERS.map((name,k)=>{
+      const points = Array.from({length:30},(_,i)=>({date:new Date(Date.UTC(2026,7,17+i)).toISOString().slice(0,10), count:Math.max(0, Math.round((9-k%9)*Math.abs(Math.sin((i+k)/5)))-2)}));
       return {name, points, total:points.reduce((a,p)=>a+p.count,0)};
     })};
   if (path==='/presence/online-count') return {online:48};
