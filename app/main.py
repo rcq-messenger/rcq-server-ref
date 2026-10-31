@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -669,6 +669,34 @@ app.include_router(ws.router)
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "app": settings.APP_NAME, "version": settings.SERVER_VERSION}
+
+
+#: What /health/bulk serves: 64 KiB of random bytes, drawn once per worker.
+#: Random so that no compression on the way (Caddy's encode, a CDN) can
+#: shrink it below the size that matters, and one fixed size so a filter
+#: cannot tell this probe apart from a download by the length it asks for.
+_BULK_PROBE_BODY = secrets.token_bytes(64 * 1024)
+
+
+@app.get("/health/bulk")
+async def health_bulk() -> Response:
+    """64 KiB that a client must actually receive, not just shake hands for.
+
+    ⚠ Exists for one filter pattern: on some networks a TLS handshake to a
+    hosting network passes and the connection then freezes after about 16 KB
+    of data. A handshake-only probe calls such a route healthy, so a client
+    that lowered its relay tunnel on that evidence would sit on a dead direct
+    route. The Android watchdog lowers an automatic tunnel only after this
+    whole body came through directly; an island without the endpoint (404)
+    keeps the tunnel up, which is what every client did before.
+
+    No database, no auth, no identity in the reply, nothing cached on the
+    way (no-store), so it measures the route and nothing else."""
+    return Response(
+        content=_BULK_PROBE_BODY,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 #: The probe below, at most one in flight per worker, and its last answer.
