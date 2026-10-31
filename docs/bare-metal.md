@@ -315,7 +315,9 @@ uuid id, not on access control over an already-encrypted blob. (`PUT /media/{id}
 also exists so a sender can deposit the same blob on several islands for
 cross-island/federated delivery.)
 
-- **Size limit:** 2 GB per upload. Behind nginx, also raise
+- **Size limit:** 512 MB per blob by default (`RCQ_MEDIA_MAX_BLOB_MB`, in whole
+  megabytes). A bigger upload is refused before its body is read, as soon as
+  it declares or reaches the limit. Behind nginx, also raise
   `client_max_body_size` (see the nginx section) or the proxy rejects large
   uploads before they reach the app.
 - **Retention:** a blob is swept once it is older than
@@ -381,9 +383,10 @@ server {
     }
 
     # IMPORTANT: nginx defaults client_max_body_size to 1 MB, which would
-    # reject any media upload bigger than that. The app accepts up to 2 GB
-    # per blob, so raise (or cap) this to taste. Caddy has no such default
-    # limit, which is why the Caddy section above needs nothing extra.
+    # reject any media upload bigger than that. The app accepts up to 512 MB
+    # per blob by default (RCQ_MEDIA_MAX_BLOB_MB) and refuses more by itself,
+    # so keep this at or above that. Caddy has no such default limit, which
+    # is why the Caddy section above needs nothing extra.
     client_max_body_size 2g;
 }
 ```
