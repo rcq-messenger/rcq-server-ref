@@ -136,6 +136,7 @@ EXPECTED: dict[tuple[str, str], str] = {
     ("PATCH", "/groups/{group_id}/state"): A,
     ("POST", "/groups/{group_id}/members/{member_uin}/permissions"): A,
     ("POST", "/groups/{group_id}/transfer-owner"): R,
+    ("POST", "/groups/{group_id}/share-token"): D,  # a guest copy never resets a room's link
     ("DELETE", "/groups/{group_id}"): A,
     # messages.py (POST /messages/sealed has no session: n/a)
     ("POST", "/messages/group-sealed"): A,

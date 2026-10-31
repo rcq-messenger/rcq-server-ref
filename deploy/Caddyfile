@@ -112,10 +112,12 @@ api.rcq.app {
             wrap json
             fields {
                 # The token, the account number in the path (/ws/123456789,
-                # /users/123456789/info) and a vault slot name (/vault/<32
-                # hex>, a stable per-account pseudonym) are all masked; the
-                # same rule as the flagship's and the compose Caddyfile's.
-                request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+" "${1}${2}${3}REDACTED"
+                # /users/123456789/info), a vault slot name (/vault/<32
+                # hex>, a stable per-account pseudonym) and a room link's key
+                # (?k=, which opens an unlisted room to whoever holds it) are
+                # all masked; the same rule as the flagship's and the compose
+                # Caddyfile's.
+                request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+|([?&]k=)[^&#]+" "${1}${2}${3}${4}REDACTED"
             }
         }
     }

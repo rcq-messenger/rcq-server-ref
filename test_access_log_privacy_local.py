@@ -106,6 +106,19 @@ out = render("uvicorn.access", '%s - "%s %s HTTP/%s" %d',
              ("10.0.0.7:1", "GET", "/v1/health", "1.1", 200))
 check("an API version segment survives", "/v1/health" in out, out)
 
+print("\nA room link's key (?k=) is a credential too")
+out = render("uvicorn.access", '%s - "%s %s HTTP/%s" %d',
+             ("10.0.0.7:1", "GET", "/groups/12/preview?k=Zx3_kQ9-aB7cD1eF2gH4iJ", "1.1", 200))
+check("the key is gone from a preview line", "Zx3_kQ9-aB7cD1eF2gH4iJ" not in out, out)
+check("...replaced, so the line still says a key was sent", "?k=<redacted>" in out, out)
+check("...and the endpoint stays readable", "/groups/12/preview" in out, out)
+out = render("uvicorn.access", '%s - "%s %s HTTP/%s" %d',
+             ("10.0.0.7:1", "POST", "/groups/7/join?x=1&k=%D0%BA%D0%BB&y=2", "1.1", 403))
+check("a hand-made key in the middle of a query goes too", "%D0%BA" not in out and "&k=<redacted>&y=2" in out, out)
+out = render("uvicorn.access", '%s - "%s %s HTTP/%s" %d',
+             ("10.0.0.7:1", "GET", "/messages/queue?ack=1", "1.1", 200))
+check("a parameter that merely ends in k is left alone", "/messages/queue?ack=1" in out, out)
+
 print("\nNon-uvicorn records are left structurally alone")
 record = logging.LogRecord("rcq.messages", logging.WARNING, __file__, 1,
                            "[sealed] to=%s type=%s", ("-", "message"), None)

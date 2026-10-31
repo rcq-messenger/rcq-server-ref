@@ -36,11 +36,13 @@
 	# number (/ws/123456789) or a session token (?token=). Mask both, the
 	# same way the maintainers' rcq.app config does: an operator's error log
 	# must not be an address-to-account map, and it must not hold credentials.
+	# A room link's key (?k=) is masked too: it opens an unlisted room to
+	# whoever holds it.
 	log default {
 		format filter {
 			wrap console
 			fields {
-				request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+" "${1}${2}${3}REDACTED"
+				request>uri regexp "(/vault/)[0-9a-f]{32}|(/)[0-9]{3,10}|(token=)[A-Za-z0-9._-]+|([?&]k=)[^&#]+" "${1}${2}${3}${4}REDACTED"
 				request>remote_ip ip_mask {
 					ipv4 24
 					ipv6 32

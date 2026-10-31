@@ -29,13 +29,24 @@ UNLISTED OPEN ROOMS (report #990, step 2). A room that is open but not in the
 catalogue is still reachable by walking ids through the join and the preview:
 unlisted meant "not searchable", never "needs the link". Now the share token
 is the key to those too. Entitled without it: a room in the catalogue that is
-open, the owner, a member. Everyone else needs `k`.
-Same rollout as above: in SOFT mode (the default) a tokenless preview or join
-of an unlisted room still works and is counted (`room_link_*_tokenless`,
-visible in the admin guests overview); `RCQ_REQUIRE_ROOM_LINK_TOKEN=true` makes
-it a 404 on preview and 403 `room_link_invalid` on join and guest entry. An
-owner or admin can reset the link (`POST /{id}/share-token`), and the old one
-stops working at once in hard mode. `/discover` shows catalogue rooms only.
+open, the owner, a member. Everyone else needs `k`, and is answered 404 on the
+preview and 403 `room_link_invalid` on the join and guest entry when
+(`_room_link_refusal`):
+  * the key they bring is not this room's. In EVERY mode: no client from
+    before keys sends one at all, so a wrong key is an old link after a reset
+    or an edited one. Letting it through made Reset a promise the island did
+    not keep (#1073: the owner reset the link, the old one still opened the
+    room);
+  * they bring no key and the room's link was reset (`link_reset_at`): a reset
+    is the owner saying the links out there must stop working;
+  * they bring no key and `RCQ_REQUIRE_ROOM_LINK_TOKEN=true` (hard mode).
+Anything else, a keyless link to a room never reset in SOFT mode (the
+default), still works and is counted (`room_link_*_tokenless`): links made
+before keys existed carry none. The refusals are counted as well
+(`room_link_badkey`, `room_link_keyless_refused`), all of it in the admin
+guests overview. The owner, or a member holding the `members` permission,
+resets the link with `POST /{id}/share-token`. `/discover` shows catalogue
+rooms only.
 """
 
 import os
@@ -74,18 +85,48 @@ _REQUIRE_CLOSED_GROUP_TOKEN: bool = (
 )
 
 # The same switch for UNLISTED OPEN rooms (#990 step 2): a tokenless preview is
-# 404 and a tokenless join 403 `room_link_invalid`. FALSE until the token-aware
-# clients are out; the tokenless counters say when that is.
+# 404 and a tokenless join 403 `room_link_invalid`, in every room and not only
+# in rooms whose link was reset. FALSE until the token-aware clients are out;
+# the tokenless counters say when that is.
 _REQUIRE_ROOM_LINK_TOKEN: bool = (
     os.environ.get("RCQ_REQUIRE_ROOM_LINK_TOKEN", "false").strip().lower()
     in {"1", "true", "yes"}
 )
 
 
+def _key_matches(g: Group, k: str | None) -> bool:
+    """Is `k` this room's current link key? Constant time, over BYTES.
+
+    `secrets.compare_digest` on two str raises TypeError the moment either one
+    holds a non-ASCII character, so a hand-made `?k=<cyrillic>` was a 500 on
+    the preview, the join and guest entry, in every mode. As bytes it is just
+    a wrong key."""
+    if not g.share_token or not k:
+        return False
+    return secrets.compare_digest(k[:64].encode(), g.share_token.encode())
+
+
+def _room_link_refusal(g: Group, k: str | None) -> str | None:
+    """For somebody outside an OPEN room that is not in the catalogue, whose
+    `k` did not match: the counter that names why they are refused, or None
+    to let them in (soft mode; the caller counts that too).
+
+    Any key that is not this room's is refused, in every mode. No client from
+    before keys sends one, so it is an old link after a reset or an edited one
+    and refusing it costs no legitimate entry (#1073). No key at all is
+    refused once the room's link has been reset, and in every room in hard
+    mode; until then it is a link made before keys existed."""
+    if k:
+        return "room_link_badkey"
+    if _REQUIRE_ROOM_LINK_TOKEN or g.link_reset_at is not None:
+        return "room_link_keyless_refused"
+    return None
+
+
 async def _link_entitled(db: AsyncSession, g: Group, viewer_uin: int | None, k: str | None) -> bool:
     """May this viewer see or enter `g` without anything else? A room in the
     catalogue that is open, its owner, a member, or the holder of the share
-    token (`k`, compared in constant time)."""
+    token (`k`, see `_key_matches`)."""
     if g.in_catalog and not g.is_closed:
         return True
     if viewer_uin is not None:
@@ -95,7 +136,7 @@ async def _link_entitled(db: AsyncSession, g: Group, viewer_uin: int | None, k: 
             select(GroupMember.id).where(GroupMember.group_id == g.id, GroupMember.uin == viewer_uin)
         ) is not None:
             return True
-    return bool(g.share_token) and bool(k) and secrets.compare_digest(k[:64], g.share_token)
+    return _key_matches(g, k)
 
 
 # Above this member count the roster stops carrying live presence — see the
@@ -1004,11 +1045,15 @@ async def preview_group(
     if g.is_closed or not g.in_catalog:
         entitled = await _link_entitled(db, g, _viewer_uin, k)
 
-    # An UNLISTED OPEN room without the key (#990 step 2): the full card in soft
-    # mode, counted, because every link in the wild is tokenless and a blank
-    # card would break them; a 404 in hard mode, like a closed room's.
+    # An UNLISTED OPEN room without its key (#990 step 2). A wrong key, no key
+    # to a room whose link was reset, or no key in hard mode: a 404, like a
+    # closed room's (`_room_link_refusal`). Any other keyless preview gets the
+    # full card, counted, because links made before keys existed carry none
+    # and a blank card would break them.
     if not entitled and not g.is_closed:
-        if _REQUIRE_ROOM_LINK_TOKEN:
+        refused = _room_link_refusal(g, k)
+        if refused:
+            await guest_policy.bump_stat(refused)
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such group")
         await guest_policy.bump_stat("room_link_preview_tokenless")
         entitled = True
@@ -1025,6 +1070,9 @@ async def preview_group(
         # everything worth harvesting — no name, no description, no owner, no
         # member count, no avatar. Flip RCQ_REQUIRE_CLOSED_GROUP_TOKEN=true
         # once token-aware clients are out.
+        # Counted, so that flip has a number to go by: every card served here
+        # would be a 404 under the flag. Joining is refused either way.
+        await guest_policy.bump_stat("closed_preview_tokenless")
         return GroupPreviewOut(
             id=g.id,
             name="",
@@ -1357,10 +1405,14 @@ async def join_group(
             detail={"code": "group_closed"},
         )
 
-    # A room outside the catalogue needs its link (#990 step 2). Soft mode lets
-    # a tokenless join through and counts it; hard mode refuses it.
+    # A room outside the catalogue needs its link (#990 step 2). A wrong key is
+    # refused in every mode, and so is no key once the room's link was reset
+    # (#1073) or when hard mode is on. Soft mode lets any other keyless join
+    # through and counts it.
     if not g.in_catalog and not await _link_entitled(db, g, uin, k):
-        if _REQUIRE_ROOM_LINK_TOKEN:
+        refused = _room_link_refusal(g, k)
+        if refused:
+            await guest_policy.bump_stat(refused)
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "room_link_invalid"})
         await guest_policy.bump_stat("room_join_tokenless")
 
@@ -1890,16 +1942,23 @@ async def reset_share_token(
     db: AsyncSession = Depends(get_db),
 ) -> GroupOut:
     """A new share link for the room (#990 step 2): the owner, or a member
-    holding the `members` permission. The old key stops opening the room the
-    moment hard mode is on; membership is untouched. Every member's client is
-    told the new token through the ordinary membership broadcast, so the share
-    sheet shows the new link without a reload. No guest marker: a guest copy
-    never resets a room's link."""
+    holding the `members` permission. From this moment the old key no longer
+    opens the room, and neither does a link with no key at all, in soft mode
+    too (`_room_link_refusal`); membership is untouched. Every member's client
+    is told the new token through the ordinary membership broadcast, so the
+    share sheet shows the new link without a reload. No guest marker: a guest
+    copy never resets a room's link."""
     me = await _ensure_member(db, group_id, uin)
     g = await _load_group(db, group_id)
     if not _member_can(g, me, "members"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "moderator permission required")
     g.share_token = secrets.token_urlsafe(16)[:22]
+    # And from now on the room wants its key. Otherwise a reset would stop
+    # only the links that carry the old key, while every link made before
+    # keys existed, or with its key cut off, went on opening the room (#1073).
+    # To the day, like a join stamp: the one reader asks whether a reset ever
+    # happened, and the minute a moderator acted is not ours to keep.
+    g.link_reset_at = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     await db.commit()
     members = await _members_with_users(db, group_id)
     payload = _serialize(g, members)

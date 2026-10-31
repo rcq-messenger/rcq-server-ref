@@ -367,6 +367,12 @@ _GROUP_COLUMNS: list[tuple[str, str]] = [
     # constant DEFAULT is metadata-only on Postgres 11+, and every existing
     # room keeps today's behaviour: people from elsewhere may come in.
     ("allow_guests", "BOOLEAN DEFAULT TRUE"),
+    # The day a room's share link was last reset (#1073): a reset room refuses
+    # a link with no key. Nullable with NO default on purpose: the add is then
+    # metadata-only, the DEFAULT self-heal below skips it, and every existing
+    # room reads as never reset. No code reads `groups` with SELECT *, so the
+    # new column changes no cached statement's result shape.
+    ("link_reset_at", "TIMESTAMP WITH TIME ZONE"),
 ]
 
 # Additive on `group_members` — granular moderator capabilities the owner

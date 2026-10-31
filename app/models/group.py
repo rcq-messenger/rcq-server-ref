@@ -114,6 +114,15 @@ class Group(Base):
     # preview gate treats NULL as "no token issued yet" and falls back to the
     # redacted card rather than locking members' existing links out.
     share_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The day the share link was last reset, NULL for a link never reset. Its
+    # one reader asks "ever reset?": a reset room refuses a link that carries
+    # no key at all, in soft mode too (routers/groups.py `_room_link_refusal`),
+    # because a reset is the owner saying the links out there must stop
+    # working (#1073). A day and not a moment, like `GroupMember.joined_at`.
+    # NULL on every row from before the column, so a room reset before it
+    # existed is not marked; its old keyed links are refused anyway, as wrong
+    # keys.
+    link_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

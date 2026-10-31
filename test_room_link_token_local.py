@@ -9,15 +9,23 @@ Pins:
   * an unlisted room with no `k`: SOFT mode serves the full card and lets the
     join through, and counts both; HARD mode answers 404 on preview and 403
     `room_link_invalid` on join;
-  * a wrong `k` is refused in hard mode, the right one opens the room;
+  * a wrong `k` is refused in EVERY mode (#1073): 404 on the preview, 403
+    `room_link_invalid` on the join and guest entry, counted as
+    `room_link_badkey`; an empty `k` is no key; the right one opens the room;
+  * a key that is not ASCII is a refusal and never a 500, in both modes;
   * the owner and an existing member are never refused;
   * guest entry (`/auth/guest`) follows the join rule;
   * reset (`POST /groups/{id}/share-token`): a member without the `members`
-    permission gets 403; the owner gets a new token, the old key stops
-    opening the room in hard mode, and the membership broadcast carries the
-    new token;
+    permission gets 403; the owner gets a new token and the membership
+    broadcast carries it. In SOFT mode too, the old key stops opening the
+    room AND so does a link with no key (`room_link_keyless_refused`), the
+    room is marked to the day, the new key works, members and the owner are
+    untouched; a reset catalogue room still takes anyone, a reset closed room
+    still gets the redacted card (`closed_preview_tokenless`). Hard mode as
+    before;
   * `/groups/discover` shows catalogue rooms only;
-  * a CLOSED room keeps its own gate (redacted card in soft mode).
+  * a CLOSED room keeps its own gate (redacted card in soft mode);
+  * `init_db` over a database that already has `link_reset_at` is a no-op.
 
 Runs the real FastAPI stack in-process on a throwaway SQLite DB with Redis
 db 15. NOT deployed.
@@ -182,10 +190,21 @@ async def main() -> int:
                 body["k"] = k
             return await c.post("/auth/guest", json=body)
 
+        async def reset(gid, tok):
+            await clear("rl:*")
+            return await c.post(f"/groups/{gid}/share-token", headers=H(tok))
+
+        async def mark_of(gid):
+            async with SessionLocal() as db:
+                return (await db.get(Group, gid)).link_reset_at
+
         OWNER, tok_o = await register("owner")
         MEMBER, tok_m = await register("member")
         S1, tok_s1 = await register("stranger-one")
         S2, tok_s2 = await register("stranger-two")
+        # Registered now: guest entry below needs a paid island, and a paid
+        # island registers nobody without a voucher.
+        S3, tok_s3 = await register("stranger-three")
 
         U = await room(tok_o, "unlisted room")   # what POST /groups makes: open, not in the catalogue
         L = await room(tok_o, "catalogue room")
@@ -216,8 +235,147 @@ async def main() -> int:
         before = await stat("room_link_preview_tokenless")
         await preview(L, tok_s1)
         check("and is not counted", await stat("room_link_preview_tokenless") == before)
+        before = await stat("closed_preview_tokenless")
         r = await preview(C, tok_s1)
         check("a closed room still gets its redacted card", r.status_code == 200 and r.json().get("name") == "")
+        check("which is counted", await stat("closed_preview_tokenless") == before + 1)
+
+        print("\nSoft mode, a key that is not the room's (#1073):")
+        before = await stat("room_link_badkey")
+        r = await preview(U, tok_s1, k="x" * 22)
+        check("a wrong key is 404 on the preview, soft mode or not", r.status_code == 404)
+        r = await preview(U, None, k="x" * 22)
+        check("anonymous too", r.status_code == 404)
+        r = await join(U, tok_s1, k="y" * 22)
+        check("and 403 room_link_invalid on the join", r.status_code == 403 and code_of(r) == "room_link_invalid")
+        check("each refusal is counted as a bad key", await stat("room_link_badkey") == before + 3)
+        r = await join(U, tok_s1, k=k_u[:-1])
+        check("an edited key (one character short) is refused",
+              r.status_code == 403 and code_of(r) == "room_link_invalid")
+        r = await preview(U, tok_m, k="x" * 22)
+        check("a member with a stale key still sees the card", r.status_code == 200 and r.json().get("name") == "unlisted room")
+        r = await preview(U, tok_o, k="x" * 22)
+        check("so does the owner", r.status_code == 200)
+        r = await preview(L, tok_s1, k="x" * 22)
+        check("a catalogue room ignores a wrong key", r.status_code == 200 and r.json().get("name") == "catalogue room")
+        r = await preview(U, tok_s1, k=k_u)
+        check("the right key opens the card", r.status_code == 200 and r.json().get("name") == "unlisted room")
+        before = await stat("room_join_tokenless")
+        r = await join(U, tok_s1, k="")
+        check("an empty key is no key: soft mode lets it through", r.status_code == 200)
+        check("counted as tokenless", await stat("room_join_tokenless") == before + 1)
+        await leave(U, tok_s1, S1)
+
+        print("\nKeys that are not ASCII never reach a 500:")
+        for hard in (False, True):
+            groups_mod._REQUIRE_ROOM_LINK_TOKEN = hard
+            mode = "hard" if hard else "soft"
+            r = await preview(U, tok_s1, k="ключ-от-комнаты")
+            check(f"{mode}: a Cyrillic key previews as 404 ({r.status_code})", r.status_code == 404)
+            r = await join(U, tok_s1, k="ключ-от-комнаты")
+            check(f"{mode}: and joins as 403 room_link_invalid ({r.status_code})",
+                  r.status_code == 403 and code_of(r) == "room_link_invalid")
+            r = await preview(C, tok_s1, k="ключ")
+            check(f"{mode}: a closed room answers it like any wrong key ({r.status_code})",
+                  r.status_code == 200 and r.json().get("name") == "")
+        groups_mod._REQUIRE_ROOM_LINK_TOKEN = False
+
+        print("\nGuest entry, soft mode:")
+        # Guests are admitted on a paid island only (guest_policy.admission_open).
+        await set_settings(registration_policy="paid")
+        before = await stat("room_link_badkey")
+        r = await guest(U, k="z" * 22)
+        check(f"a wrong key is 403 room_link_invalid for a guest too ({r.status_code})",
+              r.status_code == 403 and code_of(r) == "room_link_invalid")
+        check("and counted as a bad key", await stat("room_link_badkey") == before + 1)
+        r = await guest(U, k="ключ")
+        check(f"a Cyrillic key is a refusal, not a 500 ({r.status_code})",
+              r.status_code == 403 and code_of(r) == "room_link_invalid")
+        before = await stat("room_guest_tokenless")
+        r = await guest(U)
+        check(f"a keyless guest still comes into a room never reset ({r.status_code})", r.status_code == 201)
+        check("counted as tokenless", await stat("room_guest_tokenless") == before + 1)
+
+        print("\nReset in soft mode (#1073):")
+        U2 = await room(tok_o, "reset me")
+        L2 = await room(tok_o, "listed, then reset")
+        C2 = await room(tok_o, "closed, then reset")
+        async with SessionLocal() as db:
+            await db.execute(update(Group).where(Group.id == L2).values(in_catalog=True))
+            await db.execute(update(Group).where(Group.id == C2).values(is_closed=True))
+            await db.commit()
+        old2 = await token_of(U2, tok_o)
+        r = await join(U2, tok_m, k=old2)
+        check("a member joins the fresh room with its key", r.status_code == 200)
+        r = await join(U2, tok_s3)
+        check("before any reset a keyless join goes through", r.status_code == 200)
+        await leave(U2, tok_s3, S3)
+        check("a room never reset carries no mark", await mark_of(U2) is None)
+        broadcasts.clear()
+        r = await reset(U2, tok_o)
+        new2 = r.json().get("share_token") if r.status_code == 200 else None
+        check("the owner resets the link", r.status_code == 200 and new2 and new2 != old2)
+        check("the broadcast carries the new key",
+              any(gid == U2 and p.get("share_token") == new2 for gid, p in broadcasts))
+        mark = await mark_of(U2)
+        check(f"the room is marked, to the day ({mark})",
+              mark is not None and (mark.hour, mark.minute, mark.second, mark.microsecond) == (0, 0, 0, 0))
+        before_bad = await stat("room_link_badkey")
+        before_none = await stat("room_link_keyless_refused")
+        before_soft = await stat("room_join_tokenless")
+        r = await preview(U2, tok_s3, k=old2)
+        check("the old key no longer previews it", r.status_code == 404)
+        r = await join(U2, tok_s3, k=old2)
+        check("nor joins it", r.status_code == 403 and code_of(r) == "room_link_invalid")
+        check("both counted as bad keys", await stat("room_link_badkey") == before_bad + 2)
+        r = await preview(U2, tok_s3)
+        check("a link with no key previews as 404 now", r.status_code == 404)
+        r = await preview(U2, None)
+        check("anonymous too", r.status_code == 404)
+        r = await join(U2, tok_s3)
+        check("and does not join", r.status_code == 403 and code_of(r) == "room_link_invalid")
+        check("counted as keyless refusals", await stat("room_link_keyless_refused") == before_none + 3)
+        check("and never as a soft pass", await stat("room_join_tokenless") == before_soft)
+        r = await guest(U2)
+        check(f"a keyless guest is refused ({r.status_code})", r.status_code == 403 and code_of(r) == "room_link_invalid")
+        r = await guest(U2, k=old2)
+        check(f"so is one with the old key ({r.status_code})", r.status_code == 403 and code_of(r) == "room_link_invalid")
+        r = await guest(U2, k=new2)
+        check(f"the new key lets a guest in ({r.status_code})", r.status_code == 201)
+        r = await preview(U2, tok_s3, k=new2)
+        check("the new key previews it", r.status_code == 200 and r.json().get("name") == "reset me")
+        r = await join(U2, tok_s3, k=new2)
+        check("and joins it", r.status_code == 200)
+        r = await preview(U2, tok_m)
+        check("a member needs no key after the reset", r.status_code == 200)
+        r = await join(U2, tok_m)
+        check("and keeps the seat", r.status_code == 200)
+        r = await preview(U2, tok_o)
+        check("the owner needs none either", r.status_code == 200)
+
+        r = await reset(L2, tok_o)
+        check("a catalogue room can be reset", r.status_code == 200)
+        r = await preview(L2, tok_s3)
+        check("and still previews without a key while it is listed",
+              r.status_code == 200 and r.json().get("name") == "listed, then reset")
+        r = await join(L2, tok_s3)
+        check("and still joins without one", r.status_code == 200)
+
+        old_c = await token_of(C2, tok_o)
+        r = await reset(C2, tok_o)
+        new_c = r.json().get("share_token") if r.status_code == 200 else None
+        check("a closed room can be reset", r.status_code == 200 and new_c and new_c != old_c)
+        before = await stat("closed_preview_tokenless")
+        r = await preview(C2, tok_s3)
+        check("and still gets the redacted card without a key", r.status_code == 200 and r.json().get("name") == "")
+        r = await preview(C2, tok_s3, k=old_c)
+        check("and with the old key", r.status_code == 200 and r.json().get("name") == "")
+        check("both counted", await stat("closed_preview_tokenless") == before + 2)
+        r = await preview(C2, tok_s3, k=new_c)
+        check("the new key shows the whole card", r.status_code == 200 and r.json().get("name") == "closed, then reset")
+        r = await join(C2, tok_s3, k=new_c)
+        check("joining a closed room is refused whatever the key",
+              r.status_code == 403 and code_of(r) == "group_closed")
 
         print("\nDiscover:")
         await clear("rl:*")
@@ -284,6 +442,16 @@ async def main() -> int:
         check("members keep their seat after a reset", r.status_code == 200)
 
     groups_mod._REQUIRE_ROOM_LINK_TOKEN = False
+
+    print("\nThe column add is idempotent:")
+    try:
+        await init_db()
+        again = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"       {type(exc).__name__}: {exc}")
+        again = False
+    check("init_db over a database that already has link_reset_at is a no-op", again)
+    check("and the marks survive it", await mark_of(U2) is not None and await mark_of(U) is not None)
     await close_redis()
     print(f"\n{'ALL PASS' if fails == 0 else f'{fails} FAILED'}")
     return fails

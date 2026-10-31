@@ -1172,11 +1172,19 @@ GUEST_COUNTERS = (
     "guest_swept_b",
     "guest_swept_c",
     "guest_host_from_header",
-    # #990 step 2: uses of a room link without its key, while the island is in
-    # soft mode. When these stay near zero, hard mode can go on.
+    # #990 step 2: uses of a room link without its key that soft mode let
+    # through. When these stay near zero, hard mode can go on.
     "room_link_preview_tokenless",
     "room_join_tokenless",
     "room_guest_tokenless",
+    # The refusals, preview, join and guest entry together (#1073): a key that
+    # is not the room's, refused in every mode; and no key, to a room whose
+    # link was reset or on an island in hard mode.
+    "room_link_badkey",
+    "room_link_keyless_refused",
+    # Previews of a CLOSED room without its key, answered with the nameless
+    # card. Each one would be a 404 with RCQ_REQUIRE_CLOSED_GROUP_TOKEN on.
+    "closed_preview_tokenless",
 )
 
 

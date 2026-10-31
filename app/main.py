@@ -79,11 +79,18 @@ class _RedactSecretsInLogs(logging.Filter):
     # all the same, and one line per read or write would make the access log
     # an activity feed per account again. Same treatment as the number.
     _RE_VAULT_PATH = re.compile(r"/vault/[0-9a-f]{32}(?=[/?\s\"]|$)")
+    # A room link's key (`?k=`, #990 step 2) opens an unlisted room to whoever
+    # holds it, and a room id under three digits survives the id mask, so a
+    # logged preview or join line was a working invite. Matched as a query
+    # parameter only: a bare `k=` is too common a pair of characters.
+    _RE_ROOM_KEY = re.compile(r"([?&]k=)[^&\s\"#]+")
 
     def _scrub(self, text: str, paths: bool) -> str:
         out = text
         if "token=" in out or "invite=" in out:
             out = self._RE.sub(r"\1=<redacted>", out)
+        if "k=" in out:
+            out = self._RE_ROOM_KEY.sub(r"\1<redacted>", out)
         if paths:
             out = self._RE_ADDR.sub(r"\1.0", out)
             out = self._RE_ID_PATH.sub("/<id>", out)
